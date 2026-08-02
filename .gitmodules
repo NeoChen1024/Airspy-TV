@@ -1,0 +1,6 @@
+[submodule "contrib/imgui"]
+	path = contrib/imgui
+	url = https://github.com/ocornut/imgui.git
+[submodule "contrib/json"]
+	path = contrib/json
+	url = https://github.com/nlohmann/json.git

@@ -1,0 +1,6 @@
+/build/
+/cmake-build-*/
+/.cache/
+compile_commands.json
+*.cs16
+*.cs16.json
