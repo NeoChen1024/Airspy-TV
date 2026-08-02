@@ -1,6 +1,7 @@
 #pragma once
 
 #include "airspy_tv/recorder.hpp"
+#include "airspy_tv/spectrum.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -13,7 +14,7 @@
 
 namespace airspy_tv {
 
-enum class SdrBackend { AirspyNative, Soapy };
+enum class SdrBackend { AirspyNative, Soapy, File };
 enum class AirspyGainMode { Sensitivity, Linearity };
 
 struct DeviceDescriptor {
@@ -52,19 +53,28 @@ class SdrDevice {
     static EnumerationResult enumerate(bool include_soapy_airspy);
 
     bool open(const DeviceDescriptor &descriptor, std::string &error);
+    bool open_iq_file(const std::filesystem::path &path,
+                      SourceSettings &settings, std::string &error);
     void close();
     bool configure(const SourceSettings &settings, std::string &error);
+    bool start_stream(const SourceSettings &settings, std::string &error);
+    void stop_stream();
+    bool set_center_frequency(std::uint64_t frequency_hz, std::string &error);
+    bool set_gain(const SourceSettings &settings, std::string &error);
+    bool set_bias_tee(bool enabled, std::string &error);
 
     bool start_recording(const std::filesystem::path &path,
                          const SourceSettings &settings, std::string &error);
     void stop_recording();
 
     [[nodiscard]] bool is_open() const;
+    [[nodiscard]] bool is_streaming() const;
     [[nodiscard]] bool is_recording() const;
     [[nodiscard]] const DeviceDescriptor *descriptor() const;
     [[nodiscard]] const std::vector<std::uint32_t> &sample_rates() const;
     [[nodiscard]] std::optional<std::pair<double, double>> gain_range() const;
     [[nodiscard]] RecordingStats recording_stats() const;
+    [[nodiscard]] SpectrumSnapshot spectrum_snapshot() const;
     [[nodiscard]] std::string runtime_error() const;
 
   private:

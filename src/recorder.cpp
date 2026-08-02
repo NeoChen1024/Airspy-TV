@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <fstream>
@@ -26,8 +27,10 @@ struct RawIqRecorder::Impl {
     std::thread worker;
     std::filesystem::path path;
     RecordingMetadata metadata;
+    std::chrono::steady_clock::time_point started_at;
     bool stopping{};
     std::atomic<bool> active;
+    std::atomic<std::uint64_t> elapsed_milliseconds;
     std::atomic<std::uint64_t> complex_samples;
     std::atomic<std::uint64_t> bytes_written;
     std::atomic<std::uint64_t> dropped_blocks;
@@ -67,12 +70,14 @@ struct RawIqRecorder::Impl {
                 return;
             }
             const nlohmann::json metadata_json{
+                {"data_file", path.filename().string()},
                 {"datatype", "ci16_le"},
                 {"iq_order", "IQ"},
                 {"sample_rate", metadata.sample_rate_hz},
                 {"center_frequency", metadata.center_frequency_hz},
                 {"source", metadata.source},
                 {"complex_samples", complex_samples.load()},
+                {"duration_ms", elapsed_milliseconds.load()},
                 {"dropped_blocks", dropped_blocks.load()},
                 {"source_dropped_samples", source_dropped_samples.load()},
             };
@@ -105,7 +110,9 @@ bool RawIqRecorder::start(const std::filesystem::path &path,
     impl_->path = path;
     impl_->metadata = std::move(metadata);
     impl_->stopping = false;
+    impl_->started_at = std::chrono::steady_clock::now();
     impl_->complex_samples = 0;
+    impl_->elapsed_milliseconds = 0;
     impl_->bytes_written = 0;
     impl_->dropped_blocks = 0;
     impl_->source_dropped_samples = 0;
@@ -143,14 +150,26 @@ void RawIqRecorder::stop() noexcept {
     }
     impl_->ready.notify_one();
     impl_->worker.join();
+    impl_->elapsed_milliseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - impl_->started_at)
+            .count());
     impl_->output.close();
     impl_->write_sidecar();
     impl_->queue.clear();
 }
 
 RecordingStats RawIqRecorder::stats() const {
+    std::uint64_t elapsed_milliseconds = impl_->elapsed_milliseconds;
+    if (impl_->active) {
+        elapsed_milliseconds = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - impl_->started_at)
+                .count());
+    }
     return {
         .active = impl_->active,
+        .elapsed_milliseconds = elapsed_milliseconds,
         .complex_samples = impl_->complex_samples,
         .bytes_written = impl_->bytes_written,
         .dropped_blocks = impl_->dropped_blocks,

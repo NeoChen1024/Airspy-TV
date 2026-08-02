@@ -1,10 +1,13 @@
 #include "airspy_tv/sdr.hpp"
 
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_dialog.h>
 #include <SDL3/SDL_opengl.h>
 #include <imgui.h>
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl3.h>
+#include <imgui_stdlib.h>
+#include <tinycolormap.hpp>
 
 #include <algorithm>
 #include <array>
@@ -13,13 +16,20 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <format>
+#include <iomanip>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -29,9 +39,98 @@ using airspy_tv::EnumerationResult;
 using airspy_tv::SdrBackend;
 using airspy_tv::SdrDevice;
 using airspy_tv::SourceSettings;
+using airspy_tv::SpectrumSnapshot;
 
 constexpr ImVec4 accent{0.12F, 0.58F, 0.92F, 1.0F};
 constexpr float panel_width = 410.0F;
+constexpr float signal_meter_floor_dbfs = -140.0F;
+constexpr float signal_meter_ceiling_dbfs = 0.0F;
+constexpr float default_display_floor_dbfs = -100.0F;
+constexpr float default_display_ceiling_dbfs = -20.0F;
+constexpr float minimum_display_range_db = 1.0F;
+constexpr float spectrum_label_margin = 36.0F;
+constexpr int waterfall_texture_width = 512;
+constexpr int waterfall_texture_height = 192;
+constexpr std::size_t waterfall_cell_count =
+    static_cast<std::size_t>(waterfall_texture_width) *
+    static_cast<std::size_t>(waterfall_texture_height);
+constexpr std::uint64_t max_display_frequency = 999'999'999'999ULL;
+constexpr std::array<std::uint64_t, 12> digit_steps{
+    100'000'000'000ULL,
+    10'000'000'000ULL,
+    1'000'000'000ULL,
+    100'000'000ULL,
+    10'000'000ULL,
+    1'000'000ULL,
+    100'000ULL,
+    10'000ULL,
+    1'000ULL,
+    100ULL,
+    10ULL,
+    1ULL,
+};
+constexpr std::array<SDL_DialogFileFilter, 2> recording_filters{{
+    {"Raw interleaved I/Q", "cs16;iq"},
+    {"All files", "*"},
+}};
+constexpr std::array<SDL_DialogFileFilter, 2> transport_stream_filters{{
+    {"MPEG transport stream", "ts;m2ts"},
+    {"All files", "*"},
+}};
+constexpr std::array<SDL_DialogFileFilter, 3> iq_source_filters{{
+    {"I/Q metadata or raw INT16_IQ", "json;cs16;iq"},
+    {"I/Q metadata", "json"},
+    {"All files", "*"},
+}};
+
+struct ColormapOption {
+    const char *name;
+    tinycolormap::ColormapType type;
+};
+
+constexpr std::array colormap_options{
+    ColormapOption{"Cubehelix", tinycolormap::ColormapType::Cubehelix},
+    ColormapOption{"Viridis", tinycolormap::ColormapType::Viridis},
+    ColormapOption{"Cividis", tinycolormap::ColormapType::Cividis},
+    ColormapOption{"Magma", tinycolormap::ColormapType::Magma},
+    ColormapOption{"Inferno", tinycolormap::ColormapType::Inferno},
+    ColormapOption{"Plasma", tinycolormap::ColormapType::Plasma},
+    ColormapOption{"Turbo", tinycolormap::ColormapType::Turbo},
+    ColormapOption{"Parula", tinycolormap::ColormapType::Parula},
+    ColormapOption{"Heat", tinycolormap::ColormapType::Heat},
+    ColormapOption{"Hot", tinycolormap::ColormapType::Hot},
+    ColormapOption{"Gray", tinycolormap::ColormapType::Gray},
+    ColormapOption{"Jet", tinycolormap::ColormapType::Jet},
+    ColormapOption{"HSV", tinycolormap::ColormapType::HSV},
+    ColormapOption{"GitHub", tinycolormap::ColormapType::Github},
+};
+
+struct FileDialogState {
+    std::mutex mutex;
+    std::optional<std::string> selected_path;
+    std::optional<std::string> error;
+    std::string default_location;
+    bool open{};
+};
+
+struct WaterfallDisplay {
+    GLuint texture{};
+    std::vector<float> history =
+        std::vector<float>(waterfall_cell_count, signal_meter_floor_dbfs);
+    std::vector<std::uint8_t> rgba =
+        std::vector<std::uint8_t>(waterfall_cell_count * 4);
+    std::uint64_t sequence{};
+    std::size_t colormap_index{};
+    float floor_dbfs{default_display_floor_dbfs};
+    float ceiling_dbfs{default_display_ceiling_dbfs};
+
+    void destroy() {
+        if (texture != 0) {
+            glDeleteTextures(1, &texture);
+            texture = 0;
+        }
+    }
+};
 
 struct AppState {
     SdrDevice receiver;
@@ -40,14 +139,36 @@ struct AppState {
     std::size_t selected_device{};
     bool show_soapy_airspy{};
     std::string status{"Ready"};
-    std::array<char, 512> recording_path{};
-
-    AppState() {
-        constexpr std::string_view default_path = "capture.cs16";
-        std::copy(default_path.begin(), default_path.end(),
-                  recording_path.begin());
-    }
+    std::string recording_path{"capture.cs16"};
+    std::string ts_recording_path{"capture.ts"};
+    std::size_t selected_colormap{};
+    float display_floor_dbfs{default_display_floor_dbfs};
+    float display_ceiling_dbfs{default_display_ceiling_dbfs};
+    SpectrumSnapshot spectrum;
+    WaterfallDisplay waterfall;
+    SDL_Window *window{};
+    std::shared_ptr<FileDialogState> file_dialog{
+        std::make_shared<FileDialogState>()};
+    std::shared_ptr<FileDialogState> ts_file_dialog{
+        std::make_shared<FileDialogState>()};
+    std::shared_ptr<FileDialogState> iq_source_dialog{
+        std::make_shared<FileDialogState>()};
 };
+
+void SDLCALL save_file_callback(void *userdata, const char *const *filelist,
+                                const int selected_filter) {
+    static_cast<void>(selected_filter);
+    const std::unique_ptr<std::shared_ptr<FileDialogState>> callback_state(
+        static_cast<std::shared_ptr<FileDialogState> *>(userdata));
+    const std::shared_ptr<FileDialogState> &state = *callback_state;
+    const std::scoped_lock lock(state->mutex);
+    state->open = false;
+    if (filelist == nullptr) {
+        state->error = SDL_GetError();
+    } else if (filelist[0] != nullptr) {
+        state->selected_path = filelist[0];
+    }
+}
 
 void apply_dark_theme() {
     ImGui::StyleColorsDark();
@@ -87,7 +208,137 @@ void refresh_devices(AppState &state) {
     }
 }
 
-void draw_spectrum(const ImVec2 size) {
+std::string format_frequency_step(const std::uint64_t step_hz) {
+    if (step_hz >= 1'000'000'000ULL) {
+        return std::format("{} GHz", step_hz / 1'000'000'000ULL);
+    }
+    if (step_hz >= 1'000'000ULL) {
+        return std::format("{} MHz", step_hz / 1'000'000ULL);
+    }
+    if (step_hz >= 1'000ULL) {
+        return std::format("{} kHz", step_hz / 1'000ULL);
+    }
+    return std::format("{} Hz", step_hz);
+}
+
+std::optional<std::uint64_t>
+draw_frequency_control(const char *id, const std::uint64_t frequency_hz) {
+    const std::string digits =
+        std::format("{:012}", std::min(frequency_hz, max_display_frequency));
+    const float font_size = ImGui::GetFontSize() * 1.35F;
+    const float digit_width = (ImGui::CalcTextSize("0").x * 1.35F) + 6.0F;
+    const float separator_width = (ImGui::CalcTextSize(".").x * 1.35F) + 2.0F;
+    const float height = font_size + 10.0F;
+    std::optional<std::uint64_t> requested;
+    bool significant_digit_seen = false;
+
+    ImGui::PushID(id);
+    ImGui::BeginGroup();
+    for (std::size_t index = 0; index < digits.size(); ++index) {
+        if (index != 0) {
+            ImGui::SameLine(0.0F, 0.0F);
+        }
+        if (index != 0 && index % 3 == 0) {
+            ImGui::PushID(static_cast<int>(index));
+            ImGui::InvisibleButton("separator",
+                                   ImVec2(separator_width, height));
+            const ImVec2 separator_min = ImGui::GetItemRectMin();
+            ImGui::GetWindowDrawList()->AddText(
+                ImGui::GetFont(), font_size,
+                ImVec2(separator_min.x + 1.0F, separator_min.y + 4.0F),
+                ImGui::GetColorU32(ImGuiCol_TextDisabled), ".");
+            ImGui::PopID();
+            ImGui::SameLine(0.0F, 0.0F);
+        }
+
+        ImGui::PushID(static_cast<int>(index));
+        ImGui::InvisibleButton("digit", ImVec2(digit_width, height));
+        const ImVec2 item_min = ImGui::GetItemRectMin();
+        const ImVec2 item_max = ImGui::GetItemRectMax();
+        const bool hovered = ImGui::IsItemHovered();
+        if (hovered) {
+            ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                item_min, item_max, ImGui::GetColorU32(ImGuiCol_HeaderHovered),
+                3.0F);
+        }
+
+        int direction = 0;
+        int repeat = 1;
+        if (hovered && ImGui::GetIO().MouseWheel != 0.0F) {
+            const float wheel = ImGui::GetIO().MouseWheel;
+            direction = wheel > 0.0F ? 1 : -1;
+            repeat =
+                std::max(1, static_cast<int>(std::lround(std::abs(wheel))));
+        }
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            const float middle = (item_min.y + item_max.y) * 0.5F;
+            direction = ImGui::GetMousePos().y < middle ? 1 : -1;
+        }
+
+        if (direction != 0) {
+            const std::uint64_t step = digit_steps[index];
+            const std::uint64_t delta =
+                step * static_cast<std::uint64_t>(repeat);
+            if (direction > 0) {
+                requested = frequency_hz > max_display_frequency - delta
+                                ? max_display_frequency
+                                : frequency_hz + delta;
+            } else {
+                requested = frequency_hz > delta ? frequency_hz - delta : 0;
+            }
+        }
+
+        significant_digit_seen |= digits[index] != '0';
+        const ImU32 colour = ImGui::GetColorU32(
+            significant_digit_seen ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+        const std::array<char, 2> digit_text{digits[index], '\0'};
+        ImGui::GetWindowDrawList()->AddText(
+            ImGui::GetFont(), font_size,
+            ImVec2(item_min.x + 3.0F, item_min.y + 4.0F), colour,
+            digit_text.data());
+        if (hovered) {
+            ImGui::SetTooltip(
+                "Wheel/click: +/- %s",
+                format_frequency_step(digit_steps[index]).c_str());
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndGroup();
+    ImGui::PopID();
+    return requested;
+}
+
+void request_center_frequency(AppState &state,
+                              const std::uint64_t frequency_hz) {
+    if (!state.receiver.is_open()) {
+        state.settings.center_frequency_hz = frequency_hz;
+        state.status = "Center frequency selected";
+        return;
+    }
+
+    std::string error;
+    if (state.receiver.set_center_frequency(frequency_hz, error)) {
+        state.settings.center_frequency_hz = frequency_hz;
+        state.status = "Center frequency applied";
+    } else {
+        state.status = error;
+    }
+}
+
+float spectrum_column_peak(const SpectrumSnapshot &spectrum,
+                           const std::size_t column,
+                           const std::size_t column_count) {
+    const std::size_t begin =
+        (column * spectrum.bins_dbfs.size()) / column_count;
+    const std::size_t end = std::max(
+        begin + 1, ((column + 1) * spectrum.bins_dbfs.size()) / column_count);
+    return *std::ranges::max_element(
+        std::span(spectrum.bins_dbfs).subspan(begin, end - begin));
+}
+
+void draw_spectrum(const ImVec2 size, const SpectrumSnapshot &spectrum,
+                   const float floor_dbfs, const float ceiling_dbfs) {
     ImVec2 canvas_size = size;
     if (canvas_size.x <= 0.0F) {
         canvas_size.x = ImGui::GetContentRegionAvail().x;
@@ -98,83 +349,167 @@ void draw_spectrum(const ImVec2 size) {
     ImDrawList *draw = ImGui::GetWindowDrawList();
     draw->AddRectFilled(origin, extent, IM_COL32(4, 9, 15, 255), 4.0F);
 
-    for (int index = 1; index < 6; ++index) {
-        const float y =
-            origin.y + (canvas_size.y * static_cast<float>(index) / 6.0F);
+    const ImVec2 plot_origin{origin.x + spectrum_label_margin, origin.y};
+    const float plot_width = std::max(2.0F, extent.x - plot_origin.x);
+    constexpr int grid_divisions = 4;
+    for (int grid = 0; grid <= grid_divisions; ++grid) {
+        const float fraction =
+            static_cast<float>(grid) / static_cast<float>(grid_divisions);
+        const float level =
+            ceiling_dbfs - (fraction * (ceiling_dbfs - floor_dbfs));
+        const float y = origin.y + (canvas_size.y * fraction);
         draw->AddLine(ImVec2(origin.x, y), ImVec2(extent.x, y),
                       IM_COL32(38, 51, 65, 160));
+        draw->AddText(ImVec2(origin.x + 3.0F,
+                             y + (grid == grid_divisions ? -14.0F : 2.0F)),
+                      IM_COL32(118, 133, 148, 220),
+                      std::format("{:.0f}", level).c_str());
     }
-    for (int index = 1; index < 8; ++index) {
+    for (int index = 0; index <= 4; ++index) {
         const float x =
-            origin.x + (canvas_size.x * static_cast<float>(index) / 8.0F);
+            plot_origin.x + (plot_width * static_cast<float>(index) / 4.0F);
         draw->AddLine(ImVec2(x, origin.y), ImVec2(x, extent.y),
                       IM_COL32(38, 51, 65, 160));
     }
 
-    ImVec2 previous{origin.x, extent.y - 20.0F};
-    for (int index = 0; index <= 128; ++index) {
-        const float phase = static_cast<float>(index) / 128.0F;
-        const float carrier =
-            std::exp(-900.0F * (phase - 0.58F) * (phase - 0.58F));
-        const float ripple = (0.06F * std::sin(phase * 81.0F)) +
-                             (0.035F * std::sin(phase * 211.0F));
-        const float level =
-            std::clamp(0.22F + ripple + (carrier * 0.62F), 0.05F, 0.95F);
-        const ImVec2 point{origin.x + (phase * canvas_size.x),
-                           extent.y - (level * canvas_size.y)};
-        if (index != 0) {
-            draw->AddLine(previous, point, IM_COL32(45, 205, 235, 255), 1.4F);
+    if (spectrum.valid) {
+        const auto column_count =
+            static_cast<std::size_t>(std::clamp(plot_width, 2.0F, 768.0F));
+        std::vector<ImVec2> points;
+        points.reserve(column_count);
+        for (std::size_t column = 0; column < column_count; ++column) {
+            const float level =
+                spectrum_column_peak(spectrum, column, column_count);
+            const float normalized = std::clamp(
+                (level - floor_dbfs) / (ceiling_dbfs - floor_dbfs), 0.0F, 1.0F);
+            points.emplace_back(plot_origin.x +
+                                    (plot_width * static_cast<float>(column) /
+                                     static_cast<float>(column_count - 1)),
+                                extent.y - (normalized * canvas_size.y));
         }
-        previous = point;
+        draw->AddPolyline(points.data(), static_cast<int>(points.size()),
+                          IM_COL32(45, 205, 235, 255), 0, 1.4F);
+    } else {
+        draw->AddText(ImVec2(plot_origin.x + 8.0F, origin.y + 28.0F),
+                      IM_COL32(150, 167, 184, 255), "Waiting for I/Q data...");
     }
-    draw->AddText(ImVec2(origin.x + 8.0F, origin.y + 6.0F),
-                  IM_COL32(150, 167, 184, 255), "RF spectrum — mock data");
+    draw->AddText(ImVec2(plot_origin.x + 8.0F, origin.y + 6.0F),
+                  IM_COL32(150, 167, 184, 255), "Spectrum dBFS/bin");
 }
 
-ImU32 waterfall_colour(const float value) {
-    const float clamped = std::clamp(value, 0.0F, 1.0F);
-    const int red = static_cast<int>(25.0F + (190.0F * clamped * clamped));
-    const int green = static_cast<int>(8.0F + (210.0F * clamped));
-    const int blue =
-        static_cast<int>(55.0F + (180.0F * (1.0F - std::abs(clamped - 0.55F))));
-    return IM_COL32(red, green, blue, 255);
+void ensure_waterfall_texture(WaterfallDisplay &waterfall) {
+    if (waterfall.texture != 0) {
+        return;
+    }
+    glGenTextures(1, &waterfall.texture);
+    glBindTexture(GL_TEXTURE_2D, waterfall.texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, waterfall_texture_width,
+                 waterfall_texture_height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 waterfall.rgba.data());
 }
 
-void draw_waterfall(const ImVec2 size) {
+void recolour_waterfall(WaterfallDisplay &waterfall,
+                        const tinycolormap::ColormapType colormap,
+                        const float floor_dbfs, const float ceiling_dbfs) {
+    constexpr std::size_t lut_size = 256;
+    std::array<std::array<std::uint8_t, 4>, lut_size> colour_lut{};
+    for (std::size_t index = 0; index < colour_lut.size(); ++index) {
+        const tinycolormap::Color colour = tinycolormap::GetColor(
+            static_cast<double>(index) /
+                static_cast<double>(colour_lut.size() - 1),
+            colormap);
+        colour_lut[index] = {
+            static_cast<std::uint8_t>(
+                std::lround(std::clamp(colour.r(), 0.0, 1.0) * 255.0)),
+            static_cast<std::uint8_t>(
+                std::lround(std::clamp(colour.g(), 0.0, 1.0) * 255.0)),
+            static_cast<std::uint8_t>(
+                std::lround(std::clamp(colour.b(), 0.0, 1.0) * 255.0)),
+            255,
+        };
+    }
+
+    for (std::size_t index = 0; index < waterfall.history.size(); ++index) {
+        const float normalized =
+            std::clamp((waterfall.history[index] - floor_dbfs) /
+                           (ceiling_dbfs - floor_dbfs),
+                       0.0F, 1.0F);
+        const auto lut_index = static_cast<std::size_t>(std::lround(
+            normalized * static_cast<float>(colour_lut.size() - 1)));
+        const std::size_t pixel = index * 4;
+        std::ranges::copy(colour_lut[lut_index],
+                          waterfall.rgba.begin() +
+                              static_cast<std::ptrdiff_t>(pixel));
+    }
+
+    ensure_waterfall_texture(waterfall);
+    glBindTexture(GL_TEXTURE_2D, waterfall.texture);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, waterfall_texture_width,
+                    waterfall_texture_height, GL_RGBA, GL_UNSIGNED_BYTE,
+                    waterfall.rgba.data());
+}
+
+void update_waterfall(WaterfallDisplay &waterfall,
+                      const SpectrumSnapshot &spectrum,
+                      const std::size_t colormap_index, const float floor_dbfs,
+                      const float ceiling_dbfs) {
+    IM_ASSERT(waterfall.history.size() == waterfall_cell_count);
+    IM_ASSERT(waterfall.rgba.size() == waterfall_cell_count * 4);
+    bool changed = false;
+    if (spectrum.valid && spectrum.sequence != waterfall.sequence) {
+        constexpr std::size_t row_size = waterfall_texture_width;
+        std::memmove(waterfall.history.data() + row_size,
+                     waterfall.history.data(),
+                     (waterfall.history.size() - row_size) * sizeof(float));
+        for (std::size_t column = 0; column < row_size; ++column) {
+            waterfall.history[column] =
+                spectrum_column_peak(spectrum, column, row_size);
+        }
+        waterfall.sequence = spectrum.sequence;
+        changed = true;
+    }
+    if (waterfall.colormap_index != colormap_index) {
+        waterfall.colormap_index = colormap_index;
+        changed = true;
+    }
+    if (waterfall.floor_dbfs != floor_dbfs ||
+        waterfall.ceiling_dbfs != ceiling_dbfs) {
+        waterfall.floor_dbfs = floor_dbfs;
+        waterfall.ceiling_dbfs = ceiling_dbfs;
+        changed = true;
+    }
+    ensure_waterfall_texture(waterfall);
+    if (changed) {
+        recolour_waterfall(waterfall, colormap_options[colormap_index].type,
+                           floor_dbfs, ceiling_dbfs);
+    }
+}
+
+void draw_waterfall(const ImVec2 size, WaterfallDisplay &waterfall,
+                    const SpectrumSnapshot &spectrum,
+                    const std::size_t colormap_index, const float floor_dbfs,
+                    const float ceiling_dbfs) {
     ImVec2 canvas_size = size;
     if (canvas_size.x <= 0.0F) {
         canvas_size.x = ImGui::GetContentRegionAvail().x;
     }
+    update_waterfall(waterfall, spectrum, colormap_index, floor_dbfs,
+                     ceiling_dbfs);
     ImGui::InvisibleButton("waterfall-canvas", canvas_size);
     const ImVec2 origin = ImGui::GetItemRectMin();
+    const ImVec2 extent = ImGui::GetItemRectMax();
+    const ImVec2 plot_origin{origin.x + spectrum_label_margin, origin.y};
     ImDrawList *draw = ImGui::GetWindowDrawList();
-    constexpr int columns = 48;
-    constexpr int rows = 24;
-    const float cell_width = canvas_size.x / static_cast<float>(columns);
-    const float cell_height = canvas_size.y / static_cast<float>(rows);
-    for (int row = 0; row < rows; ++row) {
-        for (int column = 0; column < columns; ++column) {
-            const float x =
-                static_cast<float>(column) / static_cast<float>(columns);
-            const float y = static_cast<float>(row) / static_cast<float>(rows);
-            const float carrier = std::exp(-900.0F * (x - 0.58F) * (x - 0.58F));
-            const float texture =
-                0.16F + (0.11F * std::sin((x * 93.0F) + (y * 17.0F))) +
-                (0.05F * std::sin((x * 271.0F) - (y * 31.0F)));
-            const float value = std::clamp(
-                texture + (carrier * (0.62F + (0.18F * std::sin(y * 28.0F)))),
-                0.0F, 1.0F);
-            const ImVec2 low{
-                origin.x + (static_cast<float>(column) * cell_width),
-                origin.y + (static_cast<float>(row) * cell_height)};
-            draw->AddRectFilled(
-                low,
-                ImVec2(low.x + cell_width + 0.5F, low.y + cell_height + 0.5F),
-                waterfall_colour(value));
-        }
-    }
-    draw->AddText(ImVec2(origin.x + 8.0F, origin.y + 6.0F), IM_COL32_WHITE,
-                  "Waterfall — mock data");
+    draw->AddRectFilled(origin, extent, IM_COL32(4, 9, 15, 255));
+    draw->AddImage(ImTextureRef(static_cast<ImTextureID>(waterfall.texture)),
+                   plot_origin, extent);
+    draw->AddText(ImVec2(plot_origin.x + 8.0F, origin.y + 6.0F), IM_COL32_WHITE,
+                  "Waterfall");
 }
 
 void draw_constellation(const ImVec2 size) {
@@ -221,12 +556,51 @@ void draw_metric(const char *label, const char *value, const float fraction,
     ImGui::ProgressBar(fraction, ImVec2(-1.0F, 5.0F), "");
 }
 
+std::string format_recording_duration(const std::uint64_t milliseconds) {
+    const std::uint64_t total_seconds = milliseconds / 1000;
+    const std::uint64_t hours = total_seconds / 3600;
+    const std::uint64_t minutes = (total_seconds / 60) % 60;
+    const std::uint64_t seconds = total_seconds % 60;
+    const std::uint64_t tenths = (milliseconds % 1000) / 100;
+    return std::format("{:02}:{:02}:{:02}.{}", hours, minutes, seconds, tenths);
+}
+
+bool file_dialog_is_open(const std::shared_ptr<FileDialogState> &dialog);
+
 void draw_source_panel(AppState &state) {
     if (!ImGui::CollapsingHeader("Source", ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
 
-    ImGui::BeginDisabled(state.receiver.is_open());
+    std::optional<std::string> selected_iq_source;
+    {
+        const std::scoped_lock lock(state.iq_source_dialog->mutex);
+        if (state.iq_source_dialog->selected_path.has_value()) {
+            selected_iq_source =
+                std::move(*state.iq_source_dialog->selected_path);
+            state.iq_source_dialog->selected_path.reset();
+        }
+        if (state.iq_source_dialog->error.has_value()) {
+            state.status = "File dialog: " + *state.iq_source_dialog->error;
+            state.iq_source_dialog->error.reset();
+        }
+    }
+    if (selected_iq_source.has_value()) {
+        std::string error;
+        if (state.receiver.open_iq_file(*selected_iq_source, state.settings,
+                                        error) &&
+            state.receiver.start_stream(state.settings, error)) {
+            state.status =
+                "Playing I/Q from " +
+                std::filesystem::path(*selected_iq_source).filename().string();
+        } else {
+            state.receiver.close();
+            state.status = error;
+        }
+    }
+
+    const bool source_dialog_open = file_dialog_is_open(state.iq_source_dialog);
+    ImGui::BeginDisabled(state.receiver.is_open() || source_dialog_open);
     const char *preview = state.enumeration.devices.empty()
                               ? "No devices"
                               : state.enumeration.devices[state.selected_device]
@@ -274,12 +648,40 @@ void draw_source_panel(AppState &state) {
                     range.has_value()) {
                     state.settings.soapy_gain = range->first;
                 }
-                state.status = "Opened " + descriptor.display_name;
+                if (state.receiver.start_stream(state.settings, error)) {
+                    state.status = "Receiving from " + descriptor.display_name;
+                } else {
+                    state.receiver.close();
+                    state.status = error;
+                }
             } else {
                 state.status = error;
             }
         }
         ImGui::EndDisabled();
+        ImGui::BeginDisabled(source_dialog_open);
+        if (ImGui::Button("Open I/Q file...", ImVec2(-1.0F, 0.0F))) {
+            {
+                const std::scoped_lock lock(state.iq_source_dialog->mutex);
+                state.iq_source_dialog->open = true;
+                state.iq_source_dialog->default_location = ".";
+            }
+            auto callback_state =
+                std::make_unique<std::shared_ptr<FileDialogState>>(
+                    state.iq_source_dialog);
+            SDL_ShowOpenFileDialog(
+                &save_file_callback, callback_state.release(), state.window,
+                iq_source_filters.data(),
+                static_cast<int>(iq_source_filters.size()), ".", false);
+        }
+        ImGui::EndDisabled();
+        ImGui::SetNextItemWidth(-1.0F);
+        ImGui::InputScalar("Raw sample rate (Hz)", ImGuiDataType_U32,
+                           &state.settings.sample_rate_hz);
+        ImGui::TextDisabled(
+            "JSON supplies metadata; raw INT16_IQ uses %.3f MSPS / %.3f MHz.",
+            static_cast<double>(state.settings.sample_rate_hz) / 1e6,
+            static_cast<double>(state.settings.center_frequency_hz) / 1e6);
     } else {
         const DeviceDescriptor *descriptor = state.receiver.descriptor();
         ImGui::TextColored(ImVec4(0.35F, 0.88F, 0.55F, 1.0F), "OPEN");
@@ -289,9 +691,12 @@ void draw_source_panel(AppState &state) {
             ImGui::TextDisabled("Serial: %s", descriptor->serial.c_str());
         }
         ImGui::BeginDisabled(state.receiver.is_recording());
-        if (ImGui::Button("Close device", ImVec2(-1.0F, 0.0F))) {
+        if (ImGui::Button(descriptor->backend == SdrBackend::File
+                              ? "Close I/Q file"
+                              : "Close device",
+                          ImVec2(-1.0F, 0.0F))) {
             state.receiver.close();
-            state.status = "Device closed";
+            state.status = "Source closed";
         }
         ImGui::EndDisabled();
     }
@@ -307,11 +712,26 @@ void draw_receiver_panel(AppState &state) {
         return;
     }
 
+    const DeviceDescriptor *descriptor = state.receiver.descriptor();
+    if (descriptor != nullptr && descriptor->backend == SdrBackend::File) {
+        ImGui::Text("Format       CS16 / INT16_IQ");
+        ImGui::Text("Sample rate  %.3f MSPS",
+                    static_cast<double>(state.settings.sample_rate_hz) / 1e6);
+        ImGui::Text("Center       %.6f MHz",
+                    static_cast<double>(state.settings.center_frequency_hz) /
+                        1e6);
+        if (!state.receiver.is_streaming() &&
+            ImGui::Button("Replay from beginning", ImVec2(-1.0F, 0.0F))) {
+            std::string error;
+            state.status = state.receiver.start_stream(state.settings, error)
+                               ? "Replaying I/Q file"
+                               : error;
+        }
+        return;
+    }
+
     ImGui::BeginDisabled(!state.receiver.is_open() ||
                          state.receiver.is_recording());
-    ImGui::InputScalar("Center frequency (Hz)", ImGuiDataType_U64,
-                       &state.settings.center_frequency_hz);
-
     if (!state.receiver.sample_rates().empty()) {
         const std::string preview = std::format(
             "{:.3f} MSPS",
@@ -329,37 +749,101 @@ void draw_receiver_panel(AppState &state) {
         }
     }
 
-    const DeviceDescriptor *descriptor = state.receiver.descriptor();
+    if (ImGui::Button("Apply sample rate", ImVec2(-1.0F, 0.0F))) {
+        std::string error;
+        state.status = state.receiver.start_stream(state.settings, error)
+                           ? "Sample rate applied"
+                           : error;
+    }
+    ImGui::EndDisabled();
+
     if (descriptor != nullptr &&
         descriptor->backend == SdrBackend::AirspyNative) {
+        bool gain_changed = false;
         const int mode =
             state.settings.airspy_gain_mode == AirspyGainMode::Sensitivity ? 0
                                                                            : 1;
         if (ImGui::RadioButton("Sensitivity", mode == 0)) {
             state.settings.airspy_gain_mode = AirspyGainMode::Sensitivity;
+            gain_changed = true;
         }
         ImGui::SameLine();
         if (ImGui::RadioButton("Linearity", mode == 1)) {
             state.settings.airspy_gain_mode = AirspyGainMode::Linearity;
+            gain_changed = true;
         }
-        ImGui::SliderInt("Profile gain", &state.settings.airspy_gain, 0, 21);
-        ImGui::Checkbox("Bias-T", &state.settings.bias_tee);
+        gain_changed |= ImGui::SliderInt("Profile gain",
+                                         &state.settings.airspy_gain, 0, 21);
+        if (gain_changed) {
+            std::string error;
+            state.status = state.receiver.set_gain(state.settings, error)
+                               ? "Airspy gain applied"
+                               : error;
+        }
+        if (ImGui::Checkbox("Bias-T", &state.settings.bias_tee)) {
+            std::string error;
+            if (state.receiver.set_bias_tee(state.settings.bias_tee, error)) {
+                state.status = state.settings.bias_tee ? "Bias-T enabled"
+                                                       : "Bias-T disabled";
+            } else {
+                state.status = error;
+            }
+        }
     } else if (const auto range = state.receiver.gain_range();
                range.has_value()) {
-        ImGui::SliderScalar("Generic gain", ImGuiDataType_Double,
-                            &state.settings.soapy_gain, &range->first,
-                            &range->second, "%.1f");
+        if (ImGui::SliderScalar("Generic gain", ImGuiDataType_Double,
+                                &state.settings.soapy_gain, &range->first,
+                                &range->second, "%.1f")) {
+            std::string error;
+            state.status = state.receiver.set_gain(state.settings, error)
+                               ? "Soapy gain applied"
+                               : error;
+        }
         ImGui::TextDisabled(
             "Soapy driver-defined gain; not comparable across devices.");
     }
+}
 
-    if (ImGui::Button("Apply receiver settings", ImVec2(-1.0F, 0.0F))) {
-        std::string error;
-        state.status = state.receiver.configure(state.settings, error)
-                           ? "Receiver settings applied"
-                           : error;
+void consume_file_dialog_result(AppState &state,
+                                const std::shared_ptr<FileDialogState> &dialog,
+                                std::string &path,
+                                const std::string_view description) {
+    const std::scoped_lock lock(dialog->mutex);
+    if (dialog->selected_path.has_value()) {
+        path = std::move(*dialog->selected_path);
+        dialog->selected_path.reset();
+        state.status = std::string(description) + " path selected";
     }
-    ImGui::EndDisabled();
+    if (dialog->error.has_value()) {
+        state.status = "File dialog: " + *dialog->error;
+        dialog->error.reset();
+    }
+}
+
+bool file_dialog_is_open(const std::shared_ptr<FileDialogState> &dialog) {
+    const std::scoped_lock lock(dialog->mutex);
+    return dialog->open;
+}
+
+void show_recording_file_dialog(
+    AppState &state, const std::shared_ptr<FileDialogState> &dialog,
+    const std::string &path,
+    const std::span<const SDL_DialogFileFilter> filters) {
+    {
+        const std::scoped_lock lock(dialog->mutex);
+        if (dialog->open) {
+            return;
+        }
+        dialog->open = true;
+        dialog->default_location = path;
+    }
+
+    auto callback_state =
+        std::make_unique<std::shared_ptr<FileDialogState>>(dialog);
+    SDL_ShowSaveFileDialog(&save_file_callback, callback_state.release(),
+                           state.window, filters.data(),
+                           static_cast<int>(filters.size()),
+                           dialog->default_location.c_str());
 }
 
 void draw_recorder_panel(AppState &state) {
@@ -367,19 +851,35 @@ void draw_recorder_panel(AppState &state) {
                                  ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
+    consume_file_dialog_result(state, state.file_dialog, state.recording_path,
+                               "I/Q recording");
+    const bool dialog_open = file_dialog_is_open(state.file_dialog);
     ImGui::TextDisabled("Interleaved signed 16-bit little-endian I/Q (CS16)");
-    ImGui::BeginDisabled(state.receiver.is_recording());
-    ImGui::InputText("Output", state.recording_path.data(),
-                     state.recording_path.size());
+    ImGui::TextUnformatted("Output file");
+    ImGui::BeginDisabled(state.receiver.is_recording() || dialog_open);
+    ImGui::SetNextItemWidth(-92.0F);
+    ImGui::InputText("##recording-output", &state.recording_path);
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...")) {
+        show_recording_file_dialog(state, state.file_dialog,
+                                   state.recording_path, recording_filters);
+    }
     ImGui::EndDisabled();
+    if (dialog_open) {
+        ImGui::TextDisabled("Waiting for file selection...");
+    }
 
     if (!state.receiver.is_recording()) {
-        ImGui::BeginDisabled(!state.receiver.is_open());
+        const bool file_source =
+            state.receiver.descriptor() != nullptr &&
+            state.receiver.descriptor()->backend == SdrBackend::File;
+        ImGui::BeginDisabled(!state.receiver.is_open() || file_source ||
+                             dialog_open || state.recording_path.empty());
         if (ImGui::Button("Start recording", ImVec2(-1.0F, 0.0F))) {
             std::string error;
             if (state.receiver.start_recording(
-                    std::filesystem::path(state.recording_path.data()),
-                    state.settings, error)) {
+                    std::filesystem::path(state.recording_path), state.settings,
+                    error)) {
                 state.status = "Recording raw I/Q";
             } else {
                 state.status = error;
@@ -392,8 +892,8 @@ void draw_recorder_panel(AppState &state) {
     }
 
     const auto stats = state.receiver.recording_stats();
-    ImGui::Text("Samples: %s",
-                std::format("{}", stats.complex_samples).c_str());
+    ImGui::Text("Duration: %s",
+                format_recording_duration(stats.elapsed_milliseconds).c_str());
     ImGui::Text("Written: %.2f MiB",
                 static_cast<double>(stats.bytes_written) / (1024.0 * 1024.0));
     ImGui::Text("Queue drops: %llu",
@@ -408,8 +908,46 @@ void draw_sidebar(AppState &state) {
 
     if (ImGui::CollapsingHeader("Spectrum & Waterfall",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
-        draw_spectrum(ImVec2(-1.0F, 150.0F));
-        draw_waterfall(ImVec2(-1.0F, 150.0F));
+        const ColormapOption &selected =
+            colormap_options[state.selected_colormap];
+        ImGui::SetNextItemWidth(-1.0F);
+        if (ImGui::BeginCombo("##waterfall-colormap", selected.name)) {
+            for (std::size_t index = 0; index < colormap_options.size();
+                 ++index) {
+                const bool is_selected = index == state.selected_colormap;
+                if (ImGui::Selectable(colormap_options[index].name,
+                                      is_selected)) {
+                    state.selected_colormap = index;
+                }
+                if (is_selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Waterfall colormap");
+        }
+        draw_spectrum(ImVec2(-1.0F, 150.0F), state.spectrum,
+                      state.display_floor_dbfs, state.display_ceiling_dbfs);
+        draw_waterfall(ImVec2(-1.0F, 150.0F), state.waterfall, state.spectrum,
+                       state.selected_colormap, state.display_floor_dbfs,
+                       state.display_ceiling_dbfs);
+
+        ImGui::TextDisabled("Display range");
+        const float ceiling_min =
+            state.display_floor_dbfs + minimum_display_range_db;
+        ImGui::SliderFloat("Ceiling##spectrum-range",
+                           &state.display_ceiling_dbfs, ceiling_min,
+                           signal_meter_ceiling_dbfs, "%.0f dBFS");
+        state.display_ceiling_dbfs = std::clamp(
+            state.display_ceiling_dbfs, ceiling_min, signal_meter_ceiling_dbfs);
+        const float floor_max =
+            state.display_ceiling_dbfs - minimum_display_range_db;
+        ImGui::SliderFloat("Floor##spectrum-range", &state.display_floor_dbfs,
+                           signal_meter_floor_dbfs, floor_max, "%.0f dBFS");
+        state.display_floor_dbfs = std::clamp(
+            state.display_floor_dbfs, signal_meter_floor_dbfs, floor_max);
     }
 
     draw_recorder_panel(state);
@@ -421,6 +959,20 @@ void draw_sidebar(AppState &state) {
 
     if (ImGui::CollapsingHeader("Signal Quality",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        const std::string power =
+            state.spectrum.valid
+                ? std::format("{:.1f} dBFS", state.spectrum.signal_power_dbfs)
+                : "-- dBFS";
+        const float power_fraction =
+            state.spectrum.valid
+                ? std::clamp(
+                      (state.spectrum.signal_power_dbfs -
+                       signal_meter_floor_dbfs) /
+                          (signal_meter_ceiling_dbfs - signal_meter_floor_dbfs),
+                      0.0F, 1.0F)
+                : 0.0F;
+        draw_metric("Signal power", power.c_str(), power_fraction,
+                    ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
         draw_metric("SNR", "27.4 dB", 0.76F, ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
         draw_metric("MER", "25.8 dB", 0.70F, ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
         draw_metric("Viterbi BER", "1.2e-5", 0.91F,
@@ -436,7 +988,14 @@ void draw_sidebar(AppState &state) {
     }
 }
 
-void draw_video_panel() {
+void draw_video_panel(AppState &state) {
+    consume_file_dialog_result(state, state.ts_file_dialog,
+                               state.ts_recording_path, "MPEG-TS recording");
+    const bool dialog_open = file_dialog_is_open(state.ts_file_dialog);
+    constexpr bool ts_source_available = false;
+    constexpr std::uint64_t ts_elapsed_milliseconds = 0;
+    constexpr std::uint64_t ts_recorded_bytes = 0;
+
     const ImVec2 available = ImGui::GetContentRegionAvail();
     ImGui::InvisibleButton("video-surface", available);
     const ImVec2 origin = ImGui::GetItemRectMin();
@@ -452,8 +1011,10 @@ void draw_video_panel() {
     draw->AddText(ImVec2(extent.x - 165.0F, origin.y + 14.0F),
                   IM_COL32(90, 205, 255, 255), "VIDEO PREVIEW");
 
+    const float footer_height = 132.0F;
+    const ImVec2 footer_origin{origin.x, extent.y - footer_height};
     const ImVec2 center{(origin.x + extent.x) * 0.5F,
-                        (origin.y + extent.y) * 0.5F};
+                        (origin.y + footer_origin.y) * 0.5F};
     draw->AddCircle(center, 54.0F, IM_COL32(55, 78, 102, 255), 0, 2.0F);
     draw->AddTriangleFilled(ImVec2(center.x - 14.0F, center.y - 24.0F),
                             ImVec2(center.x - 14.0F, center.y + 24.0F),
@@ -464,17 +1025,52 @@ void draw_video_panel() {
     draw->AddText(ImVec2(center.x - (text_size.x * 0.5F), center.y + 74.0F),
                   IM_COL32(130, 150, 170, 255), message);
 
-    const float footer_height = 72.0F;
-    const ImVec2 footer_origin{origin.x, extent.y - footer_height};
     draw->AddRectFilled(footer_origin, extent, IM_COL32(13, 20, 30, 245), 5.0F);
     draw->AddText(ImVec2(origin.x + 18.0F, footer_origin.y + 13.0F),
                   IM_COL32_WHITE, "Program 01   1920x1080i   H.264   AAC");
-    draw->AddText(ImVec2(origin.x + 18.0F, footer_origin.y + 40.0F),
-                  IM_COL32(145, 160, 176, 255),
-                  "PAT / PMT / SDT service selection will appear here");
+    draw->AddText(ImVec2(extent.x - 260.0F, footer_origin.y + 13.0F),
+                  IM_COL32(145, 160, 176, 255), "Waiting for MPEG-TS output");
+
+    constexpr float horizontal_padding = 18.0F;
+    constexpr float browse_width = 86.0F;
+    constexpr float record_width = 104.0F;
+    constexpr float control_spacing = 8.0F;
+    const float input_width = std::max(
+        120.0F, available.x - (horizontal_padding * 2.0F) - browse_width -
+                    record_width - (control_spacing * 2.0F));
+    ImGui::SetCursorScreenPos(
+        ImVec2(footer_origin.x + horizontal_padding, footer_origin.y + 40.0F));
+    ImGui::SetNextItemWidth(input_width);
+    ImGui::InputText("##ts-recording-output", &state.ts_recording_path);
+    ImGui::SameLine(0.0F, control_spacing);
+    ImGui::BeginDisabled(dialog_open);
+    if (ImGui::Button("Browse...", ImVec2(browse_width, 0.0F))) {
+        show_recording_file_dialog(state, state.ts_file_dialog,
+                                   state.ts_recording_path,
+                                   transport_stream_filters);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(0.0F, control_spacing);
+    ImGui::BeginDisabled(!ts_source_available || dialog_open ||
+                         state.ts_recording_path.empty());
+    ImGui::Button("Record TS", ImVec2(record_width, 0.0F));
+    ImGui::EndDisabled();
+
+    const double size_mib =
+        static_cast<double>(ts_recorded_bytes) / (1024.0 * 1024.0);
+    const double elapsed_seconds =
+        static_cast<double>(ts_elapsed_milliseconds) / 1000.0;
+    const double rate_mib =
+        elapsed_seconds > 0.0 ? size_mib / elapsed_seconds : 0.0;
+    ImGui::SetCursorScreenPos(
+        ImVec2(footer_origin.x + horizontal_padding, footer_origin.y + 82.0F));
+    ImGui::Text("Duration %s    Size %.2f MiB    Rate %.2f MiB/s",
+                format_recording_duration(ts_elapsed_milliseconds).c_str(),
+                size_mib, rate_mib);
 }
 
 void draw_application(AppState &state) {
+    state.spectrum = state.receiver.spectrum_snapshot();
     const ImGuiViewport *viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
@@ -487,11 +1083,18 @@ void draw_application(AppState &state) {
     ImGui::BeginChild("top-bar", ImVec2(0.0F, 58.0F), ImGuiChildFlags_Borders);
     ImGui::TextColored(accent, "AIRSPY TV");
     ImGui::SameLine(128.0F);
-    ImGui::SetNextItemWidth(235.0F);
-    ImGui::InputScalar("##frequency", ImGuiDataType_U64,
-                       &state.settings.center_frequency_hz);
+    const bool file_source =
+        state.receiver.descriptor() != nullptr &&
+        state.receiver.descriptor()->backend == SdrBackend::File;
+    ImGui::BeginDisabled(file_source);
+    if (const auto frequency = draw_frequency_control(
+            "center-frequency", state.settings.center_frequency_hz);
+        frequency.has_value()) {
+        request_center_frequency(state, *frequency);
+    }
+    ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::TextDisabled("6 MHz DVB-T");
+    ImGui::TextDisabled("CENTERED  |  6 MHz DVB-T");
     ImGui::SameLine();
     const float status_width = ImGui::CalcTextSize(state.status.c_str()).x;
     ImGui::SetCursorPosX(
@@ -513,7 +1116,7 @@ void draw_application(AppState &state) {
     ImGui::SameLine();
     ImGui::BeginChild("video-panel", ImVec2(0.0F, 0.0F),
                       ImGuiChildFlags_Borders);
-    draw_video_panel();
+    draw_video_panel(state);
     ImGui::EndChild();
 
     ImGui::End();
@@ -564,15 +1167,69 @@ int record_first_cli(const std::filesystem::path &path, const int duration_ms) {
         std::cerr << error << '\n';
         return 1;
     }
+    ++settings.airspy_gain;
+    if (!receiver.set_gain(settings, error) ||
+        !receiver.set_bias_tee(false, error) ||
+        !receiver.set_center_frequency(settings.center_frequency_hz + 1'000,
+                                       error) ||
+        !receiver.set_center_frequency(settings.center_frequency_hz, error)) {
+        receiver.stop_recording();
+        std::cerr << error << '\n';
+        return 1;
+    }
     std::this_thread::sleep_for(
         std::chrono::milliseconds(std::max(duration_ms, 1)));
     receiver.stop_recording();
     const auto stats = receiver.recording_stats();
+    const SpectrumSnapshot spectrum = receiver.spectrum_snapshot();
     std::cout << "Recorded " << stats.complex_samples << " complex samples ("
               << stats.bytes_written
               << " bytes), queue drops=" << stats.dropped_blocks
-              << ", source drops=" << stats.source_dropped_samples << '\n';
-    return stats.bytes_written == 0 ? 1 : 0;
+              << ", source drops=" << stats.source_dropped_samples;
+    if (spectrum.valid) {
+        std::cout << ", signal power=" << std::fixed << std::setprecision(1)
+                  << spectrum.signal_power_dbfs << " dBFS";
+    }
+    std::cout << '\n';
+    return stats.bytes_written == 0 || !spectrum.valid ? 1 : 0;
+}
+
+int inspect_iq_cli(const std::filesystem::path &path,
+                   const std::uint32_t raw_sample_rate_hz,
+                   const std::uint64_t raw_center_frequency_hz) {
+    SdrDevice receiver;
+    SourceSettings settings;
+    settings.sample_rate_hz = raw_sample_rate_hz;
+    settings.center_frequency_hz = raw_center_frequency_hz;
+    std::string error;
+    if (!receiver.open_iq_file(path, settings, error) ||
+        !receiver.start_stream(settings, error)) {
+        std::cerr << error << '\n';
+        return 1;
+    }
+
+    SpectrumSnapshot spectrum;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        spectrum = receiver.spectrum_snapshot();
+        if (spectrum.valid) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const DeviceDescriptor *descriptor = receiver.descriptor();
+    std::cout << (descriptor == nullptr ? path.filename().string()
+                                        : descriptor->display_name)
+              << ", sample-rate=" << settings.sample_rate_hz
+              << ", center-frequency=" << settings.center_frequency_hz;
+    if (spectrum.valid) {
+        std::cout << ", signal-power=" << std::fixed << std::setprecision(1)
+                  << spectrum.signal_power_dbfs << " dBFS";
+    }
+    std::cout << '\n';
+    receiver.close();
+    return spectrum.valid ? 0 : 1;
 }
 
 } // namespace
@@ -583,7 +1240,8 @@ int main(const int argc, char **argv) {
     }
     if (argc > 1 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: airspy-tv [--enumerate|--record-first PATH "
-                     "[MILLISECONDS]|--help]\n";
+                     "[MILLISECONDS]|--inspect-iq PATH [SAMPLE_RATE_HZ] "
+                     "[CENTER_FREQUENCY_HZ]|--help]\n";
         return 0;
     }
     if (argc > 2 && std::string_view(argv[1]) == "--record-first") {
@@ -600,6 +1258,31 @@ int main(const int argc, char **argv) {
             }
         }
         return record_first_cli(argv[2], duration_ms);
+    }
+    if (argc > 2 && std::string_view(argv[1]) == "--inspect-iq") {
+        std::uint32_t sample_rate_hz = 10'000'000;
+        std::uint64_t center_frequency_hz = 545'000'000;
+        if (argc > 3) {
+            const std::string_view text = argv[3];
+            const auto parsed =
+                std::from_chars(text.begin(), text.end(), sample_rate_hz);
+            if (parsed.ec != std::errc{} || parsed.ptr != text.end() ||
+                sample_rate_hz == 0) {
+                std::cerr << "Invalid raw I/Q sample rate: " << text << '\n';
+                return 2;
+            }
+        }
+        if (argc > 4) {
+            const std::string_view text = argv[4];
+            const auto parsed =
+                std::from_chars(text.begin(), text.end(), center_frequency_hz);
+            if (parsed.ec != std::errc{} || parsed.ptr != text.end()) {
+                std::cerr << "Invalid raw I/Q center frequency: " << text
+                          << '\n';
+                return 2;
+            }
+        }
+        return inspect_iq_cli(argv[2], sample_rate_hz, center_frequency_hz);
     }
 
     SDL_SetAppMetadata("Airspy TV", "0.1.0", "io.github.airspy-tv");
@@ -646,6 +1329,7 @@ int main(const int argc, char **argv) {
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
     AppState state;
+    state.window = window;
     refresh_devices(state);
     bool running = true;
     while (running) {
@@ -680,6 +1364,7 @@ int main(const int argc, char **argv) {
     }
 
     state.receiver.close();
+    state.waterfall.destroy();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

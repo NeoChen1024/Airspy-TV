@@ -16,6 +16,7 @@ struct RecordingMetadata {
 
 struct RecordingStats {
     bool active{};
+    std::uint64_t elapsed_milliseconds{};
     std::uint64_t complex_samples{};
     std::uint64_t bytes_written{};
     std::uint64_t dropped_blocks{};

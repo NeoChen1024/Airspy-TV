@@ -5,15 +5,19 @@
 #include <SoapySDR/Errors.hpp>
 #include <SoapySDR/Formats.h>
 #include <libairspy/airspy.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <mutex>
@@ -29,6 +33,7 @@ namespace {
 
 constexpr std::size_t max_airspy_devices = 32;
 constexpr std::size_t soapy_block_samples = 32'768;
+constexpr std::size_t file_block_samples = 32'768;
 
 std::string format_serial(const std::uint64_t serial) {
     std::ostringstream output;
@@ -50,6 +55,15 @@ std::string argument_value(const std::map<std::string, std::string> &arguments,
     return item == arguments.end() ? std::string{} : item->second;
 }
 
+bool is_json_path(const std::filesystem::path &path) {
+    std::string extension = path.extension().string();
+    std::ranges::transform(extension, extension.begin(), [](const char value) {
+        return static_cast<char>(
+            std::tolower(static_cast<unsigned char>(value)));
+    });
+    return extension == ".json";
+}
+
 } // namespace
 
 struct SdrDevice::Impl {
@@ -61,8 +75,12 @@ struct SdrDevice::Impl {
     std::vector<std::uint32_t> rates;
     std::optional<std::pair<double, double>> soapy_gain_range;
     RawIqRecorder recorder;
+    SpectrumAnalyzer analyzer;
     std::thread soapy_worker;
+    std::thread file_worker;
+    std::filesystem::path file_path;
     std::atomic<bool> streaming;
+    std::atomic<std::uint32_t> active_sample_rate;
     mutable std::mutex error_mutex;
     std::string async_error;
 
@@ -77,11 +95,14 @@ struct SdrDevice::Impl {
             static_cast<const std::int16_t *>(transfer->samples);
         const auto scalar_count =
             static_cast<std::size_t>(transfer->sample_count) * 2;
-        self->recorder.submit(std::span(samples, scalar_count));
+        const std::span sample_block(samples, scalar_count);
         if (transfer->dropped_samples != 0) {
             self->recorder.add_source_dropped_samples(
                 transfer->dropped_samples);
+            self->analyzer.reset();
         }
+        self->analyzer.submit(sample_block, self->active_sample_rate);
+        self->recorder.submit(sample_block);
         return 0;
     }
 
@@ -100,14 +121,17 @@ struct SdrDevice::Impl {
                 soapy->readStream(soapy_stream, buffers.data(),
                                   soapy_block_samples, flags, time_ns, 100'000);
             if (received > 0) {
-                recorder.submit(std::span(
-                    samples.data(), static_cast<std::size_t>(received) * 2));
+                const std::span sample_block(
+                    samples.data(), static_cast<std::size_t>(received) * 2);
+                analyzer.submit(sample_block, active_sample_rate);
+                recorder.submit(sample_block);
                 continue;
             }
             if (received == SOAPY_SDR_TIMEOUT ||
                 received == SOAPY_SDR_OVERFLOW) {
                 if (received == SOAPY_SDR_OVERFLOW) {
                     recorder.add_source_dropped_samples(1);
+                    analyzer.reset();
                 }
                 continue;
             }
@@ -115,9 +139,50 @@ struct SdrDevice::Impl {
                             SoapySDR::errToStr(received));
             streaming = false;
         }
+        analyzer.reset();
     }
 
-    void stop_stream() {
+    void run_file() {
+        std::ifstream input(file_path, std::ios::binary);
+        if (!input) {
+            set_async_error("Unable to read I/Q file: " + file_path.string());
+            streaming = false;
+            return;
+        }
+
+        std::vector<std::int16_t> samples(file_block_samples * 2);
+        const auto started_at = std::chrono::steady_clock::now();
+        std::uint64_t emitted_samples = 0;
+        while (streaming) {
+            input.read(reinterpret_cast<char *>(samples.data()),
+                       static_cast<std::streamsize>(samples.size() *
+                                                    sizeof(std::int16_t)));
+            const std::streamsize bytes_read = input.gcount();
+            if (bytes_read <= 0) {
+                break;
+            }
+            const std::size_t scalar_count =
+                static_cast<std::size_t>(bytes_read) / sizeof(std::int16_t);
+            if (scalar_count % 2 != 0) {
+                set_async_error(
+                    "I/Q file ended with an incomplete complex sample");
+                break;
+            }
+            const std::span sample_block(samples.data(), scalar_count);
+            analyzer.submit(sample_block, active_sample_rate);
+            emitted_samples += scalar_count / 2;
+
+            const auto elapsed = std::chrono::duration<double>(
+                static_cast<double>(emitted_samples) /
+                static_cast<double>(active_sample_rate.load()));
+            std::this_thread::sleep_until(started_at + elapsed);
+        }
+        if (streaming.exchange(false)) {
+            set_async_error("I/Q file playback finished");
+        }
+    }
+
+    void stop_source() {
         const bool was_streaming = streaming.exchange(false);
         if (current.backend == SdrBackend::AirspyNative && airspy != nullptr &&
             was_streaming) {
@@ -126,11 +191,19 @@ struct SdrDevice::Impl {
         if (soapy_worker.joinable()) {
             soapy_worker.join();
         }
+        if (file_worker.joinable()) {
+            file_worker.join();
+        }
         if (soapy != nullptr && soapy_stream != nullptr) {
             soapy->deactivateStream(soapy_stream);
             soapy->closeStream(soapy_stream);
             soapy_stream = nullptr;
         }
+        analyzer.reset();
+    }
+
+    void stop_all() {
+        stop_source();
         recorder.stop();
     }
 };
@@ -237,7 +310,7 @@ bool SdrDevice::open(const DeviceDescriptor &descriptor, std::string &error) {
             impl_->rates.clear();
             return false;
         }
-    } else {
+    } else if (descriptor.backend == SdrBackend::Soapy) {
         try {
             impl_->soapy = SoapySDR::Device::make(descriptor.arguments);
             if (impl_->soapy == nullptr) {
@@ -274,8 +347,97 @@ bool SdrDevice::open(const DeviceDescriptor &descriptor, std::string &error) {
     return true;
 }
 
+bool SdrDevice::open_iq_file(const std::filesystem::path &path,
+                             SourceSettings &settings, std::string &error) {
+    close();
+    if (path.empty()) {
+        error = "I/Q source path is empty";
+        return false;
+    }
+
+    std::filesystem::path data_path = path;
+    std::string source = "airspy_rx INT16_IQ";
+    try {
+        if (is_json_path(path)) {
+            std::ifstream sidecar(path);
+            if (!sidecar) {
+                error = "Unable to open I/Q metadata: " + path.string();
+                return false;
+            }
+            const nlohmann::json metadata = nlohmann::json::parse(sidecar);
+            if (metadata.value("datatype", std::string{}) != "ci16_le" ||
+                metadata.value("iq_order", std::string{}) != "IQ") {
+                error = "Only ci16_le metadata with IQ ordering is supported";
+                return false;
+            }
+
+            const std::string data_file = metadata.value("data_file", "");
+            if (data_file.empty()) {
+                data_path = path;
+                data_path.replace_extension();
+            } else {
+                const std::filesystem::path relative(data_file);
+                if (relative.is_absolute() || relative.has_parent_path() ||
+                    relative.filename() != relative) {
+                    error = "I/Q metadata data_file must be a filename in the "
+                            "same directory";
+                    return false;
+                }
+                data_path = path.parent_path() / relative;
+            }
+
+            const auto sample_rate =
+                metadata.at("sample_rate").get<std::uint64_t>();
+            if (sample_rate == 0 ||
+                sample_rate > std::numeric_limits<std::uint32_t>::max()) {
+                error = "I/Q metadata sample_rate is out of range";
+                return false;
+            }
+            settings.sample_rate_hz = static_cast<std::uint32_t>(sample_rate);
+            settings.center_frequency_hz =
+                metadata.value("center_frequency", std::uint64_t{});
+            source = metadata.value("source", std::string{"Recorded I/Q"});
+        } else if (settings.sample_rate_hz == 0) {
+            error = "A positive sample rate is required for raw INT16_IQ";
+            return false;
+        }
+
+        if (!std::filesystem::is_regular_file(data_path)) {
+            error = "I/Q data file was not found: " + data_path.string();
+            return false;
+        }
+        const std::uintmax_t file_size = std::filesystem::file_size(data_path);
+        if (file_size == 0 || file_size % (sizeof(std::int16_t) * 2) != 0) {
+            error = "I/Q data file must contain complete interleaved INT16 I/Q "
+                    "samples";
+            return false;
+        }
+    } catch (const nlohmann::json::exception &exception) {
+        error = std::string("Invalid I/Q metadata: ") + exception.what();
+        return false;
+    } catch (const std::filesystem::filesystem_error &exception) {
+        error =
+            std::string("Unable to inspect I/Q source: ") + exception.what();
+        return false;
+    }
+
+    impl_->file_path = data_path;
+    impl_->rates = {settings.sample_rate_hz};
+    impl_->current = {
+        .backend = SdrBackend::File,
+        .id = "file:" + data_path.string(),
+        .display_name = data_path.filename().string() + " [I/Q file]",
+        .driver = "file",
+        .serial = {},
+        .arguments = {{"source", source}, {"path", data_path.string()}},
+    };
+    impl_->async_error.clear();
+    impl_->opened = true;
+    return true;
+}
+
 void SdrDevice::close() {
-    impl_->stop_stream();
+    impl_->stop_all();
     if (impl_->airspy != nullptr) {
         airspy_close(impl_->airspy);
         impl_->airspy = nullptr;
@@ -285,6 +447,7 @@ void SdrDevice::close() {
         impl_->soapy = nullptr;
     }
     impl_->opened = false;
+    impl_->file_path.clear();
     impl_->rates.clear();
     impl_->soapy_gain_range.reset();
 }
@@ -297,6 +460,10 @@ bool SdrDevice::configure(const SourceSettings &settings, std::string &error) {
     if (impl_->streaming) {
         error = "Stop recording before changing receiver settings";
         return false;
+    }
+
+    if (impl_->current.backend == SdrBackend::File) {
+        return true;
     }
 
     if (impl_->current.backend == SdrBackend::AirspyNative) {
@@ -321,63 +488,53 @@ bool SdrDevice::configure(const SourceSettings &settings, std::string &error) {
             !run("airspy_set_freq",
                  airspy_set_freq(impl_->airspy,
                                  static_cast<std::uint32_t>(
-                                     settings.center_frequency_hz))) ||
-            !run("airspy_set_rf_bias",
-                 airspy_set_rf_bias(impl_->airspy, static_cast<std::uint8_t>(
-                                                       settings.bias_tee)))) {
+                                     settings.center_frequency_hz)))) {
             return false;
         }
-        const auto gain =
-            static_cast<std::uint8_t>(std::clamp(settings.airspy_gain, 0, 21));
-        const int gain_result =
-            settings.airspy_gain_mode == AirspyGainMode::Sensitivity
-                ? airspy_set_sensitivity_gain(impl_->airspy, gain)
-                : airspy_set_linearity_gain(impl_->airspy, gain);
-        return run("airspy_set_gain_profile", gain_result);
+        return set_bias_tee(settings.bias_tee, error) &&
+               set_gain(settings, error);
     }
 
     try {
         impl_->soapy->setSampleRate(SOAPY_SDR_RX, 0, settings.sample_rate_hz);
         impl_->soapy->setFrequency(
             SOAPY_SDR_RX, 0, static_cast<double>(settings.center_frequency_hz));
-        if (impl_->soapy_gain_range.has_value()) {
-            const auto [minimum, maximum] = *impl_->soapy_gain_range;
-            impl_->soapy->setGain(
-                SOAPY_SDR_RX, 0,
-                std::clamp(settings.soapy_gain, minimum, maximum));
-        }
-        return true;
+        return set_gain(settings, error);
     } catch (const std::exception &exception) {
         error = std::string("SoapySDR configure: ") + exception.what();
         return false;
     }
 }
 
-bool SdrDevice::start_recording(const std::filesystem::path &path,
-                                const SourceSettings &settings,
-                                std::string &error) {
-    impl_->stop_stream();
+bool SdrDevice::start_stream(const SourceSettings &settings,
+                             std::string &error) {
+    if (!impl_->opened) {
+        error = "No SDR device is open";
+        return false;
+    }
+    if (impl_->recorder.stats().active) {
+        error = "Stop recording before restarting the receiver";
+        return false;
+    }
+
+    impl_->stop_source();
     if (!configure(settings, error)) {
         return false;
     }
 
-    const RecordingMetadata metadata{
-        .source = impl_->current.display_name,
-        .center_frequency_hz = settings.center_frequency_hz,
-        .sample_rate_hz = settings.sample_rate_hz,
-    };
-    if (!impl_->recorder.start(path, metadata, error)) {
-        return false;
-    }
-
     impl_->async_error.clear();
+    impl_->active_sample_rate = settings.sample_rate_hz;
+    if (impl_->current.backend == SdrBackend::File) {
+        impl_->streaming = true;
+        impl_->file_worker = std::thread([this] { impl_->run_file(); });
+        return true;
+    }
     if (impl_->current.backend == SdrBackend::AirspyNative) {
         impl_->streaming = true;
         const int result = airspy_start_rx(
             impl_->airspy, &Impl::airspy_rx_callback, impl_.get());
         if (result != AIRSPY_SUCCESS) {
             impl_->streaming = false;
-            impl_->recorder.stop();
             error = format_airspy_error("airspy_start_rx", result);
             return false;
         }
@@ -399,17 +556,143 @@ bool SdrDevice::start_recording(const std::filesystem::path &path,
         impl_->soapy_worker = std::thread([this] { impl_->run_soapy(); });
         return true;
     } catch (const std::exception &exception) {
-        error = std::string("SoapySDR start recording: ") + exception.what();
-        impl_->stop_stream();
+        error = std::string("SoapySDR start stream: ") + exception.what();
+        impl_->stop_source();
         return false;
     }
 }
 
-void SdrDevice::stop_recording() { impl_->stop_stream(); }
+void SdrDevice::stop_stream() {
+    impl_->stop_source();
+    impl_->recorder.stop();
+}
+
+bool SdrDevice::set_gain(const SourceSettings &settings, std::string &error) {
+    if (!impl_->opened) {
+        error = "No SDR device is open";
+        return false;
+    }
+
+    if (impl_->current.backend == SdrBackend::AirspyNative) {
+        const auto gain =
+            static_cast<std::uint8_t>(std::clamp(settings.airspy_gain, 0, 21));
+        const int result =
+            settings.airspy_gain_mode == AirspyGainMode::Sensitivity
+                ? airspy_set_sensitivity_gain(impl_->airspy, gain)
+                : airspy_set_linearity_gain(impl_->airspy, gain);
+        if (result != AIRSPY_SUCCESS) {
+            error = format_airspy_error("airspy_set_gain_profile", result);
+            return false;
+        }
+        return true;
+    }
+
+    if (impl_->current.backend == SdrBackend::File) {
+        return true;
+    }
+
+    if (!impl_->soapy_gain_range.has_value()) {
+        return true;
+    }
+    try {
+        const auto [minimum, maximum] = *impl_->soapy_gain_range;
+        impl_->soapy->setGain(
+            SOAPY_SDR_RX, 0, std::clamp(settings.soapy_gain, minimum, maximum));
+        return true;
+    } catch (const std::exception &exception) {
+        error = std::string("SoapySDR set gain: ") + exception.what();
+        return false;
+    }
+}
+
+bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
+                                     std::string &error) {
+    if (!impl_->opened) {
+        error = "No SDR device is open";
+        return false;
+    }
+
+    if (impl_->current.backend == SdrBackend::AirspyNative) {
+        if (frequency_hz > std::numeric_limits<std::uint32_t>::max()) {
+            error = "Airspy center frequency is out of range";
+            return false;
+        }
+        const int result = airspy_set_freq(
+            impl_->airspy, static_cast<std::uint32_t>(frequency_hz));
+        if (result != AIRSPY_SUCCESS) {
+            error = format_airspy_error("airspy_set_freq", result);
+            return false;
+        }
+        impl_->analyzer.reset();
+        return true;
+    }
+
+    if (impl_->current.backend == SdrBackend::File) {
+        error = "File source center frequency is fixed by its metadata";
+        return false;
+    }
+
+    try {
+        impl_->soapy->setFrequency(SOAPY_SDR_RX, 0,
+                                   static_cast<double>(frequency_hz));
+        impl_->analyzer.reset();
+        return true;
+    } catch (const std::exception &exception) {
+        error =
+            std::string("SoapySDR set center frequency: ") + exception.what();
+        return false;
+    }
+}
+
+bool SdrDevice::set_bias_tee(const bool enabled, std::string &error) {
+    if (!impl_->opened) {
+        error = "No SDR device is open";
+        return false;
+    }
+    if (impl_->current.backend == SdrBackend::File) {
+        return true;
+    }
+    if (impl_->current.backend != SdrBackend::AirspyNative) {
+        return true;
+    }
+
+    const int result =
+        airspy_set_rf_bias(impl_->airspy, static_cast<std::uint8_t>(enabled));
+    if (result != AIRSPY_SUCCESS) {
+        error = format_airspy_error("airspy_set_rf_bias", result);
+        return false;
+    }
+    return true;
+}
+
+bool SdrDevice::start_recording(const std::filesystem::path &path,
+                                const SourceSettings &settings,
+                                std::string &error) {
+    if (impl_->opened && impl_->current.backend == SdrBackend::File) {
+        error = "Raw I/Q recording is unavailable during file playback";
+        return false;
+    }
+    if ((!impl_->streaming ||
+         impl_->active_sample_rate != settings.sample_rate_hz) &&
+        !start_stream(settings, error)) {
+        return false;
+    }
+
+    const RecordingMetadata metadata{
+        .source = impl_->current.display_name,
+        .center_frequency_hz = settings.center_frequency_hz,
+        .sample_rate_hz = settings.sample_rate_hz,
+    };
+    return impl_->recorder.start(path, metadata, error);
+}
+
+void SdrDevice::stop_recording() { impl_->recorder.stop(); }
 
 bool SdrDevice::is_open() const { return impl_->opened; }
 
-bool SdrDevice::is_recording() const { return impl_->streaming; }
+bool SdrDevice::is_streaming() const { return impl_->streaming; }
+
+bool SdrDevice::is_recording() const { return impl_->recorder.stats().active; }
 
 const DeviceDescriptor *SdrDevice::descriptor() const {
     return impl_->opened ? &impl_->current : nullptr;
@@ -427,13 +710,25 @@ RecordingStats SdrDevice::recording_stats() const {
     return impl_->recorder.stats();
 }
 
+SpectrumSnapshot SdrDevice::spectrum_snapshot() const {
+    return impl_->analyzer.snapshot();
+}
+
 std::string SdrDevice::runtime_error() const {
     const std::scoped_lock lock(impl_->error_mutex);
     return impl_->async_error;
 }
 
 std::string backend_name(const SdrBackend backend) {
-    return backend == SdrBackend::AirspyNative ? "Airspy native" : "SoapySDR";
+    switch (backend) {
+    case SdrBackend::AirspyNative:
+        return "Airspy native";
+    case SdrBackend::Soapy:
+        return "SoapySDR";
+    case SdrBackend::File:
+        return "I/Q file";
+    }
+    return "Unknown";
 }
 
 } // namespace airspy_tv

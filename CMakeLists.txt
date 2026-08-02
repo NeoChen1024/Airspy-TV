@@ -13,9 +13,15 @@ find_package(SDL3 CONFIG REQUIRED)
 find_package(SoapySDR CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(AIRSPY REQUIRED IMPORTED_TARGET libairspy)
+pkg_check_modules(FFTW3F REQUIRED IMPORTED_TARGET fftw3f)
+pkg_check_modules(VOLK REQUIRED IMPORTED_TARGET volk)
 
 set(JSON_BuildTests OFF CACHE INTERNAL "Disable nlohmann/json tests")
 add_subdirectory(contrib/json EXCLUDE_FROM_ALL)
+
+set(TINYCOLORMAP_BUILD_TOOLS OFF CACHE INTERNAL
+    "Disable tinycolormap optional tools")
+add_subdirectory(contrib/tinycolormap EXCLUDE_FROM_ALL)
 
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/contrib/imgui")
 if(NOT EXISTS "${IMGUI_DIR}/imgui.cpp")
@@ -42,12 +48,16 @@ add_executable(airspy-tv
     src/main.cpp
     src/recorder.cpp
     src/sdr.cpp
+    src/spectrum.cpp
 )
 target_include_directories(airspy-tv PRIVATE include)
 target_link_libraries(airspy-tv PRIVATE
     imgui
     nlohmann_json::nlohmann_json
+    tinycolormap
     PkgConfig::AIRSPY
+    PkgConfig::FFTW3F
+    PkgConfig::VOLK
     SoapySDR
     Threads::Threads
 )
