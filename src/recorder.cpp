@@ -177,4 +177,115 @@ RecordingStats RawIqRecorder::stats() const {
     };
 }
 
+struct TransportStreamRecorder::Impl {
+    mutable std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::vector<std::uint8_t>> queue;
+    std::ofstream output;
+    std::thread worker;
+    std::chrono::steady_clock::time_point started_at;
+    bool stopping{};
+    std::atomic<bool> active;
+    std::atomic<std::uint64_t> elapsed_milliseconds;
+    std::atomic<std::uint64_t> bytes_written;
+    std::atomic<std::uint64_t> dropped_blocks;
+
+    void run() {
+        while (true) {
+            std::vector<std::uint8_t> block;
+            {
+                std::unique_lock lock(mutex);
+                ready.wait(lock, [this] { return stopping || !queue.empty(); });
+                if (queue.empty() && stopping) {
+                    break;
+                }
+                block = std::move(queue.front());
+                queue.pop_front();
+            }
+            output.write(reinterpret_cast<const char *>(block.data()),
+                         static_cast<std::streamsize>(block.size()));
+            if (!output) {
+                active = false;
+                continue;
+            }
+            bytes_written += block.size();
+        }
+        output.flush();
+    }
+};
+
+TransportStreamRecorder::TransportStreamRecorder()
+    : impl_(std::make_unique<Impl>()) {}
+
+TransportStreamRecorder::~TransportStreamRecorder() noexcept { stop(); }
+
+bool TransportStreamRecorder::start(const std::filesystem::path &path,
+                                    std::string &error) {
+    stop();
+    if (path.empty()) {
+        error = "Transport-stream recording path is empty";
+        return false;
+    }
+    impl_->output.open(path, std::ios::binary | std::ios::trunc);
+    if (!impl_->output) {
+        error = "Unable to open transport-stream recording: " + path.string();
+        return false;
+    }
+    impl_->stopping = false;
+    impl_->started_at = std::chrono::steady_clock::now();
+    impl_->elapsed_milliseconds = 0;
+    impl_->bytes_written = 0;
+    impl_->dropped_blocks = 0;
+    impl_->active = true;
+    impl_->worker = std::thread([this] { impl_->run(); });
+    return true;
+}
+
+void TransportStreamRecorder::submit(
+    const std::span<const std::uint8_t> transport_stream) {
+    if (!impl_->active || transport_stream.empty()) {
+        return;
+    }
+    const std::scoped_lock lock(impl_->mutex);
+    if (impl_->queue.size() >= max_queued_blocks) {
+        ++impl_->dropped_blocks;
+        return;
+    }
+    impl_->queue.emplace_back(transport_stream.begin(), transport_stream.end());
+    impl_->ready.notify_one();
+}
+
+void TransportStreamRecorder::stop() noexcept {
+    if (!impl_->worker.joinable()) {
+        return;
+    }
+    {
+        const std::scoped_lock lock(impl_->mutex);
+        impl_->stopping = true;
+        impl_->active = false;
+    }
+    impl_->ready.notify_one();
+    impl_->worker.join();
+    impl_->elapsed_milliseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - impl_->started_at)
+            .count());
+    impl_->output.close();
+    impl_->queue.clear();
+}
+
+TransportRecordingStats TransportStreamRecorder::stats() const {
+    std::uint64_t elapsed = impl_->elapsed_milliseconds;
+    if (impl_->active) {
+        elapsed = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - impl_->started_at)
+                .count());
+    }
+    return {.active = impl_->active,
+            .elapsed_milliseconds = elapsed,
+            .bytes_written = impl_->bytes_written,
+            .dropped_blocks = impl_->dropped_blocks};
+}
+
 } // namespace airspy_tv

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(AirspyTV VERSION 0.1.0 LANGUAGES CXX)
+project(AirspyTV VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,6 +18,24 @@ pkg_check_modules(VOLK REQUIRED IMPORTED_TARGET volk)
 
 set(JSON_BuildTests OFF CACHE INTERNAL "Disable nlohmann/json tests")
 add_subdirectory(contrib/json EXCLUDE_FROM_ALL)
+
+set(BUILD_EXAMPLES OFF CACHE BOOL "Disable liquid-dsp examples" FORCE)
+set(BUILD_AUTOTESTS OFF CACHE BOOL "Disable liquid-dsp tests" FORCE)
+set(BUILD_BENCHMARKS OFF CACHE BOOL "Disable liquid-dsp benchmarks" FORCE)
+set(BUILD_SHARED_LIBS ON CACHE BOOL "Build liquid-dsp shared library" FORCE)
+set(BUILD_STATIC_LIBS OFF CACHE BOOL "Disable liquid-dsp static library" FORCE)
+set(ENABLE_LOGGING OFF CACHE BOOL "Disable liquid-dsp logging" FORCE)
+add_subdirectory(contrib/liquid-dsp EXCLUDE_FROM_ALL)
+
+# libcorrect's legacy CMakeLists injects a private ASan flag whenever the
+# enclosing build type is Debug, without propagating the ASan runtime to its
+# consumers. Isolate that subproject policy while keeping Airspy TV's own
+# selected build type unchanged.
+set(AIRSPY_TV_BUILD_TYPE "${CMAKE_BUILD_TYPE}")
+set(CMAKE_BUILD_TYPE Release)
+add_subdirectory(contrib/libcorrect EXCLUDE_FROM_ALL)
+set(CMAKE_BUILD_TYPE "${AIRSPY_TV_BUILD_TYPE}")
+unset(AIRSPY_TV_BUILD_TYPE)
 
 set(TINYCOLORMAP_BUILD_TOOLS OFF CACHE INTERNAL
     "Disable tinycolormap optional tools")
@@ -44,14 +62,59 @@ target_include_directories(imgui SYSTEM PUBLIC
 )
 target_link_libraries(imgui PUBLIC SDL3::SDL3 OpenGL::GL)
 
+add_library(airspy-tv-dvbt STATIC
+    src/dvbt/decoder.cpp
+    src/dvbt/inner_decoder.cpp
+    src/dvbt/stream_decoder.cpp
+    src/dvbt/signal_analyzer.cpp
+    src/dvbt/soft_demapper.cpp
+    src/dvbt/transport_decoder.cpp
+)
+target_include_directories(airspy-tv-dvbt PUBLIC include)
+target_include_directories(airspy-tv-dvbt SYSTEM PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libcorrect/include")
+target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F Threads::Threads
+    PRIVATE correct_static liquid::liquid)
+
 add_executable(airspy-tv
     src/main.cpp
     src/recorder.cpp
     src/sdr.cpp
     src/spectrum.cpp
 )
+
+add_executable(airspy-tv-dvbt-equalized
+    tools/dvbt_native_equalized.cpp
+)
+target_include_directories(airspy-tv-dvbt-equalized PRIVATE include)
+target_link_libraries(airspy-tv-dvbt-equalized PRIVATE airspy-tv-dvbt)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(airspy-tv-dvbt-equalized PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
+
+add_executable(airspy-tv-dvbt-soft
+    tools/dvbt_native_soft.cpp
+)
+target_include_directories(airspy-tv-dvbt-soft PRIVATE include)
+target_include_directories(airspy-tv-dvbt-soft SYSTEM PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libcorrect/include")
+target_link_libraries(airspy-tv-dvbt-soft PRIVATE
+    airspy-tv-dvbt correct_static)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(airspy-tv-dvbt-soft PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
+
+add_executable(airspy-tv-dvbt-iq tools/dvbt_native_iq.cpp)
+target_link_libraries(airspy-tv-dvbt-iq PRIVATE airspy-tv-dvbt)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(airspy-tv-dvbt-iq PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
 target_include_directories(airspy-tv PRIVATE include)
 target_link_libraries(airspy-tv PRIVATE
+    airspy-tv-dvbt
     imgui
     nlohmann_json::nlohmann_json
     tinycolormap
@@ -63,7 +126,35 @@ target_link_libraries(airspy-tv PRIVATE
 )
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(airspy-tv-dvbt PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     target_compile_options(airspy-tv PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(dvbt-inner-decoder-test
+        tests/dvbt_inner_decoder_test.cpp
+    )
+    target_link_libraries(dvbt-inner-decoder-test PRIVATE airspy-tv-dvbt)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(dvbt-inner-decoder-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME dvbt-inner-decoder COMMAND dvbt-inner-decoder-test)
+
+    add_executable(dvbt-transport-decoder-test
+        tests/dvbt_transport_decoder_test.cpp
+    )
+    target_include_directories(dvbt-transport-decoder-test SYSTEM PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libcorrect/include")
+    target_link_libraries(dvbt-transport-decoder-test PRIVATE
+        airspy-tv-dvbt correct_static)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(dvbt-transport-decoder-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME dvbt-transport-decoder COMMAND dvbt-transport-decoder-test)
 endif()
 
 install(TARGETS airspy-tv RUNTIME DESTINATION bin)

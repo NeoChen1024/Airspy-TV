@@ -26,8 +26,81 @@ constexpr std::size_t scalar_count = spectrum_fft_size * 2;
 constexpr auto capture_interval = std::chrono::milliseconds(5);
 constexpr float input_scale = 32768.0F;
 constexpr float minimum_power = 1.0e-14F;
-constexpr float spectrum_ema_alpha = 0.22F;
-constexpr float signal_power_ema_alpha = 0.12F;
+constexpr float fft_rate_hz =
+    1000.0F / static_cast<float>(capture_interval.count());
+constexpr float dvbt_channel_bandwidth_hz = 6'000'000.0F;
+constexpr std::size_t notch_smoothing_radius = 4;
+
+void update_channel_metrics(SpectrumSnapshot &snapshot,
+                            const std::span<const float> averaged_power) {
+    const auto sample_rate = static_cast<float>(snapshot.sample_rate_hz);
+    if (sample_rate <= dvbt_channel_bandwidth_hz * 1.15F) {
+        return;
+    }
+
+    float in_channel_power = 0.0F;
+    std::size_t in_channel_bins = 0;
+    float noise_power = 0.0F;
+    std::size_t noise_bins = 0;
+    std::vector<float> smoothed_channel;
+
+    const auto frequency_at = [sample_rate](const std::size_t index) {
+        return ((static_cast<float>(index) /
+                 static_cast<float>(spectrum_fft_size)) -
+                0.5F) *
+               sample_rate;
+    };
+    for (std::size_t index = 0; index < spectrum_fft_size; ++index) {
+        const float frequency = std::abs(frequency_at(index));
+        if (frequency <= 2'900'000.0F) {
+            in_channel_power += averaged_power[index];
+            ++in_channel_bins;
+        } else if (frequency >= 3'500'000.0F &&
+                   frequency <= sample_rate * 0.47F) {
+            noise_power += averaged_power[index];
+            ++noise_bins;
+        }
+    }
+    if (in_channel_bins == 0 || noise_bins == 0) {
+        return;
+    }
+
+    const float mean_channel =
+        in_channel_power / static_cast<float>(in_channel_bins);
+    const float mean_noise = noise_power / static_cast<float>(noise_bins);
+    const float signal_excess =
+        std::max(mean_channel - mean_noise, minimum_power);
+    snapshot.rf_snr_db = std::clamp(
+        10.0F * std::log10(signal_excess / std::max(mean_noise, minimum_power)),
+        -20.0F, 60.0F);
+
+    for (std::size_t index = notch_smoothing_radius;
+         index + notch_smoothing_radius < spectrum_fft_size; ++index) {
+        if (std::abs(frequency_at(index)) > 2'700'000.0F) {
+            continue;
+        }
+        float sum = 0.0F;
+        for (std::size_t offset = index - notch_smoothing_radius;
+             offset <= index + notch_smoothing_radius; ++offset) {
+            sum += averaged_power[offset];
+        }
+        smoothed_channel.push_back(
+            10.0F *
+            std::log10(std::max(
+                sum / static_cast<float>((2 * notch_smoothing_radius) + 1),
+                minimum_power)));
+    }
+    if (smoothed_channel.empty()) {
+        return;
+    }
+    auto middle = smoothed_channel.begin() +
+                  static_cast<std::ptrdiff_t>(smoothed_channel.size() / 2);
+    std::ranges::nth_element(smoothed_channel, middle);
+    const float median = *middle;
+    const float minimum = *std::ranges::min_element(smoothed_channel);
+    snapshot.deepest_notch_db = std::clamp(minimum - median, -80.0F, 0.0F);
+    snapshot.channel_metrics_valid = true;
+}
 
 struct VolkDeleter {
     template <typename Value> void operator()(Value *pointer) const noexcept {
@@ -67,15 +140,22 @@ struct SpectrumAnalyzer::Impl {
     mutable std::mutex snapshot_mutex;
     SpectrumSnapshot latest;
     std::atomic<bool> reset_requested;
+    std::atomic<bool> fft_smoothing{true};
+    std::atomic<int> fft_smoothing_speed{100};
+    std::atomic<bool> snr_smoothing{true};
+    std::atomic<int> snr_smoothing_speed{20};
 
     VolkBuffer<lv_32fc_t> input;
     VolkBuffer<lv_32fc_t> windowed;
     VolkBuffer<lv_32fc_t> fft_output;
     VolkBuffer<float> window;
     VolkBuffer<float> power;
-    VolkBuffer<float> averaged_power;
+    VolkBuffer<float> shifted_power;
+    VolkBuffer<float> smoothed_bins_dbfs;
     float window_sum{};
-    float averaged_signal_power{};
+    float smoothed_signal_power_dbfs{};
+    float smoothed_rf_snr_db{};
+    float smoothed_notch_db{};
     bool average_initialized{};
     fftwf_plan plan{};
     std::thread worker;
@@ -87,7 +167,8 @@ struct SpectrumAnalyzer::Impl {
           fft_output(make_volk_buffer<lv_32fc_t>(spectrum_fft_size)),
           window(make_volk_buffer<float>(spectrum_fft_size)),
           power(make_volk_buffer<float>(spectrum_fft_size)),
-          averaged_power(make_volk_buffer<float>(spectrum_fft_size)) {
+          shifted_power(make_volk_buffer<float>(spectrum_fft_size)),
+          smoothed_bins_dbfs(make_volk_buffer<float>(spectrum_fft_size)) {
         for (std::size_t index = 0; index < spectrum_fft_size; ++index) {
             const float phase =
                 (2.0F * std::numbers::pi_v<float> * static_cast<float>(index)) /
@@ -164,13 +245,6 @@ struct SpectrumAnalyzer::Impl {
                                   static_cast<unsigned int>(spectrum_fft_size));
         const float signal_power =
             total_power / static_cast<float>(spectrum_fft_size);
-        if (!average_initialized) {
-            averaged_signal_power = signal_power;
-        } else {
-            averaged_signal_power =
-                (signal_power_ema_alpha * signal_power) +
-                ((1.0F - signal_power_ema_alpha) * averaged_signal_power);
-        }
 
         volk_32fc_32f_multiply_32fc(
             windowed.get(), input.get(), window.get(),
@@ -182,29 +256,65 @@ struct SpectrumAnalyzer::Impl {
 
         const float normalization = window_sum * window_sum;
         SpectrumSnapshot next;
-        next.signal_power_dbfs = std::clamp(
-            10.0F * std::log10(std::max(averaged_signal_power, minimum_power)),
-            -140.0F, 0.0F);
+        const float raw_signal_power_dbfs = std::clamp(
+            10.0F * std::log10(std::max(signal_power, minimum_power)), -140.0F,
+            0.0F);
         next.sample_rate_hz = sample_rate;
         next.valid = true;
+
+        const float fft_alpha =
+            fft_smoothing ? std::min(static_cast<float>(std::max(
+                                         fft_smoothing_speed.load(), 1)) /
+                                         (fft_rate_hz * 10.0F),
+                                     1.0F)
+                          : 1.0F;
 
         for (std::size_t output_index = 0; output_index < spectrum_fft_size;
              ++output_index) {
             const std::size_t fft_index =
                 (output_index + (spectrum_fft_size / 2)) % spectrum_fft_size;
             const float normalized_power = power[fft_index] / normalization;
-            if (!average_initialized) {
-                averaged_power[output_index] = normalized_power;
-            } else {
-                averaged_power[output_index] =
-                    (spectrum_ema_alpha * normalized_power) +
-                    ((1.0F - spectrum_ema_alpha) *
-                     averaged_power[output_index]);
-            }
-            next.bins_dbfs[output_index] = std::clamp(
-                10.0F * std::log10(std::max(averaged_power[output_index],
-                                            minimum_power)),
+            shifted_power[output_index] = normalized_power;
+            const float raw_dbfs = std::clamp(
+                10.0F * std::log10(std::max(normalized_power, minimum_power)),
                 -140.0F, 0.0F);
+            next.waterfall_bins_dbfs[output_index] = raw_dbfs;
+            if (!average_initialized) {
+                smoothed_bins_dbfs[output_index] = raw_dbfs;
+            } else {
+                smoothed_bins_dbfs[output_index] =
+                    (fft_alpha * raw_dbfs) +
+                    ((1.0F - fft_alpha) * smoothed_bins_dbfs[output_index]);
+            }
+            next.bins_dbfs[output_index] = smoothed_bins_dbfs[output_index];
+        }
+        update_channel_metrics(next, std::span<const float>{shifted_power.get(),
+                                                            spectrum_fft_size});
+        const float snr_alpha =
+            snr_smoothing ? std::min(static_cast<float>(std::max(
+                                         snr_smoothing_speed.load(), 1)) /
+                                         (fft_rate_hz * 10.0F),
+                                     1.0F)
+                          : 1.0F;
+        if (!average_initialized) {
+            smoothed_signal_power_dbfs = raw_signal_power_dbfs;
+            smoothed_rf_snr_db = next.rf_snr_db;
+            smoothed_notch_db = next.deepest_notch_db;
+        } else {
+            smoothed_signal_power_dbfs =
+                (snr_alpha * raw_signal_power_dbfs) +
+                ((1.0F - snr_alpha) * smoothed_signal_power_dbfs);
+            if (next.channel_metrics_valid) {
+                smoothed_rf_snr_db = (snr_alpha * next.rf_snr_db) +
+                                     ((1.0F - snr_alpha) * smoothed_rf_snr_db);
+                smoothed_notch_db = (snr_alpha * next.deepest_notch_db) +
+                                    ((1.0F - snr_alpha) * smoothed_notch_db);
+            }
+        }
+        next.signal_power_dbfs = smoothed_signal_power_dbfs;
+        if (next.channel_metrics_valid) {
+            next.rf_snr_db = smoothed_rf_snr_db;
+            next.deepest_notch_db = smoothed_notch_db;
         }
         average_initialized = true;
 
@@ -269,6 +379,16 @@ void SpectrumAnalyzer::reset() {
     }
     const std::scoped_lock lock(impl_->snapshot_mutex);
     impl_->latest.valid = false;
+}
+
+void SpectrumAnalyzer::set_smoothing(const bool fft_enabled,
+                                     const int fft_speed,
+                                     const bool snr_enabled,
+                                     const int snr_speed) {
+    impl_->fft_smoothing = fft_enabled;
+    impl_->fft_smoothing_speed = std::max(fft_speed, 1);
+    impl_->snr_smoothing = snr_enabled;
+    impl_->snr_smoothing_speed = std::max(snr_speed, 1);
 }
 
 SpectrumSnapshot SpectrumAnalyzer::snapshot() const {

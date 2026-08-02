@@ -75,7 +75,10 @@ struct SdrDevice::Impl {
     std::vector<std::uint32_t> rates;
     std::optional<std::pair<double, double>> soapy_gain_range;
     RawIqRecorder recorder;
+    TransportStreamRecorder ts_recorder;
     SpectrumAnalyzer analyzer;
+    dvbt::SignalAnalyzer signal_analyzer;
+    dvbt::StreamDecoder stream_decoder;
     std::thread soapy_worker;
     std::thread file_worker;
     std::filesystem::path file_path;
@@ -83,6 +86,13 @@ struct SdrDevice::Impl {
     std::atomic<std::uint32_t> active_sample_rate;
     mutable std::mutex error_mutex;
     std::string async_error;
+
+    Impl() {
+        stream_decoder.set_transport_callback(
+            [this](const std::span<const std::uint8_t> ts) {
+                ts_recorder.submit(ts);
+            });
+    }
 
     static int airspy_rx_callback(airspy_transfer *transfer) {
         auto *self = static_cast<Impl *>(transfer->ctx);
@@ -100,8 +110,12 @@ struct SdrDevice::Impl {
             self->recorder.add_source_dropped_samples(
                 transfer->dropped_samples);
             self->analyzer.reset();
+            self->signal_analyzer.reset();
+            self->stream_decoder.reset();
         }
         self->analyzer.submit(sample_block, self->active_sample_rate);
+        self->signal_analyzer.submit(sample_block, self->active_sample_rate);
+        self->stream_decoder.submit(sample_block, self->active_sample_rate);
         self->recorder.submit(sample_block);
         return 0;
     }
@@ -124,6 +138,8 @@ struct SdrDevice::Impl {
                 const std::span sample_block(
                     samples.data(), static_cast<std::size_t>(received) * 2);
                 analyzer.submit(sample_block, active_sample_rate);
+                signal_analyzer.submit(sample_block, active_sample_rate);
+                stream_decoder.submit(sample_block, active_sample_rate);
                 recorder.submit(sample_block);
                 continue;
             }
@@ -132,6 +148,8 @@ struct SdrDevice::Impl {
                 if (received == SOAPY_SDR_OVERFLOW) {
                     recorder.add_source_dropped_samples(1);
                     analyzer.reset();
+                    signal_analyzer.reset();
+                    stream_decoder.reset();
                 }
                 continue;
             }
@@ -140,6 +158,8 @@ struct SdrDevice::Impl {
             streaming = false;
         }
         analyzer.reset();
+        signal_analyzer.reset();
+        stream_decoder.reset();
     }
 
     void run_file() {
@@ -170,6 +190,8 @@ struct SdrDevice::Impl {
             }
             const std::span sample_block(samples.data(), scalar_count);
             analyzer.submit(sample_block, active_sample_rate);
+            signal_analyzer.submit(sample_block, active_sample_rate);
+            stream_decoder.submit(sample_block, active_sample_rate);
             emitted_samples += scalar_count / 2;
 
             const auto elapsed = std::chrono::duration<double>(
@@ -200,11 +222,14 @@ struct SdrDevice::Impl {
             soapy_stream = nullptr;
         }
         analyzer.reset();
+        signal_analyzer.reset();
+        stream_decoder.reset();
     }
 
     void stop_all() {
         stop_source();
         recorder.stop();
+        ts_recorder.stop();
     }
 };
 
@@ -624,6 +649,8 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
             return false;
         }
         impl_->analyzer.reset();
+        impl_->signal_analyzer.reset();
+        impl_->stream_decoder.reset();
         return true;
     }
 
@@ -636,6 +663,8 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
         impl_->soapy->setFrequency(SOAPY_SDR_RX, 0,
                                    static_cast<double>(frequency_hz));
         impl_->analyzer.reset();
+        impl_->signal_analyzer.reset();
+        impl_->stream_decoder.reset();
         return true;
     } catch (const std::exception &exception) {
         error =
@@ -665,6 +694,15 @@ bool SdrDevice::set_bias_tee(const bool enabled, std::string &error) {
     return true;
 }
 
+void SdrDevice::set_display_smoothing(const bool fft_enabled,
+                                      const int fft_speed,
+                                      const bool snr_enabled,
+                                      const int snr_speed) {
+    impl_->analyzer.set_smoothing(fft_enabled, fft_speed, snr_enabled,
+                                  snr_speed);
+    impl_->signal_analyzer.set_snr_smoothing(snr_enabled, snr_speed);
+}
+
 bool SdrDevice::start_recording(const std::filesystem::path &path,
                                 const SourceSettings &settings,
                                 std::string &error) {
@@ -688,6 +726,17 @@ bool SdrDevice::start_recording(const std::filesystem::path &path,
 
 void SdrDevice::stop_recording() { impl_->recorder.stop(); }
 
+bool SdrDevice::start_ts_recording(const std::filesystem::path &path,
+                                   std::string &error) {
+    if (!impl_->streaming) {
+        error = "Start an SDR or I/Q file source before recording MPEG-TS";
+        return false;
+    }
+    return impl_->ts_recorder.start(path, error);
+}
+
+void SdrDevice::stop_ts_recording() { impl_->ts_recorder.stop(); }
+
 bool SdrDevice::is_open() const { return impl_->opened; }
 
 bool SdrDevice::is_streaming() const { return impl_->streaming; }
@@ -710,8 +759,20 @@ RecordingStats SdrDevice::recording_stats() const {
     return impl_->recorder.stats();
 }
 
+TransportRecordingStats SdrDevice::ts_recording_stats() const {
+    return impl_->ts_recorder.stats();
+}
+
 SpectrumSnapshot SdrDevice::spectrum_snapshot() const {
     return impl_->analyzer.snapshot();
+}
+
+dvbt::SignalAnalysisSnapshot SdrDevice::signal_analysis_snapshot() const {
+    return impl_->signal_analyzer.snapshot();
+}
+
+dvbt::StreamDecoderStats SdrDevice::decoder_stats() const {
+    return impl_->stream_decoder.stats();
 }
 
 std::string SdrDevice::runtime_error() const {

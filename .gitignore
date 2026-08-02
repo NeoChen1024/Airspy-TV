@@ -5,3 +5,4 @@ compile_commands.json
 *.cs16
 *.cs16.json
 capture.ts
+*.pyc

@@ -46,4 +46,30 @@ class RawIqRecorder {
     std::unique_ptr<Impl> impl_;
 };
 
+struct TransportRecordingStats {
+    bool active{};
+    std::uint64_t elapsed_milliseconds{};
+    std::uint64_t bytes_written{};
+    std::uint64_t dropped_blocks{};
+};
+
+class TransportStreamRecorder {
+  public:
+    TransportStreamRecorder();
+    ~TransportStreamRecorder() noexcept;
+
+    TransportStreamRecorder(const TransportStreamRecorder &) = delete;
+    TransportStreamRecorder &
+    operator=(const TransportStreamRecorder &) = delete;
+
+    bool start(const std::filesystem::path &path, std::string &error);
+    void submit(std::span<const std::uint8_t> transport_stream);
+    void stop() noexcept;
+    [[nodiscard]] TransportRecordingStats stats() const;
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 } // namespace airspy_tv

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "airspy_tv/dvbt/signal_analyzer.hpp"
+#include "airspy_tv/dvbt/stream_decoder.hpp"
 #include "airspy_tv/recorder.hpp"
 #include "airspy_tv/spectrum.hpp"
 
@@ -62,10 +64,15 @@ class SdrDevice {
     bool set_center_frequency(std::uint64_t frequency_hz, std::string &error);
     bool set_gain(const SourceSettings &settings, std::string &error);
     bool set_bias_tee(bool enabled, std::string &error);
+    void set_display_smoothing(bool fft_enabled, int fft_speed,
+                               bool snr_enabled, int snr_speed);
 
     bool start_recording(const std::filesystem::path &path,
                          const SourceSettings &settings, std::string &error);
     void stop_recording();
+    bool start_ts_recording(const std::filesystem::path &path,
+                            std::string &error);
+    void stop_ts_recording();
 
     [[nodiscard]] bool is_open() const;
     [[nodiscard]] bool is_streaming() const;
@@ -74,7 +81,10 @@ class SdrDevice {
     [[nodiscard]] const std::vector<std::uint32_t> &sample_rates() const;
     [[nodiscard]] std::optional<std::pair<double, double>> gain_range() const;
     [[nodiscard]] RecordingStats recording_stats() const;
+    [[nodiscard]] TransportRecordingStats ts_recording_stats() const;
     [[nodiscard]] SpectrumSnapshot spectrum_snapshot() const;
+    [[nodiscard]] dvbt::SignalAnalysisSnapshot signal_analysis_snapshot() const;
+    [[nodiscard]] dvbt::StreamDecoderStats decoder_stats() const;
     [[nodiscard]] std::string runtime_error() const;
 
   private:

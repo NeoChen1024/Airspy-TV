@@ -7,3 +7,9 @@
 [submodule "contrib/tinycolormap"]
 	path = contrib/tinycolormap
 	url = https://github.com/yuki-koyama/tinycolormap.git
+[submodule "contrib/liquid-dsp"]
+	path = contrib/liquid-dsp
+	url = https://github.com/jgaeddert/liquid-dsp.git
+[submodule "contrib/libcorrect"]
+	path = contrib/libcorrect
+	url = https://github.com/quiet/libcorrect.git

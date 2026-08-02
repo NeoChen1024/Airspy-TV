@@ -40,6 +40,7 @@ using airspy_tv::SdrBackend;
 using airspy_tv::SdrDevice;
 using airspy_tv::SourceSettings;
 using airspy_tv::SpectrumSnapshot;
+using airspy_tv::dvbt::SignalAnalysisSnapshot;
 
 constexpr ImVec4 accent{0.12F, 0.58F, 0.92F, 1.0F};
 constexpr float panel_width = 410.0F;
@@ -144,7 +145,12 @@ struct AppState {
     std::size_t selected_colormap{};
     float display_floor_dbfs{default_display_floor_dbfs};
     float display_ceiling_dbfs{default_display_ceiling_dbfs};
+    bool fft_smoothing{true};
+    int fft_smoothing_speed{100};
+    bool snr_smoothing{true};
+    int snr_smoothing_speed{20};
     SpectrumSnapshot spectrum;
+    SignalAnalysisSnapshot signal_analysis;
     WaterfallDisplay waterfall;
     SDL_Window *window{};
     std::shared_ptr<FileDialogState> file_dialog{
@@ -326,15 +332,13 @@ void request_center_frequency(AppState &state,
     }
 }
 
-float spectrum_column_peak(const SpectrumSnapshot &spectrum,
+float spectrum_column_peak(const std::span<const float> bins,
                            const std::size_t column,
                            const std::size_t column_count) {
-    const std::size_t begin =
-        (column * spectrum.bins_dbfs.size()) / column_count;
-    const std::size_t end = std::max(
-        begin + 1, ((column + 1) * spectrum.bins_dbfs.size()) / column_count);
-    return *std::ranges::max_element(
-        std::span(spectrum.bins_dbfs).subspan(begin, end - begin));
+    const std::size_t begin = (column * bins.size()) / column_count;
+    const std::size_t end =
+        std::max(begin + 1, ((column + 1) * bins.size()) / column_count);
+    return *std::ranges::max_element(bins.subspan(begin, end - begin));
 }
 
 void draw_spectrum(const ImVec2 size, const SpectrumSnapshot &spectrum,
@@ -379,7 +383,7 @@ void draw_spectrum(const ImVec2 size, const SpectrumSnapshot &spectrum,
         points.reserve(column_count);
         for (std::size_t column = 0; column < column_count; ++column) {
             const float level =
-                spectrum_column_peak(spectrum, column, column_count);
+                spectrum_column_peak(spectrum.bins_dbfs, column, column_count);
             const float normalized = std::clamp(
                 (level - floor_dbfs) / (ceiling_dbfs - floor_dbfs), 0.0F, 1.0F);
             points.emplace_back(plot_origin.x +
@@ -467,8 +471,8 @@ void update_waterfall(WaterfallDisplay &waterfall,
                      waterfall.history.data(),
                      (waterfall.history.size() - row_size) * sizeof(float));
         for (std::size_t column = 0; column < row_size; ++column) {
-            waterfall.history[column] =
-                spectrum_column_peak(spectrum, column, row_size);
+            waterfall.history[column] = spectrum_column_peak(
+                spectrum.waterfall_bins_dbfs, column, row_size);
         }
         waterfall.sequence = spectrum.sequence;
         changed = true;
@@ -512,7 +516,8 @@ void draw_waterfall(const ImVec2 size, WaterfallDisplay &waterfall,
                   "Waterfall");
 }
 
-void draw_constellation(const ImVec2 size) {
+void draw_constellation(const ImVec2 size,
+                        const SignalAnalysisSnapshot &analysis) {
     ImVec2 canvas_size = size;
     if (canvas_size.x <= 0.0F) {
         canvas_size.x = ImGui::GetContentRegionAvail().x;
@@ -528,24 +533,25 @@ void draw_constellation(const ImVec2 size) {
                   IM_COL32(50, 65, 80, 255));
     draw->AddLine(ImVec2(center.x, origin.y), ImVec2(center.x, extent.y),
                   IM_COL32(50, 65, 80, 255));
-    constexpr std::array<float, 4> levels{-0.72F, -0.24F, 0.24F, 0.72F};
-    int point_index = 0;
-    for (const float i_level : levels) {
-        for (const float q_level : levels) {
-            for (int sample = 0; sample < 5; ++sample, ++point_index) {
-                const float jitter_x =
-                    std::sin(static_cast<float>(point_index) * 12.9898F) * 2.4F;
-                const float jitter_y =
-                    std::sin(static_cast<float>(point_index) * 78.233F) * 2.4F;
-                const ImVec2 point{
-                    center.x + (i_level * canvas_size.x * 0.43F) + jitter_x,
-                    center.y - (q_level * canvas_size.y * 0.43F) + jitter_y};
-                draw->AddCircleFilled(point, 2.0F, IM_COL32(70, 220, 255, 210));
+    if (analysis.locked) {
+        constexpr float constellation_extent = 1.55F;
+        const float scale = std::min(canvas_size.x, canvas_size.y) * 0.46F /
+                            constellation_extent;
+        for (std::size_t index = 0; index < analysis.point_count; ++index) {
+            const auto point = analysis.points[index];
+            const ImVec2 position{center.x + (point.real() * scale),
+                                  center.y - (point.imag() * scale)};
+            if (position.x >= origin.x && position.x <= extent.x &&
+                position.y >= origin.y && position.y <= extent.y) {
+                draw->AddCircleFilled(position, 1.5F,
+                                      IM_COL32(70, 220, 255, 150));
             }
         }
     }
     draw->AddText(ImVec2(origin.x + 8.0F, origin.y + 6.0F),
-                  IM_COL32(150, 167, 184, 255), "16-QAM — mock data");
+                  IM_COL32(150, 167, 184, 255),
+                  analysis.locked ? "Equalized DVB-T carriers"
+                                  : "Waiting for DVB-T OFDM lock");
 }
 
 void draw_metric(const char *label, const char *value, const float fraction,
@@ -554,6 +560,36 @@ void draw_metric(const char *label, const char *value, const float fraction,
     ImGui::SameLine(115.0F);
     ImGui::TextColored(colour, "%s", value);
     ImGui::ProgressBar(fraction, ImVec2(-1.0F, 5.0F), "");
+}
+
+void draw_bipolar_metric(const char *label, const char *value,
+                         const float position, const ImVec4 colour) {
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(115.0F);
+    ImGui::TextColored(colour, "%s", value);
+
+    ImGui::PushID(label);
+    ImGui::InvisibleButton("meter", ImVec2(-1.0F, 5.0F));
+    ImGui::PopID();
+
+    const ImVec2 bar_min = ImGui::GetItemRectMin();
+    const ImVec2 bar_max = ImGui::GetItemRectMax();
+    const float center_x = (bar_min.x + bar_max.x) * 0.5F;
+    const float marker_x = bar_min.x + ((bar_max.x - bar_min.x) *
+                                        std::clamp(position, 0.0F, 1.0F));
+    ImDrawList *draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(bar_min, bar_max, ImGui::GetColorU32(ImGuiCol_FrameBg),
+                        ImGui::GetStyle().FrameRounding);
+    if (marker_x != center_x) {
+        draw->AddRectFilled(ImVec2(std::min(center_x, marker_x), bar_min.y),
+                            ImVec2(std::max(center_x, marker_x), bar_max.y),
+                            ImGui::ColorConvertFloat4ToU32(colour));
+    }
+    draw->AddLine(ImVec2(center_x, bar_min.y - 1.0F),
+                  ImVec2(center_x, bar_max.y + 1.0F),
+                  IM_COL32(225, 235, 245, 220));
+    draw->AddLine(ImVec2(marker_x, bar_min.y), ImVec2(marker_x, bar_max.y),
+                  ImGui::ColorConvertFloat4ToU32(colour), 2.0F);
 }
 
 std::string format_recording_duration(const std::uint64_t milliseconds) {
@@ -948,17 +984,61 @@ void draw_sidebar(AppState &state) {
                            signal_meter_floor_dbfs, floor_max, "%.0f dBFS");
         state.display_floor_dbfs = std::clamp(
             state.display_floor_dbfs, signal_meter_floor_dbfs, floor_max);
+
+        bool smoothing_changed = false;
+        smoothing_changed |=
+            ImGui::Checkbox("FFT smoothing", &state.fft_smoothing);
+        ImGui::BeginDisabled(!state.fft_smoothing);
+        ImGui::SetNextItemWidth(-1.0F);
+        smoothing_changed |=
+            ImGui::InputInt("FFT smoothing speed", &state.fft_smoothing_speed);
+        state.fft_smoothing_speed = std::max(state.fft_smoothing_speed, 1);
+        ImGui::EndDisabled();
+        smoothing_changed |=
+            ImGui::Checkbox("SNR smoothing", &state.snr_smoothing);
+        ImGui::BeginDisabled(!state.snr_smoothing);
+        ImGui::SetNextItemWidth(-1.0F);
+        smoothing_changed |=
+            ImGui::InputInt("SNR smoothing speed", &state.snr_smoothing_speed);
+        state.snr_smoothing_speed = std::max(state.snr_smoothing_speed, 1);
+        ImGui::EndDisabled();
+        if (smoothing_changed) {
+            state.receiver.set_display_smoothing(
+                state.fft_smoothing, state.fft_smoothing_speed,
+                state.snr_smoothing, state.snr_smoothing_speed);
+        }
+        ImGui::TextDisabled(
+            "SDR++ speed model; FFT smoothing affects spectrum only.");
     }
 
     draw_recorder_panel(state);
 
     if (ImGui::CollapsingHeader("DVB-T Constellation",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
-        draw_constellation(ImVec2(-1.0F, 300.0F));
+        draw_constellation(ImVec2(-1.0F, 300.0F), state.signal_analysis);
     }
 
     if (ImGui::CollapsingHeader("Signal Quality",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        const bool locked = state.signal_analysis.locked;
+        const ImVec4 lock_colour = locked ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
+                                          : ImVec4(1.0F, 0.38F, 0.25F, 1.0F);
+        const ImVec2 indicator_position{
+            ImGui::GetCursorScreenPos().x + 5.0F,
+            ImGui::GetCursorScreenPos().y +
+                (ImGui::GetTextLineHeight() * 0.5F)};
+        ImGui::GetWindowDrawList()->AddCircleFilled(
+            indicator_position, 4.0F,
+            ImGui::ColorConvertFloat4ToU32(lock_colour));
+        ImGui::Dummy(ImVec2(12.0F, ImGui::GetTextLineHeight()));
+        ImGui::SameLine();
+        ImGui::TextColored(lock_colour, "%s", locked ? "LOCKED" : "UNLOCKED");
+        if (!locked) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("Constellation paused");
+        }
+        ImGui::Separator();
+
         const std::string power =
             state.spectrum.valid
                 ? std::format("{:.1f} dBFS", state.spectrum.signal_power_dbfs)
@@ -973,18 +1053,109 @@ void draw_sidebar(AppState &state) {
                 : 0.0F;
         draw_metric("Signal power", power.c_str(), power_fraction,
                     ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
-        draw_metric("SNR", "27.4 dB", 0.76F, ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
-        draw_metric("MER", "25.8 dB", 0.70F, ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
-        draw_metric("Viterbi BER", "1.2e-5", 0.91F,
+        const bool has_snr = state.signal_analysis.locked ||
+                             state.spectrum.channel_metrics_valid;
+        const float snr_value = state.signal_analysis.locked
+                                    ? state.signal_analysis.cp_snr_db
+                                    : state.spectrum.rf_snr_db;
+        const std::string snr =
+            has_snr ? std::format("{:.1f} dB", snr_value) : "-- dB";
+        const float snr_fraction =
+            has_snr ? std::clamp((snr_value + 5.0F) / 40.0F, 0.0F, 1.0F) : 0.0F;
+        draw_metric(
+            state.signal_analysis.locked ? "CP SNR est." : "RF SNR est.",
+            snr.c_str(), snr_fraction, ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
+        const bool has_notch = state.signal_analysis.locked ||
+                               state.spectrum.channel_metrics_valid;
+        const float notch_value = state.signal_analysis.locked
+                                      ? state.signal_analysis.deepest_notch_db
+                                      : state.spectrum.deepest_notch_db;
+        const std::string notch =
+            has_notch ? std::format("{:.1f} dB", notch_value) : "-- dB";
+        const float notch_fraction =
+            has_notch ? std::clamp(1.0F + (notch_value / 40.0F), 0.0F, 1.0F)
+                      : 0.0F;
+        draw_metric("Deepest Notch", notch.c_str(), notch_fraction,
+                    ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
+        const std::string carrier_offset =
+            state.signal_analysis.locked
+                ? std::format("{:+.2f} kHz",
+                              state.signal_analysis.carrier_offset_hz / 1000.0F)
+                : "-- kHz";
+        const float fft_size =
+            state.signal_analysis.mode == airspy_tv::dvbt::TransmissionMode::k8
+                ? 8192.0F
+                : 2048.0F;
+        constexpr float dvbt_sample_rate_hz = 48'000'000.0F / 7.0F;
+        const float maximum_fractional_offset_hz =
+            dvbt_sample_rate_hz / (2.0F * fft_size);
+        const float carrier_offset_position =
+            state.signal_analysis.locked
+                ? 0.5F + (state.signal_analysis.carrier_offset_hz /
+                          (2.0F * maximum_fractional_offset_hz))
+                : 0.5F;
+        draw_bipolar_metric("Carrier offset", carrier_offset.c_str(),
+                            carrier_offset_position,
+                            ImVec4(0.52F, 0.82F, 1.0F, 1.0F));
+        const std::string mer =
+            state.signal_analysis.locked
+                ? std::format("{:.1f} dB", state.signal_analysis.mer_db)
+                : "-- dB";
+        draw_metric(
+            "MER", mer.c_str(),
+            state.signal_analysis.locked
+                ? std::clamp(state.signal_analysis.mer_db / 40.0F, 0.0F, 1.0F)
+                : 0.0F,
+            ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
+        draw_metric("Viterbi BER", "--", 0.0F,
                     ImVec4(0.75F, 0.72F, 0.30F, 1.0F));
-        draw_metric("Post-RS BER", "0.0", 1.0F,
+        draw_metric("Post-RS BER", "--", 0.0F,
                     ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
         ImGui::Separator();
-        ImGui::Text("Mode           8K");
-        ImGui::Text("Guard          1/4");
-        ImGui::Text("Modulation     16-QAM");
-        ImGui::Text("Code rate      3/4");
-        ImGui::TextDisabled("Mock decoder telemetry");
+        const char *mode = "--";
+        const char *guard = "--";
+        const char *modulation = "--";
+        if (state.signal_analysis.locked) {
+            mode = state.signal_analysis.mode ==
+                           airspy_tv::dvbt::TransmissionMode::k8
+                       ? "8K"
+                       : "2K";
+            switch (state.signal_analysis.guard_interval) {
+            case airspy_tv::dvbt::GuardInterval::gi_1_32:
+                guard = "1/32";
+                break;
+            case airspy_tv::dvbt::GuardInterval::gi_1_16:
+                guard = "1/16";
+                break;
+            case airspy_tv::dvbt::GuardInterval::gi_1_8:
+                guard = "1/8";
+                break;
+            case airspy_tv::dvbt::GuardInterval::gi_1_4:
+                guard = "1/4";
+                break;
+            }
+            switch (state.signal_analysis.constellation) {
+            case airspy_tv::dvbt::Constellation::qpsk:
+                modulation = "QPSK";
+                break;
+            case airspy_tv::dvbt::Constellation::qam16:
+                modulation = "16-QAM";
+                break;
+            case airspy_tv::dvbt::Constellation::qam64:
+                modulation = "64-QAM";
+                break;
+            }
+        }
+        ImGui::Text("Mode           %s", mode);
+        ImGui::Text("Guard          %s", guard);
+        ImGui::Text("Modulation     %s", modulation);
+        ImGui::Text("Code rate      --");
+        ImGui::TextDisabled(
+            state.signal_analysis.locked
+                ? "GUI monitor uses CP acquisition and scattered-pilot "
+                  "equalization."
+                : "RF estimates use the 6 MHz channel and out-of-channel "
+                  "noise; MER and constellation require OFDM lock.");
     }
 }
 
@@ -992,9 +1163,8 @@ void draw_video_panel(AppState &state) {
     consume_file_dialog_result(state, state.ts_file_dialog,
                                state.ts_recording_path, "MPEG-TS recording");
     const bool dialog_open = file_dialog_is_open(state.ts_file_dialog);
-    constexpr bool ts_source_available = false;
-    constexpr std::uint64_t ts_elapsed_milliseconds = 0;
-    constexpr std::uint64_t ts_recorded_bytes = 0;
+    const bool ts_source_available = state.receiver.is_streaming();
+    const auto ts_stats = state.receiver.ts_recording_stats();
 
     const ImVec2 available = ImGui::GetContentRegionAvail();
     ImGui::InvisibleButton("video-surface", available);
@@ -1051,26 +1221,40 @@ void draw_video_panel(AppState &state) {
     }
     ImGui::EndDisabled();
     ImGui::SameLine(0.0F, control_spacing);
-    ImGui::BeginDisabled(!ts_source_available || dialog_open ||
-                         state.ts_recording_path.empty());
-    ImGui::Button("Record TS", ImVec2(record_width, 0.0F));
+    ImGui::BeginDisabled((!ts_source_available && !ts_stats.active) ||
+                         dialog_open || state.ts_recording_path.empty());
+    if (ImGui::Button(ts_stats.active ? "Stop TS" : "Record TS",
+                      ImVec2(record_width, 0.0F))) {
+        if (ts_stats.active) {
+            state.receiver.stop_ts_recording();
+            state.status = "MPEG-TS recording stopped";
+        } else {
+            std::string error;
+            state.status = state.receiver.start_ts_recording(
+                               state.ts_recording_path, error)
+                               ? "Recording decoded MPEG-TS"
+                               : error;
+        }
+    }
     ImGui::EndDisabled();
 
     const double size_mib =
-        static_cast<double>(ts_recorded_bytes) / (1024.0 * 1024.0);
+        static_cast<double>(ts_stats.bytes_written) / (1024.0 * 1024.0);
     const double elapsed_seconds =
-        static_cast<double>(ts_elapsed_milliseconds) / 1000.0;
+        static_cast<double>(ts_stats.elapsed_milliseconds) / 1000.0;
     const double rate_mib =
         elapsed_seconds > 0.0 ? size_mib / elapsed_seconds : 0.0;
     ImGui::SetCursorScreenPos(
         ImVec2(footer_origin.x + horizontal_padding, footer_origin.y + 82.0F));
-    ImGui::Text("Duration %s    Size %.2f MiB    Rate %.2f MiB/s",
-                format_recording_duration(ts_elapsed_milliseconds).c_str(),
-                size_mib, rate_mib);
+    ImGui::Text(
+        "Duration %s    Size %.2f MiB    Rate %.2f MiB/s",
+        format_recording_duration(ts_stats.elapsed_milliseconds).c_str(),
+        size_mib, rate_mib);
 }
 
 void draw_application(AppState &state) {
     state.spectrum = state.receiver.spectrum_snapshot();
+    state.signal_analysis = state.receiver.signal_analysis_snapshot();
     const ImGuiViewport *viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
@@ -1209,11 +1393,13 @@ int inspect_iq_cli(const std::filesystem::path &path,
     }
 
     SpectrumSnapshot spectrum;
+    SignalAnalysisSnapshot analysis;
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        std::chrono::steady_clock::now() + std::chrono::seconds(6);
     while (std::chrono::steady_clock::now() < deadline) {
         spectrum = receiver.spectrum_snapshot();
-        if (spectrum.valid) {
+        analysis = receiver.signal_analysis_snapshot();
+        if (spectrum.sequence >= 50 && analysis.locked) {
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1226,6 +1412,38 @@ int inspect_iq_cli(const std::filesystem::path &path,
     if (spectrum.valid) {
         std::cout << ", signal-power=" << std::fixed << std::setprecision(1)
                   << spectrum.signal_power_dbfs << " dBFS";
+        if (spectrum.channel_metrics_valid) {
+            std::cout << ", rf-snr-estimate=" << spectrum.rf_snr_db
+                      << " dB, deepest-notch=" << spectrum.deepest_notch_db
+                      << " dB";
+        }
+    }
+    if (analysis.locked) {
+        const char *guard = "1/4";
+        switch (analysis.guard_interval) {
+        case airspy_tv::dvbt::GuardInterval::gi_1_32:
+            guard = "1/32";
+            break;
+        case airspy_tv::dvbt::GuardInterval::gi_1_16:
+            guard = "1/16";
+            break;
+        case airspy_tv::dvbt::GuardInterval::gi_1_8:
+            guard = "1/8";
+            break;
+        case airspy_tv::dvbt::GuardInterval::gi_1_4:
+            break;
+        }
+        std::cout << ", ofdm-lock="
+                  << (analysis.mode == airspy_tv::dvbt::TransmissionMode::k8
+                          ? "8K"
+                          : "2K")
+                  << ", guard=" << guard << ", cp-snr=" << analysis.cp_snr_db
+                  << " dB, mer=" << analysis.mer_db
+                  << " dB, channel-notch=" << analysis.deepest_notch_db
+                  << " dB, carrier-offset=" << analysis.carrier_offset_hz
+                  << " Hz";
+    } else {
+        std::cout << ", ofdm-lock=no";
     }
     std::cout << '\n';
     receiver.close();
