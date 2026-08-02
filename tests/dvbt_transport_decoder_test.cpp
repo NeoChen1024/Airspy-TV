@@ -255,7 +255,10 @@ void test_transport_decoder(const CodeRate rate) {
         const auto failed_stats = decoder.stats();
         throw std::runtime_error(
             "decoder produced no transport packets; outer phase=" +
-            std::to_string(failed_stats.outer_deinterleaver_phase));
+            std::to_string(failed_stats.outer_deinterleaver_phase) +
+            ", RS=" + std::to_string(failed_stats.rs_packets) + ", failures=" +
+            std::to_string(failed_stats.rs_uncorrectable_packets) +
+            ", energy=" + std::to_string(failed_stats.energy_synchronized));
     }
     require(recovered.size() % ts_packet_size == 0, "TS packet alignment");
     require(

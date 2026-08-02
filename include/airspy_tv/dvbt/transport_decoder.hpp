@@ -16,6 +16,8 @@ struct TransportDecoderStats {
     std::uint64_t rs_uncorrectable_packets{};
     std::uint64_t ts_packets{};
     int outer_deinterleaver_phase{-1};
+    unsigned int outer_sync_distance{};
+    std::uint32_t outer_rs_evidence{};
     bool rs_synchronized{};
     bool energy_synchronized{};
 };

@@ -95,18 +95,25 @@ Initial native implementation:
   rational resampling and repeatedly acquires 2K/8K OFDM symbols before
   entering the validated equalized-carrier/FEC pipeline; recovered bytes are
   routed to the MPEG-TS recorder without running DSP in a source callback.
-- On the 557 MHz capture this frontend currently acquires 8K, guard 1/4 with a
-  CP score around 0.96 and stable scattered-pilot phase, but produces only
-  about 8.4 dB equalized MER versus roughly 16.2 dB from the GNU Radio
-  reference equalizer. It therefore does not yet acquire the outer RS phase or
-  emit valid TS. This checkpoint must not be presented as decoder lock.
+- A deterministic GNU Radio reference transmitter now exercises the complete
+  raw-IQ boundary with a centered 10 MSPS CS16 6 MHz, 8K, guard-1/4, 64-QAM,
+  rate-2/3 waveform. The native frontend recovers 6,695 byte-identical TS
+  packets from a one-second fixture, with zero TEI flags, zero uncorrectable RS
+  packets, and a valid PAT/PMT. This exposed and fixed an FFT-window error where
+  cyclic-prefix acquisition was incorrectly treated as the start of useful
+  symbol data.
+- The older 557 MHz capture remains a weak/multipath robustness case rather
+  than the functional baseline. It needs to be re-evaluated after continuous
+  sample-clock/channel tracking is implemented; ideal-signal lock does not yet
+  imply reliable field reception.
 - Spectrum and quality smoothing follow SDR++'s speed model
   (`alpha = min(speed / (update_rate * 10), 1)`). Raw FFT rows reach the
   waterfall before FFT smoothing is applied to the spectrum trace.
 
 Acceptance criteria:
 
-- Decode synthetic standard vectors without uncorrected RS errors.
+- Decode synthetic standard vectors and the ideal raw-IQ fixture without
+  uncorrected RS errors.
 - Recover valid PAT and PMT tables from the 557 MHz regression capture, with
   plausible PIDs and a low transport-error rate.
 - Track acquisition time, TPS lock, MER, pre-Viterbi BER, post-Viterbi BER,

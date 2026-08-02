@@ -2,6 +2,7 @@
 
 #include "airspy_tv/dvbt/transport_decoder.hpp"
 
+#include <complex>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -16,6 +17,7 @@ struct StreamDecoderStats {
     std::uint32_t guard_size{};
     int carrier_bin_offset{};
     float mer_db{};
+    float residual_carrier_offset_hz{};
     std::uint64_t pilot_phase_discontinuities{};
     std::uint64_t input_blocks{};
     std::uint64_t dropped_blocks{};
@@ -30,6 +32,9 @@ class StreamDecoder {
   public:
     using TransportCallback =
         std::function<void(std::span<const std::uint8_t>)>;
+    using EqualizedCallback =
+        std::function<void(std::span<const std::complex<float>>,
+                           std::span<const float>, std::size_t)>;
 
     StreamDecoder();
     ~StreamDecoder() noexcept;
@@ -41,6 +46,7 @@ class StreamDecoder {
                 std::uint32_t channel_bandwidth_hz = 6'000'000);
     void reset();
     void set_transport_callback(TransportCallback callback);
+    void set_equalized_callback(EqualizedCallback callback);
     [[nodiscard]] StreamDecoderStats stats() const;
 
   private:

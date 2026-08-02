@@ -6,6 +6,7 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -233,39 +234,63 @@ class EnergyDescrambler {
     std::uint16_t shift_register_{0x00A9};
 };
 
-[[nodiscard]] std::size_t
+struct AlignmentEvidence {
+    std::size_t start{std::numeric_limits<std::size_t>::max()};
+    unsigned int sync_distance{std::numeric_limits<unsigned int>::max()};
+    std::size_t rs_successes{};
+};
+
+[[nodiscard]] AlignmentEvidence
 find_rs_alignment(const std::span<const std::uint8_t> bytes,
                   ReedSolomon &reed_solomon) {
-    constexpr std::size_t required_packets = 8;
+    constexpr std::size_t required_packets = 16;
     constexpr std::size_t required_bytes = required_packets * rs_packet_size;
     if (bytes.size() < required_bytes) {
-        return std::numeric_limits<std::size_t>::max();
+        return {};
     }
+    AlignmentEvidence best;
     for (std::size_t start = 0; start + required_bytes <= bytes.size();
          ++start) {
-        bool saw_inverted_sync = false;
-        bool valid = true;
-        for (std::size_t packet = 0; packet < required_packets; ++packet) {
-            const std::size_t offset = start + (packet * rs_packet_size);
-            const std::uint8_t sync = bytes[offset];
-            if (sync != 0x47 && sync != 0xB8) {
-                valid = false;
-                break;
+        for (std::size_t energy_phase = 0;
+             energy_phase < packets_per_energy_frame; ++energy_phase) {
+            unsigned int distance = 0;
+            for (std::size_t packet = 0; packet < required_packets; ++packet) {
+                const std::uint8_t expected =
+                    (packet + energy_phase) % packets_per_energy_frame == 0
+                        ? 0xB8
+                        : 0x47;
+                distance += static_cast<unsigned int>(
+                    std::popcount(static_cast<unsigned int>(
+                        bytes[start + (packet * rs_packet_size)] ^ expected)));
             }
-            std::array<std::uint8_t, ts_packet_size> decoded{};
-            if (!reed_solomon.decode(bytes.subspan(offset, rs_packet_size),
-                                     decoded) ||
-                decoded.front() != sync) {
-                valid = false;
-                break;
+            if (best.rs_successes == 0 && distance < best.sync_distance) {
+                best = {start, distance, 0};
             }
-            saw_inverted_sync |= sync == 0xB8;
-        }
-        if (valid && saw_inverted_sync) {
-            return start;
+            if (distance > 24) {
+                continue;
+            }
+            std::size_t rs_successes = 0;
+            for (std::size_t packet = 0; packet < required_packets; ++packet) {
+                const std::uint8_t expected =
+                    (packet + energy_phase) % packets_per_energy_frame == 0
+                        ? 0xB8
+                        : 0x47;
+                std::array<std::uint8_t, ts_packet_size> decoded{};
+                rs_successes +=
+                    reed_solomon.decode(
+                        bytes.subspan(start + (packet * rs_packet_size),
+                                      rs_packet_size),
+                        decoded) &&
+                    decoded.front() == expected;
+            }
+            if (rs_successes > best.rs_successes ||
+                (rs_successes == best.rs_successes &&
+                 distance < best.sync_distance)) {
+                best = {start, distance, rs_successes};
+            }
         }
     }
-    return std::numeric_limits<std::size_t>::max();
+    return best;
 }
 
 } // namespace
@@ -326,30 +351,82 @@ struct TransportDecoder::Impl {
         statistics.viterbi_bits += decoded.size() * 8;
         constexpr std::size_t maximum_search = 32 * rs_packet_size;
         if (selected_outer_phase == outer_interleaver_branches) {
+            std::array<AlignmentEvidence, outer_interleaver_branches>
+                evidence{};
             for (std::size_t phase = 0; phase < outer_interleavers.size();
                  ++phase) {
                 auto deinterleaved = outer_interleavers[phase].process(decoded);
                 auto &candidate = outer_candidates[phase];
                 candidate.insert(candidate.end(), deinterleaved.begin(),
                                  deinterleaved.end());
-                const std::size_t alignment =
-                    find_rs_alignment(candidate, reed_solomon);
-                if (alignment != std::numeric_limits<std::size_t>::max()) {
-                    selected_outer_phase = phase;
-                    statistics.outer_deinterleaver_phase =
-                        static_cast<int>(phase);
-                    rs_bytes.assign(candidate.begin() +
-                                        static_cast<std::ptrdiff_t>(alignment),
-                                    candidate.end());
-                    statistics.rs_synchronized = true;
-                    break;
-                }
                 if (candidate.size() > maximum_search) {
                     candidate.erase(
                         candidate.begin(),
                         candidate.end() -
                             static_cast<std::ptrdiff_t>(maximum_search));
                 }
+                evidence[phase] = find_rs_alignment(candidate, reed_solomon);
+            }
+            std::size_t selected_phase = outer_interleaver_branches;
+            AlignmentEvidence selected_evidence;
+            unsigned int global_sync_distance =
+                std::numeric_limits<unsigned int>::max();
+            std::size_t global_rs_evidence = 0;
+            for (std::size_t phase = 0; phase < evidence.size(); ++phase) {
+                const auto &candidate_evidence = evidence[phase];
+                global_sync_distance = std::min(
+                    global_sync_distance, candidate_evidence.sync_distance);
+                global_rs_evidence = std::max(global_rs_evidence,
+                                              candidate_evidence.rs_successes);
+                if (candidate_evidence.rs_successes < 4) {
+                    continue;
+                }
+                if (selected_phase == outer_interleaver_branches ||
+                    candidate_evidence.rs_successes >
+                        selected_evidence.rs_successes ||
+                    (candidate_evidence.rs_successes ==
+                         selected_evidence.rs_successes &&
+                     candidate_evidence.sync_distance <
+                         selected_evidence.sync_distance)) {
+                    selected_phase = phase;
+                    selected_evidence = candidate_evidence;
+                }
+            }
+            statistics.outer_sync_distance =
+                global_sync_distance == std::numeric_limits<unsigned int>::max()
+                    ? 0U
+                    : global_sync_distance;
+            statistics.outer_rs_evidence =
+                static_cast<std::uint32_t>(global_rs_evidence);
+            const bool candidates_full = std::ranges::all_of(
+                outer_candidates, [](const auto &candidate) {
+                    return candidate.size() >= maximum_search;
+                });
+            if (selected_phase == outer_interleaver_branches &&
+                candidates_full) {
+                for (std::size_t phase = 0; phase < evidence.size(); ++phase) {
+                    const auto &candidate_evidence = evidence[phase];
+                    if (candidate_evidence.sync_distance > 20) {
+                        continue;
+                    }
+                    if (selected_phase == outer_interleaver_branches ||
+                        candidate_evidence.sync_distance <
+                            selected_evidence.sync_distance) {
+                        selected_phase = phase;
+                        selected_evidence = candidate_evidence;
+                    }
+                }
+            }
+            if (selected_phase != outer_interleaver_branches) {
+                selected_outer_phase = selected_phase;
+                statistics.outer_deinterleaver_phase =
+                    static_cast<int>(selected_phase);
+                const auto &candidate = outer_candidates[selected_phase];
+                rs_bytes.assign(
+                    candidate.begin() +
+                        static_cast<std::ptrdiff_t>(selected_evidence.start),
+                    candidate.end());
+                statistics.rs_synchronized = true;
             }
             if (!statistics.rs_synchronized) {
                 return {};

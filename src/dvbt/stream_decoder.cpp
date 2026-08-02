@@ -29,7 +29,7 @@ namespace {
 
 constexpr float input_scale = 32768.0F;
 constexpr float minimum_power = 1.0e-12F;
-constexpr std::size_t decode_chunk_samples = 1'400'000;
+constexpr std::size_t decode_chunk_samples = 7'000'000;
 constexpr std::size_t acquisition_samples = 350'000;
 constexpr std::size_t max_queued_blocks = 64;
 
@@ -240,6 +240,7 @@ struct StreamDecoder::Impl {
     std::deque<Block> queue;
     std::vector<std::int16_t> accumulated;
     TransportCallback callback;
+    EqualizedCallback equalized_callback;
     StreamDecoderStats latest;
     bool stopping{};
     bool reset_requested{};
@@ -277,8 +278,9 @@ struct StreamDecoder::Impl {
             acquisition.mode == TransmissionMode::k8 ? 6816 : 1704;
         const std::span<const int> continual = continual_2k;
         const std::span<const int> tps = tps_2k;
-        Decoder decoder(
-            {acquisition.mode, Constellation::qam64, CodeRate::rate_2_3});
+        const DecoderParameters parameters{
+            acquisition.mode, Constellation::qam64, CodeRate::rate_2_3};
+        Decoder decoder(parameters);
         MaxLogDemapper reference{Constellation::qam64};
         std::vector<std::complex<float>> fft_in(acquisition.fft_size);
         std::vector<std::complex<float>> fft_out(acquisition.fft_size);
@@ -290,22 +292,33 @@ struct StreamDecoder::Impl {
         if (plan == nullptr) {
             return;
         }
-        const float cfo_phase = std::arg(acquisition.phase) /
-                                static_cast<float>(acquisition.fft_size);
+        float tracked_cfo_phase = std::arg(acquisition.phase) /
+                                  static_cast<float>(acquisition.fft_size);
         const std::size_t period =
             acquisition.fft_size + acquisition.guard_size;
         int carrier_offset = std::numeric_limits<int>::max();
         int previous_phase = -1;
         std::uint64_t phase_discontinuities = 0;
         double mer_sum = 0.0;
+        // CP correlation locates the beginning of the guard interval.  The
+        // FFT window must start at the useful symbol, after that guard.  Using
+        // acquisition.start directly applies a large cyclic time shift and a
+        // carrier phase ramp that sparse-pilot interpolation cannot unwrap.
+        const std::size_t first_fft_start =
+            acquisition.start + acquisition.guard_size;
+        float nco_phase =
+            tracked_cfo_phase * static_cast<float>(first_fft_start);
+        std::vector<std::complex<float>> previous_continual;
+        float residual_phase_ema = 0.0F;
         std::uint64_t symbol_count = 0;
         std::uint64_t byte_count = 0;
-        for (std::size_t start = acquisition.start;
+        for (std::size_t start = first_fft_start;
              start + acquisition.fft_size <= samples.size(); start += period) {
             for (std::size_t i = 0; i < acquisition.fft_size; ++i) {
-                fft_in[i] = samples[start + i] *
-                            std::polar(1.0F, -cfo_phase *
-                                                 static_cast<float>(start + i));
+                fft_in[i] =
+                    samples[start + i] *
+                    std::polar(1.0F, -(nco_phase + (tracked_cfo_phase *
+                                                    static_cast<float>(i))));
             }
             fftwf_execute(plan);
             const PilotLock lock =
@@ -315,15 +328,69 @@ struct StreamDecoder::Impl {
             }
             previous_phase = lock.phase;
             carrier_offset = lock.offset;
+            std::vector<std::complex<float>> current_continual;
+            current_continual.reserve(continual_2k.size() *
+                                      (maximum == 6816 ? 4U : 1U));
+            for (std::size_t segment = 0; segment <= maximum / 1704;
+                 ++segment) {
+                for (const int base : continual_2k) {
+                    const std::size_t k =
+                        (segment * 1704) + static_cast<std::size_t>(base);
+                    if (k <= maximum &&
+                        (current_continual.empty() || k != segment * 1704)) {
+                        current_continual.push_back(
+                            carrier(fft_out, k, maximum, carrier_offset));
+                    }
+                }
+            }
+            float residual_phase = 0.0F;
+            if (previous_continual.size() == current_continual.size()) {
+                std::complex<float> temporal_correlation{};
+                for (std::size_t i = 0; i < current_continual.size(); ++i) {
+                    temporal_correlation +=
+                        current_continual[i] * std::conj(previous_continual[i]);
+                }
+                residual_phase = std::arg(temporal_correlation);
+                constexpr float loop_gain = 0.20F;
+                tracked_cfo_phase +=
+                    loop_gain * residual_phase / static_cast<float>(period);
+                residual_phase_ema =
+                    (0.1F * residual_phase) + (0.9F * residual_phase_ema);
+            }
+            previous_continual = std::move(current_continual);
             std::vector<std::complex<float>> channel(maximum + 1);
             std::vector<std::size_t> pilots;
             for (std::size_t k = static_cast<std::size_t>(lock.phase * 3);
                  k <= maximum; k += 12) {
                 const float sent = prbs[k] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
-                channel[k] =
-                    carrier(fft_out, k, maximum, carrier_offset) / sent;
+                const auto received =
+                    carrier(fft_out, k, maximum, carrier_offset);
+                channel[k] = std::norm(received) > minimum_power
+                                 ? std::complex<float>{sent, 0.0F} / received
+                                 : std::complex<float>{};
                 pilots.push_back(k);
             }
+            for (std::size_t segment = 0; segment <= maximum / 1704;
+                 ++segment) {
+                for (const int base : continual_2k) {
+                    const std::size_t k =
+                        (segment * 1704) + static_cast<std::size_t>(base);
+                    if (k > maximum) {
+                        continue;
+                    }
+                    const float sent =
+                        prbs[k] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+                    const auto received =
+                        carrier(fft_out, k, maximum, carrier_offset);
+                    channel[k] =
+                        std::norm(received) > minimum_power
+                            ? std::complex<float>{sent, 0.0F} / received
+                            : std::complex<float>{};
+                    pilots.push_back(k);
+                }
+            }
+            std::ranges::sort(pilots);
+            pilots.erase(std::ranges::unique(pilots).begin(), pilots.end());
             for (std::size_t i = 1; i < pilots.size(); ++i) {
                 const std::size_t left = pilots[i - 1];
                 const std::size_t right = pilots[i];
@@ -343,6 +410,8 @@ struct StreamDecoder::Impl {
                       channel.end(), channel[pilots.back()]);
             std::vector<std::complex<float>> payload;
             payload.reserve(payload_carrier_count(acquisition.mode));
+            std::vector<float> equalizer_power;
+            equalizer_power.reserve(payload_carrier_count(acquisition.mode));
             for (std::size_t k = 0; k <= maximum; ++k) {
                 const bool scattered =
                     k % 12 == static_cast<std::size_t>(lock.phase * 3);
@@ -350,8 +419,9 @@ struct StreamDecoder::Impl {
                 if (scattered || listed(continual, base) || listed(tps, base)) {
                     continue;
                 }
-                payload.push_back(carrier(fft_out, k, maximum, carrier_offset) /
+                payload.push_back(carrier(fft_out, k, maximum, carrier_offset) *
                                   channel[k]);
+                equalizer_power.push_back(std::norm(channel[k]));
             }
             if (payload.size() != payload_carrier_count(acquisition.mode)) {
                 continue;
@@ -400,9 +470,34 @@ struct StreamDecoder::Impl {
             std::ranges::nth_element(errors, middle);
             const float reliability =
                 1.0F / std::max(*middle / std::log(2.0F), 1.0e-4F);
-            std::vector<float> reliabilities(payload.size(), reliability);
+            auto equalizer_power_order = equalizer_power;
+            auto equalizer_middle =
+                equalizer_power_order.begin() +
+                static_cast<std::ptrdiff_t>(equalizer_power_order.size() / 2);
+            std::ranges::nth_element(equalizer_power_order, equalizer_middle);
+            const float median_equalizer_power =
+                std::max(*equalizer_middle, minimum_power);
+            std::vector<float> reliabilities(payload.size());
+            for (std::size_t carrier_index = 0;
+                 carrier_index < reliabilities.size(); ++carrier_index) {
+                const float relative_channel_power =
+                    median_equalizer_power /
+                    std::max(equalizer_power[carrier_index], minimum_power);
+                reliabilities[carrier_index] =
+                    reliability *
+                    std::clamp(relative_channel_power, 0.01F, 16.0F);
+            }
             const auto ts = decoder.process_symbol(
                 payload, reliabilities, static_cast<std::size_t>(lock.phase));
+            EqualizedCallback equalized_sink;
+            {
+                const std::scoped_lock guard(mutex);
+                equalized_sink = equalized_callback;
+            }
+            if (equalized_sink) {
+                equalized_sink(payload, reliabilities,
+                               static_cast<std::size_t>(lock.phase));
+            }
             if (!ts.empty()) {
                 TransportCallback sink;
                 {
@@ -415,6 +510,9 @@ struct StreamDecoder::Impl {
                 byte_count += ts.size();
             }
             ++symbol_count;
+            nco_phase = std::remainder(
+                nco_phase + (tracked_cfo_phase * static_cast<float>(period)),
+                2.0F * std::numbers::pi_v<float>);
         }
         fftwf_destroy_plan(plan);
         const std::scoped_lock guard(mutex);
@@ -424,6 +522,10 @@ struct StreamDecoder::Impl {
                             ? 0.0F
                             : static_cast<float>(
                                   mer_sum / static_cast<double>(symbol_count));
+        latest.residual_carrier_offset_hz =
+            residual_phase_ema *
+            (static_cast<float>(bandwidth) * (8.0F / 7.0F)) /
+            (2.0F * std::numbers::pi_v<float> * static_cast<float>(period));
         latest.pilot_phase_discontinuities += phase_discontinuities;
         latest.ofdm_symbols += symbol_count;
         latest.transport_bytes += byte_count;
@@ -497,6 +599,11 @@ void StreamDecoder::reset() {
 void StreamDecoder::set_transport_callback(TransportCallback callback) {
     const std::scoped_lock lock(impl_->mutex);
     impl_->callback = std::move(callback);
+}
+
+void StreamDecoder::set_equalized_callback(EqualizedCallback callback) {
+    const std::scoped_lock lock(impl_->mutex);
+    impl_->equalized_callback = std::move(callback);
 }
 
 StreamDecoderStats StreamDecoder::stats() const {

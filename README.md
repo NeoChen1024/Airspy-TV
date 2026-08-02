@@ -16,11 +16,11 @@ Early C++20 mockup for a standalone DVB-T receiver application. The current mile
   RS(204,188), and all non-hierarchical DVB-T modulation/code-rate modes;
 - mock video playback areas.
 
-The native data/FEC path can recover MPEG-TS from equalized DVB-T carriers.
-Live/file I/Q sources now feed an asynchronous native OFDM/FEC worker and its
-output is routed to the GUI's TS recorder. Carrier/sample-clock tracking and
-TPS parameter discovery are still under development, however, so the current
-raw-IQ frontend does not yet recover valid TS from the regression capture.
+The native path recovers MPEG-TS directly from an ideal centered 10 MSPS CS16
+DVB-T waveform. Live/file I/Q sources feed the same asynchronous native
+OFDM/FEC worker and its output is routed to the GUI's TS recorder. Robust
+carrier/sample-clock tracking and TPS parameter discovery are still under
+development, so recorded weak/multipath signals remain experimental.
 
 ## Build
 
@@ -75,3 +75,22 @@ symbol with:
 The final argument is the first OFDM symbol index; it determines the symbol
 deinterleaver parity. This tool is a validation boundary, not the eventual
 user-facing I/Q decoder.
+
+An offline GNU Radio reference transmitter can generate a deterministic ideal
+6 MHz, 8K, guard-1/4, 64-QAM, rate-2/3 fixture. This validation helper requires
+GNU Radio's Python bindings, NumPy, and FFmpeg; none are application runtime
+dependencies.
+
+```sh
+XDG_CACHE_HOME=/tmp/airspy-tv-gnuradio-cache \
+  python3 tools/generate_dvbt_fixture.py /tmp/airspy-tv-ideal.cs16
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --target airspy-tv-dvbt-iq
+./build-release/airspy-tv-dvbt-iq \
+  /tmp/airspy-tv-ideal.cs16 /tmp/airspy-tv-ideal-native.ts 1
+```
+
+The generator also writes an application-compatible JSON I/Q sidecar and the
+unmodulated source transport stream as `airspy-tv-ideal.expected.ts`. The
+current ideal regression recovers packet-aligned TS with a valid PAT/PMT and
+no uncorrectable RS packets.

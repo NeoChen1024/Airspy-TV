@@ -116,7 +116,10 @@ int decode(const std::filesystem::path &source,
     std::cerr << "symbols=" << symbol_count << ", output=" << output_bytes
               << " bytes, RS=" << stats.rs_packets
               << ", RS failures=" << stats.rs_uncorrectable_packets
-              << ", TS packets=" << stats.ts_packets << '\n';
+              << ", TS packets=" << stats.ts_packets
+              << ", outer phase=" << stats.outer_deinterleaver_phase
+              << ", sync distance=" << stats.outer_sync_distance
+              << ", RS evidence=" << stats.outer_rs_evidence << '\n';
     return output_bytes == 0 ? 2 : 0;
 }
 
