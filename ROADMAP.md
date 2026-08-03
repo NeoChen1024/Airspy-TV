@@ -301,17 +301,26 @@ The TS/SI/EPG/recorder/playback layer (`transport_stream`, `si_common`, `epg`,
 `recorder`, `mpv_player`) is modulation-standard-agnostic: every candidate
 standard below outputs an MPEG transport stream (except analog), and
 DVB-T2/DTMB/DVB-C use the same EN 300 468 PSI/SI tables the EPG already
-parses. Before a second standard lands, two structural changes are required:
+parses. The structural groundwork is complete:
 
-- Introduce a `Demodulator` interface (I/Q samples in, MPEG-TS callback +
-  generic stats out); `dvbt::StreamDecoder` becomes its first implementation.
-  Later standards get their own modules, mirroring the `airspy-tv-dvbt`
-  static-library precedent rather than a mode switch inside the DVB-T inner
-  decoder.
-- Split `SdrDevice` into a pure SDR source/tuner and a standard-aware Receiver
-  that owns the source, a `unique_ptr<Demodulator>`, and the TS pipeline. The
-  current `SdrDevice` owns both and leaks `dvbt::` types through its public
-  interface.
+- `airspy-tv-common` holds the shared, standard-agnostic FEC: the DVB outer
+  stage (12-branch convolutional deinterleaver, RS(204,188), energy
+  descrambler, TS recovery) and the libcorrect SoftViterbi worker pool.
+  DVB-C feeds the same `fec::OuterFec` directly from a QAM slicer, skipping
+  Viterbi; `dvbt::TransportDecoder` is now glue (depuncture + SoftViterbi
+  -> OuterFec) with an unchanged public API.
+- The `Demodulator` interface (I/Q in, MPEG-TS callback out, generic stats)
+  is implemented by `dvbt::StreamDecoder`, which now owns the DVB-T GUI
+  analysis path. Later standards get their own modules, mirroring the
+  `airspy-tv-dvbt` static-library precedent rather than a mode switch inside
+  the DVB-T inner decoder.
+- `SdrDevice` is a pure SDR source/tuner (no `dvbt::` types in its public
+  interface): it owns a `unique_ptr<Demodulator>` injected via
+  `set_demodulator()` and exposes `set_channel_bandwidth()`; standard-
+  specific configuration happens on the concrete type before injection.
+
+Still future:
+
 - Define a second output family for analog standards (I/Q to video frames +
   audio) that bypasses the TS layer entirely; the existing GL-texture video
   surface is reused for rendering.
