@@ -335,7 +335,12 @@ Per-standard deltas once those seams exist:
   coding. PSIP (VCT/MGT/STT/EIT/ETT) replaces DVB SI, so the SI/EPG layer
   needs an ATSC table branch (section-assembly infrastructure reuses).
   10 MSPS is below the roughly 11 MSPS complex-sampling floor for 8VSB, so
-  ATSC additionally requires faster hardware.
+  ATSC additionally requires faster hardware. ATSC table parsing will follow
+  the hand-rolled `si_common`/`EpgModel` pattern: TSDuck was evaluated as a
+  cross-standard PSI/SI alternative and rejected (large dependency whose
+  charset layer does not cover the Big5/GB2312/EUC-KR and mislabeled-UTF-16
+  text that Taiwanese broadcasts rely on); its source remains a spec
+  reference only.
 - **NTSC/PAL/SECAM**: an independent analog pipeline (vision demod, sync
   separation, chroma decoding, FM sound) that never produces TS; reuse is
   limited to the SDR frontend, resampler, spectrum/waterfall monitors, raw
