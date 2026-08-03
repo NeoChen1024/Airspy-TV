@@ -51,6 +51,7 @@ using airspy_tv::EpgModel;
 using airspy_tv::EpgSnapshot;
 using airspy_tv::IqFileInfo;
 using airspy_tv::MpvPlayer;
+using airspy_tv::ReceiveStandard;
 using airspy_tv::SdrBackend;
 using airspy_tv::SdrDevice;
 using airspy_tv::SourceSettings;
@@ -179,6 +180,7 @@ struct AppState {
     std::vector<TransportService> services;
     std::optional<std::uint16_t> selected_service_id;
     ReceiverParameters dvbt_parameters;
+    ReceiveStandard standard{ReceiveStandard::DvbT};
     // The concrete DVB-T demodulator is injected into the receiver; the raw
     // pointer stays valid for the DVB-T-specific GUI panels.
     std::unique_ptr<StreamDecoder> demodulator;
@@ -1002,11 +1004,44 @@ void draw_source_panel(AppState &state) {
 }
 
 void draw_receiver_panel(AppState &state) {
-    if (!ImGui::CollapsingHeader("DVB-T Mode",
+    if (!ImGui::CollapsingHeader("Demodulator",
                                  ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
     ImGui::PushID("receiver-panel");
+
+    ImGui::TextUnformatted("Decode standard");
+    ImGui::PushID("standard");
+    ImGui::SetNextItemWidth(-1.0F);
+    constexpr std::array standard_names{"DVB-T", "DVB-C", "DVB-T2", "DTMB",
+                                        "ATSC"};
+    if (ImGui::BeginCombo(
+            "##value",
+            standard_names[static_cast<std::size_t>(state.standard)])) {
+        for (int index = 0; index < static_cast<int>(standard_names.size());
+             ++index) {
+            const bool implemented =
+                static_cast<ReceiveStandard>(index) == ReceiveStandard::DvbT;
+            if (!implemented) {
+                ImGui::BeginDisabled(true);
+            }
+            if (ImGui::Selectable(
+                    standard_names[static_cast<std::size_t>(index)],
+                    state.standard == static_cast<ReceiveStandard>(index))) {
+                state.standard = static_cast<ReceiveStandard>(index);
+                // Future: rebuild the demodulator for the selected standard
+                // (dvbc/dvbt2/dtmb/atsc modules) and re-inject it through
+                // SdrDevice::set_demodulator; only DVB-T is implemented
+                // today.
+            }
+            if (!implemented) {
+                ImGui::EndDisabled();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopID();
+    ImGui::Separator();
 
     bool parameters_changed = false;
     const auto draw_optional_combo =
@@ -1523,14 +1558,14 @@ void draw_sidebar(AppState &state) {
 
     draw_receiver_panel(state);
 
-    if (ImGui::CollapsingHeader("DVB-T Constellation",
+    if (ImGui::CollapsingHeader("Constellation",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::PushID("constellation-panel");
         draw_constellation(ImVec2(-1.0F, 300.0F), state.signal_analysis);
         ImGui::PopID();
     }
 
-    if (ImGui::CollapsingHeader("Signal Quality",
+    if (ImGui::CollapsingHeader("Signal & FEC",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::PushID("signal-quality-panel");
         const bool locked = state.signal_analysis.locked;
@@ -1633,7 +1668,7 @@ void draw_sidebar(AppState &state) {
             cell("Drops", std::to_string(state.decoder.dropped_blocks));
             cell("Resample", std::to_string(state.decoder.resample_workers));
             cell("Symbol", std::to_string(state.decoder.symbol_workers));
-            cell("Viterbi",
+            cell("Inner FEC",
                  std::to_string(state.decoder.transport.viterbi_workers));
             cell("", std::string{});
             ImGui::EndTable();
@@ -1724,14 +1759,15 @@ void draw_sidebar(AppState &state) {
         const std::string pre_viterbi_text =
             pre_viterbi_available ? std::format("{:.2e}", pre_viterbi_ber)
                                   : "--";
-        draw_metric("Pre-Viterbi BER", pre_viterbi_text.c_str(),
+        draw_metric("Inner BER", pre_viterbi_text.c_str(),
                     pre_viterbi_available ? ber_quality(pre_viterbi_ber) : 0.0F,
                     ImVec4(0.75F, 0.72F, 0.30F, 1.0F));
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
             ImGui::SetTooltip(
-                "Hard-decision disagreement between received non-punctured "
-                "mother-code metrics and the re-encoded Viterbi survivor "
-                "path.\n%llu errors / %llu compared bits",
+                "Bit errors before the outer FEC, measured against the "
+                "received mother-code metrics. For DVB-T this is the "
+                "pre-Viterbi BER (re-encoded survivor path).\n%llu errors / "
+                "%llu compared bits",
                 static_cast<unsigned long long>(
                     transport.pre_viterbi_error_bits),
                 static_cast<unsigned long long>(
@@ -1748,15 +1784,16 @@ void draw_sidebar(AppState &state) {
         const std::string post_viterbi_text =
             post_viterbi_available ? std::format("{:.2e}", post_viterbi_ber)
                                    : "--";
-        draw_metric("Post-Viterbi BER", post_viterbi_text.c_str(),
+        draw_metric("Outer BER", post_viterbi_text.c_str(),
                     post_viterbi_available ? ber_quality(post_viterbi_ber)
                                            : 0.0F,
                     ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
             ImGui::SetTooltip(
-                "Payload-bit corrections made by successful RS(204,188) "
-                "codewords; uncorrectable packets are reported separately.\n"
-                "%llu corrected bits / %llu checked bits; %llu RS failures",
+                "Residual bit errors after the outer FEC: payload-bit "
+                "corrections made by successful RS(204,188) codewords; "
+                "uncorrectable packets are reported separately.\n%llu "
+                "corrected bits / %llu checked bits; %llu RS failures",
                 static_cast<unsigned long long>(
                     transport.post_viterbi_error_bits),
                 static_cast<unsigned long long>(

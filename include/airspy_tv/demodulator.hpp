@@ -19,6 +19,17 @@ struct DemodulatorStats {
     bool processing{};
 };
 
+// The broadcast standard being decoded. Each implemented standard maps to a
+// concrete Demodulator implementation (only DvbT today); the remaining values
+// are reserved for the roadmap standards (DVB-C, DVB-T2, DTMB, ATSC).
+enum class ReceiveStandard {
+    DvbT,
+    DvbC,
+    DvbT2,
+    Dtmb,
+    Atsc,
+};
+
 // Standard-agnostic I/Q-to-MPEG-TS demodulator seam. Concrete standards
 // (dvbt::StreamDecoder today; future dvbc/dvbt2/dtmb modules) implement this,
 // and the receiver layer interacts only with this interface. Standard-specific
@@ -26,7 +37,8 @@ struct DemodulatorStats {
 // parameters are inherently standard-specific.
 class Demodulator {
   public:
-    using TransportCallback = std::function<void(std::span<const std::uint8_t>)>;
+    using TransportCallback =
+        std::function<void(std::span<const std::uint8_t>)>;
 
     virtual ~Demodulator() = default;
 
