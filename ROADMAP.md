@@ -2,7 +2,8 @@
 
 Airspy TV is being developed in stages so that RF acquisition, DVB-T PHY
 decoding, transport-stream handling, and video playback can be validated
-independently.
+independently. The end goal is a standalone terrestrial broadcast decoder with
+the Airspy R2 as a first-class SDR source.
 
 ## Implemented foundation
 

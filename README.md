@@ -12,6 +12,16 @@ from an Airspy R2, including automatic TPS parameter discovery and
 PAT/PMT/SDT-based channel selection. The native decoder and GUI share the same
 processing path used by the command-line I/Q-to-TS tool.
 
+## Project vision
+
+Airspy TV's goal is a standalone terrestrial broadcast decoder with the Airspy
+R2 as a first-class SDR: one application that turns the R2's I/Q stream into
+watchable television without external demodulators or signal-processing tools.
+DVB-T is the implemented standard; DVB-T2, DTMB, ATSC, and analog
+(NTSC/PAL/SECAM), plus DVB-C, are documented long-term targets in the
+[ROADMAP](ROADMAP.md). Decoding, TS/PSI/SI/EPG parsing, recording, and playback
+all run in-process, so GNU Radio appears only as an offline test fixture.
+
 ## Highlights
 
 - Native Airspy R2/Mini support through libairspy, including sensitivity and
