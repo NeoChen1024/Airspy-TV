@@ -1,6 +1,7 @@
 #pragma once
 
 #include "airspy_tv/dvbt/inner_decoder.hpp"
+#include "airspy_tv/fec/soft_viterbi.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -30,7 +31,9 @@ struct TransportDecoderStats {
 
 // Zero in user-facing configuration means this portable hardware-concurrency
 // default. std::thread reports logical processors and may return zero.
-[[nodiscard]] std::size_t default_viterbi_worker_count() noexcept;
+[[nodiscard]] inline std::size_t default_viterbi_worker_count() noexcept {
+    return fec::default_viterbi_worker_count();
+}
 
 // Streaming DVB-T inner/outer FEC after soft bit deinterleaving. Input contains
 // the punctured convolutional-code metrics in transmission order. Positive LLR

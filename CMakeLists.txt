@@ -84,6 +84,16 @@ target_include_directories(imgui SYSTEM PUBLIC
 )
 target_link_libraries(imgui PUBLIC SDL3::SDL3 OpenGL::GL)
 
+add_library(airspy-tv-common STATIC
+    src/fec/outer_fec.cpp
+    src/fec/soft_viterbi.cpp
+)
+target_include_directories(airspy-tv-common PUBLIC include)
+target_include_directories(airspy-tv-common SYSTEM PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libcorrect/include")
+target_link_libraries(airspy-tv-common PUBLIC Threads::Threads
+    PRIVATE correct_static)
+
 add_library(airspy-tv-dvbt STATIC
     src/dvbt/decoder.cpp
     src/dvbt/inner_decoder.cpp
@@ -95,10 +105,8 @@ add_library(airspy-tv-dvbt STATIC
     src/dvbt/tps_decoder.cpp
 )
 target_include_directories(airspy-tv-dvbt PUBLIC include)
-target_include_directories(airspy-tv-dvbt SYSTEM PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libcorrect/include")
-target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F Threads::Threads
-    PRIVATE correct_static liquid::liquid PkgConfig::VOLK)
+target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F airspy-tv-common
+    Threads::Threads PRIVATE liquid::liquid PkgConfig::VOLK)
 
 add_executable(airspy-tv
     src/epg.cpp
@@ -127,6 +135,8 @@ target_link_libraries(airspy-tv PRIVATE
 )
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(airspy-tv-common PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     target_compile_options(airspy-tv-dvbt PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     target_compile_options(airspy-tv PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
