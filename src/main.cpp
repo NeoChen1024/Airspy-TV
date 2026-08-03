@@ -768,6 +768,7 @@ void draw_source_panel(AppState &state) {
     if (!ImGui::CollapsingHeader("Source", ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
+    ImGui::PushID("source-panel");
 
     const bool source_open = state.receiver.is_open();
     std::uint32_t decoder_threads =
@@ -978,6 +979,7 @@ void draw_source_panel(AppState &state) {
         ImGui::TextWrapped("%s", warning.c_str());
         ImGui::PopStyleColor();
     }
+    ImGui::PopID();
 }
 
 void draw_receiver_panel(AppState &state) {
@@ -985,6 +987,7 @@ void draw_receiver_panel(AppState &state) {
                                  ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
+    ImGui::PushID("receiver-panel");
 
     bool parameters_changed = false;
     const auto draw_optional_combo =
@@ -1132,6 +1135,7 @@ void draw_receiver_panel(AppState &state) {
         state.receiver.set_dvbt_parameters(state.dvbt_parameters);
         state.status = "DVB-T parameters updated; receiver reacquiring";
     }
+    ImGui::PopID();
 }
 
 void consume_file_dialog_result(AppState &state,
@@ -1181,6 +1185,7 @@ void draw_recorder_panel(AppState &state) {
                                  ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
+    ImGui::PushID("iq-recorder");
     consume_file_dialog_result(state, state.file_dialog, state.recording_path,
                                "I/Q recording");
     const bool dialog_open = file_dialog_is_open(state.file_dialog);
@@ -1230,6 +1235,62 @@ void draw_recorder_panel(AppState &state) {
                 static_cast<unsigned long long>(stats.dropped_blocks));
     ImGui::Text("Source drops: %llu",
                 static_cast<unsigned long long>(stats.source_dropped_samples));
+    ImGui::PopID();
+}
+
+void draw_ts_recorder_panel(AppState &state) {
+    if (!ImGui::CollapsingHeader("MPEG-TS Stream Recorder",
+                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+    ImGui::PushID("ts-recorder");
+    consume_file_dialog_result(state, state.ts_file_dialog,
+                               state.ts_recording_path, "MPEG-TS recording");
+    const bool dialog_open = file_dialog_is_open(state.ts_file_dialog);
+    const bool ts_source_available = state.receiver.is_streaming();
+    const auto ts_stats = state.receiver.ts_recording_stats();
+
+    draw_disabled_wrapped("Decoded DVB-T transport stream (MPEG-TS)");
+    ImGui::TextUnformatted("Output file");
+    ImGui::BeginDisabled(dialog_open);
+    ImGui::SetNextItemWidth(-92.0F);
+    ImGui::InputText("##ts-recording-output", &state.ts_recording_path);
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...")) {
+        show_recording_file_dialog(state, state.ts_file_dialog,
+                                   state.ts_recording_path,
+                                   transport_stream_filters);
+    }
+    ImGui::EndDisabled();
+    if (dialog_open) {
+        ImGui::TextDisabled("Waiting for file selection...");
+    }
+
+    if (!ts_stats.active) {
+        ImGui::BeginDisabled(!ts_source_available || dialog_open ||
+                             state.ts_recording_path.empty());
+        if (ImGui::Button("Start recording", ImVec2(-1.0F, 0.0F))) {
+            std::string error;
+            state.status = state.receiver.start_ts_recording(
+                               state.ts_recording_path, error)
+                               ? "Recording decoded MPEG-TS"
+                               : error;
+        }
+        ImGui::EndDisabled();
+    } else if (ImGui::Button("Stop recording", ImVec2(-1.0F, 0.0F))) {
+        state.receiver.stop_ts_recording();
+        state.status = "MPEG-TS recording stopped";
+    }
+
+    ImGui::Text(
+        "Duration: %s",
+        format_recording_duration(ts_stats.elapsed_milliseconds).c_str());
+    ImGui::Text("Written: %.2f MiB",
+                static_cast<double>(ts_stats.bytes_written) /
+                    (1024.0 * 1024.0));
+    ImGui::Text("Queue drops: %llu",
+                static_cast<unsigned long long>(ts_stats.dropped_blocks));
+    ImGui::PopID();
 }
 
 void draw_sidebar(AppState &state) {
@@ -1237,6 +1298,7 @@ void draw_sidebar(AppState &state) {
 
     if (ImGui::CollapsingHeader("Spectrum & Waterfall",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushID("spectrum-panel");
         const ColormapOption &selected =
             colormap_options[state.selected_colormap];
         ImGui::SetNextItemWidth(-1.0F);
@@ -1304,17 +1366,21 @@ void draw_sidebar(AppState &state) {
         }
         draw_disabled_wrapped(
             "SDR++ speed model; FFT smoothing affects spectrum only.");
+        ImGui::PopID();
     }
 
     draw_receiver_panel(state);
 
     if (ImGui::CollapsingHeader("DVB-T Constellation",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushID("constellation-panel");
         draw_constellation(ImVec2(-1.0F, 300.0F), state.signal_analysis);
+        ImGui::PopID();
     }
 
     if (ImGui::CollapsingHeader("Signal Quality",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushID("signal-quality-panel");
         const bool locked = state.signal_analysis.locked;
         const ImVec4 lock_colour = locked ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
                                           : ImVec4(1.0F, 0.38F, 0.25F, 1.0F);
@@ -1671,18 +1737,14 @@ void draw_sidebar(AppState &state) {
                 : "RF estimates use the selected channel bandwidth and "
                   "out-of-channel noise; MER and constellation require OFDM "
                   "lock.");
+        ImGui::PopID();
     }
 
+    draw_ts_recorder_panel(state);
     draw_recorder_panel(state);
 }
 
 void draw_video_panel(AppState &state) {
-    consume_file_dialog_result(state, state.ts_file_dialog,
-                               state.ts_recording_path, "MPEG-TS recording");
-    const bool dialog_open = file_dialog_is_open(state.ts_file_dialog);
-    const bool ts_source_available = state.receiver.is_streaming();
-    const auto ts_stats = state.receiver.ts_recording_stats();
-
     const ImVec2 available = ImGui::GetContentRegionAvail();
     ImGui::Dummy(available);
     const ImVec2 origin = ImGui::GetItemRectMin();
@@ -1691,7 +1753,7 @@ void draw_video_panel(AppState &state) {
     draw->AddRectFilled(origin, extent, IM_COL32(5, 8, 13, 255), 5.0F);
 
     const float header_height = 46.0F;
-    const float footer_height = 142.0F;
+    const float footer_height = 46.0F;
     const ImVec2 footer_origin{origin.x, extent.y - footer_height};
     const ImVec2 video_origin{origin.x, origin.y + header_height};
     const ImVec2 video_extent{extent.x, footer_origin.y};
@@ -1745,8 +1807,6 @@ void draw_video_panel(AppState &state) {
     draw->AddRectFilled(footer_origin, extent, IM_COL32(13, 20, 30, 245), 5.0F);
 
     constexpr float horizontal_padding = 18.0F;
-    constexpr float browse_width = 86.0F;
-    constexpr float record_width = 104.0F;
     constexpr float mute_width = 72.0F;
     constexpr float control_spacing = 8.0F;
     ImGui::SetCursorScreenPos(
@@ -1795,52 +1855,6 @@ void draw_video_panel(AppState &state) {
                            "Volume %.0f%%")) {
         state.player.set_volume(volume);
     }
-
-    const float input_width = std::max(
-        120.0F, available.x - (horizontal_padding * 2.0F) - browse_width -
-                    record_width - (control_spacing * 2.0F));
-    ImGui::SetCursorScreenPos(
-        ImVec2(footer_origin.x + horizontal_padding, footer_origin.y + 49.0F));
-    ImGui::SetNextItemWidth(input_width);
-    ImGui::InputText("##ts-recording-output", &state.ts_recording_path);
-    ImGui::SameLine(0.0F, control_spacing);
-    ImGui::BeginDisabled(dialog_open);
-    if (ImGui::Button("Browse...", ImVec2(browse_width, 0.0F))) {
-        show_recording_file_dialog(state, state.ts_file_dialog,
-                                   state.ts_recording_path,
-                                   transport_stream_filters);
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine(0.0F, control_spacing);
-    ImGui::BeginDisabled((!ts_source_available && !ts_stats.active) ||
-                         dialog_open || state.ts_recording_path.empty());
-    if (ImGui::Button(ts_stats.active ? "Stop TS" : "Record TS",
-                      ImVec2(record_width, 0.0F))) {
-        if (ts_stats.active) {
-            state.receiver.stop_ts_recording();
-            state.status = "MPEG-TS recording stopped";
-        } else {
-            std::string error;
-            state.status = state.receiver.start_ts_recording(
-                               state.ts_recording_path, error)
-                               ? "Recording decoded MPEG-TS"
-                               : error;
-        }
-    }
-    ImGui::EndDisabled();
-
-    const double size_mib =
-        static_cast<double>(ts_stats.bytes_written) / (1024.0 * 1024.0);
-    const double elapsed_seconds =
-        static_cast<double>(ts_stats.elapsed_milliseconds) / 1000.0;
-    const double rate_mib =
-        elapsed_seconds > 0.0 ? size_mib / elapsed_seconds : 0.0;
-    ImGui::SetCursorScreenPos(
-        ImVec2(footer_origin.x + horizontal_padding, footer_origin.y + 92.0F));
-    ImGui::Text(
-        "Duration %s    Size %.2f MiB    Rate %.2f MiB/s",
-        format_recording_duration(ts_stats.elapsed_milliseconds).c_str(),
-        size_mib, rate_mib);
 }
 
 void draw_application(AppState &state) {
