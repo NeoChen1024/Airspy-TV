@@ -90,6 +90,7 @@ add_library(airspy-tv-dvbt STATIC
     src/dvbt/signal_analyzer.cpp
     src/dvbt/soft_demapper.cpp
     src/dvbt/transport_decoder.cpp
+    src/dvbt/tps_decoder.cpp
 )
 target_include_directories(airspy-tv-dvbt PUBLIC include)
 target_include_directories(airspy-tv-dvbt SYSTEM PRIVATE
@@ -103,6 +104,7 @@ add_executable(airspy-tv
     src/recorder.cpp
     src/sdr.cpp
     src/spectrum.cpp
+    src/transport_stream.cpp
 )
 target_include_directories(airspy-tv PRIVATE include)
 target_link_libraries(airspy-tv PRIVATE

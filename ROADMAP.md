@@ -23,9 +23,14 @@ independently.
   rational resampling; the tested centered 6 MHz path runs at 48/7 MSPS.
 - Native 2K/8K cyclic-prefix acquisition, carrier tracking, pilot channel
   estimation, and equalization feed the complete soft-decoding chain.
-- Finish continuous sample-clock tracking and standards-validated TPS decoding.
-- Cover 5, 6, 7, and 8 MHz channel raster rates and guard intervals 1/4, 1/8,
-  1/16, and 1/32. The initial Taiwan regression path remains centered 6 MHz.
+- Finish continuous sample-clock tracking. Differential TPS demodulation,
+  synchronization, BCH validation, and non-hierarchical modulation/HP-code-rate
+  discovery are implemented; add lock-loss hysteresis, superframe/cell-ID
+  assembly, and hierarchical HP/LP selection.
+- The UI and native resampling/monitor/decoder paths accept 5, 6, 7, and 8 MHz
+  channel raster rates and guard intervals 1/4, 1/8, 1/16, and 1/32. Add
+  reference fixtures for the non-6-MHz bandwidths; the current Taiwan
+  regression baseline remains centered 6 MHz.
 - Continue improving continuous carrier, channel, and sample-clock tracking so
   the frontend remains locked on weak, multipath, and SFN captures.
 
@@ -161,6 +166,11 @@ Current native implementation:
 - Spectrum and quality smoothing follow SDR++'s speed model
   (`alpha = min(speed / (update_rate * 10), 1)`). Raw FFT rows reach the
   waterfall before FFT smoothing is applied to the spectrum trace.
+- Pre-Viterbi BER is estimated by re-encoding each decoded survivor path and
+  comparing it with non-punctured hard decisions. Post-Viterbi BER counts
+  payload-bit corrections in successfully decoded RS(204,188) codewords;
+  uncorrectable RS packets remain a separate counter because their bit-error
+  count is unknowable.
 
 ## Verification status
 
@@ -177,8 +187,8 @@ Completed checks:
 
 Remaining receiver validation:
 
-- Track TPS lock, pre-Viterbi BER, post-Viterbi BER, corrected RS packets, and
-  uncorrectable packets consistently across processing chunks.
+- Track TPS lock, corrected RS packets, and uncorrectable/TEI packets
+  consistently across processing chunks.
 - Compare hard- and soft-decision behavior on clean, weak-signal, multipath,
   SFN, and discontinuous captures.
 - Add long-running live reception regressions for Airspy and selected SoapySDR
@@ -186,11 +196,16 @@ Remaining receiver validation:
 
 Next decoder step:
 
+- Make the rational resampler, OFDM tracking, TPS frame phase, and FEC/outer
+  synchronization continuous across input chunks. The current independently
+  acquired chunks create a multiplex-wide discontinuity at most chunk
+  boundaries even when every decoded RS packet inside each chunk is clean;
+  this must be fixed before judging libmpv playback stability.
 - Add continuous sample-clock and channel tracking across processing chunks;
   the current frontend is measurably less robust on captured multipath signals
   than the reference receiver.
-- Add TPS differential demodulation, BCH validation, frame/superframe index,
-  modulation/code-rate discovery, and deterministic decoder reset tags.
+- Carry validated TPS frame/superframe index and cell ID across chunks, and add
+  deterministic decoder reset tags when TPS parameters change.
 - Eliminate duplicated GUI-monitor/frontend work by publishing constellation
   and quality snapshots from the complete decoder where practical.
 - Profile a modern AVX2 Viterbi implementation; libcorrect's SSE decoder is now
@@ -198,11 +213,20 @@ Next decoder step:
 
 ## Transport stream and playback
 
-- Parse PAT, PMT, SDT, and EIT and expose service selection.
+- PAT, PMT, and SDT section assembly, CRC validation, service/component
+  discovery, and the bottom-right service selector are implemented. Selection
+  currently describes the MPTS only; add PID filtering or libmpv program
+  selection before presenting it as playback channel switching.
+- Parse EIT present/following and schedule tables for EPG, plus TDT/TOT clock
+  data, DVB text encodings, multilingual service/event descriptors, parental
+  ratings, subtitles, teletext, and alternate audio/language tracks.
 - Feed a selected service to libmpv and render video into the application-owned
   OpenGL framebuffer.
 - Reset playback state cleanly after source discontinuities, retunes, or
   service changes.
+- Preserve uncorrectable RS codewords as cadence-correct TS packets with TEI
+  set, expose their count, and let the demuxer discard corrupt payload instead
+  of silently manufacturing continuity-counter gaps.
 
 ## Possible future work
 

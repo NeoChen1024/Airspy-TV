@@ -44,6 +44,7 @@ using airspy_tv::SdrBackend;
 using airspy_tv::SdrDevice;
 using airspy_tv::SourceSettings;
 using airspy_tv::SpectrumSnapshot;
+using airspy_tv::TransportService;
 using airspy_tv::dvbt::CodeRate;
 using airspy_tv::dvbt::Constellation;
 using airspy_tv::dvbt::GuardInterval;
@@ -163,6 +164,8 @@ struct AppState {
     SpectrumSnapshot spectrum;
     SignalAnalysisSnapshot signal_analysis;
     StreamDecoderStats decoder;
+    std::vector<TransportService> services;
+    std::optional<std::uint16_t> selected_service_id;
     ReceiverParameters dvbt_parameters;
     WaterfallDisplay waterfall;
     SDL_Window *window{};
@@ -575,6 +578,13 @@ void draw_metric(const char *label, const char *value, const float fraction,
     ImGui::ProgressBar(fraction, ImVec2(-1.0F, 5.0F), "");
 }
 
+void draw_disabled_wrapped(const std::string_view text) {
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("%.*s", static_cast<int>(text.size()), text.data());
+    ImGui::PopStyleColor();
+}
+
 void draw_status_indicator(const char *label, const ImVec4 colour,
                            const char *detail = nullptr) {
     const ImVec2 cursor = ImGui::GetCursorScreenPos();
@@ -586,8 +596,7 @@ void draw_status_indicator(const char *label, const ImVec4 colour,
     ImGui::SameLine();
     ImGui::TextColored(colour, "%s", label);
     if (detail != nullptr) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", detail);
+        draw_disabled_wrapped(detail);
     }
 }
 
@@ -641,17 +650,19 @@ void draw_source_panel(AppState &state) {
     std::uint32_t decoder_threads =
         static_cast<std::uint32_t>(state.dvbt_parameters.worker_threads);
     ImGui::BeginDisabled(source_open);
+    ImGui::TextUnformatted("Decoder worker budget");
     ImGui::SetNextItemWidth(-1.0F);
-    if (ImGui::InputScalar("Decoder worker budget", ImGuiDataType_U32,
+    if (ImGui::InputScalar("##decoder-worker-budget", ImGuiDataType_U32,
                            &decoder_threads)) {
         decoder_threads = std::min(decoder_threads, std::uint32_t{256});
         state.dvbt_parameters.worker_threads = decoder_threads;
         state.receiver.set_dvbt_parameters(state.dvbt_parameters);
     }
     ImGui::EndDisabled();
-    ImGui::TextDisabled("0 = Auto (%zu logical CPUs); fixed while open",
-                        airspy_tv::dvbt::default_viterbi_worker_count());
-    ImGui::TextDisabled("Budget is split across symbol and Viterbi pools.");
+    draw_disabled_wrapped(std::format(
+        "0 = Auto ({} logical CPUs); fixed while a source is open. Budget is "
+        "split across symbol and Viterbi pools.",
+        airspy_tv::dvbt::default_viterbi_worker_count()));
 
     std::optional<std::string> selected_iq_source;
     {
@@ -687,7 +698,9 @@ void draw_source_panel(AppState &state) {
                               ? "No devices"
                               : state.enumeration.devices[state.selected_device]
                                     .display_name.c_str();
-    if (ImGui::BeginCombo("Device", preview)) {
+    ImGui::TextUnformatted("Device");
+    ImGui::SetNextItemWidth(-1.0F);
+    if (ImGui::BeginCombo("##source-device", preview)) {
         for (std::size_t index = 0; index < state.enumeration.devices.size();
              ++index) {
             const bool selected = index == state.selected_device;
@@ -701,6 +714,9 @@ void draw_source_panel(AppState &state) {
             }
         }
         ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("%s", preview);
     }
     ImGui::Checkbox("Show Airspy through Soapy", &state.show_soapy_airspy);
     ImGui::SameLine();
@@ -758,20 +774,22 @@ void draw_source_panel(AppState &state) {
                 static_cast<int>(iq_source_filters.size()), ".", false);
         }
         ImGui::EndDisabled();
+        ImGui::TextUnformatted("Raw sample rate (Hz)");
         ImGui::SetNextItemWidth(-1.0F);
-        ImGui::InputScalar("Raw sample rate (Hz)", ImGuiDataType_U32,
+        ImGui::InputScalar("##raw-sample-rate", ImGuiDataType_U32,
                            &state.settings.sample_rate_hz);
-        ImGui::TextDisabled(
-            "JSON supplies metadata; raw INT16_IQ uses %.3f MSPS / %.3f MHz.",
+        draw_disabled_wrapped(std::format(
+            "JSON supplies metadata; raw INT16_IQ uses {:.3f} MSPS / {:.3f} "
+            "MHz.",
             static_cast<double>(state.settings.sample_rate_hz) / 1e6,
-            static_cast<double>(state.settings.center_frequency_hz) / 1e6);
+            static_cast<double>(state.settings.center_frequency_hz) / 1e6));
     } else {
         const DeviceDescriptor *descriptor = state.receiver.descriptor();
         ImGui::TextColored(ImVec4(0.35F, 0.88F, 0.55F, 1.0F), "OPEN");
         ImGui::SameLine();
         ImGui::TextWrapped("%s", descriptor->display_name.c_str());
         if (!descriptor->serial.empty()) {
-            ImGui::TextDisabled("Serial: %s", descriptor->serial.c_str());
+            draw_disabled_wrapped("Serial: " + descriptor->serial);
         }
         ImGui::BeginDisabled(state.receiver.is_recording());
         if (ImGui::Button(descriptor->backend == SdrBackend::File
@@ -782,11 +800,60 @@ void draw_source_panel(AppState &state) {
             state.status = "Source closed";
         }
         ImGui::EndDisabled();
+
+        if (descriptor->backend == SdrBackend::File) {
+            ImGui::Text("Format       CS16 / INT16_IQ");
+            ImGui::Text("Sample rate  %.3f MSPS",
+                        static_cast<double>(state.settings.sample_rate_hz) /
+                            1e6);
+            ImGui::Text(
+                "Center       %.6f MHz",
+                static_cast<double>(state.settings.center_frequency_hz) / 1e6);
+            if (!state.receiver.is_streaming() &&
+                ImGui::Button("Replay from beginning", ImVec2(-1.0F, 0.0F))) {
+                std::string error;
+                state.status =
+                    state.receiver.start_stream(state.settings, error)
+                        ? "Replaying I/Q file"
+                        : error;
+            }
+        } else {
+            ImGui::BeginDisabled(state.receiver.is_recording());
+            if (!state.receiver.sample_rates().empty()) {
+                const std::string rate_preview = std::format(
+                    "{:.3f} MSPS",
+                    static_cast<double>(state.settings.sample_rate_hz) / 1e6);
+                ImGui::TextUnformatted("Sample rate");
+                ImGui::SetNextItemWidth(-1.0F);
+                if (ImGui::BeginCombo("##sample-rate", rate_preview.c_str())) {
+                    for (const std::uint32_t rate :
+                         state.receiver.sample_rates()) {
+                        const std::string label = std::format(
+                            "{:.3f} MSPS", static_cast<double>(rate) / 1e6);
+                        if (ImGui::Selectable(
+                                label.c_str(),
+                                rate == state.settings.sample_rate_hz)) {
+                            state.settings.sample_rate_hz = rate;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+            if (ImGui::Button("Apply sample rate", ImVec2(-1.0F, 0.0F))) {
+                std::string error;
+                state.status =
+                    state.receiver.start_stream(state.settings, error)
+                        ? "Sample rate applied"
+                        : error;
+            }
+            ImGui::EndDisabled();
+        }
     }
 
     for (const std::string &warning : state.enumeration.warnings) {
-        ImGui::TextColored(ImVec4(1.0F, 0.64F, 0.25F, 1.0F), "%s",
-                           warning.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.64F, 0.25F, 1.0F));
+        ImGui::TextWrapped("%s", warning.c_str());
+        ImGui::PopStyleColor();
     }
 }
 
@@ -800,7 +867,10 @@ void draw_receiver_panel(AppState &state) {
         [&parameters_changed](const char *label,
                               const std::span<const char *const> names,
                               int &selected) {
-            if (ImGui::BeginCombo(label,
+            ImGui::TextUnformatted(label);
+            ImGui::PushID(label);
+            ImGui::SetNextItemWidth(-1.0F);
+            if (ImGui::BeginCombo("##value",
                                   names[static_cast<std::size_t>(selected)])) {
                 for (int index = 0; index < static_cast<int>(names.size());
                      ++index) {
@@ -813,7 +883,30 @@ void draw_receiver_panel(AppState &state) {
                 }
                 ImGui::EndCombo();
             }
+            ImGui::PopID();
         };
+
+    int bandwidth = 1;
+    switch (state.dvbt_parameters.channel_bandwidth_hz) {
+    case 5'000'000:
+        bandwidth = 0;
+        break;
+    case 7'000'000:
+        bandwidth = 2;
+        break;
+    case 8'000'000:
+        bandwidth = 3;
+        break;
+    default:
+        bandwidth = 1;
+        break;
+    }
+    constexpr std::array bandwidth_names{"5 MHz", "6 MHz", "7 MHz", "8 MHz"};
+    constexpr std::array<std::uint32_t, 4> bandwidth_values{
+        5'000'000, 6'000'000, 7'000'000, 8'000'000};
+    draw_optional_combo("Channel bandwidth", bandwidth_names, bandwidth);
+    state.dvbt_parameters.channel_bandwidth_hz =
+        bandwidth_values[static_cast<std::size_t>(bandwidth)];
 
     int selected_mode =
         !state.dvbt_parameters.mode.has_value()
@@ -868,7 +961,8 @@ void draw_receiver_panel(AppState &state) {
             break;
         }
     }
-    constexpr std::array modulation_names{"Auto", "QPSK", "16-QAM", "64-QAM"};
+    constexpr std::array modulation_names{"Auto (TPS)", "QPSK", "16-QAM",
+                                          "64-QAM"};
     draw_optional_combo("Modulation", modulation_names, modulation);
     constexpr std::array modulation_values{
         Constellation::qpsk, Constellation::qam16, Constellation::qam64};
@@ -898,8 +992,8 @@ void draw_receiver_panel(AppState &state) {
             break;
         }
     }
-    constexpr std::array code_rate_names{"Auto", "1/2", "2/3",
-                                         "3/4",  "5/6", "7/8"};
+    constexpr std::array code_rate_names{"Auto (TPS)", "1/2", "2/3",
+                                         "3/4",        "5/6", "7/8"};
     draw_optional_combo("Code rate", code_rate_names, code_rate);
     constexpr std::array code_rate_values{
         CodeRate::rate_1_2, CodeRate::rate_2_3, CodeRate::rate_3_4,
@@ -914,56 +1008,13 @@ void draw_receiver_panel(AppState &state) {
         state.receiver.set_dvbt_parameters(state.dvbt_parameters);
         state.status = "DVB-T parameters updated; receiver reacquiring";
     }
-    ImGui::TextDisabled(
-        "Auto mode/guard uses CP acquisition. Auto modulation/code rate "
-        "currently decodes as 64-QAM 2/3 until TPS is implemented.");
+    draw_disabled_wrapped(
+        "Auto mode/guard begins with cyclic-prefix acquisition. Modulation "
+        "and code rate are taken from BCH-validated TPS before transport "
+        "decoding starts; manual values override their TPS fields.");
     ImGui::Separator();
 
     const DeviceDescriptor *descriptor = state.receiver.descriptor();
-    if (descriptor != nullptr && descriptor->backend == SdrBackend::File) {
-        ImGui::Text("Format       CS16 / INT16_IQ");
-        ImGui::Text("Sample rate  %.3f MSPS",
-                    static_cast<double>(state.settings.sample_rate_hz) / 1e6);
-        ImGui::Text("Center       %.6f MHz",
-                    static_cast<double>(state.settings.center_frequency_hz) /
-                        1e6);
-        if (!state.receiver.is_streaming() &&
-            ImGui::Button("Replay from beginning", ImVec2(-1.0F, 0.0F))) {
-            std::string error;
-            state.status = state.receiver.start_stream(state.settings, error)
-                               ? "Replaying I/Q file"
-                               : error;
-        }
-        return;
-    }
-
-    ImGui::BeginDisabled(!state.receiver.is_open() ||
-                         state.receiver.is_recording());
-    if (!state.receiver.sample_rates().empty()) {
-        const std::string preview = std::format(
-            "{:.3f} MSPS",
-            static_cast<double>(state.settings.sample_rate_hz) / 1e6);
-        if (ImGui::BeginCombo("Sample rate", preview.c_str())) {
-            for (const std::uint32_t rate : state.receiver.sample_rates()) {
-                const std::string label =
-                    std::format("{:.3f} MSPS", static_cast<double>(rate) / 1e6);
-                if (ImGui::Selectable(label.c_str(),
-                                      rate == state.settings.sample_rate_hz)) {
-                    state.settings.sample_rate_hz = rate;
-                }
-            }
-            ImGui::EndCombo();
-        }
-    }
-
-    if (ImGui::Button("Apply sample rate", ImVec2(-1.0F, 0.0F))) {
-        std::string error;
-        state.status = state.receiver.start_stream(state.settings, error)
-                           ? "Sample rate applied"
-                           : error;
-    }
-    ImGui::EndDisabled();
-
     if (descriptor != nullptr &&
         descriptor->backend == SdrBackend::AirspyNative) {
         bool gain_changed = false;
@@ -1006,7 +1057,7 @@ void draw_receiver_panel(AppState &state) {
                                ? "Soapy gain applied"
                                : error;
         }
-        ImGui::TextDisabled(
+        draw_disabled_wrapped(
             "Soapy driver-defined gain; not comparable across devices.");
     }
 }
@@ -1061,7 +1112,7 @@ void draw_recorder_panel(AppState &state) {
     consume_file_dialog_result(state, state.file_dialog, state.recording_path,
                                "I/Q recording");
     const bool dialog_open = file_dialog_is_open(state.file_dialog);
-    ImGui::TextDisabled("Interleaved signed 16-bit little-endian I/Q (CS16)");
+    draw_disabled_wrapped("Interleaved signed 16-bit little-endian I/Q (CS16)");
     ImGui::TextUnformatted("Output file");
     ImGui::BeginDisabled(state.receiver.is_recording() || dialog_open);
     ImGui::SetNextItemWidth(-92.0F);
@@ -1160,17 +1211,19 @@ void draw_sidebar(AppState &state) {
         smoothing_changed |=
             ImGui::Checkbox("FFT smoothing", &state.fft_smoothing);
         ImGui::BeginDisabled(!state.fft_smoothing);
+        ImGui::TextUnformatted("FFT smoothing speed");
         ImGui::SetNextItemWidth(-1.0F);
-        smoothing_changed |=
-            ImGui::InputInt("FFT smoothing speed", &state.fft_smoothing_speed);
+        smoothing_changed |= ImGui::InputInt("##fft-smoothing-speed",
+                                             &state.fft_smoothing_speed);
         state.fft_smoothing_speed = std::max(state.fft_smoothing_speed, 1);
         ImGui::EndDisabled();
         smoothing_changed |=
             ImGui::Checkbox("SNR smoothing", &state.snr_smoothing);
         ImGui::BeginDisabled(!state.snr_smoothing);
+        ImGui::TextUnformatted("SNR smoothing speed");
         ImGui::SetNextItemWidth(-1.0F);
-        smoothing_changed |=
-            ImGui::InputInt("SNR smoothing speed", &state.snr_smoothing_speed);
+        smoothing_changed |= ImGui::InputInt("##snr-smoothing-speed",
+                                             &state.snr_smoothing_speed);
         state.snr_smoothing_speed = std::max(state.snr_smoothing_speed, 1);
         ImGui::EndDisabled();
         if (smoothing_changed) {
@@ -1178,7 +1231,7 @@ void draw_sidebar(AppState &state) {
                 state.fft_smoothing, state.fft_smoothing_speed,
                 state.snr_smoothing, state.snr_smoothing_speed);
         }
-        ImGui::TextDisabled(
+        draw_disabled_wrapped(
             "SDR++ speed model; FFT smoothing affects spectrum only.");
     }
 
@@ -1220,15 +1273,17 @@ void draw_sidebar(AppState &state) {
             state.decoder.input_queue_capacity_samples != 0 &&
             state.decoder.queued_input_samples * 4 >=
                 state.decoder.input_queue_capacity_samples * 3;
+        const bool cpu_slow =
+            ratio_available && state.decoder.processing_realtime_ratio > 1.0F;
         const bool cpu_overload =
-            (ratio_available &&
-             state.decoder.processing_realtime_ratio > 1.0F) ||
             input_queue_near_full || state.decoder.dropped_blocks != 0;
         const ImVec4 cpu_colour =
             cpu_overload
                 ? ImVec4(1.0F, 0.38F, 0.25F, 1.0F)
-                : (ratio_available ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
-                                   : ImVec4(0.55F, 0.62F, 0.70F, 1.0F));
+                : (cpu_slow
+                       ? ImVec4(1.0F, 0.72F, 0.22F, 1.0F)
+                       : (ratio_available ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
+                                          : ImVec4(0.55F, 0.62F, 0.70F, 1.0F)));
         const float input_queue_percent =
             state.decoder.input_queue_capacity_samples == 0
                 ? 0.0F
@@ -1256,8 +1311,10 @@ void draw_sidebar(AppState &state) {
                               state.decoder.symbol_workers,
                               state.decoder.transport.viterbi_workers);
         draw_status_indicator(
-            cpu_overload ? "CPU OVERLOAD"
-                         : (ratio_available ? "CPU REALTIME" : "CPU LOAD"),
+            cpu_overload
+                ? "CPU OVERLOAD"
+                : (cpu_slow ? "CPU SLOW"
+                            : (ratio_available ? "CPU REALTIME" : "CPU LOAD")),
             cpu_colour, cpu_detail.c_str());
         ImGui::Separator();
 
@@ -1313,7 +1370,9 @@ void draw_sidebar(AppState &state) {
             state.signal_analysis.mode == airspy_tv::dvbt::TransmissionMode::k8
                 ? 8192.0F
                 : 2048.0F;
-        constexpr float dvbt_sample_rate_hz = 48'000'000.0F / 7.0F;
+        const float dvbt_sample_rate_hz =
+            static_cast<float>(state.dvbt_parameters.channel_bandwidth_hz) *
+            (8.0F / 7.0F);
         const float maximum_fractional_offset_hz =
             dvbt_sample_rate_hz / (2.0F * fft_size);
         const float carrier_offset_position =
@@ -1334,14 +1393,94 @@ void draw_sidebar(AppState &state) {
                 ? std::clamp(state.signal_analysis.mer_db / 40.0F, 0.0F, 1.0F)
                 : 0.0F,
             ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
-        draw_metric("Viterbi BER", "--", 0.0F,
+        const auto ber_quality = [](const double ber) {
+            return ber == 0.0
+                       ? 1.0F
+                       : std::clamp(static_cast<float>(-std::log10(ber) / 7.0),
+                                    0.0F, 1.0F);
+        };
+        const auto &transport = state.decoder.transport;
+        const bool pre_viterbi_available =
+            transport.pre_viterbi_compared_bits != 0;
+        const double pre_viterbi_ber =
+            pre_viterbi_available
+                ? static_cast<double>(transport.pre_viterbi_error_bits) /
+                      static_cast<double>(transport.pre_viterbi_compared_bits)
+                : 0.0;
+        const std::string pre_viterbi_text =
+            pre_viterbi_available ? std::format("{:.2e}", pre_viterbi_ber)
+                                  : "--";
+        draw_metric("Pre-Viterbi BER", pre_viterbi_text.c_str(),
+                    pre_viterbi_available ? ber_quality(pre_viterbi_ber) : 0.0F,
                     ImVec4(0.75F, 0.72F, 0.30F, 1.0F));
-        draw_metric("Post-RS BER", "--", 0.0F,
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip(
+                "Hard-decision disagreement between received non-punctured "
+                "mother-code metrics and the re-encoded Viterbi survivor "
+                "path.\n%llu errors / %llu compared bits",
+                static_cast<unsigned long long>(
+                    transport.pre_viterbi_error_bits),
+                static_cast<unsigned long long>(
+                    transport.pre_viterbi_compared_bits));
+        }
+
+        const bool post_viterbi_available =
+            transport.post_viterbi_compared_bits != 0;
+        const double post_viterbi_ber =
+            post_viterbi_available
+                ? static_cast<double>(transport.post_viterbi_error_bits) /
+                      static_cast<double>(transport.post_viterbi_compared_bits)
+                : 0.0;
+        const std::string post_viterbi_text =
+            post_viterbi_available ? std::format("{:.2e}", post_viterbi_ber)
+                                   : "--";
+        draw_metric("Post-Viterbi BER", post_viterbi_text.c_str(),
+                    post_viterbi_available ? ber_quality(post_viterbi_ber)
+                                           : 0.0F,
                     ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip(
+                "Payload-bit corrections made by successful RS(204,188) "
+                "codewords; uncorrectable packets are reported separately.\n"
+                "%llu corrected bits / %llu checked bits; %llu RS failures",
+                static_cast<unsigned long long>(
+                    transport.post_viterbi_error_bits),
+                static_cast<unsigned long long>(
+                    transport.post_viterbi_compared_bits),
+                static_cast<unsigned long long>(
+                    transport.rs_uncorrectable_packets));
+        }
+        ImGui::TextColored(
+            transport.rs_uncorrectable_packets == 0
+                ? ImVec4(0.45F, 0.82F, 0.62F, 1.0F)
+                : ImVec4(0.95F, 0.55F, 0.28F, 1.0F),
+            "RS failures %llu    TEI output %llu",
+            static_cast<unsigned long long>(transport.rs_uncorrectable_packets),
+            static_cast<unsigned long long>(transport.tei_packets));
         ImGui::Separator();
         const char *mode = "--";
         const char *guard = "--";
         const char *modulation = "--";
+        const char *code_rate = "--";
+        if (state.dvbt_parameters.code_rate.has_value()) {
+            switch (*state.dvbt_parameters.code_rate) {
+            case airspy_tv::dvbt::CodeRate::rate_1_2:
+                code_rate = "1/2 (manual)";
+                break;
+            case airspy_tv::dvbt::CodeRate::rate_2_3:
+                code_rate = "2/3 (manual)";
+                break;
+            case airspy_tv::dvbt::CodeRate::rate_3_4:
+                code_rate = "3/4 (manual)";
+                break;
+            case airspy_tv::dvbt::CodeRate::rate_5_6:
+                code_rate = "5/6 (manual)";
+                break;
+            case airspy_tv::dvbt::CodeRate::rate_7_8:
+                code_rate = "7/8 (manual)";
+                break;
+            }
+        }
         if (state.signal_analysis.locked) {
             mode = state.signal_analysis.mode ==
                            airspy_tv::dvbt::TransmissionMode::k8
@@ -1373,16 +1512,69 @@ void draw_sidebar(AppState &state) {
                 break;
             }
         }
+        if (state.decoder.tps_locked) {
+            mode = state.decoder.tps_mode == TransmissionMode::k8 ? "8K (TPS)"
+                                                                  : "2K (TPS)";
+            switch (state.decoder.tps_guard_interval) {
+            case GuardInterval::gi_1_32:
+                guard = "1/32 (TPS)";
+                break;
+            case GuardInterval::gi_1_16:
+                guard = "1/16 (TPS)";
+                break;
+            case GuardInterval::gi_1_8:
+                guard = "1/8 (TPS)";
+                break;
+            case GuardInterval::gi_1_4:
+                guard = "1/4 (TPS)";
+                break;
+            }
+            switch (state.decoder.tps_constellation) {
+            case Constellation::qpsk:
+                modulation = "QPSK (TPS)";
+                break;
+            case Constellation::qam16:
+                modulation = "16-QAM (TPS)";
+                break;
+            case Constellation::qam64:
+                modulation = "64-QAM (TPS)";
+                break;
+            }
+            if (!state.dvbt_parameters.code_rate.has_value()) {
+                switch (state.decoder.tps_code_rate) {
+                case CodeRate::rate_1_2:
+                    code_rate = "1/2 (TPS)";
+                    break;
+                case CodeRate::rate_2_3:
+                    code_rate = "2/3 (TPS)";
+                    break;
+                case CodeRate::rate_3_4:
+                    code_rate = "3/4 (TPS)";
+                    break;
+                case CodeRate::rate_5_6:
+                    code_rate = "5/6 (TPS)";
+                    break;
+                case CodeRate::rate_7_8:
+                    code_rate = "7/8 (TPS)";
+                    break;
+                }
+            }
+        }
+        ImGui::Text("Bandwidth      %u MHz",
+                    state.dvbt_parameters.channel_bandwidth_hz / 1'000'000U);
         ImGui::Text("Mode           %s", mode);
         ImGui::Text("Guard          %s", guard);
         ImGui::Text("Modulation     %s", modulation);
-        ImGui::Text("Code rate      --");
-        ImGui::TextDisabled(
-            state.signal_analysis.locked
-                ? "GUI monitor uses CP acquisition and scattered-pilot "
-                  "equalization."
-                : "RF estimates use the 6 MHz channel and out-of-channel "
-                  "noise; MER and constellation require OFDM lock.");
+        ImGui::Text("Code rate      %s", code_rate);
+        draw_disabled_wrapped(
+            state.decoder.tps_locked
+                ? "TPS synchronization and BCH are valid; auto decoder "
+                  "parameters come from this TPS frame."
+            : state.signal_analysis.locked
+                ? "OFDM monitor is locked; waiting for a valid TPS frame."
+                : "RF estimates use the selected channel bandwidth and "
+                  "out-of-channel noise; MER and constellation require OFDM "
+                  "lock.");
     }
 }
 
@@ -1403,12 +1595,24 @@ void draw_video_panel(AppState &state) {
     const float header_height = 46.0F;
     draw->AddRectFilled(origin, ImVec2(extent.x, origin.y + header_height),
                         IM_COL32(15, 24, 35, 255), 5.0F);
+    const auto selected_service = std::ranges::find_if(
+        state.services, [&state](const TransportService &service) {
+            return state.selected_service_id == service.service_id;
+        });
+    const std::string program_title =
+        selected_service == state.services.end()
+            ? "DVB-T SERVICE"
+            : std::format(
+                  "DVB-T  {}",
+                  selected_service->name.empty()
+                      ? std::format("Service {}", selected_service->service_id)
+                      : selected_service->name);
     draw->AddText(ImVec2(origin.x + 16.0F, origin.y + 14.0F),
-                  IM_COL32(220, 230, 240, 255), "DVB-T PROGRAM 01");
+                  IM_COL32(220, 230, 240, 255), program_title.c_str());
     draw->AddText(ImVec2(extent.x - 165.0F, origin.y + 14.0F),
                   IM_COL32(90, 205, 255, 255), "VIDEO PREVIEW");
 
-    const float footer_height = 132.0F;
+    const float footer_height = 142.0F;
     const ImVec2 footer_origin{origin.x, extent.y - footer_height};
     const ImVec2 center{(origin.x + extent.x) * 0.5F,
                         (origin.y + footer_origin.y) * 0.5F};
@@ -1423,20 +1627,51 @@ void draw_video_panel(AppState &state) {
                   IM_COL32(130, 150, 170, 255), message);
 
     draw->AddRectFilled(footer_origin, extent, IM_COL32(13, 20, 30, 245), 5.0F);
-    draw->AddText(ImVec2(origin.x + 18.0F, footer_origin.y + 13.0F),
-                  IM_COL32_WHITE, "Program 01   1920x1080i   H.264   AAC");
     draw->AddText(ImVec2(extent.x - 260.0F, footer_origin.y + 13.0F),
-                  IM_COL32(145, 160, 176, 255), "Waiting for MPEG-TS output");
+                  IM_COL32(145, 160, 176, 255),
+                  state.services.empty() ? "Waiting for service tables"
+                                         : "MPTS service list available");
 
     constexpr float horizontal_padding = 18.0F;
     constexpr float browse_width = 86.0F;
     constexpr float record_width = 104.0F;
     constexpr float control_spacing = 8.0F;
+    ImGui::SetCursorScreenPos(
+        ImVec2(footer_origin.x + horizontal_padding, footer_origin.y + 8.0F));
+    ImGui::SetNextItemWidth(std::max(180.0F, available.x * 0.48F));
+    const std::string service_preview =
+        selected_service == state.services.end()
+            ? "No DVB-T services"
+            : (selected_service->name.empty()
+                   ? std::format("Service {}", selected_service->service_id)
+                   : std::format("{}  ({})", selected_service->name,
+                                 selected_service->service_id));
+    ImGui::BeginDisabled(state.services.empty());
+    if (ImGui::BeginCombo("##service-selection", service_preview.c_str())) {
+        for (const auto &service : state.services) {
+            const std::string label =
+                service.name.empty()
+                    ? std::format("Service {}", service.service_id)
+                    : std::format("{}  ({})", service.name, service.service_id);
+            const bool selected =
+                state.selected_service_id == service.service_id;
+            if (ImGui::Selectable(label.c_str(), selected)) {
+                state.selected_service_id = service.service_id;
+                state.status = "Selected " + label;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+
     const float input_width = std::max(
         120.0F, available.x - (horizontal_padding * 2.0F) - browse_width -
                     record_width - (control_spacing * 2.0F));
     ImGui::SetCursorScreenPos(
-        ImVec2(footer_origin.x + horizontal_padding, footer_origin.y + 40.0F));
+        ImVec2(footer_origin.x + horizontal_padding, footer_origin.y + 49.0F));
     ImGui::SetNextItemWidth(input_width);
     ImGui::InputText("##ts-recording-output", &state.ts_recording_path);
     ImGui::SameLine(0.0F, control_spacing);
@@ -1472,7 +1707,7 @@ void draw_video_panel(AppState &state) {
     const double rate_mib =
         elapsed_seconds > 0.0 ? size_mib / elapsed_seconds : 0.0;
     ImGui::SetCursorScreenPos(
-        ImVec2(footer_origin.x + horizontal_padding, footer_origin.y + 82.0F));
+        ImVec2(footer_origin.x + horizontal_padding, footer_origin.y + 92.0F));
     ImGui::Text(
         "Duration %s    Size %.2f MiB    Rate %.2f MiB/s",
         format_recording_duration(ts_stats.elapsed_milliseconds).c_str(),
@@ -1483,6 +1718,13 @@ void draw_application(AppState &state) {
     state.spectrum = state.receiver.spectrum_snapshot();
     state.signal_analysis = state.receiver.signal_analysis_snapshot();
     state.decoder = state.receiver.decoder_stats();
+    state.services = state.receiver.transport_services();
+    if (!state.services.empty() &&
+        std::ranges::none_of(state.services, [&state](const auto &service) {
+            return state.selected_service_id == service.service_id;
+        })) {
+        state.selected_service_id = state.services.front().service_id;
+    }
     const ImGuiViewport *viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
@@ -1506,7 +1748,9 @@ void draw_application(AppState &state) {
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::TextDisabled("CENTERED  |  6 MHz DVB-T");
+    ImGui::TextDisabled("CENTERED  |  %u MHz DVB-T",
+                        state.dvbt_parameters.channel_bandwidth_hz /
+                            1'000'000U);
     ImGui::SameLine();
     const float status_width = ImGui::CalcTextSize(state.status.c_str()).x;
     ImGui::SetCursorPosX(
@@ -1763,6 +2007,29 @@ int decode_iq_cli(const std::filesystem::path &source,
                       << " ms deinterleave=" << stats.deinterleave_time_ms
                       << " ms depuncture/quantize=" << stats.depuncture_time_ms
                       << " ms transport=" << stats.transport_time_ms << " ms\n";
+            std::cerr << "  TPS: " << (stats.tps_locked ? "locked" : "unlocked")
+                      << '\n';
+            if (stats.transport.pre_viterbi_compared_bits != 0) {
+                const double pre_viterbi_ber =
+                    static_cast<double>(
+                        stats.transport.pre_viterbi_error_bits) /
+                    static_cast<double>(
+                        stats.transport.pre_viterbi_compared_bits);
+                std::cerr << std::format("  BER: pre-Viterbi={:.3e}",
+                                         pre_viterbi_ber);
+                if (stats.transport.post_viterbi_compared_bits != 0) {
+                    const double post_viterbi_ber =
+                        static_cast<double>(
+                            stats.transport.post_viterbi_error_bits) /
+                        static_cast<double>(
+                            stats.transport.post_viterbi_compared_bits);
+                    std::cerr << std::format(" post-Viterbi={:.3e}",
+                                             post_viterbi_ber);
+                } else {
+                    std::cerr << " post-Viterbi=--";
+                }
+                std::cerr << '\n';
+            }
         }
     };
     while (input && !output_failed) {
@@ -1803,6 +2070,7 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << " bytes, symbols=" << stats.ofdm_symbols
                   << ", RS=" << stats.transport.rs_packets << ", RS failures="
                   << stats.transport.rs_uncorrectable_packets
+                  << ", TEI=" << stats.transport.tei_packets
                   << ", packets=" << stats.transport.ts_packets << '\n';
     }
     if (output_failed || !output) {

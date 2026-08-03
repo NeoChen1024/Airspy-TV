@@ -3,6 +3,7 @@
 #include "airspy_tv/dvbt/decoder.hpp"
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
+#include "airspy_tv/dvbt/tps_decoder.hpp"
 
 #include <fftw3.h>
 
@@ -423,6 +424,8 @@ struct StreamDecoder::Impl {
     };
     struct ChunkSummary {
         bool ofdm_locked{};
+        bool tps_locked{};
+        TpsParameters tps_parameters{};
         int carrier_bin_offset{};
         float mer_db{};
         float residual_carrier_offset_hz{};
@@ -556,24 +559,19 @@ struct StreamDecoder::Impl {
             acquisition.mode == TransmissionMode::k8 ? 6816 : 1704;
         const std::span<const int> continual = continual_2k;
         const std::span<const int> tps = tps_2k;
-        const DecoderParameters decoder_parameters{
-            acquisition.mode,
-            selected_parameters.constellation.value_or(Constellation::qam64),
-            selected_parameters.code_rate.value_or(CodeRate::rate_2_3),
-            allocate_workers(selected_parameters.worker_threads).viterbi};
+        std::optional<DecoderParameters> decoder_parameters;
+        if (selected_parameters.constellation.has_value() &&
+            selected_parameters.code_rate.has_value()) {
+            decoder_parameters = DecoderParameters{
+                acquisition.mode, *selected_parameters.constellation,
+                *selected_parameters.code_rate,
+                allocate_workers(selected_parameters.worker_threads).viterbi};
+        }
         const std::size_t symbol_queue_capacity = buffered_symbol_count(
             bandwidth, acquisition.fft_size + acquisition.guard_size);
         {
             const std::scoped_lock guard(mutex);
             fec_queue_capacity = symbol_queue_capacity;
-        }
-        if (!enqueue_fec({.kind = FecItem::Kind::begin,
-                          .generation = generation,
-                          .parameters = decoder_parameters,
-                          .mother_metrics = {},
-                          .symbol_index = 0,
-                          .summary = {}})) {
-            return;
         }
         std::vector<std::complex<float>> fft_in(acquisition.fft_size);
         std::vector<std::complex<float>> fft_out(acquisition.fft_size);
@@ -620,9 +618,28 @@ struct StreamDecoder::Impl {
         float depuncture_time_sum = 0.0F;
         const WorkerAllocation workers =
             allocate_workers(selected_parameters.worker_threads);
-        SymbolPostprocessorPool postprocessor(
-            workers.symbol, acquisition.mode, decoder_parameters.constellation,
-            decoder_parameters.code_rate, symbol_queue_capacity);
+        std::unique_ptr<SymbolPostprocessorPool> postprocessor;
+        const auto start_decoder = [&]() {
+            if (!decoder_parameters || postprocessor) {
+                return true;
+            }
+            if (!enqueue_fec({.kind = FecItem::Kind::begin,
+                              .generation = generation,
+                              .parameters = *decoder_parameters,
+                              .mother_metrics = {},
+                              .symbol_index = 0,
+                              .summary = {}})) {
+                return false;
+            }
+            postprocessor = std::make_unique<SymbolPostprocessorPool>(
+                workers.symbol, acquisition.mode,
+                decoder_parameters->constellation,
+                decoder_parameters->code_rate, symbol_queue_capacity);
+            return true;
+        };
+        if (decoder_parameters && !start_decoder()) {
+            return;
+        }
         const auto emit_postprocessed =
             [this, generation, &mer_sum, &demap_time_sum,
              &deinterleave_time_sum,
@@ -662,6 +679,14 @@ struct StreamDecoder::Impl {
         float nco_phase =
             tracked_cfo_phase * static_cast<float>(first_fft_start);
         std::vector<std::complex<float>> previous_continual;
+        TpsDecoder tps_decoder;
+        TpsSnapshot tps_snapshot;
+        struct PendingSymbol {
+            std::vector<std::complex<float>> payload;
+            std::vector<float> equalizer_power;
+            std::size_t fallback_index{};
+        };
+        std::deque<PendingSymbol> pending_symbols;
         float residual_phase_ema = 0.0F;
         std::uint64_t symbol_count = 0;
         for (std::size_t start = first_fft_start;
@@ -735,6 +760,33 @@ struct StreamDecoder::Impl {
             std::fill(channel.begin() +
                           static_cast<std::ptrdiff_t>(pilots.back()),
                       channel.end(), channel[pilots.back()]);
+            std::vector<std::complex<float>> tps_values;
+            tps_values.reserve(tps.size() * (maximum == 6816 ? 4U : 1U));
+            for (std::size_t k = 0; k <= maximum; ++k) {
+                if (listed(tps, k % 1704)) {
+                    tps_values.push_back(
+                        carrier(fft_out, k, maximum, carrier_offset) *
+                        channel[k]);
+                }
+            }
+            tps_snapshot = tps_decoder.process(tps_values);
+            const bool matching_tps =
+                tps_snapshot.locked &&
+                tps_snapshot.parameters.mode == acquisition.mode &&
+                tps_snapshot.parameters.guard_interval == acquisition.guard;
+            if (!decoder_parameters && matching_tps &&
+                tps_snapshot.parameters.hierarchy == 0U) {
+                decoder_parameters = DecoderParameters{
+                    acquisition.mode,
+                    selected_parameters.constellation.value_or(
+                        tps_snapshot.parameters.constellation),
+                    selected_parameters.code_rate.value_or(
+                        tps_snapshot.parameters.high_priority_code_rate),
+                    workers.viterbi};
+                if (!start_decoder()) {
+                    break;
+                }
+            }
             std::vector<std::complex<float>> payload;
             payload.reserve(payload_carrier_count(acquisition.mode));
             std::vector<float> equalizer_power;
@@ -748,17 +800,47 @@ struct StreamDecoder::Impl {
             if (payload.size() != payload_carrier_count(acquisition.mode)) {
                 continue;
             }
-            postprocessor.submit(std::move(payload), std::move(equalizer_power),
-                                 static_cast<std::size_t>(lock.phase));
-            if (!emit_postprocessed(postprocessor.take_ready())) {
-                break;
+            if (!postprocessor) {
+                pending_symbols.push_back(
+                    {.payload = std::move(payload),
+                     .equalizer_power = std::move(equalizer_power),
+                     .fallback_index = static_cast<std::size_t>(lock.phase)});
+                if (pending_symbols.size() > 136) {
+                    pending_symbols.pop_front();
+                }
+            } else {
+                if (!pending_symbols.empty()) {
+                    const std::size_t count = pending_symbols.size();
+                    for (std::size_t index = 0; index < count; ++index) {
+                        auto pending = std::move(pending_symbols.front());
+                        pending_symbols.pop_front();
+                        const std::size_t distance = count - index;
+                        const std::size_t symbol_index =
+                            matching_tps ? (tps_snapshot.symbol_index + 68 -
+                                            (distance % 68)) %
+                                               68
+                                         : pending.fallback_index;
+                        postprocessor->submit(
+                            std::move(pending.payload),
+                            std::move(pending.equalizer_power), symbol_index);
+                    }
+                }
+                const std::size_t symbol_index =
+                    matching_tps ? tps_snapshot.symbol_index
+                                 : static_cast<std::size_t>(lock.phase);
+                postprocessor->submit(std::move(payload),
+                                      std::move(equalizer_power), symbol_index);
+                if (!emit_postprocessed(postprocessor->take_ready())) {
+                    break;
+                }
             }
             ++symbol_count;
             nco_phase = std::remainder(
                 nco_phase + (tracked_cfo_phase * static_cast<float>(period)),
                 2.0F * std::numbers::pi_v<float>);
         }
-        if (!cancel_requested && !emit_postprocessed(postprocessor.flush())) {
+        if (!cancel_requested && postprocessor &&
+            !emit_postprocessed(postprocessor->flush())) {
             return;
         }
         fftwf_destroy_plan(plan);
@@ -768,6 +850,8 @@ struct StreamDecoder::Impl {
         }
         const ChunkSummary summary{
             .ofdm_locked = symbol_count != 0,
+            .tps_locked = tps_snapshot.locked,
+            .tps_parameters = tps_snapshot.parameters,
             .carrier_bin_offset = carrier_offset,
             .mer_db = symbol_count == 0
                           ? 0.0F
@@ -797,12 +881,14 @@ struct StreamDecoder::Impl {
             .symbol_workers = workers.symbol,
             .started_at = started_at,
         };
-        static_cast<void>(enqueue_fec({.kind = FecItem::Kind::end,
-                                       .generation = generation,
-                                       .parameters = {},
-                                       .mother_metrics = {},
-                                       .symbol_index = 0,
-                                       .summary = summary}));
+        if (postprocessor) {
+            static_cast<void>(enqueue_fec({.kind = FecItem::Kind::end,
+                                           .generation = generation,
+                                           .parameters = {},
+                                           .mother_metrics = {},
+                                           .symbol_index = 0,
+                                           .summary = summary}));
+        }
     }
 
     void run_fec() {
@@ -885,6 +971,16 @@ struct StreamDecoder::Impl {
                     const std::scoped_lock guard(mutex);
                     if (item.generation == latest_generation) {
                         latest.ofdm_locked = item.summary.ofdm_locked;
+                        latest.tps_locked = item.summary.tps_locked;
+                        latest.tps_constellation =
+                            item.summary.tps_parameters.constellation;
+                        latest.tps_code_rate =
+                            item.summary.tps_parameters.high_priority_code_rate;
+                        latest.tps_guard_interval =
+                            item.summary.tps_parameters.guard_interval;
+                        latest.tps_mode = item.summary.tps_parameters.mode;
+                        latest.tps_hierarchy =
+                            item.summary.tps_parameters.hierarchy;
                         latest.carrier_bin_offset =
                             item.summary.carrier_bin_offset;
                         latest.mer_db = item.summary.mer_db;

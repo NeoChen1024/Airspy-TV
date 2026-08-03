@@ -33,7 +33,8 @@ class SpectrumAnalyzer {
     SpectrumAnalyzer &operator=(SpectrumAnalyzer &&) = delete;
 
     void submit(std::span<const std::int16_t> interleaved_iq,
-                std::uint32_t sample_rate_hz);
+                std::uint32_t sample_rate_hz,
+                std::uint32_t channel_bandwidth_hz = 6'000'000);
     void reset();
     void set_smoothing(bool fft_enabled, int fft_speed, bool snr_enabled,
                        int snr_speed);

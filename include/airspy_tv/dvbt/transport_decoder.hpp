@@ -12,8 +12,13 @@ namespace airspy_tv::dvbt {
 
 struct TransportDecoderStats {
     std::uint64_t viterbi_bits{};
+    std::uint64_t pre_viterbi_error_bits{};
+    std::uint64_t pre_viterbi_compared_bits{};
+    std::uint64_t post_viterbi_error_bits{};
+    std::uint64_t post_viterbi_compared_bits{};
     std::uint64_t rs_packets{};
     std::uint64_t rs_uncorrectable_packets{};
+    std::uint64_t tei_packets{};
     std::uint64_t ts_packets{};
     int outer_deinterleaver_phase{-1};
     unsigned int outer_sync_distance{};

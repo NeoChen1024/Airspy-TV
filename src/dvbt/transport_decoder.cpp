@@ -95,6 +95,8 @@ class SoftViterbi {
         completed_.clear();
         next_sequence_ = 0;
         next_result_ = 0;
+        hard_decision_errors_ = 0;
+        compared_metrics_ = 0;
         worker_error_ = nullptr;
     }
 
@@ -182,6 +184,12 @@ class SoftViterbi {
         std::vector<std::uint8_t> metrics;
     };
 
+    struct Result {
+        std::vector<std::uint8_t> bytes;
+        std::uint64_t hard_decision_errors{};
+        std::uint64_t compared_metrics{};
+    };
+
 #if defined(HAVE_SSE)
     using DecoderHandle = correct_convolutional_sse;
 #else
@@ -208,8 +216,7 @@ class SoftViterbi {
 #endif
     }
 
-    static std::vector<std::uint8_t> decode(DecoderHandle *decoder,
-                                            const Task &task) {
+    static Result decode(DecoderHandle *decoder, const Task &task) {
         std::array<std::uint8_t, viterbi_window_bits / 8> decoded{};
 #if defined(HAVE_SSE)
         const ssize_t decoded_bytes = correct_convolutional_sse_decode_soft(
@@ -223,8 +230,42 @@ class SoftViterbi {
         if (decoded_bytes < static_cast<ssize_t>(margin_bytes + output_bytes)) {
             throw std::runtime_error("libcorrect Viterbi decode failed");
         }
-        return {decoded.begin() + margin_bytes,
-                decoded.begin() + margin_bytes + output_bytes};
+        Result result;
+        result.bytes.assign(decoded.begin() + margin_bytes,
+                            decoded.begin() + margin_bytes + output_bytes);
+
+        // Estimate pre-Viterbi BER by re-encoding the survivor path and
+        // comparing it with hard decisions from the received mother-code
+        // metrics. The traceback margins establish encoder state and are not
+        // counted. Metric 128 is the neutral value inserted for punctures.
+        constexpr std::array<std::uint8_t, 2> polynomials{0117, 0155};
+        std::uint8_t shift_register = 0;
+        for (std::size_t bit = 0; bit < viterbi_window_bits; ++bit) {
+            const std::uint8_t decoded_bit = static_cast<std::uint8_t>(
+                (decoded[bit / 8] >> (7U - (bit % 8))) & 1U);
+            shift_register = static_cast<std::uint8_t>(
+                ((shift_register << 1U) | decoded_bit) & 0x7FU);
+            if (bit < viterbi_margin_bits ||
+                bit >= viterbi_margin_bits + viterbi_output_bits) {
+                continue;
+            }
+            for (std::size_t branch = 0; branch < polynomials.size();
+                 ++branch) {
+                const std::uint8_t metric =
+                    task.metrics[(bit * convolutional_rate) + branch];
+                if (metric == 128U) {
+                    continue;
+                }
+                const std::uint8_t encoded_bit = static_cast<std::uint8_t>(
+                    std::popcount(static_cast<unsigned int>(
+                        shift_register & polynomials[branch])) &
+                    1U);
+                result.hard_decision_errors += static_cast<std::uint64_t>(
+                    (metric > 127U) != (encoded_bit != 0U));
+                ++result.compared_metrics;
+            }
+        }
+        return result;
     }
 
     void run_worker() noexcept {
@@ -284,8 +325,10 @@ class SoftViterbi {
         std::vector<std::uint8_t> output;
         auto found = completed_.find(next_result_);
         while (found != completed_.end()) {
-            output.insert(output.end(), found->second.begin(),
-                          found->second.end());
+            output.insert(output.end(), found->second.bytes.begin(),
+                          found->second.bytes.end());
+            hard_decision_errors_ += found->second.hard_decision_errors;
+            compared_metrics_ += found->second.compared_metrics;
             completed_.erase(found);
             ++next_result_;
             found = completed_.find(next_result_);
@@ -293,19 +336,28 @@ class SoftViterbi {
         return output;
     }
 
+  public:
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> error_counts() const {
+        const std::scoped_lock lock(mutex_);
+        return {hard_decision_errors_, compared_metrics_};
+    }
+
+  private:
     std::vector<std::uint8_t> metrics_;
     std::size_t metric_offset_{};
     const std::size_t worker_count_;
     const std::size_t maximum_queued_windows_;
     std::vector<std::thread> workers_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable task_ready_;
     std::condition_variable queue_space_;
     std::condition_variable all_finished_;
     std::deque<Task> tasks_;
-    std::map<std::uint64_t, std::vector<std::uint8_t>> completed_;
+    std::map<std::uint64_t, Result> completed_;
     std::uint64_t next_sequence_{};
     std::uint64_t next_result_{};
+    std::uint64_t hard_decision_errors_{};
+    std::uint64_t compared_metrics_{};
     std::size_t outstanding_{};
     std::exception_ptr worker_error_;
     bool stopping_{};
@@ -363,14 +415,25 @@ class ReedSolomon {
     ReedSolomon &operator=(const ReedSolomon &) = delete;
 
     [[nodiscard]] bool decode(const std::span<const std::uint8_t> encoded,
-                              const std::span<std::uint8_t> decoded) {
+                              const std::span<std::uint8_t> decoded,
+                              std::uint64_t *corrected_payload_bits = nullptr) {
         if (encoded.size() != rs_packet_size ||
             decoded.size() != ts_packet_size) {
             throw std::invalid_argument("DVB-T RS block size mismatch");
         }
-        return correct_reed_solomon_decode(codec_, encoded.data(),
-                                           encoded.size(), decoded.data()) ==
-               static_cast<ssize_t>(decoded.size());
+        const bool valid =
+            correct_reed_solomon_decode(codec_, encoded.data(), encoded.size(),
+                                        decoded.data()) ==
+            static_cast<ssize_t>(decoded.size());
+        if (valid && corrected_payload_bits != nullptr) {
+            *corrected_payload_bits = 0;
+            for (std::size_t index = 0; index < decoded.size(); ++index) {
+                *corrected_payload_bits += static_cast<std::uint64_t>(
+                    std::popcount(static_cast<unsigned int>(encoded[index] ^
+                                                            decoded[index])));
+            }
+        }
+        return valid;
     }
 
   private:
@@ -431,6 +494,32 @@ class EnergyDescrambler {
         // those bytes themselves are not randomized.
         static_cast<void>(clock_byte());
         packet_index_ = (packet_index_ + 1) % packets_per_energy_frame;
+        return true;
+    }
+
+    // RS(204,188) is systematic, so an uncorrectable codeword still carries
+    // the received randomized TS bytes in its first 188 positions. Once the
+    // energy-frame phase is known, preserve packet cadence and mark the output
+    // as corrupt instead of silently creating a continuity-counter gap.
+    [[nodiscard]] bool
+    process_corrupt(const std::span<const std::uint8_t> input,
+                    const std::span<std::uint8_t> output) {
+        if (input.size() != ts_packet_size || output.size() != ts_packet_size) {
+            throw std::invalid_argument("DVB-T energy block size mismatch");
+        }
+        if (!synchronized_) {
+            return false;
+        }
+        if (packet_index_ == 0) {
+            shift_register_ = 0x00A9;
+        }
+        output.front() = 0x47;
+        for (std::size_t index = 1; index < ts_packet_size; ++index) {
+            output[index] = input[index] ^ clock_byte();
+        }
+        static_cast<void>(clock_byte());
+        packet_index_ = (packet_index_ + 1) % packets_per_energy_frame;
+        output[1] = static_cast<std::uint8_t>(output[1] | 0x80U);
         return true;
     }
 
@@ -690,20 +779,32 @@ struct TransportDecoder::Impl {
 
         std::vector<std::uint8_t> transport_stream;
         while (rs_bytes.size() >= rs_packet_size) {
+            std::array<std::uint8_t, ts_packet_size> received_randomized{};
+            std::ranges::copy_n(rs_bytes.begin(), ts_packet_size,
+                                received_randomized.begin());
             std::array<std::uint8_t, ts_packet_size> randomized{};
+            std::uint64_t corrected_payload_bits = 0;
             const bool valid = reed_solomon.decode(
                 std::span<const std::uint8_t>{rs_bytes}.first(rs_packet_size),
-                randomized);
+                randomized, &corrected_payload_bits);
             rs_bytes.erase(rs_bytes.begin(), rs_bytes.begin() + rs_packet_size);
             ++statistics.rs_packets;
             if (!valid) {
                 ++statistics.rs_uncorrectable_packets;
-                energy_descrambler.skip_packet();
+                std::array<std::uint8_t, ts_packet_size> packet{};
+                if (energy_descrambler.process_corrupt(received_randomized,
+                                                       packet)) {
+                    transport_stream.insert(transport_stream.end(),
+                                            packet.begin(), packet.end());
+                    ++statistics.tei_packets;
+                    ++statistics.ts_packets;
+                }
                 continue;
             }
-
             std::array<std::uint8_t, ts_packet_size> packet{};
             if (energy_descrambler.process(randomized, packet)) {
+                statistics.post_viterbi_error_bits += corrected_payload_bits;
+                statistics.post_viterbi_compared_bits += ts_packet_size * 8;
                 transport_stream.insert(transport_stream.end(), packet.begin(),
                                         packet.end());
                 ++statistics.ts_packets;
@@ -751,7 +852,11 @@ std::vector<std::uint8_t> TransportDecoder::process_soft(
 std::vector<std::uint8_t> TransportDecoder::flush() { return impl_->flush(); }
 
 TransportDecoderStats TransportDecoder::stats() const {
-    return impl_->statistics;
+    auto statistics = impl_->statistics;
+    const auto [errors, compared] = impl_->viterbi.error_counts();
+    statistics.pre_viterbi_error_bits = errors;
+    statistics.pre_viterbi_compared_bits = compared;
+    return statistics;
 }
 
 } // namespace airspy_tv::dvbt

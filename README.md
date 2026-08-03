@@ -5,6 +5,8 @@ The current implementation provides:
 
 - a single-window SDL3 + Dear ImGui interface;
 - an always-centered, per-digit mouse-wheel frequency control;
+- selectable 5/6/7/8 MHz DVB-T channel bandwidth applied consistently to
+  spectrum metrics, OFDM monitoring, and transport decoding;
 - native Airspy and generic SoapySDR device enumeration/opening;
 - Airspy sensitivity/linearity gain profiles;
 - bounded-queue CS16 raw I/Q recording with a JSON metadata sidecar;
@@ -13,23 +15,29 @@ The current implementation provides:
 - live 4096-bin FFTW/VOLK spectrum, selectable-colormap waterfall, and dBFS
   signal-power telemetry, with an adjustable display range defaulting to
   -100/-20 dBFS;
-- live diagnostic DVB-T constellation and OFDM quality metrics;
+- live diagnostic DVB-T constellation, OFDM quality metrics, and measured
+  pre-/post-Viterbi BER;
 - a native raw-I/Q-to-MPEG-TS decoder with 2K/8K OFDM acquisition, soft
   Viterbi, RS(204,188), and all non-hierarchical DVB-T modulation/code-rate
   modes;
 - MPEG-TS recording with duration, size, and throughput telemetry.
+- BCH-validated TPS parameter discovery and PAT/PMT/SDT service discovery with
+  a live service-selection drop-down.
 
 The native path recovers MPEG-TS directly from an ideal centered 10 MSPS CS16
-DVB-T waveform. Live/file I/Q sources feed the same asynchronous native
+6 MHz DVB-T waveform. Live/file I/Q sources feed the same asynchronous native
 OFDM/FEC worker and its output is routed to the GUI's TS recorder. Robust
-carrier/sample-clock tracking and TPS parameter discovery are still under
-development. Clean 557 MHz and 581 MHz Airspy recordings now recover valid TS,
-while weak/multipath recordings remain experimental.
+carrier/sample-clock tracking is still under development. Automatic transport
+decoding now waits for differential TPS synchronization and BCH validation,
+then uses the advertised constellation and high-priority code rate; manual UI
+parameters remain available as test overrides. Clean 557 MHz and 581 MHz Airspy
+recordings recover valid TS, while weak/multipath recordings remain
+experimental.
 
-The right-side video surface is reserved for future libmpv playback. Service
-table parsing, channel selection, and video/audio rendering are not implemented
-yet; decoded transport streams can currently be recorded and opened with an
-external player.
+The right-side video surface is reserved for future libmpv playback. PAT, PMT,
+and SDT are parsed into the service drop-down, but selection does not yet filter
+the multiplex or control a player. TS recording therefore still writes the full
+MPTS, which can be opened with an external player.
 
 ## Build
 

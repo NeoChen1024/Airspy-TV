@@ -29,7 +29,6 @@ constexpr float input_scale = 32768.0F;
 constexpr float minimum_power = 1.0e-14F;
 constexpr float fft_rate_hz =
     1000.0F / static_cast<float>(capture_interval.count());
-constexpr float dvbt_channel_bandwidth_hz = 6'000'000.0F;
 constexpr std::size_t notch_smoothing_radius = 4;
 constexpr std::size_t notch_lower_percentile_divisor = 100;
 
@@ -44,11 +43,16 @@ constexpr std::size_t notch_lower_percentile_divisor = 100;
 }
 
 void update_channel_metrics(SpectrumSnapshot &snapshot,
-                            const std::span<const float> averaged_power) {
+                            const std::span<const float> averaged_power,
+                            const std::uint32_t channel_bandwidth_hz) {
     const auto sample_rate = static_cast<float>(snapshot.sample_rate_hz);
-    if (sample_rate <= dvbt_channel_bandwidth_hz * 1.15F) {
+    const auto bandwidth = static_cast<float>(channel_bandwidth_hz);
+    if (bandwidth <= 0.0F || sample_rate <= bandwidth * 1.15F) {
         return;
     }
+    const float in_channel_edge = bandwidth * (2.9F / 6.0F);
+    const float noise_start = bandwidth * (3.5F / 6.0F);
+    const float notch_edge = bandwidth * (2.7F / 6.0F);
 
     float in_channel_power = 0.0F;
     std::size_t in_channel_bins = 0;
@@ -64,10 +68,10 @@ void update_channel_metrics(SpectrumSnapshot &snapshot,
     };
     for (std::size_t index = 0; index < spectrum_fft_size; ++index) {
         const float frequency = std::abs(frequency_at(index));
-        if (frequency <= 2'900'000.0F) {
+        if (frequency <= in_channel_edge) {
             in_channel_power += averaged_power[index];
             ++in_channel_bins;
-        } else if (frequency >= 3'500'000.0F &&
+        } else if (frequency >= noise_start &&
                    frequency <= sample_rate * 0.47F) {
             noise_power += averaged_power[index];
             ++noise_bins;
@@ -88,7 +92,7 @@ void update_channel_metrics(SpectrumSnapshot &snapshot,
 
     for (std::size_t index = notch_smoothing_radius;
          index + notch_smoothing_radius < spectrum_fft_size; ++index) {
-        if (std::abs(frequency_at(index)) > 2'700'000.0F) {
+        if (std::abs(frequency_at(index)) > notch_edge) {
             continue;
         }
         float sum = 0.0F;
@@ -148,6 +152,7 @@ struct SpectrumAnalyzer::Impl {
     bool pending{};
     bool stopping{};
     std::uint32_t pending_sample_rate{};
+    std::uint32_t pending_channel_bandwidth{6'000'000};
     std::chrono::steady_clock::time_point next_capture;
 
     mutable std::mutex snapshot_mutex;
@@ -226,6 +231,7 @@ struct SpectrumAnalyzer::Impl {
     void run() {
         while (true) {
             std::uint32_t sample_rate = 0;
+            std::uint32_t channel_bandwidth = 0;
             {
                 std::unique_lock lock(pending_mutex);
                 pending_ready.wait(lock,
@@ -235,17 +241,19 @@ struct SpectrumAnalyzer::Impl {
                 }
                 std::ranges::copy(pending_samples, worker_samples.get());
                 sample_rate = pending_sample_rate;
+                channel_bandwidth = pending_channel_bandwidth;
                 pending = false;
             }
 
             if (reset_requested.exchange(false)) {
                 average_initialized = false;
             }
-            process(sample_rate);
+            process(sample_rate, channel_bandwidth);
         }
     }
 
-    void process(const std::uint32_t sample_rate) {
+    void process(const std::uint32_t sample_rate,
+                 const std::uint32_t channel_bandwidth) {
         volk_16i_s32f_convert_32f(reinterpret_cast<float *>(input.get()),
                                   worker_samples.get(), input_scale,
                                   static_cast<unsigned int>(scalar_count));
@@ -301,8 +309,10 @@ struct SpectrumAnalyzer::Impl {
             }
             next.bins_dbfs[output_index] = smoothed_bins_dbfs[output_index];
         }
-        update_channel_metrics(next, std::span<const float>{shifted_power.get(),
-                                                            spectrum_fft_size});
+        update_channel_metrics(
+            next,
+            std::span<const float>{shifted_power.get(), spectrum_fft_size},
+            channel_bandwidth);
         const float snr_alpha =
             snr_smoothing ? std::min(static_cast<float>(std::max(
                                          snr_smoothing_speed.load(), 1)) /
@@ -343,7 +353,8 @@ SpectrumAnalyzer::~SpectrumAnalyzer() noexcept = default;
 
 void SpectrumAnalyzer::submit(
     const std::span<const std::int16_t> interleaved_iq,
-    const std::uint32_t sample_rate_hz) {
+    const std::uint32_t sample_rate_hz,
+    const std::uint32_t channel_bandwidth_hz) {
     if (interleaved_iq.empty()) {
         return;
     }
@@ -376,6 +387,7 @@ void SpectrumAnalyzer::submit(
         impl_->staging_count = 0;
     }
     impl_->pending_sample_rate = sample_rate_hz;
+    impl_->pending_channel_bandwidth = channel_bandwidth_hz;
     impl_->pending = true;
     impl_->next_capture = now + capture_interval;
     lock.unlock();

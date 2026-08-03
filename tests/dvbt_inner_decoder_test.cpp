@@ -1,6 +1,7 @@
 #include "airspy_tv/dvbt/inner_decoder.hpp"
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 #include "airspy_tv/dvbt/soft_demapper.hpp"
+#include "airspy_tv/dvbt/tps_decoder.hpp"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,7 @@ using airspy_tv::dvbt::Constellation;
 using airspy_tv::dvbt::MaxLogDemapper;
 using airspy_tv::dvbt::ReceiverParameters;
 using airspy_tv::dvbt::SymbolDeinterleaver;
+using airspy_tv::dvbt::TpsDecoder;
 using airspy_tv::dvbt::TransmissionMode;
 
 void require(const bool condition, const std::string_view message) {
@@ -281,14 +283,80 @@ void test_partitioned_resampler() {
         sample = static_cast<std::int16_t>(sample_distribution(generator));
     }
 
-    const auto serial =
-        airspy_tv::dvbt::resample_cs16(input, 10'000'000, 6'000'000, 1);
-    for (const std::size_t workers : {2U, 4U, 16U}) {
-        const auto partitioned = airspy_tv::dvbt::resample_cs16(
-            input, 10'000'000, 6'000'000, workers);
-        require(partitioned == serial,
-                "partitioned resampler must be bit-identical to serial");
+    for (const std::uint32_t bandwidth :
+         {5'000'000U, 6'000'000U, 7'000'000U, 8'000'000U}) {
+        const auto serial =
+            airspy_tv::dvbt::resample_cs16(input, 10'000'000, bandwidth, 1);
+        require(!serial.empty(), "supported-bandwidth resampler output");
+        for (const std::size_t workers : {2U, 4U, 16U}) {
+            const auto partitioned = airspy_tv::dvbt::resample_cs16(
+                input, 10'000'000, bandwidth, workers);
+            require(partitioned == serial,
+                    "partitioned resampler must be bit-identical to serial");
+        }
     }
+}
+
+void test_tps_decoder() {
+    std::array<std::uint8_t, 68> bits{};
+    const auto set = [&bits](const std::size_t first, const std::size_t count,
+                             unsigned int value) {
+        for (std::size_t index = 0; index < count; ++index) {
+            bits[first + count - index - 1] =
+                static_cast<std::uint8_t>(value & 1U);
+            value >>= 1U;
+        }
+    };
+    set(1, 16, 0x35EEU);
+    set(17, 6, 0x17U);
+    set(23, 2, 2U);
+    set(25, 2, 2U); // 64-QAM
+    set(27, 3, 0U); // non-hierarchical
+    set(30, 3, 1U); // HP 2/3
+    set(33, 3, 2U); // LP 3/4
+    set(36, 2, 3U); // guard 1/4
+    set(38, 2, 1U); // 8K
+    set(40, 8, 0x5AU);
+
+    unsigned int reg = 0;
+    for (std::size_t input = 0; input < 113; ++input) {
+        const unsigned int data = input < 60 ? 0U : bits[1 + input - 60];
+        const unsigned int feedback = (data ^ reg) & 1U;
+        reg >>= 1U;
+        reg |= feedback << 13U;
+        reg ^= (feedback << 12U) ^ (feedback << 11U) ^ (feedback << 9U) ^
+               (feedback << 8U) ^ (feedback << 7U) ^ (feedback << 5U) ^
+               (feedback << 4U);
+    }
+    for (std::size_t bit = 0; bit < 14; ++bit) {
+        bits[54 + bit] = static_cast<std::uint8_t>((reg >> bit) & 1U);
+    }
+
+    TpsDecoder decoder;
+    std::vector<std::complex<float>> carriers(17, {1.0F, 0.0F});
+    static_cast<void>(decoder.process(carriers));
+    for (const std::uint8_t bit : bits) {
+        if (bit != 0U) {
+            for (auto &carrier : carriers) {
+                carrier = -carrier;
+            }
+        }
+        static_cast<void>(decoder.process(carriers));
+    }
+    const auto snapshot = decoder.snapshot();
+    require(snapshot.locked, "TPS BCH and synchronization lock");
+    require(snapshot.symbol_index == 67, "TPS frame-end symbol index");
+    require(snapshot.parameters.constellation == Constellation::qam64,
+            "TPS constellation");
+    require(snapshot.parameters.high_priority_code_rate == CodeRate::rate_2_3,
+            "TPS HP code rate");
+    require(snapshot.parameters.low_priority_code_rate == CodeRate::rate_3_4,
+            "TPS LP code rate");
+    require(snapshot.parameters.mode == TransmissionMode::k8,
+            "TPS transmission mode");
+    require(snapshot.parameters.guard_interval ==
+                airspy_tv::dvbt::GuardInterval::gi_1_4,
+            "TPS guard interval");
 }
 
 } // namespace
@@ -304,6 +372,7 @@ int main() {
         test_bit_deinterleaver();
         test_depuncturer();
         test_partitioned_resampler();
+        test_tps_decoder();
     } catch (const std::exception &error) {
         std::cerr << "DVB-T inner decoder test failed: " << error.what()
                   << '\n';

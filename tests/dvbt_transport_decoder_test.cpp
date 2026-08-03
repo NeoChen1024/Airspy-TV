@@ -12,6 +12,7 @@ extern "C" {
 #include <cstdint>
 #include <deque>
 #include <iostream>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <stdexcept>
@@ -281,6 +282,15 @@ void test_transport_decoder(const CodeRate rate,
     require(stats.rs_uncorrectable_packets == 0, "no RS failures");
     require(stats.ts_packets == recovered.size() / ts_packet_size,
             "TS packet statistics");
+    require(stats.pre_viterbi_compared_bits != 0,
+            "pre-Viterbi BER sample count");
+    require(stats.pre_viterbi_error_bits == 0,
+            "clean pre-Viterbi BER estimate");
+    require(stats.post_viterbi_compared_bits != 0,
+            "post-Viterbi BER sample count");
+    require(stats.post_viterbi_error_bits * 100 <
+                stats.post_viterbi_compared_bits,
+            "clean post-Viterbi BER remains below one percent");
     require(stats.viterbi_workers == viterbi_workers,
             "Viterbi worker statistics");
 }
@@ -317,6 +327,48 @@ void test_prepared_soft_transport() {
     soft_output.insert(soft_output.end(), soft_tail.begin(), soft_tail.end());
     require(soft_output == float_output,
             "prepared soft metrics must match float transport path");
+}
+
+void test_uncorrectable_packet_is_emitted_with_tei() {
+    constexpr CodeRate rate = CodeRate::rate_2_3;
+    const auto expected = make_transport_stream();
+    const auto randomized = energy_scramble(expected);
+    auto rs = rs_encode(randomized);
+    constexpr std::size_t corrupt_packet = 120;
+    for (std::size_t byte = 0; byte < 9; ++byte) {
+        rs[(corrupt_packet * rs_packet_size) + 20 + byte] ^= 0xFFU;
+    }
+    const auto interleaved = outer_interleave(rs);
+    const auto encoded = convolutional_encode(interleaved);
+    const auto metrics = make_metrics(encoded, rate);
+
+    TransportDecoder decoder{rate, 1};
+    auto recovered = decoder.process(metrics);
+    const auto tail = decoder.flush();
+    recovered.insert(recovered.end(), tail.begin(), tail.end());
+
+    const auto stats = decoder.stats();
+    require(stats.rs_uncorrectable_packets == 1,
+            "one deliberately uncorrectable RS packet");
+    require(stats.tei_packets == 1,
+            "uncorrectable synchronized packet is emitted with TEI");
+    require(stats.ts_packets == recovered.size() / ts_packet_size,
+            "TEI packet participates in TS packet statistics");
+
+    std::size_t tei_packets = 0;
+    std::optional<unsigned int> previous_counter;
+    for (std::size_t offset = 0; offset < recovered.size();
+         offset += ts_packet_size) {
+        require(recovered[offset] == 0x47, "TEI stream remains TS aligned");
+        tei_packets += (recovered[offset + 1] & 0x80U) != 0U ? 1U : 0U;
+        const unsigned int counter = recovered[offset + 3] & 0x0FU;
+        if (previous_counter.has_value()) {
+            require(counter == ((*previous_counter + 1U) & 0x0FU),
+                    "TEI output preserves continuity-counter cadence");
+        }
+        previous_counter = counter;
+    }
+    require(tei_packets == 1, "exactly one output packet has TEI set");
 }
 
 void test_equalized_symbol_decoder(const DecoderParameters parameters) {
@@ -383,6 +435,7 @@ int main() {
         test_transport_decoder(CodeRate::rate_7_8);
         test_transport_decoder(CodeRate::rate_2_3, 4);
         test_prepared_soft_transport();
+        test_uncorrectable_packet_is_emitted_with_tei();
         test_equalized_symbol_decoder(
             {TransmissionMode::k2, Constellation::qpsk, CodeRate::rate_1_2, 1});
         test_equalized_symbol_decoder({TransmissionMode::k8,

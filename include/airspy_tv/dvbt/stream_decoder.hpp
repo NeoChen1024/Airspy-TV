@@ -14,6 +14,12 @@ namespace airspy_tv::dvbt {
 
 struct StreamDecoderStats {
     bool ofdm_locked{};
+    bool tps_locked{};
+    Constellation tps_constellation{Constellation::qpsk};
+    CodeRate tps_code_rate{CodeRate::rate_1_2};
+    GuardInterval tps_guard_interval{GuardInterval::gi_1_32};
+    TransmissionMode tps_mode{TransmissionMode::k2};
+    std::uint8_t tps_hierarchy{};
     float acquisition_score{};
     std::uint32_t fft_size{};
     std::uint32_t guard_size{};

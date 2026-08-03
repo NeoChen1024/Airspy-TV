@@ -4,6 +4,7 @@
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 #include "airspy_tv/recorder.hpp"
 #include "airspy_tv/spectrum.hpp"
+#include "airspy_tv/transport_stream.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -86,6 +87,7 @@ class SdrDevice {
     [[nodiscard]] SpectrumSnapshot spectrum_snapshot() const;
     [[nodiscard]] dvbt::SignalAnalysisSnapshot signal_analysis_snapshot() const;
     [[nodiscard]] dvbt::StreamDecoderStats decoder_stats() const;
+    [[nodiscard]] std::vector<TransportService> transport_services() const;
     [[nodiscard]] std::string runtime_error() const;
 
   private:

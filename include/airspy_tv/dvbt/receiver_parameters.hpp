@@ -4,6 +4,7 @@
 #include "airspy_tv/dvbt/soft_demapper.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 
 namespace airspy_tv::dvbt {
@@ -11,6 +12,7 @@ namespace airspy_tv::dvbt {
 enum class GuardInterval { gi_1_32, gi_1_16, gi_1_8, gi_1_4 };
 
 struct ReceiverParameters {
+    std::uint32_t channel_bandwidth_hz{6'000'000};
     std::optional<TransmissionMode> mode;
     std::optional<GuardInterval> guard_interval;
     std::optional<Constellation> constellation;

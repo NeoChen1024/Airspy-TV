@@ -66,6 +66,7 @@ struct SdrDevice::Impl {
     std::optional<std::pair<double, double>> soapy_gain_range;
     RawIqRecorder recorder;
     TransportStreamRecorder ts_recorder;
+    TransportStreamModel transport_model;
     SpectrumAnalyzer analyzer;
     dvbt::SignalAnalyzer signal_analyzer;
     dvbt::StreamDecoder stream_decoder;
@@ -74,12 +75,14 @@ struct SdrDevice::Impl {
     std::filesystem::path file_path;
     std::atomic<bool> streaming;
     std::atomic<std::uint32_t> active_sample_rate;
+    std::atomic<std::uint32_t> active_channel_bandwidth{6'000'000};
     mutable std::mutex error_mutex;
     std::string async_error;
 
     Impl() {
         stream_decoder.set_transport_callback(
             [this](const std::span<const std::uint8_t> ts) {
+                transport_model.consume(ts);
                 ts_recorder.submit(ts);
             });
     }
@@ -103,9 +106,12 @@ struct SdrDevice::Impl {
             self->signal_analyzer.reset();
             self->stream_decoder.reset();
         }
-        self->analyzer.submit(sample_block, self->active_sample_rate);
-        self->signal_analyzer.submit(sample_block, self->active_sample_rate);
-        self->stream_decoder.submit(sample_block, self->active_sample_rate);
+        self->analyzer.submit(sample_block, self->active_sample_rate,
+                              self->active_channel_bandwidth);
+        self->signal_analyzer.submit(sample_block, self->active_sample_rate,
+                                     self->active_channel_bandwidth);
+        self->stream_decoder.submit(sample_block, self->active_sample_rate,
+                                    self->active_channel_bandwidth);
         self->recorder.submit(sample_block);
         return 0;
     }
@@ -127,9 +133,12 @@ struct SdrDevice::Impl {
             if (received > 0) {
                 const std::span sample_block(
                     samples.data(), static_cast<std::size_t>(received) * 2);
-                analyzer.submit(sample_block, active_sample_rate);
-                signal_analyzer.submit(sample_block, active_sample_rate);
-                stream_decoder.submit(sample_block, active_sample_rate);
+                analyzer.submit(sample_block, active_sample_rate,
+                                active_channel_bandwidth);
+                signal_analyzer.submit(sample_block, active_sample_rate,
+                                       active_channel_bandwidth);
+                stream_decoder.submit(sample_block, active_sample_rate,
+                                      active_channel_bandwidth);
                 recorder.submit(sample_block);
                 continue;
             }
@@ -179,9 +188,12 @@ struct SdrDevice::Impl {
                 break;
             }
             const std::span sample_block(samples.data(), scalar_count);
-            analyzer.submit(sample_block, active_sample_rate);
-            signal_analyzer.submit(sample_block, active_sample_rate);
-            stream_decoder.submit(sample_block, active_sample_rate);
+            analyzer.submit(sample_block, active_sample_rate,
+                            active_channel_bandwidth);
+            signal_analyzer.submit(sample_block, active_sample_rate,
+                                   active_channel_bandwidth);
+            stream_decoder.submit(sample_block, active_sample_rate,
+                                  active_channel_bandwidth);
             emitted_samples += scalar_count / 2;
 
             const auto elapsed = std::chrono::duration<double>(
@@ -298,6 +310,7 @@ EnumerationResult SdrDevice::enumerate(const bool include_soapy_airspy) {
 
 bool SdrDevice::open(const DeviceDescriptor &descriptor, std::string &error) {
     close();
+    impl_->transport_model.reset();
     impl_->current = descriptor;
     impl_->async_error.clear();
 
@@ -371,6 +384,7 @@ bool SdrDevice::open(const DeviceDescriptor &descriptor, std::string &error) {
 bool SdrDevice::open_iq_file(const std::filesystem::path &path,
                              SourceSettings &settings, std::string &error) {
     close();
+    impl_->transport_model.reset();
     IqFileInfo info;
     if (!resolve_iq_file(path, settings.sample_rate_hz,
                          settings.center_frequency_hz, info, error)) {
@@ -408,6 +422,7 @@ void SdrDevice::close() {
     impl_->file_path.clear();
     impl_->rates.clear();
     impl_->soapy_gain_range.reset();
+    impl_->transport_model.reset();
 }
 
 bool SdrDevice::configure(const SourceSettings &settings, std::string &error) {
@@ -476,6 +491,7 @@ bool SdrDevice::start_stream(const SourceSettings &settings,
     }
 
     impl_->stop_source();
+    impl_->transport_model.reset();
     if (!configure(settings, error)) {
         return false;
     }
@@ -584,6 +600,7 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
         impl_->analyzer.reset();
         impl_->signal_analyzer.reset();
         impl_->stream_decoder.reset();
+        impl_->transport_model.reset();
         return true;
     }
 
@@ -598,6 +615,7 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
         impl_->analyzer.reset();
         impl_->signal_analyzer.reset();
         impl_->stream_decoder.reset();
+        impl_->transport_model.reset();
         return true;
     } catch (const std::exception &exception) {
         error =
@@ -638,6 +656,7 @@ void SdrDevice::set_display_smoothing(const bool fft_enabled,
 
 void SdrDevice::set_dvbt_parameters(
     const dvbt::ReceiverParameters &parameters) {
+    impl_->active_channel_bandwidth = parameters.channel_bandwidth_hz;
     impl_->signal_analyzer.set_parameters(parameters);
     impl_->stream_decoder.set_parameters(parameters);
 }
@@ -712,6 +731,10 @@ dvbt::SignalAnalysisSnapshot SdrDevice::signal_analysis_snapshot() const {
 
 dvbt::StreamDecoderStats SdrDevice::decoder_stats() const {
     return impl_->stream_decoder.stats();
+}
+
+std::vector<TransportService> SdrDevice::transport_services() const {
+    return impl_->transport_model.services();
 }
 
 std::string SdrDevice::runtime_error() const {
