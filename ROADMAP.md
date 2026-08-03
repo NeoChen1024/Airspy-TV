@@ -66,8 +66,8 @@ Implementation requirements:
   confident hard errors.
 - Preserve soft metrics through DVB-T bit deinterleaving.
 - Support code rates 1/2, 2/3, 3/4, 5/6, and 7/8. Insert a neutral metric for
-  punctured bits before decoding the K=7, G1=171 octal, G2=133 octal mother
-  code.
+  punctured bits before decoding the K=7, rate-1/2 mother code (libcorrect
+  stores the polynomials as 0117/0155 octal, the bit-reversed DVB-T 171/133).
 - Wrap libcorrect with streaming traceback and deterministic superframe reset
   behavior; do not assume its packet-oriented API directly matches DVB-T.
 - Keep the decoder API independent of Airspy, SoapySDR, the UI, and the

@@ -321,9 +321,9 @@ std::optional<std::uint64_t>
 draw_frequency_control(const char *id, const std::uint64_t frequency_hz) {
     const std::string digits =
         std::format("{:012}", std::min(frequency_hz, max_display_frequency));
-    const float font_size = ImGui::GetFontSize() * 1.35F;
-    const float digit_width = (ImGui::CalcTextSize("0").x * 1.35F) + 6.0F;
-    const float separator_width = (ImGui::CalcTextSize(".").x * 1.35F) + 2.0F;
+    const float font_size = ImGui::GetFontSize() * 2.0F;
+    const float digit_width = (ImGui::CalcTextSize("0").x * 2.0F) + 6.0F;
+    const float separator_width = (ImGui::CalcTextSize(".").x * 2.0F) + 2.0F;
     const float height = font_size + 10.0F;
     std::optional<std::uint64_t> requested;
     bool significant_digit_seen = false;
@@ -1345,6 +1345,7 @@ void draw_sidebar(AppState &state) {
             ImGui::Checkbox("FFT smoothing", &state.fft_smoothing);
         ImGui::BeginDisabled(!state.fft_smoothing);
         ImGui::TextUnformatted("FFT smoothing speed");
+        ImGui::SameLine();
         ImGui::SetNextItemWidth(-1.0F);
         smoothing_changed |= ImGui::InputInt("##fft-smoothing-speed",
                                              &state.fft_smoothing_speed);
@@ -1354,6 +1355,7 @@ void draw_sidebar(AppState &state) {
             ImGui::Checkbox("SNR smoothing", &state.snr_smoothing);
         ImGui::BeginDisabled(!state.snr_smoothing);
         ImGui::TextUnformatted("SNR smoothing speed");
+        ImGui::SameLine();
         ImGui::SetNextItemWidth(-1.0F);
         smoothing_changed |= ImGui::InputInt("##snr-smoothing-speed",
                                              &state.snr_smoothing_speed);
@@ -1364,8 +1366,6 @@ void draw_sidebar(AppState &state) {
                 state.fft_smoothing, state.fft_smoothing_speed,
                 state.snr_smoothing, state.snr_smoothing_speed);
         }
-        draw_disabled_wrapped(
-            "SDR++ speed model; FFT smoothing affects spectrum only.");
         ImGui::PopID();
     }
 
@@ -1903,10 +1903,6 @@ void draw_application(AppState &state) {
         request_center_frequency(state, *frequency);
     }
     ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::TextDisabled("CENTERED  |  %u MHz DVB-T",
-                        state.dvbt_parameters.channel_bandwidth_hz /
-                            1'000'000U);
     ImGui::SameLine();
     const float status_width = ImGui::CalcTextSize(state.status.c_str()).x;
     ImGui::SetCursorPosX(
