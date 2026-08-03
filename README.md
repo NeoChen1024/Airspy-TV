@@ -34,6 +34,12 @@ parameters remain available as test overrides. Clean 557 MHz and 581 MHz Airspy
 recordings recover valid TS, while weak/multipath recordings remain
 experimental.
 
+Raw-I/Q processing uses a 100 ms overlap-save boundary. The overlapping region
+is decoded independently, matched as an exact sequence of 188-byte transport
+packets, and emitted only once. This preserves multiplex continuity across
+internal processing chunks without making file input lossy; `--debug` reports
+the joined-packet and failed-join counters.
+
 The right-side video surface is reserved for future libmpv playback. PAT, PMT,
 and SDT are parsed into the service drop-down, but selection does not yet filter
 the multiplex or control a player. TS recording therefore still writes the full

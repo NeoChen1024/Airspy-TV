@@ -16,6 +16,9 @@ independently.
   lock, carrier offset, MER, CP-SNR, deepest-notch, and decoder CPU status.
 - Native raw-I/Q-to-MPEG-TS decoding and TS recording through the same
   `StreamDecoder` used by GUI and CLI sources.
+- Overlap-save processing across raw-I/Q chunks with exact 188-byte TS packet
+  joining, so independently acquired frontend/FEC windows do not create an
+  output discontinuity at every internal chunk boundary.
 
 ## DVB-T reference receiver
 
@@ -171,6 +174,14 @@ Current native implementation:
   payload-bit corrections in successfully decoded RS(204,188) codewords;
   uncorrectable RS packets remain a separate counter because their bit-error
   count is unknowable.
+- Raw-I/Q chunks retain 100 ms of input overlap. Each chunk is decoded through
+  acquisition, TPS, and FEC independently, then an exact packet-sequence join
+  removes the redundant prefix before delivery. This is a deterministic
+  continuity bridge while retaining bounded state and simple reset behavior;
+  diagnostics count joined packets and failed joins. On the full horizontal
+  557 MHz capture it reduced continuity-counter gaps on every active PID from
+  roughly 170--200 to zero. The added DSP work still runs faster than realtime
+  on the current 16-thread test host.
 
 ## Verification status
 
@@ -188,7 +199,8 @@ Completed checks:
 Remaining receiver validation:
 
 - Track TPS lock, corrected RS packets, and uncorrectable/TEI packets
-  consistently across processing chunks.
+  consistently across processing chunks without double-counting overlap-save
+  work.
 - Compare hard- and soft-decision behavior on clean, weak-signal, multipath,
   SFN, and discontinuous captures.
 - Add long-running live reception regressions for Airspy and selected SoapySDR
@@ -196,11 +208,12 @@ Remaining receiver validation:
 
 Next decoder step:
 
-- Make the rational resampler, OFDM tracking, TPS frame phase, and FEC/outer
-  synchronization continuous across input chunks. The current independently
-  acquired chunks create a multiplex-wide discontinuity at most chunk
-  boundaries even when every decoded RS packet inside each chunk is clean;
-  this must be fixed before judging libmpv playback stability.
+- Replace overlap-save reacquisition with persistent rational-resampler,
+  OFDM/TPS tracking, and FEC/outer-sync state where that improves throughput or
+  weak-signal robustness. Exact TS packet joining already prevents internal
+  chunk boundaries from creating multiplex-wide continuity gaps, so this is
+  now an optimization and tracking-quality task rather than an output-
+  correctness blocker.
 - Add continuous sample-clock and channel tracking across processing chunks;
   the current frontend is measurably less robust on captured multipath signals
   than the reference receiver.
@@ -227,6 +240,13 @@ Next decoder step:
 - Preserve uncorrectable RS codewords as cadence-correct TS packets with TEI
   set, expose their count, and let the demuxer discard corrupt payload instead
   of silently manufacturing continuity-counter gaps.
+- Keep an elementary-stream decode check in long-capture validation. FFmpeg's
+  initial multi-program TS probing still prints misleading SPS/PPS diagnostics,
+  but extracting service 300 from the joined 557 MHz regression and decoding
+  from its first SPS leaves only one macroblock error over roughly 150 seconds.
+  The same check on the pre-join `a.ts` produces hundreds of missing-reference
+  and damaged-frame errors, confirming that chunk continuity was the dominant
+  playback corruption.
 
 ## Possible future work
 

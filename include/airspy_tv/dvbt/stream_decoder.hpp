@@ -42,6 +42,8 @@ struct StreamDecoderStats {
     std::uint64_t dropped_blocks{};
     std::uint64_t ofdm_symbols{};
     std::uint64_t transport_bytes{};
+    std::uint64_t ts_overlap_packets{};
+    std::uint64_t ts_overlap_join_failures{};
     std::size_t queued_blocks{};
     std::size_t queued_input_samples{};
     std::size_t input_queue_capacity_samples{};

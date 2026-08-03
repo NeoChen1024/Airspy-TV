@@ -35,7 +35,11 @@ namespace {
 constexpr float minimum_power = 1.0e-12F;
 constexpr std::size_t acquisition_samples = 350'000;
 constexpr std::size_t buffer_duration_denominator = 5;
+constexpr std::size_t chunk_overlap_duration_denominator = 10;
 constexpr std::size_t initial_symbol_queue_capacity = 256;
+constexpr std::size_t ts_packet_size = 188;
+constexpr std::size_t retained_ts_packets = 32'768;
+constexpr std::size_t minimum_ts_overlap_packets = 32;
 
 constexpr std::array continual_2k{
     0,    48,   54,   87,   141,  156,  192,  201,  255,  279,  282,  333,
@@ -159,6 +163,84 @@ buffered_input_samples(const std::uint32_t sample_rate) noexcept {
     return std::max<std::size_t>(1, (static_cast<std::size_t>(sample_rate) +
                                      buffer_duration_denominator - 1) /
                                         buffer_duration_denominator);
+}
+
+[[nodiscard]] std::size_t
+chunk_overlap_samples(const std::uint32_t sample_rate) noexcept {
+    const std::size_t duration_samples =
+        (static_cast<std::size_t>(sample_rate) +
+         chunk_overlap_duration_denominator - 1) /
+        chunk_overlap_duration_denominator;
+    return std::min<std::size_t>(StreamDecoder::processing_chunk_samples / 2,
+                                 duration_samples);
+}
+
+[[nodiscard]] std::uint64_t
+packet_hash(const std::span<const std::uint8_t> packet) noexcept {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const std::uint8_t byte : packet) {
+        hash = (hash ^ byte) * 1099511628211ULL;
+    }
+    return hash;
+}
+
+[[nodiscard]] std::size_t
+find_ts_overlap(const std::span<const std::uint8_t> history,
+                const std::span<const std::uint8_t> current,
+                const std::size_t expected_packets) {
+    if (history.size() % ts_packet_size != 0 ||
+        current.size() % ts_packet_size != 0 || history.empty() ||
+        current.empty()) {
+        return 0;
+    }
+    const std::size_t history_packets = history.size() / ts_packet_size;
+    const std::size_t current_packets = current.size() / ts_packet_size;
+    std::vector<std::uint64_t> pattern(current_packets);
+    for (std::size_t packet = 0; packet < current_packets; ++packet) {
+        pattern[packet] = packet_hash(
+            current.subspan(packet * ts_packet_size, ts_packet_size));
+    }
+    std::vector<std::size_t> prefix(current_packets);
+    for (std::size_t index = 1, matched = 0; index < current_packets; ++index) {
+        while (matched != 0 && pattern[index] != pattern[matched]) {
+            matched = prefix[matched - 1];
+        }
+        if (pattern[index] == pattern[matched]) {
+            ++matched;
+        }
+        prefix[index] = matched;
+    }
+    std::size_t matched = 0;
+    for (std::size_t packet = 0; packet < history_packets; ++packet) {
+        const auto hash = packet_hash(
+            history.subspan(packet * ts_packet_size, ts_packet_size));
+        while (matched != 0 && hash != pattern[matched]) {
+            matched = prefix[matched - 1];
+        }
+        if (hash == pattern[matched]) {
+            ++matched;
+        }
+        if (matched == current_packets && packet + 1 != history_packets) {
+            matched = prefix[matched - 1];
+        }
+    }
+    std::size_t best = 0;
+    std::size_t best_distance = std::numeric_limits<std::size_t>::max();
+    while (matched >= minimum_ts_overlap_packets) {
+        const auto history_suffix = history.last(matched * ts_packet_size);
+        const auto current_prefix = current.first(matched * ts_packet_size);
+        if (std::ranges::equal(history_suffix, current_prefix)) {
+            const std::size_t distance = matched > expected_packets
+                                             ? matched - expected_packets
+                                             : expected_packets - matched;
+            if (distance < best_distance) {
+                best = matched;
+                best_distance = distance;
+            }
+        }
+        matched = prefix[matched - 1];
+    }
+    return best;
 }
 
 class SymbolPostprocessorPool {
@@ -432,6 +514,7 @@ struct StreamDecoder::Impl {
         std::uint64_t pilot_phase_discontinuities{};
         std::uint64_t ofdm_symbols{};
         float input_seconds{};
+        float overlap_input_seconds{};
         float resample_time_ms{};
         float acquisition_time_ms{};
         float equalization_time_ms{};
@@ -476,6 +559,7 @@ struct StreamDecoder::Impl {
     bool flush_requested{};
     bool worker_busy{};
     bool fec_worker_busy{};
+    bool overlap_active{};
     std::atomic<std::uint64_t> latest_generation{};
     std::uint32_t accumulated_rate{};
     std::uint32_t accumulated_bandwidth{};
@@ -514,7 +598,8 @@ struct StreamDecoder::Impl {
     }
 
     void decode_chunk(const std::span<const std::int16_t> iq,
-                      const std::uint32_t rate, const std::uint32_t bandwidth) {
+                      const std::uint32_t rate, const std::uint32_t bandwidth,
+                      const std::size_t new_complex_samples) {
         ReceiverParameters selected_parameters;
         std::uint64_t generation = 0;
         const auto started_at = std::chrono::steady_clock::now();
@@ -863,8 +948,11 @@ struct StreamDecoder::Impl {
                 (2.0F * std::numbers::pi_v<float> * static_cast<float>(period)),
             .pilot_phase_discontinuities = phase_discontinuities,
             .ofdm_symbols = symbol_count,
-            .input_seconds =
-                static_cast<float>(iq.size() / 2) / static_cast<float>(rate),
+            .input_seconds = static_cast<float>(new_complex_samples) /
+                             static_cast<float>(rate),
+            .overlap_input_seconds =
+                static_cast<float>((iq.size() / 2) - new_complex_samples) /
+                static_cast<float>(rate),
             .resample_time_ms = std::chrono::duration<float, std::milli>(
                                     resampled_at - started_at)
                                     .count(),
@@ -896,6 +984,8 @@ struct StreamDecoder::Impl {
         std::uint64_t decoder_generation = 0;
         std::uint64_t byte_count = 0;
         float fec_work_ms = 0.0F;
+        std::vector<std::uint8_t> chunk_transport;
+        std::vector<std::uint8_t> transport_history;
         while (true) {
             FecItem item;
             {
@@ -913,6 +1003,8 @@ struct StreamDecoder::Impl {
 
             if (item.generation == latest_generation) {
                 if (item.kind == FecItem::Kind::begin) {
+                    const bool generation_changed =
+                        decoder_generation != item.generation;
                     if (!decoder || decoder_generation != item.generation ||
                         decoder->parameters() != item.parameters) {
                         decoder = std::make_unique<Decoder>(item.parameters);
@@ -922,6 +1014,10 @@ struct StreamDecoder::Impl {
                     decoder_generation = item.generation;
                     byte_count = 0;
                     fec_work_ms = 0.0F;
+                    chunk_transport.clear();
+                    if (generation_changed) {
+                        transport_history.clear();
+                    }
                 } else if (item.kind == FecItem::Kind::symbol && decoder &&
                            decoder_generation == item.generation) {
                     const auto fec_started_at =
@@ -933,15 +1029,8 @@ struct StreamDecoder::Impl {
                             std::chrono::steady_clock::now() - fec_started_at)
                             .count();
                     if (!ts.empty() && item.generation == latest_generation) {
-                        TransportCallback sink;
-                        {
-                            const std::scoped_lock guard(mutex);
-                            sink = callback;
-                        }
-                        if (sink) {
-                            sink(ts);
-                        }
-                        byte_count += ts.size();
+                        chunk_transport.insert(chunk_transport.end(),
+                                               ts.begin(), ts.end());
                     }
                 } else if (item.kind == FecItem::Kind::end && decoder &&
                            decoder_generation == item.generation) {
@@ -953,15 +1042,56 @@ struct StreamDecoder::Impl {
                             std::chrono::steady_clock::now() - fec_started_at)
                             .count();
                     if (!ts.empty() && item.generation == latest_generation) {
-                        TransportCallback sink;
-                        {
-                            const std::scoped_lock guard(mutex);
-                            sink = callback;
+                        chunk_transport.insert(chunk_transport.end(),
+                                               ts.begin(), ts.end());
+                    }
+                    const float chunk_seconds =
+                        item.summary.input_seconds +
+                        item.summary.overlap_input_seconds;
+                    const std::size_t expected_overlap_packets =
+                        chunk_seconds <= 0.0F
+                            ? 0
+                            : static_cast<std::size_t>(
+                                  static_cast<float>(chunk_transport.size() /
+                                                     ts_packet_size) *
+                                  item.summary.overlap_input_seconds /
+                                  chunk_seconds);
+                    const std::size_t overlap_packets =
+                        find_ts_overlap(transport_history, chunk_transport,
+                                        expected_overlap_packets);
+                    const bool join_failed =
+                        !transport_history.empty() && overlap_packets == 0;
+                    const auto emitted =
+                        std::span<const std::uint8_t>{chunk_transport}.subspan(
+                            overlap_packets * ts_packet_size);
+                    TransportCallback sink;
+                    {
+                        const std::scoped_lock guard(mutex);
+                        sink = callback;
+                    }
+                    if (sink && !emitted.empty()) {
+                        sink(emitted);
+                    }
+                    byte_count = emitted.size();
+                    if (chunk_transport.size() >=
+                        retained_ts_packets * ts_packet_size) {
+                        transport_history.assign(
+                            chunk_transport.end() -
+                                static_cast<std::ptrdiff_t>(
+                                    retained_ts_packets * ts_packet_size),
+                            chunk_transport.end());
+                    } else {
+                        transport_history.insert(transport_history.end(),
+                                                 emitted.begin(),
+                                                 emitted.end());
+                        if (transport_history.size() >
+                            retained_ts_packets * ts_packet_size) {
+                            transport_history.erase(
+                                transport_history.begin(),
+                                transport_history.end() -
+                                    static_cast<std::ptrdiff_t>(
+                                        retained_ts_packets * ts_packet_size));
                         }
-                        if (sink) {
-                            sink(ts);
-                        }
-                        byte_count += ts.size();
                     }
                     const float wall_seconds =
                         std::chrono::duration<float>(
@@ -990,6 +1120,9 @@ struct StreamDecoder::Impl {
                             item.summary.pilot_phase_discontinuities;
                         latest.ofdm_symbols += item.summary.ofdm_symbols;
                         latest.transport_bytes += byte_count;
+                        latest.ts_overlap_packets += overlap_packets;
+                        latest.ts_overlap_join_failures +=
+                            join_failed ? 1U : 0U;
                         latest.transport = decoder->stats();
                         latest.processing_realtime_ratio =
                             wall_seconds / item.summary.input_seconds;
@@ -1036,6 +1169,7 @@ struct StreamDecoder::Impl {
                     fec_queue.clear();
                     queued_complex_samples = 0;
                     accumulated.clear();
+                    overlap_active = false;
                     stable_mode.reset();
                     stable_guard.reset();
                     latest = {};
@@ -1068,6 +1202,7 @@ struct StreamDecoder::Impl {
                     (accumulated_rate != block.rate ||
                      accumulated_bandwidth != block.bandwidth)) {
                     accumulated.clear();
+                    overlap_active = false;
                 }
                 accumulated_rate = block.rate;
                 accumulated_bandwidth = block.bandwidth;
@@ -1075,18 +1210,29 @@ struct StreamDecoder::Impl {
                                    block.samples.end());
             }
             const std::size_t scalar_chunk = processing_chunk_samples * 2;
+            const std::size_t overlap = chunk_overlap_samples(accumulated_rate);
+            const std::size_t scalar_step =
+                (processing_chunk_samples - overlap) * 2;
             while (accumulated.size() >= scalar_chunk) {
                 decode_chunk(std::span(accumulated).first(scalar_chunk),
-                             accumulated_rate, accumulated_bandwidth);
-                accumulated.erase(
-                    accumulated.begin(),
-                    accumulated.begin() +
-                        static_cast<std::ptrdiff_t>(scalar_chunk));
+                             accumulated_rate, accumulated_bandwidth,
+                             overlap_active ? processing_chunk_samples - overlap
+                                            : processing_chunk_samples);
+                overlap_active = true;
+                accumulated.erase(accumulated.begin(),
+                                  accumulated.begin() +
+                                      static_cast<std::ptrdiff_t>(scalar_step));
             }
-            if (block.samples.empty() && !accumulated.empty()) {
+            const std::size_t accumulated_complex = accumulated.size() / 2;
+            const std::size_t pending_complex =
+                overlap_active && accumulated_complex >= overlap
+                    ? accumulated_complex - overlap
+                    : accumulated_complex;
+            if (block.samples.empty() && pending_complex != 0) {
                 decode_chunk(accumulated, accumulated_rate,
-                             accumulated_bandwidth);
+                             accumulated_bandwidth, pending_complex);
                 accumulated.clear();
+                overlap_active = false;
             }
             {
                 const std::scoped_lock guard(mutex);

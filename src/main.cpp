@@ -1983,6 +1983,8 @@ int decode_iq_cli(const std::filesystem::path &source,
     std::vector<std::int16_t> block(scalar_samples);
     std::uint64_t input_complex_samples = 0;
     std::uint64_t reported_complex_samples = 0;
+    std::uint64_t reported_overlap_packets = 0;
+    std::uint64_t reported_join_failures = 0;
     std::size_t chunk_count = 0;
     const auto report_chunk = [&](const StreamDecoderStats &stats) {
         ++chunk_count;
@@ -2009,6 +2011,12 @@ int decode_iq_cli(const std::filesystem::path &source,
                       << " ms transport=" << stats.transport_time_ms << " ms\n";
             std::cerr << "  TPS: " << (stats.tps_locked ? "locked" : "unlocked")
                       << '\n';
+            std::cerr << "  chunk join: overlap="
+                      << stats.ts_overlap_packets - reported_overlap_packets
+                      << " TS packets, failures="
+                      << stats.ts_overlap_join_failures -
+                             reported_join_failures
+                      << '\n';
             if (stats.transport.pre_viterbi_compared_bits != 0) {
                 const double pre_viterbi_ber =
                     static_cast<double>(
@@ -2031,6 +2039,8 @@ int decode_iq_cli(const std::filesystem::path &source,
                 std::cerr << '\n';
             }
         }
+        reported_overlap_packets = stats.ts_overlap_packets;
+        reported_join_failures = stats.ts_overlap_join_failures;
     };
     while (input && !output_failed) {
         input.read(
@@ -2071,7 +2081,10 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << ", RS=" << stats.transport.rs_packets << ", RS failures="
                   << stats.transport.rs_uncorrectable_packets
                   << ", TEI=" << stats.transport.tei_packets
-                  << ", packets=" << stats.transport.ts_packets << '\n';
+                  << ", packets=" << stats.transport.ts_packets
+                  << ", joined-overlap=" << stats.ts_overlap_packets
+                  << ", join-failures="
+                  << stats.ts_overlap_join_failures << '\n';
     }
     if (output_failed || !output) {
         std::cerr << "Failed while writing MPEG-TS output\n";
