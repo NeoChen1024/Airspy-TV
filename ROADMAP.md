@@ -226,6 +226,25 @@ Next decoder step:
 - Add continuous sample-clock and channel tracking across processing chunks;
   the current frontend is measurably less robust on captured multipath signals
   than the reference receiver.
+- Turn the stateful frontend into one continuous stream pipeline:
+
+  ```text
+  streaming rational resampler
+      -> sample-clock / fractional-timing loop
+      -> carrier NCO and residual-CFO loop
+      -> OFDM symbol extraction
+      -> time/frequency pilot-channel tracker
+      -> TPS frame/superframe state
+  ```
+
+  Preserve resampler phase and filter history, fractional symbol position,
+  sample-clock-rate estimate, carrier phase/frequency, channel history, and TPS
+  state across input blocks. Keep this time-ordered frontend serial (or use an
+  explicit ordered state handoff), then dispatch FFT/equalization/demapping and
+  FEC work that is safe to parallelize. The current 100 ms overlap remains the
+  fallback reacquisition and discontinuity bridge until this path is validated;
+  afterwards reduce or remove routine overlap and reserve full reacquisition for
+  source drops, seeks, retunes, parameter changes, and genuine lock loss.
 - Carry validated TPS frame/superframe index and cell ID across chunks, and add
   deterministic decoder reset tags when TPS parameters change.
 - Eliminate duplicated GUI-monitor/frontend work by publishing constellation
@@ -253,6 +272,15 @@ Next decoder step:
   OpenGL framebuffer.
 - Reset playback state cleanly after source discontinuities, retunes, or
   service changes.
+- Validate long-running libmpv playback against the selected service's PCR and
+  audio/video PTS/DTS clocks. Track PCR discontinuities, timestamp wrap and
+  monotonicity, TS queue depth, and the measured audio-versus-video presentation
+  offset so RF/sample loss, decoder stalls, and genuine A/V clock drift can be
+  distinguished. Keep the live custom stream blocking and bounded, preserve
+  broadcast timestamps instead of synthesizing a wall-clock timeline, and
+  perform a controlled libmpv stream reload when a discontinuity cannot be
+  recovered without unbounded drift. Add multi-hour live/file regressions with
+  an explicit bound on sustained A/V offset and queue growth.
 - Preserve uncorrectable RS codewords as cadence-correct TS packets with TEI
   set, expose their count, and let the demuxer discard corrupt payload instead
   of silently manufacturing continuity-counter gaps.
@@ -266,9 +294,54 @@ Next decoder step:
 
 ## Possible future work
 
-- DVB-T2 support after the DVB-T receiver is stable and covered by regression
-  captures. DVB-T2 has a distinct framing, pilot, interleaving, and FEC chain
-  and therefore belongs in a separate decoder module rather than a mode switch
-  inside the DVB-T inner decoder.
+### Multi-standard architecture readiness
+
+The TS/SI/EPG/recorder/playback layer (`transport_stream`, `si_common`, `epg`,
+`recorder`, `mpv_player`) is modulation-standard-agnostic: every candidate
+standard below outputs an MPEG transport stream (except analog), and
+DVB-T2/DTMB/DVB-C use the same EN 300 468 PSI/SI tables the EPG already
+parses. Before a second standard lands, two structural changes are required:
+
+- Introduce a `Demodulator` interface (I/Q samples in, MPEG-TS callback +
+  generic stats out); `dvbt::StreamDecoder` becomes its first implementation.
+  Later standards get their own modules, mirroring the `airspy-tv-dvbt`
+  static-library precedent rather than a mode switch inside the DVB-T inner
+  decoder.
+- Split `SdrDevice` into a pure SDR source/tuner and a standard-aware Receiver
+  that owns the source, a `unique_ptr<Demodulator>`, and the TS pipeline. The
+  current `SdrDevice` owns both and leaks `dvbt::` types through its public
+  interface.
+- Define a second output family for analog standards (I/Q to video frames +
+  audio) that bypasses the TS layer entirely; the existing GL-texture video
+  surface is reused for rendering.
+
+Per-standard deltas once those seams exist:
+
+- **DVB-C** (smallest delta, closest to DVB-T beyond the PHY): single-carrier
+  QAM 16/32/64/128/256. The outer FEC is byte-identical to DVB-T
+  (RS(204,188) + I=12/M=17 convolutional interleaver + energy descrambler),
+  so the stateful outer stage of the DVB-T transport decoder is shared
+  verbatim; DVB-C feeds it directly from a hard-decision QAM slicer (no
+  Viterbi, no soft decisions). New work is limited to symbol timing/carrier
+  recovery, a small equalizer, and the cross-QAM (32/128) bit-to-symbol
+  mapping; liquid-dsp already provides the single-carrier modem primitives.
+  6/7/8 MHz cable channels fit the current bandwidth model and the 10 MSPS
+  Airspy rates. Validation follows the GNU Radio fixture pattern.
+- **DVB-T2 / DTMB**: new OFDM chains (T2: P1/P2 and L1 signalling; DTMB:
+  PN-sequence TDS-OFDM) plus LDPC+BCH FEC are the bulk of the work; SI/EPG
+  carry over unchanged (DTMB also uses the DVB SI family).
+- **ATSC**: single-carrier 8VSB with a decision-feedback equalizer and trellis
+  coding. PSIP (VCT/MGT/STT/EIT/ETT) replaces DVB SI, so the SI/EPG layer
+  needs an ATSC table branch (section-assembly infrastructure reuses).
+  10 MSPS is below the roughly 11 MSPS complex-sampling floor for 8VSB, so
+  ATSC additionally requires faster hardware.
+- **NTSC/PAL/SECAM**: an independent analog pipeline (vision demod, sync
+  separation, chroma decoding, FM sound) that never produces TS; reuse is
+  limited to the SDR frontend, resampler, spectrum/waterfall monitors, raw
+  I/Q recording, and the UI shell. Rendered through the existing GL-texture
+  video surface with an SDL3 audio sink.
+
+### Other
+
 - Additional native SDR backends when they provide useful capabilities that a
   generic SoapySDR path cannot expose.
