@@ -68,8 +68,7 @@ struct SdrDevice::Impl {
     TransportStreamRecorder ts_recorder;
     TransportStreamModel transport_model;
     SpectrumAnalyzer analyzer;
-    dvbt::SignalAnalyzer signal_analyzer;
-    dvbt::StreamDecoder stream_decoder;
+    std::unique_ptr<Demodulator> demodulator;
     std::thread soapy_worker;
     std::thread file_worker;
     std::filesystem::path file_path;
@@ -81,17 +80,7 @@ struct SdrDevice::Impl {
     mutable std::mutex transport_sink_mutex;
     TransportSink transport_sink;
 
-    Impl() {
-        stream_decoder.set_transport_callback(
-            [this](const std::span<const std::uint8_t> ts) {
-                transport_model.consume(ts);
-                ts_recorder.submit(ts);
-                const std::scoped_lock lock(transport_sink_mutex);
-                if (transport_sink) {
-                    transport_sink(ts);
-                }
-            });
-    }
+    Impl() = default;
 
     static int airspy_rx_callback(airspy_transfer *transfer) {
         auto *self = static_cast<Impl *>(transfer->ctx);
@@ -109,15 +98,16 @@ struct SdrDevice::Impl {
             self->recorder.add_source_dropped_samples(
                 transfer->dropped_samples);
             self->analyzer.reset();
-            self->signal_analyzer.reset();
-            self->stream_decoder.reset();
+            if (self->demodulator) {
+                self->demodulator->reset();
+            }
         }
         self->analyzer.submit(sample_block, self->active_sample_rate,
                               self->active_channel_bandwidth);
-        self->signal_analyzer.submit(sample_block, self->active_sample_rate,
-                                     self->active_channel_bandwidth);
-        self->stream_decoder.submit(sample_block, self->active_sample_rate,
-                                    self->active_channel_bandwidth);
+        if (self->demodulator) {
+            self->demodulator->submit(sample_block, self->active_sample_rate,
+                                      self->active_channel_bandwidth);
+        }
         self->recorder.submit(sample_block);
         return 0;
     }
@@ -141,10 +131,10 @@ struct SdrDevice::Impl {
                     samples.data(), static_cast<std::size_t>(received) * 2);
                 analyzer.submit(sample_block, active_sample_rate,
                                 active_channel_bandwidth);
-                signal_analyzer.submit(sample_block, active_sample_rate,
-                                       active_channel_bandwidth);
-                stream_decoder.submit(sample_block, active_sample_rate,
-                                      active_channel_bandwidth);
+                if (demodulator) {
+                    demodulator->submit(sample_block, active_sample_rate,
+                                        active_channel_bandwidth);
+                }
                 recorder.submit(sample_block);
                 continue;
             }
@@ -153,8 +143,9 @@ struct SdrDevice::Impl {
                 if (received == SOAPY_SDR_OVERFLOW) {
                     recorder.add_source_dropped_samples(1);
                     analyzer.reset();
-                    signal_analyzer.reset();
-                    stream_decoder.reset();
+                    if (demodulator) {
+                        demodulator->reset();
+                    }
                 }
                 continue;
             }
@@ -163,8 +154,9 @@ struct SdrDevice::Impl {
             streaming = false;
         }
         analyzer.reset();
-        signal_analyzer.reset();
-        stream_decoder.reset();
+        if (demodulator) {
+            demodulator->reset();
+        }
     }
 
     void run_file() {
@@ -196,10 +188,10 @@ struct SdrDevice::Impl {
             const std::span sample_block(samples.data(), scalar_count);
             analyzer.submit(sample_block, active_sample_rate,
                             active_channel_bandwidth);
-            signal_analyzer.submit(sample_block, active_sample_rate,
-                                   active_channel_bandwidth);
-            stream_decoder.submit(sample_block, active_sample_rate,
-                                  active_channel_bandwidth);
+            if (demodulator) {
+                demodulator->submit(sample_block, active_sample_rate,
+                                    active_channel_bandwidth);
+            }
             emitted_samples += scalar_count / 2;
 
             const auto elapsed = std::chrono::duration<double>(
@@ -207,8 +199,8 @@ struct SdrDevice::Impl {
                 static_cast<double>(active_sample_rate.load()));
             std::this_thread::sleep_until(started_at + elapsed);
         }
-        if (streaming) {
-            stream_decoder.flush();
+        if (streaming && demodulator) {
+            demodulator->flush();
         }
         if (streaming.exchange(false)) {
             set_async_error("I/Q file playback finished");
@@ -221,8 +213,9 @@ struct SdrDevice::Impl {
         // DVB-T worker may otherwise continue decoding a large chunk while
         // the UI is already tearing down after a window-close request.
         analyzer.reset();
-        signal_analyzer.reset();
-        stream_decoder.reset();
+        if (demodulator) {
+            demodulator->reset();
+        }
         if (current.backend == SdrBackend::AirspyNative && airspy != nullptr &&
             was_streaming) {
             airspy_stop_rx(airspy);
@@ -604,8 +597,9 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
             return false;
         }
         impl_->analyzer.reset();
-        impl_->signal_analyzer.reset();
-        impl_->stream_decoder.reset();
+        if (impl_->demodulator) {
+            impl_->demodulator->reset();
+        }
         impl_->transport_model.reset();
         return true;
     }
@@ -619,8 +613,9 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
         impl_->soapy->setFrequency(SOAPY_SDR_RX, 0,
                                    static_cast<double>(frequency_hz));
         impl_->analyzer.reset();
-        impl_->signal_analyzer.reset();
-        impl_->stream_decoder.reset();
+        if (impl_->demodulator) {
+            impl_->demodulator->reset();
+        }
         impl_->transport_model.reset();
         return true;
     } catch (const std::exception &exception) {
@@ -657,14 +652,25 @@ void SdrDevice::set_display_smoothing(const bool fft_enabled,
                                       const int snr_speed) {
     impl_->analyzer.set_smoothing(fft_enabled, fft_speed, snr_enabled,
                                   snr_speed);
-    impl_->signal_analyzer.set_snr_smoothing(snr_enabled, snr_speed);
 }
 
-void SdrDevice::set_dvbt_parameters(
-    const dvbt::ReceiverParameters &parameters) {
-    impl_->active_channel_bandwidth = parameters.channel_bandwidth_hz;
-    impl_->signal_analyzer.set_parameters(parameters);
-    impl_->stream_decoder.set_parameters(parameters);
+void SdrDevice::set_demodulator(std::unique_ptr<Demodulator> demodulator) {
+    impl_->demodulator = std::move(demodulator);
+    if (impl_->demodulator) {
+        impl_->demodulator->set_transport_callback(
+            [this](const std::span<const std::uint8_t> ts) {
+                impl_->transport_model.consume(ts);
+                impl_->ts_recorder.submit(ts);
+                const std::scoped_lock lock(impl_->transport_sink_mutex);
+                if (impl_->transport_sink) {
+                    impl_->transport_sink(ts);
+                }
+            });
+    }
+}
+
+void SdrDevice::set_channel_bandwidth(const std::uint32_t bandwidth_hz) {
+    impl_->active_channel_bandwidth = bandwidth_hz;
 }
 
 bool SdrDevice::start_recording(const std::filesystem::path &path,
@@ -734,14 +740,6 @@ TransportRecordingStats SdrDevice::ts_recording_stats() const {
 
 SpectrumSnapshot SdrDevice::spectrum_snapshot() const {
     return impl_->analyzer.snapshot();
-}
-
-dvbt::SignalAnalysisSnapshot SdrDevice::signal_analysis_snapshot() const {
-    return impl_->signal_analyzer.snapshot();
-}
-
-dvbt::StreamDecoderStats SdrDevice::decoder_stats() const {
-    return impl_->stream_decoder.stats();
 }
 
 std::vector<TransportService> SdrDevice::transport_services() const {

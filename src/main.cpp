@@ -1,5 +1,7 @@
 #include "airspy_tv/sdr.hpp"
 
+#include "airspy_tv/dvbt/signal_analyzer.hpp"
+#include "airspy_tv/dvbt/stream_decoder.hpp"
 #include "airspy_tv/epg.hpp"
 #include "airspy_tv/iq_file.hpp"
 #include "airspy_tv/mpv_player.hpp"
@@ -177,6 +179,10 @@ struct AppState {
     std::vector<TransportService> services;
     std::optional<std::uint16_t> selected_service_id;
     ReceiverParameters dvbt_parameters;
+    // The concrete DVB-T demodulator is injected into the receiver; the raw
+    // pointer stays valid for the DVB-T-specific GUI panels.
+    std::unique_ptr<StreamDecoder> demodulator;
+    StreamDecoder *dvbt_demod{};
     WaterfallDisplay waterfall;
     SDL_Window *window{};
     std::shared_ptr<FileDialogState> file_dialog{
@@ -787,7 +793,9 @@ void draw_source_panel(AppState &state) {
                            &decoder_threads)) {
         decoder_threads = std::min(decoder_threads, std::uint32_t{256});
         state.dvbt_parameters.worker_threads = decoder_threads;
-        state.receiver.set_dvbt_parameters(state.dvbt_parameters);
+        state.dvbt_demod->set_parameters(state.dvbt_parameters);
+        state.receiver.set_channel_bandwidth(
+            state.dvbt_parameters.channel_bandwidth_hz);
     }
     ImGui::EndDisabled();
     ImGui::TextDisabled("0 = Auto (%zu logical CPUs)",
@@ -808,7 +816,9 @@ void draw_source_panel(AppState &state) {
     }
     if (selected_iq_source.has_value()) {
         std::string error;
-        state.receiver.set_dvbt_parameters(state.dvbt_parameters);
+        state.dvbt_demod->set_parameters(state.dvbt_parameters);
+        state.receiver.set_channel_bandwidth(
+            state.dvbt_parameters.channel_bandwidth_hz);
         if (state.receiver.open_iq_file(*selected_iq_source, state.settings,
                                         error) &&
             state.receiver.start_stream(state.settings, error)) {
@@ -858,7 +868,9 @@ void draw_source_panel(AppState &state) {
         ImGui::BeginDisabled(state.enumeration.devices.empty());
         if (ImGui::Button("Open device", ImVec2(-1.0F, 0.0F))) {
             std::string error;
-            state.receiver.set_dvbt_parameters(state.dvbt_parameters);
+            state.dvbt_demod->set_parameters(state.dvbt_parameters);
+            state.receiver.set_channel_bandwidth(
+                state.dvbt_parameters.channel_bandwidth_hz);
             const DeviceDescriptor &descriptor =
                 state.enumeration.devices[state.selected_device];
             if (state.receiver.open(descriptor, error)) {
@@ -1139,7 +1151,9 @@ void draw_receiver_panel(AppState &state) {
                   code_rate_values[static_cast<std::size_t>(code_rate - 1)]};
 
     if (parameters_changed) {
-        state.receiver.set_dvbt_parameters(state.dvbt_parameters);
+        state.dvbt_demod->set_parameters(state.dvbt_parameters);
+        state.receiver.set_channel_bandwidth(
+            state.dvbt_parameters.channel_bandwidth_hz);
         state.status = "DVB-T parameters updated; receiver reacquiring";
     }
     ImGui::PopID();
@@ -1501,6 +1515,8 @@ void draw_sidebar(AppState &state) {
             state.receiver.set_display_smoothing(
                 state.fft_smoothing, state.fft_smoothing_speed,
                 state.snr_smoothing, state.snr_smoothing_speed);
+            state.dvbt_demod->set_snr_smoothing(state.snr_smoothing,
+                                                state.snr_smoothing_speed);
         }
         ImGui::PopID();
     }
@@ -2003,8 +2019,8 @@ void draw_application(AppState &state) {
     }
     state.player.poll_events();
     state.spectrum = state.receiver.spectrum_snapshot();
-    state.signal_analysis = state.receiver.signal_analysis_snapshot();
-    state.decoder = state.receiver.decoder_stats();
+    state.signal_analysis = state.dvbt_demod->analysis_snapshot();
+    state.decoder = state.dvbt_demod->stats();
     state.services = state.receiver.transport_services();
     if (!state.services.empty() &&
         std::ranges::none_of(state.services, [&state](const auto &service) {
@@ -2148,6 +2164,9 @@ int inspect_iq_cli(const std::filesystem::path &path,
                    const std::uint32_t raw_sample_rate_hz,
                    const std::uint64_t raw_center_frequency_hz) {
     SdrDevice receiver;
+    auto demodulator = std::make_unique<StreamDecoder>();
+    StreamDecoder *dvbt_demod = demodulator.get();
+    receiver.set_demodulator(std::move(demodulator));
     SourceSettings settings;
     settings.sample_rate_hz = raw_sample_rate_hz;
     settings.center_frequency_hz = raw_center_frequency_hz;
@@ -2164,7 +2183,7 @@ int inspect_iq_cli(const std::filesystem::path &path,
         std::chrono::steady_clock::now() + std::chrono::seconds(6);
     while (std::chrono::steady_clock::now() < deadline) {
         spectrum = receiver.spectrum_snapshot();
-        analysis = receiver.signal_analysis_snapshot();
+        analysis = dvbt_demod->analysis_snapshot();
         if (spectrum.sequence >= 50 && analysis.locked) {
             break;
         }
@@ -2552,6 +2571,10 @@ int main(const int argc, char **argv) {
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
     AppState state;
+    state.demodulator = std::make_unique<StreamDecoder>();
+    state.dvbt_demod = state.demodulator.get();
+    state.dvbt_demod->set_parameters(state.dvbt_parameters);
+    state.receiver.set_demodulator(std::move(state.demodulator));
     state.window = window;
     std::string player_error;
     if (!state.player.initialize(player_error)) {

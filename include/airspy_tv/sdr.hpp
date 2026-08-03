@@ -1,7 +1,6 @@
 #pragma once
 
-#include "airspy_tv/dvbt/signal_analyzer.hpp"
-#include "airspy_tv/dvbt/stream_decoder.hpp"
+#include "airspy_tv/demodulator.hpp"
 #include "airspy_tv/recorder.hpp"
 #include "airspy_tv/spectrum.hpp"
 #include "airspy_tv/transport_stream.hpp"
@@ -70,7 +69,13 @@ class SdrDevice {
     bool set_bias_tee(bool enabled, std::string &error);
     void set_display_smoothing(bool fft_enabled, int fft_speed,
                                bool snr_enabled, int snr_speed);
-    void set_dvbt_parameters(const dvbt::ReceiverParameters &parameters);
+    // Install the standard demodulator. The demodulator takes over the
+    // MPEG-TS pipeline (service model, TS recorder, transport sink) via its
+    // transport callback. Standard-specific parameters are configured on the
+    // concrete type before injection. A null demodulator disconnects the
+    // pipeline.
+    void set_demodulator(std::unique_ptr<Demodulator> demodulator);
+    void set_channel_bandwidth(std::uint32_t bandwidth_hz);
 
     bool start_recording(const std::filesystem::path &path,
                          const SourceSettings &settings, std::string &error);
@@ -89,8 +94,6 @@ class SdrDevice {
     [[nodiscard]] RecordingStats recording_stats() const;
     [[nodiscard]] TransportRecordingStats ts_recording_stats() const;
     [[nodiscard]] SpectrumSnapshot spectrum_snapshot() const;
-    [[nodiscard]] dvbt::SignalAnalysisSnapshot signal_analysis_snapshot() const;
-    [[nodiscard]] dvbt::StreamDecoderStats decoder_stats() const;
     [[nodiscard]] std::vector<TransportService> transport_services() const;
     [[nodiscard]] std::string runtime_error() const;
 

@@ -11,10 +11,8 @@ extern "C" {
 #include <cstdint>
 #include <deque>
 #include <limits>
-#include <ranges>
 #include <span>
 #include <stdexcept>
-#include <utility>
 #include <vector>
 
 namespace airspy_tv::fec {

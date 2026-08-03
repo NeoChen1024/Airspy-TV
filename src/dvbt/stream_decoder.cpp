@@ -564,6 +564,7 @@ struct StreamDecoder::Impl {
     TransportCallback callback;
     EqualizedCallback equalized_callback;
     ReceiverParameters parameters;
+    dvbt::SignalAnalyzer analyzer;
     std::optional<TransmissionMode> stable_mode;
     std::optional<GuardInterval> stable_guard;
     StreamDecoderStats latest;
@@ -1289,6 +1290,8 @@ void StreamDecoder::submit(const std::span<const std::int16_t> interleaved_iq,
         (interleaved_iq.size() % 2) != 0) {
         return;
     }
+    impl_->analyzer.submit(interleaved_iq, sample_rate_hz,
+                           channel_bandwidth_hz);
     const std::scoped_lock lock(impl_->mutex);
     const std::size_t incoming_samples = interleaved_iq.size() / 2;
     impl_->input_queue_capacity_samples =
@@ -1351,6 +1354,7 @@ void StreamDecoder::wait_until_idle() {
 }
 
 void StreamDecoder::reset() {
+    impl_->analyzer.reset();
     impl_->cancel_requested = true;
     {
         const std::scoped_lock lock(impl_->mutex);
@@ -1361,6 +1365,7 @@ void StreamDecoder::reset() {
 }
 
 void StreamDecoder::set_parameters(const ReceiverParameters &parameters) {
+    impl_->analyzer.set_parameters(parameters);
     {
         const std::scoped_lock lock(impl_->mutex);
         impl_->parameters = parameters;
@@ -1392,6 +1397,32 @@ StreamDecoderStats StreamDecoder::stats() const {
     statistics.processing = impl_->worker_busy || impl_->fec_worker_busy ||
                             !impl_->queue.empty() || !impl_->fec_queue.empty();
     return statistics;
+}
+
+DemodulatorStats StreamDecoder::demodulator_stats() const {
+    const auto statistics = stats();
+    DemodulatorStats result;
+    result.locked = statistics.ofdm_locked;
+    result.mer_db = statistics.mer_db;
+    if (statistics.transport.pre_viterbi_compared_bits != 0) {
+        result.ber =
+            static_cast<float>(statistics.transport.pre_viterbi_error_bits) /
+            static_cast<float>(statistics.transport.pre_viterbi_compared_bits);
+    }
+    result.worker_threads = statistics.resample_workers +
+                            statistics.symbol_workers +
+                            statistics.transport.viterbi_workers;
+    result.transport_bytes = statistics.transport_bytes;
+    result.processing = statistics.processing;
+    return result;
+}
+
+SignalAnalysisSnapshot StreamDecoder::analysis_snapshot() const {
+    return impl_->analyzer.snapshot();
+}
+
+void StreamDecoder::set_snr_smoothing(const bool enabled, const int speed) {
+    impl_->analyzer.set_snr_smoothing(enabled, speed);
 }
 
 } // namespace airspy_tv::dvbt
