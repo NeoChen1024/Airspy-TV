@@ -19,6 +19,10 @@ independently.
 - Overlap-save processing across raw-I/Q chunks with exact 188-byte TS packet
   joining, so independently acquired frontend/FEC windows do not create an
   output discontinuity at every internal chunk boundary.
+- A sidebar EPG panel shows the selected service's now/next guide, parsed from
+  EIT present/following and TDT/TOT clock data in the decoded transport
+  stream, with iconv-based DVB text decoding (Big5, GB2312, EUC-KR,
+  ISO-8859-x, and the Taiwan mislabeled-UTF-16 quirk).
 
 ## DVB-T reference receiver
 
@@ -195,6 +199,11 @@ Completed checks:
   byte-identical across tested 1/2/4/8/16-thread budgets.
 - Optimized Debug and Release builds run the same decoder tests and raw-IQ
   pipeline.
+- EIT present/following and TDT/TOT parsing plus DVB text decoding are
+  verified against decoded captures of two Taiwanese muxes (581 MHz TTV,
+  557 MHz FTV). Program names, start times, durations, and running status
+  match the broadcast schedules; both muxes use the 14-byte EIT header with
+  the service id in the table_id extension.
 
 Remaining receiver validation:
 
@@ -226,13 +235,20 @@ Next decoder step:
 
 ## Transport stream and playback
 
-- PAT, PMT, and SDT section assembly, CRC validation, service/component
-  discovery, and the bottom-right service selector are implemented. Selection
-  currently describes the MPTS only; add PID filtering or libmpv program
-  selection before presenting it as playback channel switching.
-- Parse EIT present/following and schedule tables for EPG, plus TDT/TOT clock
-  data, DVB text encodings, multilingual service/event descriptors, parental
-  ratings, subtitles, teletext, and alternate audio/language tracks.
+- PAT, PMT, and SDT section assembly, CRC validation, and service/component
+  discovery are implemented. The video-footer service selector feeds the
+  selected service's PMT, PCR, audio, and video PIDs to libmpv (with
+  `MpvPlayer::packet_selected`) while retaining required PSI/SI packets;
+  selecting the same service a second time is a no-op.
+- EIT present/following (now/next) and TDT/TOT clock data are parsed into the
+  sidebar EPG panel, with DVB text decoding (Big5, GB2312, EUC-KR,
+  ISO-8859-x, and the Taiwan mislabeled-UTF-16 quirk) through glibc iconv.
+  Real EIT sections put the service id in the table_id extension and carry
+  transport_stream_id, original_network_id, segment_last_section_number, and
+  last_table_id before the event loop, so events begin at byte 14 of the
+  section. Still to add: EIT schedule (0x50-0x5F) with segment reassembly,
+  multilingual service/event descriptors, parental ratings, subtitles,
+  teletext, and alternate audio/language tracks.
 - Feed a selected service to libmpv and render video into the application-owned
   OpenGL framebuffer.
 - Reset playback state cleanly after source discontinuities, retunes, or

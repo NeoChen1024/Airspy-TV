@@ -2,8 +2,8 @@
 
 Airspy TV is a standalone C++20 DVB-T receiver that turns live SDR or recorded
 I/Q samples into watchable television. It includes a native DVB-T decoder,
-real-time RF diagnostics, service selection, embedded libmpv playback, and raw
-I/Q/MPEG-TS recording in one application.
+real-time RF diagnostics, service selection, a now/next EPG guide, embedded
+libmpv playback, and raw I/Q/MPEG-TS recording in one application.
 
 ![Airspy TV receiving and playing a Taiwanese DVB-T service](images/Screenshot_20260803_142304.jpg)
 
@@ -29,6 +29,9 @@ processing path used by the command-line I/Q-to-TS tool.
   testing.
 - Embedded libmpv video/audio playback rendered into the application OpenGL
   surface, with service selection, volume, and mute controls.
+- Sidebar EPG now/next guide for the selected service, decoded from EIT
+  present/following and TDT/TOT clock data with iconv-based DVB text support
+  (Big5, GB2312, EUC-KR, ISO-8859-x, and the Taiwan mislabeled-UTF-16 quirk).
 - Raw CS16 I/Q and full-multiplex MPEG-TS recording with duration, size,
   throughput, and drop telemetry.
 - Real-time replay of application sidecars and raw `airspy_rx` INT16_IQ files.
@@ -48,7 +51,10 @@ Airspy / SoapySDR / CS16 file
 ```
 
 Clean 557 MHz and 581 MHz Airspy recordings recover valid transport streams and
-play in the GUI. Weak signals and difficult multipath environments remain
+play in the GUI. EIT present/following data from the same streams drives the
+EPG panel, which shows the selected service's current and next programs with
+correct names, times, and durations for both Taiwanese broadcasters (581 MHz
+TTV and 557 MHz FTV). Weak signals and difficult multipath environments remain
 experimental while carrier, sample-clock, and channel tracking are improved.
 DVB-T2 is not currently implemented.
 
@@ -91,9 +97,10 @@ Open a native Airspy, a compatible SoapySDR device, or an I/Q recording, then:
    digit currently under the pointer.
 3. Leave DVB-T mode parameters on Auto for TPS discovery, or set them manually
    for diagnostics.
-4. Wait for OFDM and TS lock, then choose a service below the video surface.
+4. Wait for OFDM and TS lock, then choose a service in the video footer.
 5. Adjust volume or mute playback, and optionally record raw I/Q or the full
-   MPEG transport stream.
+   MPEG transport stream. The EPG sidebar panel follows the selected service
+   and shows its current and next programs.
 
 The service selector filters playback to the selected service's PMT, PCR,
 audio, and video PIDs while retaining required PSI/SI packets. MPEG-TS recording
