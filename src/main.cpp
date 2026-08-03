@@ -1267,15 +1267,13 @@ void draw_epg_panel(AppState &state) {
             return state.selected_service_id == service.service_id;
         });
     if (selected_service != state.services.end()) {
-        ImGui::TextDisabled("%s",
-                            selected_service->name.empty()
-                                ? std::format("Service {}",
-                                              selected_service->service_id)
-                                      .c_str()
-                                : std::format("{}  ({})",
-                                              selected_service->name,
-                                              selected_service->service_id)
-                                      .c_str());
+        ImGui::TextDisabled(
+            "%s", selected_service->name.empty()
+                      ? std::format("Service {}", selected_service->service_id)
+                            .c_str()
+                      : std::format("{}  ({})", selected_service->name,
+                                    selected_service->service_id)
+                            .c_str());
     }
     const EpgSnapshot snapshot = state.epg.snapshot(*state.selected_service_id);
     if (snapshot.events.empty()) {
@@ -1319,14 +1317,15 @@ void draw_epg_panel(AppState &state) {
                                   full_width_space) == 0);
         };
         while (begin < end && is_space(text, begin)) {
-            begin += text[begin] == ' ' || text[begin] == '\t' ? 1
-                                                                : full_width_space.size();
+            begin += text[begin] == ' ' || text[begin] == '\t'
+                         ? 1
+                         : full_width_space.size();
         }
         while (end > begin) {
-            const std::size_t previous = end - (text[end - 1] == ' ' ||
-                                                        text[end - 1] == '\t'
-                                                    ? 1
-                                                    : full_width_space.size());
+            const std::size_t previous =
+                end - (text[end - 1] == ' ' || text[end - 1] == '\t'
+                           ? 1
+                           : full_width_space.size());
             if (!is_space(text, previous)) {
                 break;
             }
