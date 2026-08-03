@@ -218,6 +218,44 @@ Remaining receiver validation:
 
 Next decoder step:
 
+Completed (validated 2026-08 on 557M/581mhz field captures):
+
+- Continuous front-end tracking across processing chunks: the CFO loop
+  (tracked_cfo_phase/residual_phase_ema), integer carrier offset, and
+  continual-carrier reference now carry across chunks; the per-chunk CP
+  acquisition is a monitor that re-anchors the window and verifies mode/guard.
+  Carrier-frequency tracking resumes warm instead of re-converging from the
+  noisy acquisition phase estimate every 0.7 s.
+- The CFO loop only updates from a contiguous symbol pair; the first symbol of
+  a chunk is ~65 symbols earlier than the previous chunk's last symbol (the
+  100 ms overlap), and feeding that rewind to the temporal-correlation loop
+  overshot the frequency by ~13x at every chunk head. A start-contiguity
+  guard (start == previous_symbol_start + period) skips the update instead.
+- TPS superframe state is deliberately NOT carried: the differential TPS
+  decoder is also sequence-sensitive, and the overlap rewind corrupts its
+  frame sync and symbol index for the whole chunk (locked stays true while
+  the index drifts). Each chunk re-locks TPS (~68 symbols) and the
+  pending-symbol buffer absorbs the gap losslessly.
+- MER gate: equalized symbols are buffered until the chunk's own symbol
+  quality is known, then enqueued to the FEC (or discarded). The gate skips
+  the Viterbi only when even the chunk's best-10% symbols fall below the
+  constellation floor (QPSK 5 / 16-QAM 10 / 64-QAM 14 dB + 4 dB margin), so
+  faded-head/recovered-tail chunks still decode while hopeless chunks are
+  spared the Viterbi grind. Front-end tracking continues regardless.
+
+Measured before/after (121 s 581 MHz + 135 s 557 MHz captures, 64-QAM):
+
+- 581 MHz (multipath valley 10.3-33.7 s): TS 183,999,360 bytes before and
+  after (identical), RS failures 4/4, join-failures 41/41, valley gap ~23 s
+  unchanged (signal physically undecodable there), carried state 155/157
+  chunks; wall time 171.5 s -> 25.1 s (6.8x) with the MER gate.
+- 557 MHz (uniform MER 8-12 dB, ~10 dB below the 64-QAM threshold): TS 0
+  before and after (physics), wall time 800 s -> 19.3 s (41x) via the gate.
+- Clean-signal regression: the 557-first-chunk fixture still decodes
+  byte-identical (MD5 eabba87cccf3dd29a3ef18a8e23ecdd9); 3/3 ctest.
+
+Remaining:
+
 - Replace overlap-save reacquisition with persistent rational-resampler,
   OFDM/TPS tracking, and FEC/outer-sync state where that improves throughput or
   weak-signal robustness. Exact TS packet joining already prevents internal
@@ -226,8 +264,10 @@ Next decoder step:
   correctness blocker.
 - Add continuous sample-clock and channel tracking across processing chunks;
   the current frontend is measurably less robust on captured multipath signals
-  than the reference receiver.
-- Turn the stateful frontend into one continuous stream pipeline:
+  than the reference receiver. (On Airspy R2 the 0.5 ppm TCXO drifts only
+  ~2.4 samples per chunk, so fractional timing is a SoapySDR-generic path
+  concern rather than an R2 one.)
+- Turn the remaining stateful frontend into one continuous stream pipeline:
 
   ```text
   streaming rational resampler
@@ -239,13 +279,15 @@ Next decoder step:
   ```
 
   Preserve resampler phase and filter history, fractional symbol position,
-  sample-clock-rate estimate, carrier phase/frequency, channel history, and TPS
-  state across input blocks. Keep this time-ordered frontend serial (or use an
-  explicit ordered state handoff), then dispatch FFT/equalization/demapping and
-  FEC work that is safe to parallelize. The current 100 ms overlap remains the
-  fallback reacquisition and discontinuity bridge until this path is validated;
-  afterwards reduce or remove routine overlap and reserve full reacquisition for
-  source drops, seeks, retunes, parameter changes, and genuine lock loss.
+  sample-clock-rate estimate, and channel history across input blocks (carrier
+  phase/frequency already carries, with a contiguity guard; TPS cannot carry
+  while the overlap rewinds the symbol sequence). Keep this time-ordered
+  frontend serial (or use an explicit ordered state handoff), then dispatch
+  FFT/equalization/demapping and FEC work that is safe to parallelize. The
+  current 100 ms overlap remains the fallback reacquisition and discontinuity
+  bridge until this path is validated; afterwards reduce or remove routine
+  overlap and reserve full reacquisition for source drops, seeks, retunes,
+  parameter changes, and genuine lock loss.
 - Carry validated TPS frame/superframe index and cell ID across chunks, and add
   deterministic decoder reset tags when TPS parameters change.
 - Eliminate duplicated GUI-monitor/frontend work by publishing constellation

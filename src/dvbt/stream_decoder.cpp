@@ -519,6 +519,8 @@ struct StreamDecoder::Impl {
     };
     struct ChunkSummary {
         bool ofdm_locked{};
+        bool state_carried{};
+        bool fec_skipped{};
         bool tps_locked{};
         TpsParameters tps_parameters{};
         int carrier_bin_offset{};
@@ -539,6 +541,31 @@ struct StreamDecoder::Impl {
         std::size_t symbol_workers{};
         std::chrono::steady_clock::time_point started_at{};
     };
+    // Continuous front-end tracking state carried across processing chunks.
+    // The worker thread owns this; decode_chunk() reads and updates it
+    // directly. A chunk whose acquisition agrees with the carried mode/guard
+    // resumes tracking instead of cold-starting the CFO loop, carrier search,
+    // continual-carrier reference, and TPS superframe from scratch.
+    struct FrontendState {
+        bool valid{false};
+        TransmissionMode mode{TransmissionMode::k8};
+        GuardInterval guard{GuardInterval::gi_1_4};
+        std::size_t fft_size{};
+        std::size_t guard_size{};
+        float tracked_cfo_phase{0.0F};
+        float residual_phase_ema{0.0F};
+        int carrier_offset{std::numeric_limits<int>::max()};
+        std::vector<std::complex<float>> previous_continual;
+        int previous_phase{-1};
+        std::uint64_t phase_discontinuities{0};
+        std::size_t consecutive_acquisition_failures{0};
+    };
+    // NOTE: TPS superframe state is deliberately NOT carried across chunks.
+    // The 100 ms overlap re-decodes ~65 symbols, so the first symbol of a
+    // chunk is always EARLIER than the previous chunk's last symbol; feeding
+    // that non-contiguous sequence to the differential TPS decoder corrupts
+    // the frame sync and symbol index. Each chunk re-locks TPS (~68 symbols)
+    // and the pending-symbol buffer absorbs the gap losslessly.
     struct FecItem {
         enum class Kind { begin, symbol, end };
 
@@ -567,6 +594,7 @@ struct StreamDecoder::Impl {
     dvbt::SignalAnalyzer analyzer;
     std::optional<TransmissionMode> stable_mode;
     std::optional<GuardInterval> stable_guard;
+    FrontendState frontend;
     StreamDecoderStats latest;
     std::atomic<bool> cancel_requested{};
     bool stopping{};
@@ -596,6 +624,19 @@ struct StreamDecoder::Impl {
         fec_not_full.notify_all();
         worker.join();
         fec_worker.join();
+    }
+
+    void reset_frontend_state() noexcept {
+        frontend.valid = false;
+        frontend.fft_size = 0;
+        frontend.guard_size = 0;
+        frontend.tracked_cfo_phase = 0.0F;
+        frontend.residual_phase_ema = 0.0F;
+        frontend.carrier_offset = std::numeric_limits<int>::max();
+        frontend.previous_continual.clear();
+        frontend.previous_phase = -1;
+        frontend.phase_discontinuities = 0;
+        frontend.consecutive_acquisition_failures = 0;
     }
 
     [[nodiscard]] bool enqueue_fec(FecItem item) {
@@ -660,6 +701,26 @@ struct StreamDecoder::Impl {
             latest.guard_size =
                 static_cast<std::uint32_t>(acquisition.guard_size);
         }
+        const bool carried = frontend.valid &&
+                             frontend.mode == acquisition.mode &&
+                             frontend.guard == acquisition.guard;
+        frontend.mode = acquisition.mode;
+        frontend.guard = acquisition.guard;
+        frontend.fft_size = acquisition.fft_size;
+        frontend.guard_size = acquisition.guard_size;
+        frontend.consecutive_acquisition_failures = 0;
+        frontend.valid = true;
+        if (!carried) {
+            // Cold start: seed the continuous tracking state from this
+            // chunk's acquisition estimate instead of resuming carried state.
+            frontend.tracked_cfo_phase =
+                std::arg(acquisition.phase) /
+                static_cast<float>(acquisition.fft_size);
+            frontend.residual_phase_ema = 0.0F;
+            frontend.carrier_offset = std::numeric_limits<int>::max();
+            frontend.previous_continual.clear();
+            frontend.previous_phase = -1;
+        }
         const std::size_t maximum =
             acquisition.mode == TransmissionMode::k8 ? 6816 : 1704;
         const std::span<const int> continual = continual_2k;
@@ -688,8 +749,7 @@ struct StreamDecoder::Impl {
         if (plan == nullptr) {
             return;
         }
-        float tracked_cfo_phase = std::arg(acquisition.phase) /
-                                  static_cast<float>(acquisition.fft_size);
+        float &tracked_cfo_phase = frontend.tracked_cfo_phase;
         const std::size_t period =
             acquisition.fft_size + acquisition.guard_size;
         std::vector<std::size_t> continual_indices;
@@ -714,9 +774,9 @@ struct StreamDecoder::Impl {
                 }
             }
         }
-        int carrier_offset = std::numeric_limits<int>::max();
-        int previous_phase = -1;
-        std::uint64_t phase_discontinuities = 0;
+        int &carrier_offset = frontend.carrier_offset;
+        int &previous_phase = frontend.previous_phase;
+        std::uint64_t &phase_discontinuities = frontend.phase_discontinuities;
         double mer_sum = 0.0;
         float demap_time_sum = 0.0F;
         float deinterleave_time_sum = 0.0F;
@@ -758,10 +818,29 @@ struct StreamDecoder::Impl {
         if (decoder_parameters && !start_decoder()) {
             return;
         }
+        // MER gate: equalized symbols whose mean falls far below the
+        // constellation's decode floor cannot be FEC-decoded (deep multipath
+        // fades). Symbols are buffered until the whole chunk's MER is known,
+        // so a chunk whose head is faded but whose tail recovers is decoded
+        // normally, while a hopeless chunk discards its symbols and spares
+        // the Viterbi from grinding them. Front-end tracking is unaffected.
+        const auto fec_floor = [](const Constellation constellation) {
+            switch (constellation) {
+            case Constellation::qpsk:
+                return 5.0F;
+            case Constellation::qam16:
+                return 10.0F;
+            case Constellation::qam64:
+                return 14.0F;
+            }
+            return 14.0F;
+        };
+        std::vector<PostprocessedSymbol> chunk_symbols;
+        chunk_symbols.reserve(1024);
         const auto emit_postprocessed =
-            [this, generation, &mer_sum, &demap_time_sum,
-             &deinterleave_time_sum,
-             &depuncture_time_sum](std::vector<PostprocessedSymbol> symbols) {
+            [this, &mer_sum, &demap_time_sum, &deinterleave_time_sum,
+             &depuncture_time_sum,
+             &chunk_symbols](std::vector<PostprocessedSymbol> symbols) {
                 for (auto &symbol : symbols) {
                     mer_sum += symbol.mer_db;
                     demap_time_sum += symbol.demap_time_ms;
@@ -776,15 +855,7 @@ struct StreamDecoder::Impl {
                         equalized_sink(symbol.carriers, symbol.reliabilities,
                                        symbol.symbol_index);
                     }
-                    if (!enqueue_fec(
-                            {.kind = FecItem::Kind::symbol,
-                             .generation = generation,
-                             .parameters = {},
-                             .mother_metrics = std::move(symbol.mother_metrics),
-                             .symbol_index = symbol.symbol_index,
-                             .summary = {}})) {
-                        return false;
-                    }
+                    chunk_symbols.push_back(std::move(symbol));
                 }
                 return true;
             };
@@ -796,7 +867,11 @@ struct StreamDecoder::Impl {
             acquisition.start + acquisition.guard_size;
         float nco_phase =
             tracked_cfo_phase * static_cast<float>(first_fft_start);
-        std::vector<std::complex<float>> previous_continual;
+        std::vector<std::complex<float>> &previous_continual =
+            frontend.previous_continual;
+        // TPS state is per-chunk: the overlap re-decodes earlier symbols at
+        // every chunk boundary, which would corrupt a carried differential
+        // TPS decoder (see the FrontendState comment).
         TpsDecoder tps_decoder;
         TpsSnapshot tps_snapshot;
         struct PendingSymbol {
@@ -805,8 +880,12 @@ struct StreamDecoder::Impl {
             std::size_t fallback_index{};
         };
         std::deque<PendingSymbol> pending_symbols;
-        float residual_phase_ema = 0.0F;
+        float &residual_phase_ema = frontend.residual_phase_ema;
         std::uint64_t symbol_count = 0;
+        const std::uint64_t phase_discontinuity_base =
+            frontend.phase_discontinuities;
+        std::size_t previous_symbol_start =
+            std::numeric_limits<std::size_t>::max();
         for (std::size_t start = first_fft_start;
              start + acquisition.fft_size <= samples.size() &&
              !cancel_requested;
@@ -836,7 +915,13 @@ struct StreamDecoder::Impl {
                     carrier(fft_out, k, maximum, carrier_offset));
             }
             float residual_phase = 0.0F;
-            if (previous_continual.size() == current_continual.size()) {
+            // Only update the CFO loop from a contiguous symbol pair. The
+            // first symbol of a chunk follows the previous chunk's last symbol
+            // by the overlap (~65 symbols earlier), so its temporal
+            // correlation would measure 65x the true residual and overshoot;
+            // the carried frequency is already converged, so skip the update.
+            if (previous_continual.size() == current_continual.size() &&
+                start == previous_symbol_start + period) {
                 std::complex<float> temporal_correlation{};
                 for (std::size_t i = 0; i < current_continual.size(); ++i) {
                     temporal_correlation +=
@@ -849,6 +934,7 @@ struct StreamDecoder::Impl {
                 residual_phase_ema =
                     (0.1F * residual_phase) + (0.9F * residual_phase_ema);
             }
+            previous_symbol_start = start;
             previous_continual = std::move(current_continual);
             std::vector<std::complex<float>> channel(maximum + 1);
             const auto &pilots =
@@ -961,6 +1047,45 @@ struct StreamDecoder::Impl {
             !emit_postprocessed(postprocessor->flush())) {
             return;
         }
+        // Decide the MER gate from the chunk's symbol quality, then enqueue
+        // the buffered symbols (or discard them as hopeless). A faded-head /
+        // recovered-tail chunk must still decode, so the gate skips the FEC
+        // only when even the chunk's best symbols fall below the floor: a
+        // uniformly hopeless chunk is spared the Viterbi grind entirely.
+        bool fec_skipped = false;
+        if (!cancel_requested && !chunk_symbols.empty() && decoder_parameters) {
+            const float floor = fec_floor(decoder_parameters->constellation);
+            std::vector<float> mers;
+            mers.reserve(chunk_symbols.size());
+            for (const auto &symbol : chunk_symbols) {
+                mers.push_back(symbol.mer_db);
+            }
+            const std::size_t top = std::max<std::size_t>(1, mers.size() / 10);
+            std::ranges::nth_element(
+                mers,
+                mers.begin() + static_cast<std::ptrdiff_t>(mers.size() - top));
+            double best = 0.0;
+            for (std::size_t index = mers.size() - top; index < mers.size();
+                 ++index) {
+                best += mers[index];
+            }
+            best /= static_cast<double>(top);
+            fec_skipped = static_cast<float>(best) < floor + 4.0F;
+            if (!fec_skipped) {
+                for (auto &symbol : chunk_symbols) {
+                    if (!enqueue_fec(
+                            {.kind = FecItem::Kind::symbol,
+                             .generation = generation,
+                             .parameters = {},
+                             .mother_metrics = std::move(symbol.mother_metrics),
+                             .symbol_index = symbol.symbol_index,
+                             .summary = {}})) {
+                        break;
+                    }
+                }
+            }
+            chunk_symbols.clear();
+        }
         fftwf_destroy_plan(plan);
         const auto equalized_at = std::chrono::steady_clock::now();
         if (cancel_requested) {
@@ -968,6 +1093,8 @@ struct StreamDecoder::Impl {
         }
         const ChunkSummary summary{
             .ofdm_locked = symbol_count != 0,
+            .state_carried = carried,
+            .fec_skipped = fec_skipped,
             .tps_locked = tps_snapshot.locked,
             .tps_parameters = tps_snapshot.parameters,
             .carrier_bin_offset = carrier_offset,
@@ -979,7 +1106,8 @@ struct StreamDecoder::Impl {
                 residual_phase_ema *
                 (static_cast<float>(bandwidth) * (8.0F / 7.0F)) /
                 (2.0F * std::numbers::pi_v<float> * static_cast<float>(period)),
-            .pilot_phase_discontinuities = phase_discontinuities,
+            .pilot_phase_discontinuities =
+                phase_discontinuities - phase_discontinuity_base,
             .ofdm_symbols = symbol_count,
             .input_seconds = static_cast<float>(new_complex_samples) /
                              static_cast<float>(rate),
@@ -1178,6 +1306,8 @@ struct StreamDecoder::Impl {
                         latest.transport_time_ms =
                             decoder->timing().transport_time_ms;
                         latest.resample_workers = item.summary.resample_workers;
+                        latest.state_carried = item.summary.state_carried;
+                        latest.fec_skipped = item.summary.fec_skipped;
                     }
                 }
             }
@@ -1209,6 +1339,7 @@ struct StreamDecoder::Impl {
                     overlap_active = false;
                     stable_mode.reset();
                     stable_guard.reset();
+                    reset_frontend_state();
                     latest = {};
                     ++latest_generation;
                     reset_requested = false;
@@ -1240,6 +1371,7 @@ struct StreamDecoder::Impl {
                      accumulated_bandwidth != block.bandwidth)) {
                     accumulated.clear();
                     overlap_active = false;
+                    reset_frontend_state();
                 }
                 accumulated_rate = block.rate;
                 accumulated_bandwidth = block.bandwidth;

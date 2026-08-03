@@ -2263,7 +2263,19 @@ int inspect_iq_cli(const std::filesystem::path &path,
                   << " dB, mer=" << analysis.mer_db
                   << " dB, channel-notch=" << analysis.deepest_notch_db
                   << " dB, carrier-offset=" << analysis.carrier_offset_hz
-                  << " Hz";
+                  << " Hz, constellation=";
+        switch (analysis.constellation) {
+        case airspy_tv::dvbt::Constellation::qpsk:
+            std::cout << "QPSK";
+            break;
+        case airspy_tv::dvbt::Constellation::qam16:
+            std::cout << "16-QAM";
+            break;
+        case airspy_tv::dvbt::Constellation::qam64:
+            std::cout << "64-QAM";
+            break;
+        }
+        std::cout << "\n";
     } else {
         std::cout << ", ofdm-lock=no";
     }
@@ -2339,6 +2351,7 @@ int decode_iq_cli(const std::filesystem::path &source,
     std::uint64_t reported_transport_bytes = 0;
     std::uint64_t reported_overlap_packets = 0;
     std::uint64_t reported_join_failures = 0;
+    std::uint64_t reported_phase_discontinuities = 0;
     const auto report_chunk = [&](const StreamDecoderStats &stats) {
         reported_processed_chunks = stats.processed_chunks;
         reported_processed_samples = stats.processed_input_samples;
@@ -2350,7 +2363,14 @@ int decode_iq_cli(const std::filesystem::path &source,
         std::cerr << "chunk=" << stats.processed_chunks
                   << " input=" << stats.processed_input_samples
                   << " samples TS=" << stats.transport_bytes
-                  << " bytes realtime-speed=" << realtime_speed << "x\n";
+                  << " bytes realtime-speed=" << realtime_speed << "x";
+        if (stats.mer_db != 0.0F) {
+            std::cerr << " MER=" << stats.mer_db << " dB";
+        }
+        std::cerr << " carrier=" << stats.carrier_bin_offset
+                  << " residual=" << stats.residual_carrier_offset_hz << " Hz"
+                  << " carried=" << (stats.state_carried ? 1 : 0)
+                  << " fec-skip=" << (stats.fec_skipped ? 1 : 0) << '\n';
         if (debug) {
             std::cerr << "  stages: resample=" << stats.resample_time_ms
                       << " ms acquisition=" << stats.acquisition_time_ms
@@ -2394,6 +2414,12 @@ int decode_iq_cli(const std::filesystem::path &source,
         }
         reported_overlap_packets = stats.ts_overlap_packets;
         reported_join_failures = stats.ts_overlap_join_failures;
+        const std::uint64_t phase_delta =
+            stats.pilot_phase_discontinuities - reported_phase_discontinuities;
+        reported_phase_discontinuities = stats.pilot_phase_discontinuities;
+        if (phase_delta != 0) {
+            std::cerr << "  phase-discontinuities=" << phase_delta << '\n';
+        }
     };
     while (input && !output_failed.load(std::memory_order_relaxed)) {
         input.read(

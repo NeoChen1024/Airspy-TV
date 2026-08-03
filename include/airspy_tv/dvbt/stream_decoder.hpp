@@ -40,6 +40,8 @@ struct StreamDecoderStats {
     std::size_t resample_workers{};
     std::size_t symbol_workers{};
     std::uint64_t pilot_phase_discontinuities{};
+    bool state_carried{};
+    bool fec_skipped{};
     std::uint64_t input_blocks{};
     std::uint64_t processed_chunks{};
     std::uint64_t processed_input_samples{};
