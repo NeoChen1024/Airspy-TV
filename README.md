@@ -1,76 +1,129 @@
 # Airspy TV
 
-Airspy TV is a standalone C++20 DVB-T receiver and diagnostics application.
-The current implementation provides:
+Airspy TV is a standalone C++20 DVB-T receiver that turns live SDR or recorded
+I/Q samples into watchable television. It includes a native DVB-T decoder,
+real-time RF diagnostics, service selection, embedded libmpv playback, and raw
+I/Q/MPEG-TS recording in one application.
 
-- a single-window SDL3 + Dear ImGui interface with embedded libmpv playback;
-- an always-centered, per-digit mouse-wheel frequency control;
-- selectable 5/6/7/8 MHz DVB-T channel bandwidth applied consistently to
-  spectrum metrics, OFDM monitoring, and transport decoding;
-- native Airspy and generic SoapySDR device enumeration/opening;
-- Airspy sensitivity/linearity gain profiles;
-- bounded-queue CS16 raw I/Q recording with a JSON metadata sidecar;
-- real-time playback of recorded sidecars and raw `airspy_rx` INT16_IQ files;
-- decoder-paced offline I/Q-to-MPEG-TS extraction through the main executable;
-- live 4096-bin FFTW/VOLK spectrum, selectable-colormap waterfall, and dBFS
-  signal-power telemetry, with an adjustable display range defaulting to
-  -100/-20 dBFS;
-- live diagnostic DVB-T constellation, OFDM quality metrics, and measured
-  pre-/post-Viterbi BER;
-- a native raw-I/Q-to-MPEG-TS decoder with 2K/8K OFDM acquisition, soft
-  Viterbi, RS(204,188), and all non-hierarchical DVB-T modulation/code-rate
-  modes;
-- MPEG-TS recording with duration, size, and throughput telemetry.
-- BCH-validated TPS parameter discovery and PAT/PMT/SDT service discovery with
-  a live service-selection drop-down.
+![Airspy TV receiving and playing a Taiwanese DVB-T service](images/Screenshot_20260803_142304.jpg)
 
-The native path recovers MPEG-TS directly from an ideal centered 10 MSPS CS16
-6 MHz DVB-T waveform. Live/file I/Q sources feed the same asynchronous native
-OFDM/FEC worker and its output is routed to the GUI's TS recorder. Robust
-carrier/sample-clock tracking is still under development. Automatic transport
-decoding now waits for differential TPS synchronization and BCH validation,
-then uses the advertised constellation and high-priority code rate; manual UI
-parameters remain available as test overrides. Clean 557 MHz and 581 MHz Airspy
-recordings recover valid TS, while weak/multipath recordings remain
-experimental.
+The current receiver can lock and play clean 6 MHz Taiwanese DVB-T captures
+from an Airspy R2, including automatic TPS parameter discovery and
+PAT/PMT/SDT-based channel selection. The native decoder and GUI share the same
+processing path used by the command-line I/Q-to-TS tool.
 
-Raw-I/Q processing uses a 100 ms overlap-save boundary. The overlapping region
-is decoded independently, matched as an exact sequence of 188-byte transport
-packets, and emitted only once. This preserves multiplex continuity across
-internal processing chunks without making file input lossy; `--debug` reports
-the joined-packet and failed-join counters.
+## Highlights
 
-The right-side video surface feeds the decoded transport stream to libmpv
-through a bounded custom stream and renders video into an application-owned
-OpenGL framebuffer. PAT, PMT, and SDT populate the service drop-down; selecting
-a service restarts playback with only its PMT, PCR, audio, and video PIDs while
-retaining the required PSI/SI packets. Volume and mute are controlled directly
-from the video footer. TS recording intentionally continues to write the full
-MPTS.
+- Native Airspy R2/Mini support through libairspy, including sensitivity and
+  linearity gain profiles, Bias-T control, and dropped-sample reporting.
+- Generic SDR support through SoapySDR for compatible devices with sufficient
+  sample rate and usable bandwidth.
+- Live 4096-bin spectrum and waterfall with Blackman-Harris windowing, FFT
+  smoothing, adjustable dBFS range, and selectable tinycolormap palettes.
+- Live DVB-T constellation, signal power, CP SNR, MER, deepest-notch estimate,
+  carrier offset, pre-/post-Viterbi BER, and decoder/CPU queue diagnostics.
+- Native 2K/8K DVB-T demodulation with QPSK, 16-QAM, 64-QAM, all
+  non-hierarchical code rates, soft Viterbi, and RS(204,188) decoding.
+- BCH-validated TPS discovery of transmission mode, guard interval,
+  constellation, and high-priority code rate, with manual overrides for
+  testing.
+- Embedded libmpv video/audio playback rendered into the application OpenGL
+  surface, with service selection, volume, and mute controls.
+- Raw CS16 I/Q and full-multiplex MPEG-TS recording with duration, size,
+  throughput, and drop telemetry.
+- Real-time replay of application sidecars and raw `airspy_rx` INT16_IQ files.
+- Decoder-paced offline I/Q-to-MPEG-TS extraction without realtime throttling
+  or file-input drops.
+
+## Current status
+
+The end-to-end path is operational for clean, centered DVB-T signals:
+
+```text
+Airspy / SoapySDR / CS16 file
+        -> native DVB-T OFDM + FEC decoder
+        -> MPEG transport stream
+        -> service selection
+        -> libmpv video and audio
+```
+
+Clean 557 MHz and 581 MHz Airspy recordings recover valid transport streams and
+play in the GUI. Weak signals and difficult multipath environments remain
+experimental while carrier, sample-clock, and channel tracking are improved.
+DVB-T2 is not currently implemented.
 
 ## Build
+
+Required system libraries:
+
+- SDL3 and OpenGL
+- libairspy and SoapySDR
+- libmpv and Fontconfig
+- FFTW3f and VOLK
+- a C++20 compiler and CMake 3.25 or newer
+
+Dear ImGui, nlohmann/json, tinycolormap, liquid-dsp, and libcorrect are pinned
+under `contrib/` as Git submodules.
 
 ```sh
 git submodule update --init --recursive
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
+./build/airspy-tv
 ```
 
-Debug builds default to `-O3 -g -DNDEBUG` so the binary retains debugger
-symbols while the realtime DSP and libcorrect SIMD paths run at Release-like
-speed. Configure with `-DAIRSPY_TV_OPTIMIZED_DEBUG=OFF` when assertion-enabled,
-unoptimized debugging is more important than receiver throughput.
+Debug builds default to `-O3 -g -DNDEBUG`, retaining debugger symbols while the
+DSP and libcorrect SIMD paths run at Release-like speed. Configure with
+`-DAIRSPY_TV_OPTIMIZED_DEBUG=OFF` for an assertion-enabled, unoptimized Debug
+build.
 
-Builds also default to `-march=native` so FFT/equalizer/demapper code can use
-the build host's instruction set. Use `-DAIRSPY_TV_NATIVE_ARCH=OFF` for a
-portable binary intended to run on other CPUs.
+Builds also default to `-march=native`. Use
+`-DAIRSPY_TV_NATIVE_ARCH=OFF` when producing a portable binary for a different
+CPU.
 
-Required system libraries are SDL3, OpenGL, libairspy, SoapySDR, libmpv,
-Fontconfig, FFTW3f, VOLK, and a C++20 compiler.
-Dear ImGui, nlohmann/json, tinycolormap, liquid-dsp, and libcorrect are pinned
-submodules under `contrib/`. The native decoder uses libcorrect for soft
-Viterbi and shortened Reed-Solomon decoding, and liquid-dsp for exact rational
-input resampling. Cubehelix is the default waterfall colormap.
+## Using the receiver
+
+The Source panel exposes the decoder worker budget and available input sources.
+Open a native Airspy, a compatible SoapySDR device, or an I/Q recording, then:
+
+1. Select the DVB-T channel bandwidth (5, 6, 7, or 8 MHz).
+2. Tune the always-centered frequency control; the mouse wheel changes the
+   digit currently under the pointer.
+3. Leave DVB-T mode parameters on Auto for TPS discovery, or set them manually
+   for diagnostics.
+4. Wait for OFDM and TS lock, then choose a service below the video surface.
+5. Adjust volume or mute playback, and optionally record raw I/Q or the full
+   MPEG transport stream.
+
+The service selector filters playback to the selected service's PMT, PCR,
+audio, and video PIDs while retaining required PSI/SI packets. MPEG-TS recording
+intentionally writes the complete MPTS rather than only the selected service.
+
+## I/Q files and recording
+
+Application recordings use raw interleaved little-endian signed 16-bit I/Q
+(`ci16_le`). Stopping a recording writes a JSON sidecar beside the sample data.
+It records the data filename, sample rate, center frequency, source, duration,
+sample count, and drop counters.
+
+The sidecar and data file must remain in the same directory. Open the JSON file
+from the Source panel and Airspy TV resolves the data filename from its
+metadata. Bare `.cs16` and `.iq` files are also supported and use the
+INT16_IQ layout produced by `airspy_rx -t 2`; specify their sample rate and
+center frequency manually.
+
+| Input | Metadata | Playback behavior |
+|---|---|---|
+| Airspy native | Device/driver supplied | Live |
+| SoapySDR | Device/driver supplied | Live |
+| Airspy TV `.json` sidecar | Sample rate, center frequency, data filename | Real time |
+| Bare `.cs16` / `.iq` | Enter sample rate and center frequency manually | Real time |
+
+The raw I/Q recorder has a five-second queue. DSP queues retain approximately
+200 ms of their respective streams to tolerate ordinary scheduler jitter; RF
+input remains non-blocking because live hardware cannot accept backpressure.
+
+## Command-line tools
 
 List visible SDR devices without starting the GUI:
 
@@ -78,83 +131,69 @@ List visible SDR devices without starting the GUI:
 ./build/airspy-tv --enumerate
 ```
 
-For a short end-to-end source/recorder diagnostic using the first native Airspy
-(or first Soapy device when no native Airspy is present):
+Run a short source/recorder diagnostic using the first native Airspy, falling
+back to the first SoapySDR device:
 
 ```sh
 ./build/airspy-tv --record-first /tmp/airspy-tv-smoke.cs16 250
 ```
 
-Recordings are raw interleaved little-endian signed 16-bit I/Q (`ci16_le`).
-Stopping a recording writes `<recording>.json` with the raw data filename,
-sample rate, center frequency, source, duration, sample count, and drop
-counters. The filename is a basename only; the sidecar and raw data remain in
-the same directory.
-
-The Source panel can open either the JSON sidecar or a raw `.cs16`/`.iq` file.
-Sidecars supply the sample rate and center frequency. A bare file is interpreted
-as the same interleaved signed 16-bit I/Q layout written by `airspy_rx -t 2`;
-set its sample rate in the Source panel and its center frequency in the top bar
-before opening it. A headless file-source check is also available:
+Inspect a sidecar or bare I/Q file without starting the GUI:
 
 ```sh
 ./build/airspy-tv --inspect-iq capture.cs16.json
 ./build/airspy-tv --inspect-iq airspy-rx-output.iq 10000000 545000000
 ```
 
-Decode a finite capture to MPEG-TS without throttling it to its recorded sample
-rate with:
+Decode finite I/Q input to MPEG-TS as quickly as the CPU permits:
 
 ```sh
-./build-release/airspy-tv --decode-iq capture.cs16.json output.ts
-./build-release/airspy-tv --decode-iq airspy-rx-output.iq output.ts 10000000
-./build-release/airspy-tv --decode-iq capture.cs16.json output.ts \
+./build/airspy-tv --decode-iq capture.cs16.json output.ts
+./build/airspy-tv --decode-iq airspy-rx-output.iq output.ts 10000000
+./build/airspy-tv --decode-iq capture.cs16.json output.ts \
   --decoder-threads 8
-./build-release/airspy-tv --decode-iq capture.cs16.json output.ts --debug
+./build/airspy-tv --decode-iq capture.cs16.json output.ts --debug
 ```
 
-The decoder uses a blocking submission path for offline input and applies
-backpressure at its native processing-chunk boundary. It runs as quickly as the
-CPU permits without dropping file blocks or simulating 10 MSPS wall-clock
-playback. JSON input uses the same sidecar resolver as the GUI; the optional
-sample rate is only needed for bare raw INT16_IQ files.
+JSON input uses the same sidecar resolver as the GUI. A sample rate is only
+needed for bare INT16_IQ files. Offline decoding uses blocking submission and
+does not drop input when the decoder is slower than the file reader.
 
-The decoder's parallel-worker budget defaults to
-`std::thread::hardware_concurrency()` (logical CPUs, with a one-worker fallback
-when unavailable). It is divided between an independent-symbol postprocessing
-pool and the Viterbi window pool; the partitioned resampler reuses the full
-budget before those stages begin. `--decoder-threads N` overrides the budget
-for offline decoding; the same setting is available in the GUI Source panel and
-is deliberately locked while an SDR or I/Q file source is open. `0` selects
-the automatic default. The old `--viterbi-threads` spelling remains an alias.
-Normal progress output is one compact line per processing chunk. Pass `-d` or
-`--debug` to also print worker allocation, per-stage timing, and the final
-decoder/FEC summary.
+The decoder worker budget defaults to `std::thread::hardware_concurrency()`.
+`--decoder-threads N` overrides it; the same option appears in the GUI and is
+fixed while a source is open. `0` selects the automatic default. The legacy
+`--viterbi-threads` spelling remains an alias. Pass `-d` or `--debug` to include
+worker allocation, per-stage timings, and detailed FEC statistics.
 
-The shared GUI/CLI decoder is a bounded ordered pipeline. Its front-end performs
-partitioned rational resampling, acquisition, FFT, pilot tracking and channel
-interpolation. Resampler partitions reconstruct their FIR history and therefore
-remain bit-identical to serial liquid-dsp output. A symbol pool performs
-decision-directed gain correction, MER/error estimation and carrier reliability
-calculation, Max-Log demapping, symbol/bit deinterleaving, depuncturing, and
-soft-byte quantization out of order, then rejoins mother-code metric blocks in
-input order. The FEC worker dispatches overlapping Viterbi windows to
-independent libcorrect contexts and rejoins results before Reed-Solomon and TS
-output. A full queue applies backpressure instead of dropping symbols, because
-a single missing symbol would invalidate the stateful convolutional and
-outer-interleaver stream.
+## Decoder architecture
 
-Backpressure queues are sized by payload duration rather than callback block
-count. Raw I/Q, OFDM-symbol/FEC, and Viterbi-window queues retain approximately
-200 ms of their respective streams to tolerate ordinary OS scheduler jitter.
-Disk recorders have their own deeper buffers: five seconds of raw I/Q and more
-than five seconds of maximum-rate DVB-T transport stream. Spectrum and
-signal-quality workers remain latest-snapshot mailboxes intentionally, so a
-delayed GUI never works through stale displays.
+<details>
+<summary>Native DVB-T processing pipeline</summary>
 
-An offline GNU Radio reference transmitter can generate a deterministic ideal
-6 MHz, 8K, guard-1/4, 64-QAM, rate-2/3 fixture. This validation helper requires
-GNU Radio's Python bindings, NumPy, and FFmpeg; none are application runtime
+The shared GUI/CLI decoder is a bounded ordered pipeline. Its front end performs
+partitioned rational resampling, OFDM acquisition, FFT, pilot tracking, channel
+interpolation, decision-directed gain correction, MER estimation, carrier
+reliability calculation, Max-Log demapping, symbol/bit deinterleaving, and
+depuncturing.
+
+Independent OFDM symbols are processed by a worker pool and rejoined in input
+order. The FEC worker dispatches overlapping Viterbi windows to independent
+libcorrect contexts, performs an ordered join, then runs convolutional
+deinterleaving, Reed-Solomon decoding, energy descrambling, and TS recovery.
+
+Raw-I/Q chunks use a 100 ms overlap-save boundary. Packet-aligned overlap
+matching emits the shared transport region only once and preserves continuity
+across processing chunks. Backpressure is applied to offline decoding instead
+of dropping symbols, because a missing symbol invalidates the stateful
+convolutional and outer-interleaver stream.
+
+</details>
+
+## Reproducible test signal
+
+An offline GNU Radio reference transmitter generates a deterministic ideal
+6 MHz, 8K, guard-1/4, 64-QAM, rate-2/3 fixture. This helper requires GNU
+Radio's Python bindings, NumPy, and FFmpeg, but they are not application runtime
 dependencies.
 
 ```sh
@@ -166,7 +205,7 @@ cmake --build build-release --target airspy-tv
   /tmp/airspy-tv-ideal.cs16.json /tmp/airspy-tv-ideal-native.ts
 ```
 
-The generator also writes an application-compatible JSON I/Q sidecar and the
-unmodulated source transport stream as `airspy-tv-ideal.expected.ts`. The
-current ideal regression deterministically recovers packet-aligned TS with a
-valid PAT and PMT.
+The generator writes an application-compatible JSON sidecar and the
+unmodulated source stream as `airspy-tv-ideal.expected.ts`. The current ideal
+regression deterministically recovers packet-aligned TS with a valid PAT and
+PMT.
