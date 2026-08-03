@@ -1,5 +1,7 @@
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
 
+#include "airspy_tv/dvbt/ofdm_acquisition.hpp"
+
 #include <fftw3.h>
 
 #include <algorithm>
@@ -22,22 +24,13 @@
 namespace airspy_tv::dvbt {
 namespace {
 
+constexpr std::size_t notch_lower_percentile_divisor = 100;
+
 constexpr std::size_t raw_snapshot_samples = 350'000;
 constexpr auto analysis_interval = std::chrono::milliseconds(100);
 constexpr float analysis_rate_hz =
     1000.0F / static_cast<float>(analysis_interval.count());
-constexpr float input_scale = 32768.0F;
 constexpr float minimum_power = 1.0e-12F;
-
-struct Acquisition {
-    std::size_t cp_start{};
-    std::size_t fft_size{};
-    std::size_t guard_size{};
-    float correlation{};
-    std::complex<float> cp_phase{};
-    TransmissionMode mode{TransmissionMode::k8};
-    GuardInterval guard{GuardInterval::gi_1_4};
-};
 
 struct PilotLock {
     int phase{};
@@ -57,195 +50,16 @@ struct PilotLock {
 
 const auto prbs = pilot_prbs();
 
-[[nodiscard]] std::size_t guard_size(const std::size_t fft_size,
-                                     const GuardInterval guard) {
-    switch (guard) {
-    case GuardInterval::gi_1_32:
-        return fft_size / 32;
-    case GuardInterval::gi_1_16:
-        return fft_size / 16;
-    case GuardInterval::gi_1_8:
-        return fft_size / 8;
-    case GuardInterval::gi_1_4:
-        return fft_size / 4;
-    }
-    return fft_size / 4;
-}
-
-[[nodiscard]] std::vector<std::complex<float>>
-windowed_sinc_resample(const std::span<const std::complex<float>> input,
-                       const double output_rate_over_input_rate) {
-    constexpr std::ptrdiff_t radius = 24;
-    constexpr std::size_t phase_count = 1024;
-    constexpr std::size_t tap_count = static_cast<std::size_t>(2 * radius);
-    if (input.size() <= static_cast<std::size_t>(2 * radius) ||
-        output_rate_over_input_rate <= 0.0 ||
-        output_rate_over_input_rate > 1.0) {
-        return {};
-    }
-    const auto first_position = static_cast<double>(radius);
-    const double available =
-        static_cast<double>(input.size() - static_cast<std::size_t>(radius)) -
-        first_position;
-    const auto output_size =
-        static_cast<std::size_t>(available * output_rate_over_input_rate);
-    std::vector<std::complex<float>> output(output_size);
-    std::array<std::array<double, tap_count>, phase_count> kernels{};
-    for (std::size_t phase = 0; phase < phase_count; ++phase) {
-        const double fraction =
-            static_cast<double>(phase) / static_cast<double>(phase_count);
-        double weight_sum = 0.0;
-        for (std::ptrdiff_t tap = -radius + 1; tap <= radius; ++tap) {
-            const double distance = fraction - static_cast<double>(tap);
-            const double argument = std::numbers::pi_v<double> *
-                                    output_rate_over_input_rate * distance;
-            const double sinc =
-                std::abs(argument) < 1.0e-12
-                    ? output_rate_over_input_rate
-                    : std::sin(argument) /
-                          (std::numbers::pi_v<double> * distance);
-            const double window_phase = static_cast<double>(tap + radius - 1) /
-                                        static_cast<double>((2 * radius) - 1);
-            const double window =
-                0.35875 -
-                (0.48829 *
-                 std::cos(2.0 * std::numbers::pi_v<double> * window_phase)) +
-                (0.14128 *
-                 std::cos(4.0 * std::numbers::pi_v<double> * window_phase)) -
-                (0.01168 *
-                 std::cos(6.0 * std::numbers::pi_v<double> * window_phase));
-            const std::size_t tap_index =
-                static_cast<std::size_t>(tap + radius - 1);
-            kernels[phase][tap_index] = sinc * window;
-            weight_sum += kernels[phase][tap_index];
-        }
-        for (double &weight : kernels[phase]) {
-            weight /= weight_sum;
-        }
-    }
-    const double input_step = 1.0 / output_rate_over_input_rate;
-    for (std::size_t index = 0; index < output.size(); ++index) {
-        const double position =
-            first_position + (static_cast<double>(index) * input_step);
-        const auto center = static_cast<std::ptrdiff_t>(std::floor(position));
-        const double fraction = position - std::floor(position);
-        const std::size_t phase =
-            std::min(static_cast<std::size_t>(fraction *
-                                              static_cast<double>(phase_count)),
-                     phase_count - 1);
-        std::complex<double> sum{};
-        for (std::ptrdiff_t tap = -radius + 1; tap <= radius; ++tap) {
-            const std::size_t tap_index =
-                static_cast<std::size_t>(tap + radius - 1);
-            sum += static_cast<std::complex<double>>(
-                       input[static_cast<std::size_t>(center + tap)]) *
-                   kernels[phase][tap_index];
-        }
-        output[index] = static_cast<std::complex<float>>(sum);
-    }
-    return output;
-}
-
-[[nodiscard]] Acquisition
-find_acquisition(const std::span<const std::complex<float>> samples) {
-    Acquisition best;
-    float best_periodic_score = 0.0F;
-    for (const auto mode : {TransmissionMode::k8, TransmissionMode::k2}) {
-        const std::size_t fft_size = mode == TransmissionMode::k8 ? 8192 : 2048;
-        for (const auto guard :
-             {GuardInterval::gi_1_32, GuardInterval::gi_1_16,
-              GuardInterval::gi_1_8, GuardInterval::gi_1_4}) {
-            const std::size_t cp_size = guard_size(fft_size, guard);
-            if (samples.size() <= fft_size + cp_size) {
-                continue;
-            }
-            const std::size_t symbol_period = fft_size + cp_size;
-            std::vector<float> scores(samples.size() - fft_size - cp_size + 1);
-            std::complex<float> correlation{};
-            float first_power = 0.0F;
-            float second_power = 0.0F;
-            for (std::size_t index = 0; index < cp_size; ++index) {
-                correlation +=
-                    std::conj(samples[index]) * samples[index + fft_size];
-                first_power += std::norm(samples[index]);
-                second_power += std::norm(samples[index + fft_size]);
-            }
-            const std::size_t last_start = samples.size() - fft_size - cp_size;
-            for (std::size_t start = 0; start <= last_start; ++start) {
-                const float score =
-                    std::norm(correlation) /
-                    std::max(first_power * second_power, minimum_power);
-                scores[start] = score;
-                if (start == last_start) {
-                    break;
-                }
-                correlation -=
-                    std::conj(samples[start]) * samples[start + fft_size];
-                first_power -= std::norm(samples[start]);
-                second_power -= std::norm(samples[start + fft_size]);
-                const std::size_t entering = start + cp_size;
-                correlation +=
-                    std::conj(samples[entering]) * samples[entering + fft_size];
-                first_power += std::norm(samples[entering]);
-                second_power += std::norm(samples[entering + fft_size]);
-            }
-
-            std::size_t best_phase = 0;
-            float candidate_score = 0.0F;
-            for (std::size_t phase = 0; phase < symbol_period; ++phase) {
-                float score_sum = 0.0F;
-                std::size_t count = 0;
-                for (std::size_t start = phase; start < scores.size();
-                     start += symbol_period) {
-                    score_sum += scores[start];
-                    ++count;
-                }
-                if (count < 10) {
-                    continue;
-                }
-                const float average = score_sum / static_cast<float>(count);
-                if (average > candidate_score) {
-                    candidate_score = average;
-                    best_phase = phase;
-                }
-            }
-            if (candidate_score <= best_periodic_score) {
-                continue;
-            }
-            std::size_t selected_start = best_phase;
-            for (std::size_t start = best_phase; start < scores.size();
-                 start += symbol_period) {
-                if (scores[start] > scores[selected_start]) {
-                    selected_start = start;
-                }
-            }
-            std::complex<float> selected_correlation{};
-            for (std::size_t index = 0; index < cp_size; ++index) {
-                selected_correlation +=
-                    std::conj(samples[selected_start + index]) *
-                    samples[selected_start + index + fft_size];
-            }
-            best_periodic_score = candidate_score;
-            best = {
-                selected_start,       fft_size, cp_size, scores[selected_start],
-                selected_correlation, mode,     guard};
-        }
-    }
-    return best;
-}
-
 [[nodiscard]] std::vector<std::complex<float>>
 transform_symbol(const std::span<const std::complex<float>> samples,
-                 const Acquisition &acquisition) {
+                 const OfdmAcquisition &acquisition) {
     std::vector<std::complex<float>> input(acquisition.fft_size);
     std::vector<std::complex<float>> output(acquisition.fft_size);
-    const float phase_per_sample = std::arg(acquisition.cp_phase) /
-                                   static_cast<float>(acquisition.fft_size);
-    // A CP-correlation maximum can occur anywhere inside the cyclic prefix.
-    // Starting an N-sample FFT at that point is valid (a cyclic shift only);
-    // adding the full guard length again would move the window into the next
-    // symbol and destroy orthogonality.
-    const std::size_t data_start = acquisition.cp_start;
+    const float phase_per_sample =
+        std::arg(acquisition.phase) / static_cast<float>(acquisition.fft_size);
+    // Match the complete streaming decoder: the shared CP acquisition returns
+    // a guard start and the useful-symbol FFT begins after that guard.
+    const std::size_t data_start = acquisition.start + acquisition.guard_size;
     for (std::size_t index = 0; index < acquisition.fft_size; ++index) {
         input[index] =
             samples[data_start + index] *
@@ -353,11 +167,15 @@ estimate_channel(const std::span<const std::complex<float>> fft,
 
 [[nodiscard]] Constellation
 classify_constellation(const std::span<const std::complex<float>> points,
-                       float &mer_db) {
+                       float &mer_db,
+                       const std::optional<Constellation> fixed) {
     Constellation best = Constellation::qam64;
     float best_error = std::numeric_limits<float>::infinity();
     for (const auto candidate :
          {Constellation::qpsk, Constellation::qam16, Constellation::qam64}) {
+        if (fixed.has_value() && candidate != *fixed) {
+            continue;
+        }
         const MaxLogDemapper demapper(candidate);
         float error = 0.0F;
         float power = 0.0F;
@@ -383,19 +201,13 @@ classify_constellation(const std::span<const std::complex<float>> points,
 
 [[nodiscard]] SignalAnalysisSnapshot
 analyze(const std::span<const std::int16_t> scalars,
-        const std::uint32_t sample_rate, const std::uint32_t bandwidth) {
+        const std::uint32_t sample_rate, const std::uint32_t bandwidth,
+        const ReceiverParameters &parameters) {
     SignalAnalysisSnapshot snapshot;
-    std::vector<std::complex<float>> input(scalars.size() / 2);
-    for (std::size_t index = 0; index < input.size(); ++index) {
-        input[index] = {static_cast<float>(scalars[2 * index]) / input_scale,
-                        static_cast<float>(scalars[(2 * index) + 1]) /
-                            input_scale};
-    }
     const double target_rate = static_cast<double>(bandwidth) * 8.0 / 7.0;
-    const auto resampled = windowed_sinc_resample(
-        input, target_rate / static_cast<double>(sample_rate));
-    const Acquisition acquisition = find_acquisition(resampled);
-    if (acquisition.correlation < 0.20F) {
+    const auto resampled = resample_cs16(scalars, sample_rate, bandwidth);
+    const OfdmAcquisition acquisition = acquire_ofdm(resampled, parameters);
+    if (acquisition.score < 0.20F) {
         return snapshot;
     }
     const auto fft = transform_symbol(resampled, acquisition);
@@ -413,9 +225,15 @@ analyze(const std::span<const std::int16_t> scalars,
     equalized.reserve(carrier_max + 1);
     for (std::size_t carrier = 0; carrier <= carrier_max; ++carrier) {
         if (carrier % 12 == (static_cast<std::size_t>(pilot_lock.phase) * 3)) {
-            channel_db.push_back(
-                10.0F * std::log10(std::max(std::norm(channel[carrier]),
-                                            minimum_power)));
+            // The outer active carriers include transmitter/receiver channel
+            // filter skirts.  They are not multipath notches and would make
+            // an otherwise flat channel look tens of dB worse.
+            const std::size_t edge_guard = carrier_max / 32;
+            if (carrier >= edge_guard && carrier + edge_guard <= carrier_max) {
+                channel_db.push_back(
+                    10.0F * std::log10(std::max(std::norm(channel[carrier]),
+                                                minimum_power)));
+            }
             continue;
         }
         if (std::norm(channel[carrier]) > minimum_power) {
@@ -437,12 +255,20 @@ analyze(const std::span<const std::int16_t> scalars,
     snapshot.constellation = classify_constellation(
         std::span<const std::complex<float>>{snapshot.points.data(),
                                              snapshot.point_count},
-        snapshot.mer_db);
-    auto middle =
-        channel_db.begin() + static_cast<std::ptrdiff_t>(channel_db.size() / 2);
-    std::ranges::nth_element(channel_db, middle);
-    snapshot.deepest_notch_db = *std::ranges::min_element(channel_db) - *middle;
-    const float rho = std::sqrt(acquisition.correlation);
+        snapshot.mer_db, parameters.constellation);
+    auto baseline_values = channel_db;
+    auto middle = baseline_values.begin() +
+                  static_cast<std::ptrdiff_t>(baseline_values.size() / 2);
+    std::ranges::nth_element(baseline_values, middle);
+    const float median = *middle;
+    const std::size_t lower_index =
+        std::min(channel_db.size() - 1,
+                 std::max<std::size_t>(1, channel_db.size() /
+                                              notch_lower_percentile_divisor));
+    auto lower = channel_db.begin() + static_cast<std::ptrdiff_t>(lower_index);
+    std::ranges::nth_element(channel_db, lower);
+    snapshot.deepest_notch_db = *lower - median;
+    const float rho = std::sqrt(acquisition.score);
     snapshot.cp_snr_db =
         10.0F * std::log10(std::max(rho / std::max(1.0F - rho, 1.0e-4F),
                                     minimum_power));
@@ -450,7 +276,7 @@ analyze(const std::span<const std::int16_t> scalars,
     // scattered-pilot search also finds an integer bin displacement, but that
     // result is not a trustworthy physical-frequency estimate until continual
     // pilots/TPS confirm it. Keep the public metric fractional-only.
-    snapshot.carrier_offset_hz = std::arg(acquisition.cp_phase) *
+    snapshot.carrier_offset_hz = std::arg(acquisition.phase) *
                                  static_cast<float>(target_rate) /
                                  (2.0F * std::numbers::pi_v<float> *
                                   static_cast<float>(acquisition.fft_size));
@@ -467,6 +293,7 @@ struct SignalAnalyzer::Impl {
     std::size_t pending_count{};
     std::uint32_t sample_rate{};
     std::uint32_t bandwidth{};
+    ReceiverParameters parameters;
     std::chrono::steady_clock::time_point next_analysis{};
     mutable std::mutex pending_mutex;
     std::condition_variable ready;
@@ -508,6 +335,7 @@ struct SignalAnalyzer::Impl {
         while (true) {
             std::uint32_t current_rate = 0;
             std::uint32_t current_bandwidth = 0;
+            ReceiverParameters current_parameters;
             {
                 std::unique_lock lock(pending_mutex);
                 ready.wait(lock, [this] { return stopping || pending; });
@@ -517,24 +345,50 @@ struct SignalAnalyzer::Impl {
                 samples = pending_samples;
                 current_rate = sample_rate;
                 current_bandwidth = bandwidth;
+                current_parameters = parameters;
                 pending = false;
             }
-            auto next = analyze(samples, current_rate, current_bandwidth);
+            ReceiverParameters acquisition_parameters = current_parameters;
+            {
+                const std::scoped_lock lock(snapshot_mutex);
+                if (tracking_reset_requested.exchange(false)) {
+                    configuration_votes.fill(0);
+                    configuration_vote_count = 0;
+                    missed_count = 0;
+                    configuration_locked = false;
+                } else if (configuration_locked) {
+                    if (!acquisition_parameters.mode.has_value()) {
+                        acquisition_parameters.mode = stable_mode;
+                    }
+                    if (!acquisition_parameters.guard_interval.has_value()) {
+                        acquisition_parameters.guard_interval = stable_guard;
+                    }
+                }
+            }
+            auto next = analyze(samples, current_rate, current_bandwidth,
+                                acquisition_parameters);
             const std::scoped_lock lock(snapshot_mutex);
             if (tracking_reset_requested.exchange(false)) {
                 configuration_votes.fill(0);
                 configuration_vote_count = 0;
                 missed_count = 0;
                 configuration_locked = false;
+                latest = {};
+                continue;
+            }
+            if (next.locked && current_parameters.mode.has_value() &&
+                current_parameters.guard_interval.has_value()) {
+                stable_mode = *current_parameters.mode;
+                stable_guard = *current_parameters.guard_interval;
+                configuration_locked = true;
+                configuration_votes.fill(0);
+                configuration_vote_count = 0;
+                missed_count = 0;
             }
             if (!next.locked) {
                 ++missed_count;
                 if (configuration_locked && latest.locked && missed_count < 3) {
                     next = latest;
-                } else if (missed_count >= 3) {
-                    configuration_locked = false;
-                    configuration_votes.fill(0);
-                    configuration_vote_count = 0;
                 }
             } else if (!configuration_locked) {
                 missed_count = 0;
@@ -575,9 +429,6 @@ struct SignalAnalyzer::Impl {
                 if (latest.locked && missed_count < 3) {
                     next = latest;
                 } else {
-                    configuration_locked = false;
-                    configuration_votes.fill(0);
-                    configuration_vote_count = 0;
                     next.locked = false;
                     next.point_count = 0;
                 }
@@ -670,6 +521,14 @@ void SignalAnalyzer::reset() {
     impl_->tracking_reset_requested = true;
     const std::scoped_lock lock(impl_->snapshot_mutex);
     impl_->latest = {};
+}
+
+void SignalAnalyzer::set_parameters(const ReceiverParameters &parameters) {
+    {
+        const std::scoped_lock lock(impl_->pending_mutex);
+        impl_->parameters = parameters;
+    }
+    reset();
 }
 
 void SignalAnalyzer::set_snr_smoothing(const bool enabled, const int speed) {

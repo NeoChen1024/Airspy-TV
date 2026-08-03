@@ -1,5 +1,7 @@
 #include "airspy_tv/sdr.hpp"
 
+#include "airspy_tv/iq_file.hpp"
+
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_dialog.h>
 #include <SDL3/SDL_opengl.h>
@@ -19,6 +21,7 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -36,11 +39,19 @@ namespace {
 using airspy_tv::AirspyGainMode;
 using airspy_tv::DeviceDescriptor;
 using airspy_tv::EnumerationResult;
+using airspy_tv::IqFileInfo;
 using airspy_tv::SdrBackend;
 using airspy_tv::SdrDevice;
 using airspy_tv::SourceSettings;
 using airspy_tv::SpectrumSnapshot;
+using airspy_tv::dvbt::CodeRate;
+using airspy_tv::dvbt::Constellation;
+using airspy_tv::dvbt::GuardInterval;
+using airspy_tv::dvbt::ReceiverParameters;
 using airspy_tv::dvbt::SignalAnalysisSnapshot;
+using airspy_tv::dvbt::StreamDecoder;
+using airspy_tv::dvbt::StreamDecoderStats;
+using airspy_tv::dvbt::TransmissionMode;
 
 constexpr ImVec4 accent{0.12F, 0.58F, 0.92F, 1.0F};
 constexpr float panel_width = 410.0F;
@@ -151,6 +162,8 @@ struct AppState {
     int snr_smoothing_speed{20};
     SpectrumSnapshot spectrum;
     SignalAnalysisSnapshot signal_analysis;
+    StreamDecoderStats decoder;
+    ReceiverParameters dvbt_parameters;
     WaterfallDisplay waterfall;
     SDL_Window *window{};
     std::shared_ptr<FileDialogState> file_dialog{
@@ -562,6 +575,22 @@ void draw_metric(const char *label, const char *value, const float fraction,
     ImGui::ProgressBar(fraction, ImVec2(-1.0F, 5.0F), "");
 }
 
+void draw_status_indicator(const char *label, const ImVec4 colour,
+                           const char *detail = nullptr) {
+    const ImVec2 cursor = ImGui::GetCursorScreenPos();
+    const ImVec2 indicator_position{
+        cursor.x + 5.0F, cursor.y + (ImGui::GetTextLineHeight() * 0.5F)};
+    ImGui::GetWindowDrawList()->AddCircleFilled(
+        indicator_position, 4.0F, ImGui::ColorConvertFloat4ToU32(colour));
+    ImGui::Dummy(ImVec2(12.0F, ImGui::GetTextLineHeight()));
+    ImGui::SameLine();
+    ImGui::TextColored(colour, "%s", label);
+    if (detail != nullptr) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", detail);
+    }
+}
+
 void draw_bipolar_metric(const char *label, const char *value,
                          const float position, const ImVec4 colour) {
     ImGui::TextUnformatted(label);
@@ -608,6 +637,22 @@ void draw_source_panel(AppState &state) {
         return;
     }
 
+    const bool source_open = state.receiver.is_open();
+    std::uint32_t decoder_threads =
+        static_cast<std::uint32_t>(state.dvbt_parameters.worker_threads);
+    ImGui::BeginDisabled(source_open);
+    ImGui::SetNextItemWidth(-1.0F);
+    if (ImGui::InputScalar("Decoder worker budget", ImGuiDataType_U32,
+                           &decoder_threads)) {
+        decoder_threads = std::min(decoder_threads, std::uint32_t{256});
+        state.dvbt_parameters.worker_threads = decoder_threads;
+        state.receiver.set_dvbt_parameters(state.dvbt_parameters);
+    }
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("0 = Auto (%zu logical CPUs); fixed while open",
+                        airspy_tv::dvbt::default_viterbi_worker_count());
+    ImGui::TextDisabled("Budget is split across symbol and Viterbi pools.");
+
     std::optional<std::string> selected_iq_source;
     {
         const std::scoped_lock lock(state.iq_source_dialog->mutex);
@@ -623,6 +668,7 @@ void draw_source_panel(AppState &state) {
     }
     if (selected_iq_source.has_value()) {
         std::string error;
+        state.receiver.set_dvbt_parameters(state.dvbt_parameters);
         if (state.receiver.open_iq_file(*selected_iq_source, state.settings,
                                         error) &&
             state.receiver.start_stream(state.settings, error)) {
@@ -667,6 +713,7 @@ void draw_source_panel(AppState &state) {
         ImGui::BeginDisabled(state.enumeration.devices.empty());
         if (ImGui::Button("Open device", ImVec2(-1.0F, 0.0F))) {
             std::string error;
+            state.receiver.set_dvbt_parameters(state.dvbt_parameters);
             const DeviceDescriptor &descriptor =
                 state.enumeration.devices[state.selected_device];
             if (state.receiver.open(descriptor, error)) {
@@ -747,6 +794,130 @@ void draw_receiver_panel(AppState &state) {
     if (!ImGui::CollapsingHeader("Receiver", ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
+
+    bool parameters_changed = false;
+    const auto draw_optional_combo =
+        [&parameters_changed](const char *label,
+                              const std::span<const char *const> names,
+                              int &selected) {
+            if (ImGui::BeginCombo(label,
+                                  names[static_cast<std::size_t>(selected)])) {
+                for (int index = 0; index < static_cast<int>(names.size());
+                     ++index) {
+                    if (ImGui::Selectable(
+                            names[static_cast<std::size_t>(index)],
+                            selected == index)) {
+                        selected = index;
+                        parameters_changed = true;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+        };
+
+    int selected_mode =
+        !state.dvbt_parameters.mode.has_value()
+            ? 0
+            : (*state.dvbt_parameters.mode == TransmissionMode::k2 ? 1 : 2);
+    constexpr std::array mode_names{"Auto", "2K", "8K"};
+    draw_optional_combo("Transmission mode", mode_names, selected_mode);
+    state.dvbt_parameters.mode =
+        selected_mode == 0
+            ? std::nullopt
+            : std::optional{selected_mode == 1 ? TransmissionMode::k2
+                                               : TransmissionMode::k8};
+
+    int guard = 0;
+    if (state.dvbt_parameters.guard_interval.has_value()) {
+        switch (*state.dvbt_parameters.guard_interval) {
+        case GuardInterval::gi_1_32:
+            guard = 1;
+            break;
+        case GuardInterval::gi_1_16:
+            guard = 2;
+            break;
+        case GuardInterval::gi_1_8:
+            guard = 3;
+            break;
+        case GuardInterval::gi_1_4:
+            guard = 4;
+            break;
+        }
+    }
+    constexpr std::array guard_names{"Auto", "1/32", "1/16", "1/8", "1/4"};
+    draw_optional_combo("Guard interval", guard_names, guard);
+    constexpr std::array guard_values{
+        GuardInterval::gi_1_32, GuardInterval::gi_1_16, GuardInterval::gi_1_8,
+        GuardInterval::gi_1_4};
+    state.dvbt_parameters.guard_interval =
+        guard == 0
+            ? std::nullopt
+            : std::optional{guard_values[static_cast<std::size_t>(guard - 1)]};
+
+    int modulation = 0;
+    if (state.dvbt_parameters.constellation.has_value()) {
+        switch (*state.dvbt_parameters.constellation) {
+        case Constellation::qpsk:
+            modulation = 1;
+            break;
+        case Constellation::qam16:
+            modulation = 2;
+            break;
+        case Constellation::qam64:
+            modulation = 3;
+            break;
+        }
+    }
+    constexpr std::array modulation_names{"Auto", "QPSK", "16-QAM", "64-QAM"};
+    draw_optional_combo("Modulation", modulation_names, modulation);
+    constexpr std::array modulation_values{
+        Constellation::qpsk, Constellation::qam16, Constellation::qam64};
+    state.dvbt_parameters.constellation =
+        modulation == 0
+            ? std::nullopt
+            : std::optional{
+                  modulation_values[static_cast<std::size_t>(modulation - 1)]};
+
+    int code_rate = 0;
+    if (state.dvbt_parameters.code_rate.has_value()) {
+        switch (*state.dvbt_parameters.code_rate) {
+        case CodeRate::rate_1_2:
+            code_rate = 1;
+            break;
+        case CodeRate::rate_2_3:
+            code_rate = 2;
+            break;
+        case CodeRate::rate_3_4:
+            code_rate = 3;
+            break;
+        case CodeRate::rate_5_6:
+            code_rate = 4;
+            break;
+        case CodeRate::rate_7_8:
+            code_rate = 5;
+            break;
+        }
+    }
+    constexpr std::array code_rate_names{"Auto", "1/2", "2/3",
+                                         "3/4",  "5/6", "7/8"};
+    draw_optional_combo("Code rate", code_rate_names, code_rate);
+    constexpr std::array code_rate_values{
+        CodeRate::rate_1_2, CodeRate::rate_2_3, CodeRate::rate_3_4,
+        CodeRate::rate_5_6, CodeRate::rate_7_8};
+    state.dvbt_parameters.code_rate =
+        code_rate == 0
+            ? std::nullopt
+            : std::optional{
+                  code_rate_values[static_cast<std::size_t>(code_rate - 1)]};
+
+    if (parameters_changed) {
+        state.receiver.set_dvbt_parameters(state.dvbt_parameters);
+        state.status = "DVB-T parameters updated; receiver reacquiring";
+    }
+    ImGui::TextDisabled(
+        "Auto mode/guard uses CP acquisition. Auto modulation/code rate "
+        "currently decodes as 64-QAM 2/3 until TPS is implemented.");
+    ImGui::Separator();
 
     const DeviceDescriptor *descriptor = state.receiver.descriptor();
     if (descriptor != nullptr && descriptor->backend == SdrBackend::File) {
@@ -1023,20 +1194,71 @@ void draw_sidebar(AppState &state) {
         const bool locked = state.signal_analysis.locked;
         const ImVec4 lock_colour = locked ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
                                           : ImVec4(1.0F, 0.38F, 0.25F, 1.0F);
-        const ImVec2 indicator_position{
-            ImGui::GetCursorScreenPos().x + 5.0F,
-            ImGui::GetCursorScreenPos().y +
-                (ImGui::GetTextLineHeight() * 0.5F)};
-        ImGui::GetWindowDrawList()->AddCircleFilled(
-            indicator_position, 4.0F,
-            ImGui::ColorConvertFloat4ToU32(lock_colour));
-        ImGui::Dummy(ImVec2(12.0F, ImGui::GetTextLineHeight()));
-        ImGui::SameLine();
-        ImGui::TextColored(lock_colour, "%s", locked ? "LOCKED" : "UNLOCKED");
-        if (!locked) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("Constellation paused");
-        }
+        draw_status_indicator(
+            locked ? "OFDM MONITOR LOCKED" : "OFDM MONITOR UNLOCKED",
+            lock_colour, locked ? nullptr : "Constellation paused");
+
+        const bool transport_locked = state.decoder.transport.rs_synchronized &&
+                                      state.decoder.transport.ts_packets != 0;
+        const bool decoder_active = state.decoder.processing ||
+                                    state.decoder.ofdm_locked ||
+                                    state.decoder.input_blocks != 0;
+        const ImVec4 decoder_colour =
+            transport_locked
+                ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
+                : (decoder_active ? ImVec4(1.0F, 0.72F, 0.22F, 1.0F)
+                                  : ImVec4(0.55F, 0.62F, 0.70F, 1.0F));
+        draw_status_indicator(
+            transport_locked
+                ? "TS DECODER LOCKED"
+                : (decoder_active ? "TS DECODER ACQUIRING" : "TS DECODER IDLE"),
+            decoder_colour);
+
+        const bool ratio_available =
+            state.decoder.processing_realtime_ratio > 0.0F;
+        const bool input_queue_near_full =
+            state.decoder.input_queue_capacity_samples != 0 &&
+            state.decoder.queued_input_samples * 4 >=
+                state.decoder.input_queue_capacity_samples * 3;
+        const bool cpu_overload =
+            (ratio_available &&
+             state.decoder.processing_realtime_ratio > 1.0F) ||
+            input_queue_near_full || state.decoder.dropped_blocks != 0;
+        const ImVec4 cpu_colour =
+            cpu_overload
+                ? ImVec4(1.0F, 0.38F, 0.25F, 1.0F)
+                : (ratio_available ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
+                                   : ImVec4(0.55F, 0.62F, 0.70F, 1.0F));
+        const float input_queue_percent =
+            state.decoder.input_queue_capacity_samples == 0
+                ? 0.0F
+                : 100.0F *
+                      static_cast<float>(state.decoder.queued_input_samples) /
+                      static_cast<float>(
+                          state.decoder.input_queue_capacity_samples);
+        const std::string cpu_detail =
+            ratio_available
+                ? std::format(
+                      "{:.2f}x input | IQ {:.0f}% | FEC {} | drops {} | "
+                      "RSP {} SYM {} VIT {}",
+                      state.decoder.processing_realtime_ratio,
+                      input_queue_percent, state.decoder.queued_symbols,
+                      state.decoder.dropped_blocks,
+                      state.decoder.resample_workers,
+                      state.decoder.symbol_workers,
+                      state.decoder.transport.viterbi_workers)
+                : std::format("measuring | IQ {:.0f}% | FEC {} | drops {} | "
+                              "RSP {} SYM {} "
+                              "VIT {}",
+                              input_queue_percent, state.decoder.queued_symbols,
+                              state.decoder.dropped_blocks,
+                              state.decoder.resample_workers,
+                              state.decoder.symbol_workers,
+                              state.decoder.transport.viterbi_workers);
+        draw_status_indicator(
+            cpu_overload ? "CPU OVERLOAD"
+                         : (ratio_available ? "CPU REALTIME" : "CPU LOAD"),
+            cpu_colour, cpu_detail.c_str());
         ImGui::Separator();
 
         const std::string power =
@@ -1077,6 +1299,11 @@ void draw_sidebar(AppState &state) {
                       : 0.0F;
         draw_metric("Deepest Notch", notch.c_str(), notch_fraction,
                     ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip(
+                "Robust channel dip: lower 1%% versus median; outer filter "
+                "skirts are excluded when OFDM is locked.");
+        }
         const std::string carrier_offset =
             state.signal_analysis.locked
                 ? std::format("{:+.2f} kHz",
@@ -1255,6 +1482,7 @@ void draw_video_panel(AppState &state) {
 void draw_application(AppState &state) {
     state.spectrum = state.receiver.spectrum_snapshot();
     state.signal_analysis = state.receiver.signal_analysis_snapshot();
+    state.decoder = state.receiver.decoder_stats();
     const ImGuiViewport *viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
@@ -1450,6 +1678,145 @@ int inspect_iq_cli(const std::filesystem::path &path,
     return spectrum.valid ? 0 : 1;
 }
 
+int decode_iq_cli(const std::filesystem::path &source,
+                  const std::filesystem::path &destination,
+                  const std::uint32_t raw_sample_rate_hz,
+                  const std::size_t decoder_threads, const bool debug) {
+    IqFileInfo info;
+    std::string error;
+    if (!airspy_tv::resolve_iq_file(source, raw_sample_rate_hz, 0, info,
+                                    error)) {
+        std::cerr << error << '\n';
+        return 1;
+    }
+
+    try {
+        const auto output_path =
+            std::filesystem::absolute(destination).lexically_normal();
+        if (std::filesystem::absolute(source).lexically_normal() ==
+                output_path ||
+            std::filesystem::absolute(info.data_path).lexically_normal() ==
+                output_path) {
+            std::cerr << "Output MPEG-TS path must differ from the I/Q source "
+                         "and data paths\n";
+            return 1;
+        }
+    } catch (const std::filesystem::filesystem_error &exception) {
+        std::cerr << "Unable to resolve input/output paths: "
+                  << exception.what() << '\n';
+        return 1;
+    }
+
+    std::ifstream input(info.data_path, std::ios::binary);
+    std::ofstream output(destination, std::ios::binary | std::ios::trunc);
+    if (!input || !output) {
+        std::cerr << "Unable to open I/Q input or MPEG-TS output\n";
+        return 1;
+    }
+
+    StreamDecoder decoder;
+    ReceiverParameters decoder_parameters;
+    decoder_parameters.worker_threads = decoder_threads;
+    decoder.set_parameters(decoder_parameters);
+    if (debug) {
+        std::cerr << "Decoder worker budget="
+                  << (decoder_threads == 0
+                          ? airspy_tv::dvbt::default_viterbi_worker_count()
+                          : decoder_threads)
+                  << (decoder_threads == 0 ? " (auto)\n" : "\n");
+    }
+    bool output_failed = false;
+    decoder.set_transport_callback(
+        [&output, &output_failed](const std::span<const std::uint8_t> ts) {
+            output.write(reinterpret_cast<const char *>(ts.data()),
+                         static_cast<std::streamsize>(ts.size()));
+            output_failed = output_failed || !output;
+        });
+
+    const auto started_at = std::chrono::steady_clock::now();
+    constexpr std::size_t scalar_samples =
+        StreamDecoder::processing_chunk_samples * 2;
+    std::vector<std::int16_t> block(scalar_samples);
+    std::uint64_t input_complex_samples = 0;
+    std::uint64_t reported_complex_samples = 0;
+    std::size_t chunk_count = 0;
+    const auto report_chunk = [&](const StreamDecoderStats &stats) {
+        ++chunk_count;
+        reported_complex_samples = input_complex_samples;
+        const float realtime_speed =
+            stats.processing_realtime_ratio > 0.0F
+                ? 1.0F / stats.processing_realtime_ratio
+                : 0.0F;
+        std::cerr << "chunk=" << chunk_count
+                  << " input=" << input_complex_samples
+                  << " samples TS=" << stats.transport_bytes
+                  << " bytes realtime-speed=" << realtime_speed << "x\n";
+        if (debug) {
+            std::cerr << "  stages: resample=" << stats.resample_time_ms
+                      << " ms acquisition=" << stats.acquisition_time_ms
+                      << " ms equalization=" << stats.equalization_time_ms
+                      << " ms FEC=" << stats.fec_time_ms << " ms; workers "
+                      << "resample=" << stats.resample_workers
+                      << " symbol=" << stats.symbol_workers
+                      << " Viterbi=" << stats.transport.viterbi_workers << '\n';
+            std::cerr << "  FEC detail: demap=" << stats.demap_time_ms
+                      << " ms deinterleave=" << stats.deinterleave_time_ms
+                      << " ms depuncture/quantize=" << stats.depuncture_time_ms
+                      << " ms transport=" << stats.transport_time_ms << " ms\n";
+        }
+    };
+    while (input && !output_failed) {
+        input.read(
+            reinterpret_cast<char *>(block.data()),
+            static_cast<std::streamsize>(block.size() * sizeof(block.front())));
+        const std::streamsize bytes_read = input.gcount();
+        if (bytes_read <= 0) {
+            break;
+        }
+        const std::size_t scalar_count =
+            static_cast<std::size_t>(bytes_read) / sizeof(block.front());
+        input_complex_samples += scalar_count / 2;
+        decoder.submit_blocking(std::span(block).first(scalar_count),
+                                info.sample_rate_hz);
+        if (scalar_count == block.size()) {
+            decoder.wait_until_idle();
+            report_chunk(decoder.stats());
+        }
+    }
+    decoder.flush();
+    output.flush();
+
+    const auto stats = decoder.stats();
+    if (reported_complex_samples != input_complex_samples) {
+        report_chunk(stats);
+    }
+    const double input_seconds = static_cast<double>(input_complex_samples) /
+                                 static_cast<double>(info.sample_rate_hz);
+    const double wall_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      started_at)
+            .count();
+    if (debug) {
+        std::cerr << "decoded " << input_complex_samples << " complex samples ("
+                  << input_seconds << " s) in " << wall_seconds
+                  << " s, TS=" << stats.transport_bytes
+                  << " bytes, symbols=" << stats.ofdm_symbols
+                  << ", RS=" << stats.transport.rs_packets << ", RS failures="
+                  << stats.transport.rs_uncorrectable_packets
+                  << ", packets=" << stats.transport.ts_packets << '\n';
+    }
+    if (output_failed || !output) {
+        std::cerr << "Failed while writing MPEG-TS output\n";
+        return 1;
+    }
+    if (stats.dropped_blocks != 0) {
+        std::cerr << "Internal error: decoder-paced I/Q input dropped "
+                  << stats.dropped_blocks << " block(s)\n";
+        return 1;
+    }
+    return stats.transport_bytes == 0 ? 2 : 0;
+}
+
 } // namespace
 
 int main(const int argc, char **argv) {
@@ -1459,7 +1826,9 @@ int main(const int argc, char **argv) {
     if (argc > 1 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: airspy-tv [--enumerate|--record-first PATH "
                      "[MILLISECONDS]|--inspect-iq PATH [SAMPLE_RATE_HZ] "
-                     "[CENTER_FREQUENCY_HZ]|--help]\n";
+                     "[CENTER_FREQUENCY_HZ]|--decode-iq INPUT OUTPUT.ts "
+                     "[SAMPLE_RATE_HZ] [--decoder-threads N] [-d|--debug]|"
+                     "--help]\n";
         return 0;
     }
     if (argc > 2 && std::string_view(argv[1]) == "--record-first") {
@@ -1501,6 +1870,56 @@ int main(const int argc, char **argv) {
             }
         }
         return inspect_iq_cli(argv[2], sample_rate_hz, center_frequency_hz);
+    }
+    if (argc > 1 && std::string_view(argv[1]) == "--decode-iq") {
+        std::uint32_t sample_rate_hz = 10'000'000;
+        std::size_t decoder_threads = 0;
+        bool debug = false;
+        bool sample_rate_supplied = false;
+        if (argc < 4) {
+            std::cerr << "Usage: airspy-tv --decode-iq INPUT OUTPUT.ts "
+                         "[SAMPLE_RATE_HZ] [--decoder-threads N] "
+                         "[-d|--debug]\n";
+            return 2;
+        }
+        for (int index = 4; index < argc; ++index) {
+            const std::string_view text = argv[index];
+            if (text == "-d" || text == "--debug") {
+                debug = true;
+                continue;
+            }
+            if (text == "--decoder-threads" || text == "--viterbi-threads") {
+                if (++index >= argc) {
+                    std::cerr << "Missing decoder thread count\n";
+                    return 2;
+                }
+                const std::string_view count_text = argv[index];
+                const auto parsed = std::from_chars(
+                    count_text.begin(), count_text.end(), decoder_threads);
+                if (parsed.ec != std::errc{} ||
+                    parsed.ptr != count_text.end() || decoder_threads > 256) {
+                    std::cerr << "Invalid decoder worker budget: " << count_text
+                              << " (expected 0..256)\n";
+                    return 2;
+                }
+                continue;
+            }
+            if (sample_rate_supplied) {
+                std::cerr << "Unexpected --decode-iq argument: " << text
+                          << '\n';
+                return 2;
+            }
+            const auto parsed =
+                std::from_chars(text.begin(), text.end(), sample_rate_hz);
+            if (parsed.ec != std::errc{} || parsed.ptr != text.end() ||
+                sample_rate_hz == 0) {
+                std::cerr << "Invalid raw I/Q sample rate: " << text << '\n';
+                return 2;
+            }
+            sample_rate_supplied = true;
+        }
+        return decode_iq_cli(argv[2], argv[3], sample_rate_hz, decoder_threads,
+                             debug);
     }
 
     SDL_SetAppMetadata("Airspy TV", "0.1.0", "io.github.airspy-tv");

@@ -1,24 +1,28 @@
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 
 #include "airspy_tv/dvbt/decoder.hpp"
+#include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
 
 #include <fftw3.h>
-#include <liquid.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <numbers>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <thread>
 #include <utility>
@@ -27,11 +31,10 @@
 namespace airspy_tv::dvbt {
 namespace {
 
-constexpr float input_scale = 32768.0F;
 constexpr float minimum_power = 1.0e-12F;
-constexpr std::size_t decode_chunk_samples = 7'000'000;
 constexpr std::size_t acquisition_samples = 350'000;
-constexpr std::size_t max_queued_blocks = 64;
+constexpr std::size_t buffer_duration_denominator = 5;
+constexpr std::size_t initial_symbol_queue_capacity = 256;
 
 constexpr std::array continual_2k{
     0,    48,   54,   87,   141,  156,  192,  201,  255,  279,  282,  333,
@@ -41,7 +44,7 @@ constexpr std::array continual_2k{
 constexpr std::array tps_2k{34,  50,   209,  346,  413,  569,  595,  688, 790,
                             901, 1073, 1219, 1262, 1286, 1469, 1594, 1687};
 
-[[nodiscard]] std::array<std::uint8_t, 6817> make_prbs() {
+[[nodiscard]] constexpr std::array<std::uint8_t, 6817> make_prbs() {
     std::array<std::uint8_t, 6817> result{};
     std::uint32_t state = 0x7ffU;
     for (auto &bit : result) {
@@ -50,97 +53,7 @@ constexpr std::array tps_2k{34,  50,   209,  346,  413,  569,  595,  688, 790,
     }
     return result;
 }
-const auto prbs = make_prbs();
-
-struct Acquisition {
-    std::size_t start{};
-    std::size_t fft_size{};
-    std::size_t guard_size{};
-    std::complex<float> phase{};
-    float score{};
-    TransmissionMode mode{TransmissionMode::k8};
-};
-
-[[nodiscard]] Acquisition
-acquire(const std::span<const std::complex<float>> samples) {
-    Acquisition best;
-    float best_periodic_score = 0.0F;
-    for (const auto mode : {TransmissionMode::k8, TransmissionMode::k2}) {
-        const std::size_t fft_size = mode == TransmissionMode::k8 ? 8192 : 2048;
-        for (const std::size_t divisor : {32U, 16U, 8U, 4U}) {
-            const std::size_t guard = fft_size / divisor;
-            if (samples.size() <= fft_size + guard) {
-                continue;
-            }
-            std::complex<float> corr{};
-            float p0 = 0.0F;
-            float p1 = 0.0F;
-            for (std::size_t i = 0; i < guard; ++i) {
-                corr += std::conj(samples[i]) * samples[i + fft_size];
-                p0 += std::norm(samples[i]);
-                p1 += std::norm(samples[i + fft_size]);
-            }
-            const std::size_t last = samples.size() - fft_size - guard;
-            std::vector<float> scores(last + 1);
-            for (std::size_t start = 0; start <= last; ++start) {
-                const float score =
-                    std::norm(corr) / std::max(p0 * p1, minimum_power);
-                scores[start] = score;
-                if (start == last) {
-                    break;
-                }
-                corr -= std::conj(samples[start]) * samples[start + fft_size];
-                p0 -= std::norm(samples[start]);
-                p1 -= std::norm(samples[start + fft_size]);
-                const std::size_t next = start + guard;
-                corr += std::conj(samples[next]) * samples[next + fft_size];
-                p0 += std::norm(samples[next]);
-                p1 += std::norm(samples[next + fft_size]);
-            }
-            const std::size_t period = fft_size + guard;
-            std::size_t best_phase = 0;
-            float candidate_score = 0.0F;
-            for (std::size_t phase = 0; phase < period; ++phase) {
-                float sum = 0.0F;
-                std::size_t count = 0;
-                for (std::size_t start = phase; start < scores.size();
-                     start += period) {
-                    sum += scores[start];
-                    ++count;
-                }
-                if (count >= 10 &&
-                    sum / static_cast<float>(count) > candidate_score) {
-                    candidate_score = sum / static_cast<float>(count);
-                    best_phase = phase;
-                }
-            }
-            if (candidate_score <= best_periodic_score) {
-                continue;
-            }
-            std::size_t selected = best_phase;
-            for (std::size_t start = best_phase; start < scores.size();
-                 start += period) {
-                if (scores[start] > scores[selected]) {
-                    selected = start;
-                }
-            }
-            std::complex<float> selected_correlation{};
-            for (std::size_t symbol_start = best_phase;
-                 symbol_start + fft_size + guard <= samples.size();
-                 symbol_start += period) {
-                for (std::size_t i = 0; i < guard; ++i) {
-                    selected_correlation +=
-                        std::conj(samples[symbol_start + i]) *
-                        samples[symbol_start + i + fft_size];
-                }
-            }
-            best_periodic_score = candidate_score;
-            best = {selected,         fft_size, guard, selected_correlation,
-                    scores[selected], mode};
-        }
-    }
-    return best;
-}
+constexpr auto prbs = make_prbs();
 
 [[nodiscard]] std::complex<float>
 carrier(const std::span<const std::complex<float>> fft, const std::size_t index,
@@ -199,33 +112,306 @@ lock_pilots(const std::span<const std::complex<float>> fft,
     return std::ranges::binary_search(list, static_cast<int>(value));
 }
 
-[[nodiscard]] std::vector<std::complex<float>>
-resample(const std::span<const std::int16_t> iq,
-         const std::uint32_t sample_rate, const std::uint32_t bandwidth) {
-    const std::uint64_t interpolation =
-        static_cast<std::uint64_t>(bandwidth) * 8U;
-    const std::uint64_t decimation =
-        static_cast<std::uint64_t>(sample_rate) * 7U;
-    const std::uint64_t divisor = std::gcd(interpolation, decimation);
-    const unsigned int p = static_cast<unsigned int>(interpolation / divisor);
-    const unsigned int q = static_cast<unsigned int>(decimation / divisor);
-    const std::size_t complex_count = iq.size() / 2;
-    const std::size_t blocks = complex_count / q;
-    std::vector<std::complex<float>> input(blocks * q);
-    for (std::size_t i = 0; i < input.size(); ++i) {
-        input[i] = {static_cast<float>(iq[i * 2]) / input_scale,
-                    static_cast<float>(iq[i * 2 + 1]) / input_scale};
+struct PostprocessedSymbol {
+    std::vector<std::complex<float>> carriers;
+    std::vector<float> reliabilities;
+    std::vector<std::uint8_t> mother_metrics;
+    std::size_t symbol_index{};
+    float mer_db{};
+    float demap_time_ms{};
+    float deinterleave_time_ms{};
+    float depuncture_time_ms{};
+};
+
+struct WorkerAllocation {
+    std::size_t symbol{};
+    std::size_t viterbi{};
+};
+
+[[nodiscard]] WorkerAllocation
+allocate_workers(const std::size_t requested_threads) noexcept {
+    const std::size_t total = requested_threads == 0
+                                  ? default_viterbi_worker_count()
+                                  : requested_threads;
+    if (total <= 1) {
+        return {1, 1};
     }
-    std::vector<std::complex<float>> output(blocks * p);
-    rresamp_crcf filter = rresamp_crcf_create_kaiser(p, q, 12, -1.0F, 60.0F);
-    if (filter == nullptr) {
-        return {};
-    }
-    rresamp_crcf_execute_block(
-        filter, input.data(), static_cast<unsigned int>(blocks), output.data());
-    rresamp_crcf_destroy(filter);
-    return output;
+    const std::size_t symbol = std::max<std::size_t>(1, total / 3);
+    return {symbol, std::max<std::size_t>(1, total - symbol)};
 }
+
+[[nodiscard]] std::size_t
+buffered_symbol_count(const std::uint32_t bandwidth,
+                      const std::size_t symbol_samples) noexcept {
+    // Nominal DVB-T sample rate is bandwidth * 8 / 7; retain one fifth of a
+    // second at the current OFDM symbol duration.
+    const std::uint64_t numerator = static_cast<std::uint64_t>(bandwidth) * 8U;
+    const std::uint64_t denominator =
+        7U * buffer_duration_denominator * symbol_samples;
+    return std::max<std::size_t>(
+        1,
+        static_cast<std::size_t>((numerator + denominator - 1) / denominator));
+}
+
+[[nodiscard]] std::size_t
+buffered_input_samples(const std::uint32_t sample_rate) noexcept {
+    return std::max<std::size_t>(1, (static_cast<std::size_t>(sample_rate) +
+                                     buffer_duration_denominator - 1) /
+                                        buffer_duration_denominator);
+}
+
+class SymbolPostprocessorPool {
+  public:
+    SymbolPostprocessorPool(const std::size_t requested_workers,
+                            const TransmissionMode mode,
+                            const Constellation constellation,
+                            const CodeRate code_rate,
+                            const std::size_t queue_capacity)
+        : worker_count_(requested_workers == 0 ? default_viterbi_worker_count()
+                                               : requested_workers),
+          reference_(constellation), symbol_deinterleaver_(mode),
+          bits_per_carrier_(bits_per_symbol(constellation)),
+          code_rate_(code_rate), maximum_queued_(std::max<std::size_t>(
+                                     queue_capacity, worker_count_ * 2)) {
+        workers_.reserve(worker_count_);
+        try {
+            for (std::size_t index = 0; index < worker_count_; ++index) {
+                workers_.emplace_back([this] { run_worker(); });
+            }
+        } catch (...) {
+            stop_and_join();
+            throw;
+        }
+    }
+
+    ~SymbolPostprocessorPool() { stop_and_join(); }
+    SymbolPostprocessorPool(const SymbolPostprocessorPool &) = delete;
+    SymbolPostprocessorPool &
+    operator=(const SymbolPostprocessorPool &) = delete;
+
+    void submit(std::vector<std::complex<float>> carriers,
+                std::vector<float> equalizer_power,
+                const std::size_t symbol_index) {
+        Task task{.carriers = std::move(carriers),
+                  .equalizer_power = std::move(equalizer_power),
+                  .symbol_index = symbol_index};
+        {
+            std::unique_lock lock(mutex_);
+            space_available_.wait(lock, [this] {
+                return stopping_ || worker_error_ ||
+                       tasks_.size() < maximum_queued_;
+            });
+            rethrow_worker_error();
+            if (stopping_) {
+                return;
+            }
+            task.sequence = next_sequence_++;
+            ++outstanding_;
+            tasks_.push_back(std::move(task));
+        }
+        task_ready_.notify_one();
+    }
+
+    [[nodiscard]] std::vector<PostprocessedSymbol> take_ready() {
+        std::scoped_lock lock(mutex_);
+        rethrow_worker_error();
+        return take_ready_locked();
+    }
+
+    [[nodiscard]] std::vector<PostprocessedSymbol> flush() {
+        std::unique_lock lock(mutex_);
+        finished_.wait(lock,
+                       [this] { return outstanding_ == 0 || worker_error_; });
+        rethrow_worker_error();
+        return take_ready_locked();
+    }
+
+  private:
+    struct Task {
+        std::uint64_t sequence{};
+        std::vector<std::complex<float>> carriers;
+        std::vector<float> equalizer_power;
+        std::size_t symbol_index{};
+    };
+
+    [[nodiscard]] PostprocessedSymbol process(Task task) const {
+        std::vector<std::complex<float>> nearest(task.carriers.size());
+        for (int iteration = 0; iteration < 2; ++iteration) {
+            reference_.slice_nearest(task.carriers, nearest);
+            std::complex<double> numerator{};
+            double denominator = 0.0;
+            for (std::size_t index = 0; index < task.carriers.size(); ++index) {
+                const auto value = task.carriers[index];
+                const auto reference = nearest[index];
+                numerator +=
+                    std::conj(static_cast<std::complex<double>>(reference)) *
+                    static_cast<std::complex<double>>(value);
+                denominator += std::norm(reference);
+            }
+            const auto gain =
+                static_cast<std::complex<float>>(numerator / denominator);
+            if (std::abs(gain) > 1.0e-6F) {
+                const std::complex<float> inverse_gain = 1.0F / gain;
+                for (auto &value : task.carriers) {
+                    value *= inverse_gain;
+                }
+            }
+        }
+
+        std::vector<float> errors;
+        errors.reserve(task.carriers.size());
+        reference_.slice_nearest(task.carriers, nearest);
+        for (std::size_t index = 0; index < task.carriers.size(); ++index) {
+            errors.push_back(std::norm(task.carriers[index] - nearest[index]));
+        }
+        const double mean_error =
+            std::accumulate(errors.begin(), errors.end(), 0.0) /
+            static_cast<double>(errors.size());
+        auto middle =
+            errors.begin() + static_cast<std::ptrdiff_t>(errors.size() / 2);
+        std::ranges::nth_element(errors, middle);
+        const float reliability =
+            1.0F / std::max(*middle / std::log(2.0F), 1.0e-4F);
+
+        auto equalizer_power_order = task.equalizer_power;
+        auto equalizer_middle =
+            equalizer_power_order.begin() +
+            static_cast<std::ptrdiff_t>(equalizer_power_order.size() / 2);
+        std::ranges::nth_element(equalizer_power_order, equalizer_middle);
+        const float median_equalizer_power =
+            std::max(*equalizer_middle, minimum_power);
+        std::vector<float> reliabilities(task.carriers.size());
+        for (std::size_t index = 0; index < reliabilities.size(); ++index) {
+            const float relative_channel_power =
+                median_equalizer_power /
+                std::max(task.equalizer_power[index], minimum_power);
+            reliabilities[index] =
+                reliability * std::clamp(relative_channel_power, 0.01F, 16.0F);
+        }
+
+        const std::size_t metric_count =
+            task.carriers.size() * bits_per_carrier_;
+        std::vector<float> demapped(metric_count);
+        std::vector<float> symbol_metrics(metric_count);
+        std::vector<float> bit_metrics(metric_count);
+        const auto demap_started_at = std::chrono::steady_clock::now();
+        reference_.demap(task.carriers, reliabilities, demapped);
+        const auto deinterleave_started_at = std::chrono::steady_clock::now();
+        symbol_deinterleaver_.process(demapped, bits_per_carrier_,
+                                      task.symbol_index, symbol_metrics);
+        bit_deinterleave(symbol_metrics, bits_per_carrier_, bit_metrics);
+        const auto depuncture_started_at = std::chrono::steady_clock::now();
+        std::vector<float> depunctured(
+            depunctured_size(bit_metrics.size(), code_rate_));
+        depuncture(bit_metrics, code_rate_, depunctured);
+        std::vector<std::uint8_t> mother_metrics(depunctured.size());
+        for (std::size_t index = 0; index < depunctured.size(); ++index) {
+            const float soft =
+                std::clamp(127.5F + (depunctured[index] * 8.0F), 0.0F, 255.0F);
+            mother_metrics[index] = static_cast<std::uint8_t>(soft + 0.5F);
+        }
+        const auto finished_at = std::chrono::steady_clock::now();
+        return {.carriers = std::move(task.carriers),
+                .reliabilities = std::move(reliabilities),
+                .mother_metrics = std::move(mother_metrics),
+                .symbol_index = task.symbol_index,
+                .mer_db = static_cast<float>(
+                    -10.0 * std::log10(std::max(mean_error, 1.0e-12))),
+                .demap_time_ms = std::chrono::duration<float, std::milli>(
+                                     deinterleave_started_at - demap_started_at)
+                                     .count(),
+                .deinterleave_time_ms =
+                    std::chrono::duration<float, std::milli>(
+                        depuncture_started_at - deinterleave_started_at)
+                        .count(),
+                .depuncture_time_ms = std::chrono::duration<float, std::milli>(
+                                          finished_at - depuncture_started_at)
+                                          .count()};
+    }
+
+    void run_worker() {
+        while (true) {
+            Task task;
+            {
+                std::unique_lock lock(mutex_);
+                task_ready_.wait(
+                    lock, [this] { return stopping_ || !tasks_.empty(); });
+                if (stopping_ && tasks_.empty()) {
+                    return;
+                }
+                task = std::move(tasks_.front());
+                tasks_.pop_front();
+            }
+            space_available_.notify_one();
+            try {
+                const std::uint64_t sequence = task.sequence;
+                auto result = process(std::move(task));
+                const std::scoped_lock lock(mutex_);
+                completed_.emplace(sequence, std::move(result));
+                --outstanding_;
+            } catch (...) {
+                const std::scoped_lock lock(mutex_);
+                if (!worker_error_) {
+                    worker_error_ = std::current_exception();
+                }
+                --outstanding_;
+            }
+            finished_.notify_all();
+            space_available_.notify_all();
+        }
+    }
+
+    [[nodiscard]] std::vector<PostprocessedSymbol> take_ready_locked() {
+        std::vector<PostprocessedSymbol> output;
+        auto found = completed_.find(next_result_);
+        while (found != completed_.end()) {
+            output.push_back(std::move(found->second));
+            completed_.erase(found);
+            ++next_result_;
+            found = completed_.find(next_result_);
+        }
+        return output;
+    }
+
+    void stop_and_join() {
+        {
+            const std::scoped_lock lock(mutex_);
+            stopping_ = true;
+        }
+        task_ready_.notify_all();
+        space_available_.notify_all();
+        for (auto &worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    void rethrow_worker_error() const {
+        if (worker_error_) {
+            std::rethrow_exception(worker_error_);
+        }
+    }
+
+    const std::size_t worker_count_;
+    const MaxLogDemapper reference_;
+    const SymbolDeinterleaver symbol_deinterleaver_;
+    const std::size_t bits_per_carrier_;
+    const CodeRate code_rate_;
+    const std::size_t maximum_queued_;
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable task_ready_;
+    std::condition_variable space_available_;
+    std::condition_variable finished_;
+    std::deque<Task> tasks_;
+    std::map<std::uint64_t, PostprocessedSymbol> completed_;
+    std::uint64_t next_sequence_{};
+    std::uint64_t next_result_{};
+    std::size_t outstanding_{};
+    std::exception_ptr worker_error_;
+    bool stopping_{};
+};
 
 } // namespace
 
@@ -235,40 +421,132 @@ struct StreamDecoder::Impl {
         std::uint32_t rate{};
         std::uint32_t bandwidth{};
     };
+    struct ChunkSummary {
+        bool ofdm_locked{};
+        int carrier_bin_offset{};
+        float mer_db{};
+        float residual_carrier_offset_hz{};
+        std::uint64_t pilot_phase_discontinuities{};
+        std::uint64_t ofdm_symbols{};
+        float input_seconds{};
+        float resample_time_ms{};
+        float acquisition_time_ms{};
+        float equalization_time_ms{};
+        float demap_time_ms{};
+        float deinterleave_time_ms{};
+        float depuncture_time_ms{};
+        std::size_t resample_workers{};
+        std::size_t symbol_workers{};
+        std::chrono::steady_clock::time_point started_at{};
+    };
+    struct FecItem {
+        enum class Kind { begin, symbol, end };
+
+        Kind kind{Kind::symbol};
+        std::uint64_t generation{};
+        DecoderParameters parameters{};
+        std::vector<std::uint8_t> mother_metrics;
+        std::size_t symbol_index{};
+        ChunkSummary summary{};
+    };
     mutable std::mutex mutex;
     std::condition_variable ready;
+    std::condition_variable idle;
+    std::condition_variable input_not_full;
+    std::condition_variable fec_ready;
+    std::condition_variable fec_not_full;
     std::deque<Block> queue;
+    std::deque<FecItem> fec_queue;
+    std::size_t queued_complex_samples{};
+    std::size_t input_queue_capacity_samples{};
+    std::size_t fec_queue_capacity{initial_symbol_queue_capacity};
     std::vector<std::int16_t> accumulated;
     TransportCallback callback;
     EqualizedCallback equalized_callback;
+    ReceiverParameters parameters;
+    std::optional<TransmissionMode> stable_mode;
+    std::optional<GuardInterval> stable_guard;
     StreamDecoderStats latest;
+    std::atomic<bool> cancel_requested{};
     bool stopping{};
     bool reset_requested{};
+    bool flush_requested{};
+    bool worker_busy{};
+    bool fec_worker_busy{};
+    std::atomic<std::uint64_t> latest_generation{};
+    std::uint32_t accumulated_rate{};
+    std::uint32_t accumulated_bandwidth{};
     std::thread worker;
+    std::thread fec_worker;
 
-    Impl() : worker([this] { run(); }) {}
+    Impl() : worker([this] { run(); }), fec_worker([this] { run_fec(); }) {}
     ~Impl() {
+        cancel_requested = true;
         {
             const std::scoped_lock lock(mutex);
             stopping = true;
         }
         ready.notify_one();
+        input_not_full.notify_all();
+        fec_ready.notify_one();
+        fec_not_full.notify_all();
         worker.join();
+        fec_worker.join();
+    }
+
+    [[nodiscard]] bool enqueue_fec(FecItem item) {
+        std::unique_lock lock(mutex);
+        fec_not_full.wait(lock, [this, generation = item.generation] {
+            return stopping || cancel_requested ||
+                   generation != latest_generation ||
+                   fec_queue.size() < fec_queue_capacity;
+        });
+        if (stopping || cancel_requested ||
+            item.generation != latest_generation) {
+            return false;
+        }
+        fec_queue.push_back(std::move(item));
+        fec_ready.notify_one();
+        return true;
     }
 
     void decode_chunk(const std::span<const std::int16_t> iq,
                       const std::uint32_t rate, const std::uint32_t bandwidth) {
-        auto samples = resample(iq, rate, bandwidth);
-        if (samples.size() < acquisition_samples) {
+        ReceiverParameters selected_parameters;
+        std::uint64_t generation = 0;
+        const auto started_at = std::chrono::steady_clock::now();
+        {
+            const std::scoped_lock guard(mutex);
+            selected_parameters = parameters;
+            generation = latest_generation;
+            if (!selected_parameters.mode.has_value() &&
+                stable_mode.has_value()) {
+                selected_parameters.mode = stable_mode;
+            }
+            if (!selected_parameters.guard_interval.has_value() &&
+                stable_guard.has_value()) {
+                selected_parameters.guard_interval = stable_guard;
+            }
+        }
+        const std::size_t resample_workers =
+            selected_parameters.worker_threads == 0
+                ? default_viterbi_worker_count()
+                : selected_parameters.worker_threads;
+        auto samples = resample_cs16(iq, rate, bandwidth, resample_workers);
+        const auto resampled_at = std::chrono::steady_clock::now();
+        if (cancel_requested || samples.size() < acquisition_samples) {
             return;
         }
-        const Acquisition acquisition =
-            acquire(std::span(samples).first(acquisition_samples));
-        if (acquisition.score < 0.20F) {
+        const OfdmAcquisition acquisition = acquire_ofdm(
+            std::span(samples).first(acquisition_samples), selected_parameters);
+        const auto acquired_at = std::chrono::steady_clock::now();
+        if (cancel_requested || acquisition.score < 0.20F) {
             return;
         }
         {
             const std::scoped_lock guard(mutex);
+            stable_mode = acquisition.mode;
+            stable_guard = acquisition.guard;
             latest.acquisition_score = acquisition.score;
             latest.fft_size = static_cast<std::uint32_t>(acquisition.fft_size);
             latest.guard_size =
@@ -278,10 +556,25 @@ struct StreamDecoder::Impl {
             acquisition.mode == TransmissionMode::k8 ? 6816 : 1704;
         const std::span<const int> continual = continual_2k;
         const std::span<const int> tps = tps_2k;
-        const DecoderParameters parameters{
-            acquisition.mode, Constellation::qam64, CodeRate::rate_2_3};
-        Decoder decoder(parameters);
-        MaxLogDemapper reference{Constellation::qam64};
+        const DecoderParameters decoder_parameters{
+            acquisition.mode,
+            selected_parameters.constellation.value_or(Constellation::qam64),
+            selected_parameters.code_rate.value_or(CodeRate::rate_2_3),
+            allocate_workers(selected_parameters.worker_threads).viterbi};
+        const std::size_t symbol_queue_capacity = buffered_symbol_count(
+            bandwidth, acquisition.fft_size + acquisition.guard_size);
+        {
+            const std::scoped_lock guard(mutex);
+            fec_queue_capacity = symbol_queue_capacity;
+        }
+        if (!enqueue_fec({.kind = FecItem::Kind::begin,
+                          .generation = generation,
+                          .parameters = decoder_parameters,
+                          .mother_metrics = {},
+                          .symbol_index = 0,
+                          .summary = {}})) {
+            return;
+        }
         std::vector<std::complex<float>> fft_in(acquisition.fft_size);
         std::vector<std::complex<float>> fft_out(acquisition.fft_size);
         fftwf_plan plan =
@@ -296,10 +589,70 @@ struct StreamDecoder::Impl {
                                   static_cast<float>(acquisition.fft_size);
         const std::size_t period =
             acquisition.fft_size + acquisition.guard_size;
+        std::vector<std::size_t> continual_indices;
+        std::array<std::vector<std::size_t>, 4> pilot_indices;
+        std::array<std::vector<std::size_t>, 4> payload_indices;
+        continual_indices.reserve(continual_2k.size() *
+                                  (maximum == 6816 ? 4U : 1U));
+        for (std::size_t k = 0; k <= maximum; ++k) {
+            const std::size_t base = k % 1704;
+            const bool continual_carrier = listed(continual, base);
+            const bool tps_carrier = listed(tps, base);
+            if (continual_carrier) {
+                continual_indices.push_back(k);
+            }
+            for (std::size_t phase = 0; phase < 4; ++phase) {
+                const bool scattered = k % 12 == phase * 3;
+                if (scattered || continual_carrier) {
+                    pilot_indices[phase].push_back(k);
+                }
+                if (!scattered && !continual_carrier && !tps_carrier) {
+                    payload_indices[phase].push_back(k);
+                }
+            }
+        }
         int carrier_offset = std::numeric_limits<int>::max();
         int previous_phase = -1;
         std::uint64_t phase_discontinuities = 0;
         double mer_sum = 0.0;
+        float demap_time_sum = 0.0F;
+        float deinterleave_time_sum = 0.0F;
+        float depuncture_time_sum = 0.0F;
+        const WorkerAllocation workers =
+            allocate_workers(selected_parameters.worker_threads);
+        SymbolPostprocessorPool postprocessor(
+            workers.symbol, acquisition.mode, decoder_parameters.constellation,
+            decoder_parameters.code_rate, symbol_queue_capacity);
+        const auto emit_postprocessed =
+            [this, generation, &mer_sum, &demap_time_sum,
+             &deinterleave_time_sum,
+             &depuncture_time_sum](std::vector<PostprocessedSymbol> symbols) {
+                for (auto &symbol : symbols) {
+                    mer_sum += symbol.mer_db;
+                    demap_time_sum += symbol.demap_time_ms;
+                    deinterleave_time_sum += symbol.deinterleave_time_ms;
+                    depuncture_time_sum += symbol.depuncture_time_ms;
+                    EqualizedCallback equalized_sink;
+                    {
+                        const std::scoped_lock guard(mutex);
+                        equalized_sink = equalized_callback;
+                    }
+                    if (equalized_sink) {
+                        equalized_sink(symbol.carriers, symbol.reliabilities,
+                                       symbol.symbol_index);
+                    }
+                    if (!enqueue_fec(
+                            {.kind = FecItem::Kind::symbol,
+                             .generation = generation,
+                             .parameters = {},
+                             .mother_metrics = std::move(symbol.mother_metrics),
+                             .symbol_index = symbol.symbol_index,
+                             .summary = {}})) {
+                        return false;
+                    }
+                }
+                return true;
+            };
         // CP correlation locates the beginning of the guard interval.  The
         // FFT window must start at the useful symbol, after that guard.  Using
         // acquisition.start directly applies a large cyclic time shift and a
@@ -311,14 +664,19 @@ struct StreamDecoder::Impl {
         std::vector<std::complex<float>> previous_continual;
         float residual_phase_ema = 0.0F;
         std::uint64_t symbol_count = 0;
-        std::uint64_t byte_count = 0;
         for (std::size_t start = first_fft_start;
-             start + acquisition.fft_size <= samples.size(); start += period) {
+             start + acquisition.fft_size <= samples.size() &&
+             !cancel_requested;
+             start += period) {
+            std::complex<float> nco = std::polar(1.0F, -nco_phase);
+            const std::complex<float> nco_step =
+                std::polar(1.0F, -tracked_cfo_phase);
             for (std::size_t i = 0; i < acquisition.fft_size; ++i) {
-                fft_in[i] =
-                    samples[start + i] *
-                    std::polar(1.0F, -(nco_phase + (tracked_cfo_phase *
-                                                    static_cast<float>(i))));
+                fft_in[i] = samples[start + i] * nco;
+                nco *= nco_step;
+                if ((i & 511U) == 511U) {
+                    nco *= 1.0F / std::sqrt(std::norm(nco));
+                }
             }
             fftwf_execute(plan);
             const PilotLock lock =
@@ -329,19 +687,10 @@ struct StreamDecoder::Impl {
             previous_phase = lock.phase;
             carrier_offset = lock.offset;
             std::vector<std::complex<float>> current_continual;
-            current_continual.reserve(continual_2k.size() *
-                                      (maximum == 6816 ? 4U : 1U));
-            for (std::size_t segment = 0; segment <= maximum / 1704;
-                 ++segment) {
-                for (const int base : continual_2k) {
-                    const std::size_t k =
-                        (segment * 1704) + static_cast<std::size_t>(base);
-                    if (k <= maximum &&
-                        (current_continual.empty() || k != segment * 1704)) {
-                        current_continual.push_back(
-                            carrier(fft_out, k, maximum, carrier_offset));
-                    }
-                }
+            current_continual.reserve(continual_indices.size());
+            for (const std::size_t k : continual_indices) {
+                current_continual.push_back(
+                    carrier(fft_out, k, maximum, carrier_offset));
             }
             float residual_phase = 0.0F;
             if (previous_continual.size() == current_continual.size()) {
@@ -359,38 +708,16 @@ struct StreamDecoder::Impl {
             }
             previous_continual = std::move(current_continual);
             std::vector<std::complex<float>> channel(maximum + 1);
-            std::vector<std::size_t> pilots;
-            for (std::size_t k = static_cast<std::size_t>(lock.phase * 3);
-                 k <= maximum; k += 12) {
+            const auto &pilots =
+                pilot_indices[static_cast<std::size_t>(lock.phase)];
+            for (const std::size_t k : pilots) {
                 const float sent = prbs[k] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
                 const auto received =
                     carrier(fft_out, k, maximum, carrier_offset);
                 channel[k] = std::norm(received) > minimum_power
                                  ? std::complex<float>{sent, 0.0F} / received
                                  : std::complex<float>{};
-                pilots.push_back(k);
             }
-            for (std::size_t segment = 0; segment <= maximum / 1704;
-                 ++segment) {
-                for (const int base : continual_2k) {
-                    const std::size_t k =
-                        (segment * 1704) + static_cast<std::size_t>(base);
-                    if (k > maximum) {
-                        continue;
-                    }
-                    const float sent =
-                        prbs[k] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
-                    const auto received =
-                        carrier(fft_out, k, maximum, carrier_offset);
-                    channel[k] =
-                        std::norm(received) > minimum_power
-                            ? std::complex<float>{sent, 0.0F} / received
-                            : std::complex<float>{};
-                    pilots.push_back(k);
-                }
-            }
-            std::ranges::sort(pilots);
-            pilots.erase(std::ranges::unique(pilots).begin(), pilots.end());
             for (std::size_t i = 1; i < pilots.size(); ++i) {
                 const std::size_t left = pilots[i - 1];
                 const std::size_t right = pilots[i];
@@ -412,13 +739,8 @@ struct StreamDecoder::Impl {
             payload.reserve(payload_carrier_count(acquisition.mode));
             std::vector<float> equalizer_power;
             equalizer_power.reserve(payload_carrier_count(acquisition.mode));
-            for (std::size_t k = 0; k <= maximum; ++k) {
-                const bool scattered =
-                    k % 12 == static_cast<std::size_t>(lock.phase * 3);
-                const std::size_t base = k % 1704;
-                if (scattered || listed(continual, base) || listed(tps, base)) {
-                    continue;
-                }
+            for (const std::size_t k :
+                 payload_indices[static_cast<std::size_t>(lock.phase)]) {
                 payload.push_back(carrier(fft_out, k, maximum, carrier_offset) *
                                   channel[k]);
                 equalizer_power.push_back(std::norm(channel[k]));
@@ -426,110 +748,179 @@ struct StreamDecoder::Impl {
             if (payload.size() != payload_carrier_count(acquisition.mode)) {
                 continue;
             }
-            for (int iteration = 0; iteration < 2; ++iteration) {
-                std::complex<double> numerator{};
-                double denominator = 0.0;
-                for (const auto value : payload) {
-                    auto nearest = reference.constellation_points().front();
-                    float distance = std::numeric_limits<float>::infinity();
-                    for (const auto point : reference.constellation_points()) {
-                        if (const float d = std::norm(value - point);
-                            d < distance) {
-                            distance = d;
-                            nearest = point;
-                        }
-                    }
-                    numerator +=
-                        std::conj(static_cast<std::complex<double>>(nearest)) *
-                        static_cast<std::complex<double>>(value);
-                    denominator += std::norm(nearest);
-                }
-                const auto gain =
-                    static_cast<std::complex<float>>(numerator / denominator);
-                if (std::abs(gain) > 1.0e-6F) {
-                    for (auto &value : payload) {
-                        value /= gain;
-                    }
-                }
-            }
-            std::vector<float> errors;
-            errors.reserve(payload.size());
-            for (const auto value : payload) {
-                float error = std::numeric_limits<float>::infinity();
-                for (const auto point : reference.constellation_points()) {
-                    error = std::min(error, std::norm(value - point));
-                }
-                errors.push_back(error);
-            }
-            const double mean_error =
-                std::accumulate(errors.begin(), errors.end(), 0.0) /
-                static_cast<double>(errors.size());
-            mer_sum += -10.0 * std::log10(std::max(mean_error, 1.0e-12));
-            auto middle =
-                errors.begin() + static_cast<std::ptrdiff_t>(errors.size() / 2);
-            std::ranges::nth_element(errors, middle);
-            const float reliability =
-                1.0F / std::max(*middle / std::log(2.0F), 1.0e-4F);
-            auto equalizer_power_order = equalizer_power;
-            auto equalizer_middle =
-                equalizer_power_order.begin() +
-                static_cast<std::ptrdiff_t>(equalizer_power_order.size() / 2);
-            std::ranges::nth_element(equalizer_power_order, equalizer_middle);
-            const float median_equalizer_power =
-                std::max(*equalizer_middle, minimum_power);
-            std::vector<float> reliabilities(payload.size());
-            for (std::size_t carrier_index = 0;
-                 carrier_index < reliabilities.size(); ++carrier_index) {
-                const float relative_channel_power =
-                    median_equalizer_power /
-                    std::max(equalizer_power[carrier_index], minimum_power);
-                reliabilities[carrier_index] =
-                    reliability *
-                    std::clamp(relative_channel_power, 0.01F, 16.0F);
-            }
-            const auto ts = decoder.process_symbol(
-                payload, reliabilities, static_cast<std::size_t>(lock.phase));
-            EqualizedCallback equalized_sink;
-            {
-                const std::scoped_lock guard(mutex);
-                equalized_sink = equalized_callback;
-            }
-            if (equalized_sink) {
-                equalized_sink(payload, reliabilities,
-                               static_cast<std::size_t>(lock.phase));
-            }
-            if (!ts.empty()) {
-                TransportCallback sink;
-                {
-                    const std::scoped_lock guard(mutex);
-                    sink = callback;
-                }
-                if (sink) {
-                    sink(ts);
-                }
-                byte_count += ts.size();
+            postprocessor.submit(std::move(payload), std::move(equalizer_power),
+                                 static_cast<std::size_t>(lock.phase));
+            if (!emit_postprocessed(postprocessor.take_ready())) {
+                break;
             }
             ++symbol_count;
             nco_phase = std::remainder(
                 nco_phase + (tracked_cfo_phase * static_cast<float>(period)),
                 2.0F * std::numbers::pi_v<float>);
         }
+        if (!cancel_requested && !emit_postprocessed(postprocessor.flush())) {
+            return;
+        }
         fftwf_destroy_plan(plan);
-        const std::scoped_lock guard(mutex);
-        latest.ofdm_locked = symbol_count != 0;
-        latest.carrier_bin_offset = carrier_offset;
-        latest.mer_db = symbol_count == 0
-                            ? 0.0F
-                            : static_cast<float>(
-                                  mer_sum / static_cast<double>(symbol_count));
-        latest.residual_carrier_offset_hz =
-            residual_phase_ema *
-            (static_cast<float>(bandwidth) * (8.0F / 7.0F)) /
-            (2.0F * std::numbers::pi_v<float> * static_cast<float>(period));
-        latest.pilot_phase_discontinuities += phase_discontinuities;
-        latest.ofdm_symbols += symbol_count;
-        latest.transport_bytes += byte_count;
-        latest.transport = decoder.stats();
+        const auto equalized_at = std::chrono::steady_clock::now();
+        if (cancel_requested) {
+            return;
+        }
+        const ChunkSummary summary{
+            .ofdm_locked = symbol_count != 0,
+            .carrier_bin_offset = carrier_offset,
+            .mer_db = symbol_count == 0
+                          ? 0.0F
+                          : static_cast<float>(
+                                mer_sum / static_cast<double>(symbol_count)),
+            .residual_carrier_offset_hz =
+                residual_phase_ema *
+                (static_cast<float>(bandwidth) * (8.0F / 7.0F)) /
+                (2.0F * std::numbers::pi_v<float> * static_cast<float>(period)),
+            .pilot_phase_discontinuities = phase_discontinuities,
+            .ofdm_symbols = symbol_count,
+            .input_seconds =
+                static_cast<float>(iq.size() / 2) / static_cast<float>(rate),
+            .resample_time_ms = std::chrono::duration<float, std::milli>(
+                                    resampled_at - started_at)
+                                    .count(),
+            .acquisition_time_ms = std::chrono::duration<float, std::milli>(
+                                       acquired_at - resampled_at)
+                                       .count(),
+            .equalization_time_ms = std::chrono::duration<float, std::milli>(
+                                        equalized_at - acquired_at)
+                                        .count(),
+            .demap_time_ms = demap_time_sum,
+            .deinterleave_time_ms = deinterleave_time_sum,
+            .depuncture_time_ms = depuncture_time_sum,
+            .resample_workers = resample_workers,
+            .symbol_workers = workers.symbol,
+            .started_at = started_at,
+        };
+        static_cast<void>(enqueue_fec({.kind = FecItem::Kind::end,
+                                       .generation = generation,
+                                       .parameters = {},
+                                       .mother_metrics = {},
+                                       .symbol_index = 0,
+                                       .summary = summary}));
+    }
+
+    void run_fec() {
+        std::unique_ptr<Decoder> decoder;
+        std::uint64_t decoder_generation = 0;
+        std::uint64_t byte_count = 0;
+        float fec_work_ms = 0.0F;
+        while (true) {
+            FecItem item;
+            {
+                std::unique_lock lock(mutex);
+                fec_ready.wait(
+                    lock, [this] { return stopping || !fec_queue.empty(); });
+                if (stopping) {
+                    return;
+                }
+                item = std::move(fec_queue.front());
+                fec_queue.pop_front();
+                fec_worker_busy = true;
+            }
+            fec_not_full.notify_one();
+
+            if (item.generation == latest_generation) {
+                if (item.kind == FecItem::Kind::begin) {
+                    if (!decoder || decoder_generation != item.generation ||
+                        decoder->parameters() != item.parameters) {
+                        decoder = std::make_unique<Decoder>(item.parameters);
+                    } else {
+                        decoder->reset();
+                    }
+                    decoder_generation = item.generation;
+                    byte_count = 0;
+                    fec_work_ms = 0.0F;
+                } else if (item.kind == FecItem::Kind::symbol && decoder &&
+                           decoder_generation == item.generation) {
+                    const auto fec_started_at =
+                        std::chrono::steady_clock::now();
+                    const auto ts =
+                        decoder->process_soft_metrics(item.mother_metrics);
+                    fec_work_ms +=
+                        std::chrono::duration<float, std::milli>(
+                            std::chrono::steady_clock::now() - fec_started_at)
+                            .count();
+                    if (!ts.empty() && item.generation == latest_generation) {
+                        TransportCallback sink;
+                        {
+                            const std::scoped_lock guard(mutex);
+                            sink = callback;
+                        }
+                        if (sink) {
+                            sink(ts);
+                        }
+                        byte_count += ts.size();
+                    }
+                } else if (item.kind == FecItem::Kind::end && decoder &&
+                           decoder_generation == item.generation) {
+                    const auto fec_started_at =
+                        std::chrono::steady_clock::now();
+                    const auto ts = decoder->flush();
+                    fec_work_ms +=
+                        std::chrono::duration<float, std::milli>(
+                            std::chrono::steady_clock::now() - fec_started_at)
+                            .count();
+                    if (!ts.empty() && item.generation == latest_generation) {
+                        TransportCallback sink;
+                        {
+                            const std::scoped_lock guard(mutex);
+                            sink = callback;
+                        }
+                        if (sink) {
+                            sink(ts);
+                        }
+                        byte_count += ts.size();
+                    }
+                    const float wall_seconds =
+                        std::chrono::duration<float>(
+                            std::chrono::steady_clock::now() -
+                            item.summary.started_at)
+                            .count();
+                    const std::scoped_lock guard(mutex);
+                    if (item.generation == latest_generation) {
+                        latest.ofdm_locked = item.summary.ofdm_locked;
+                        latest.carrier_bin_offset =
+                            item.summary.carrier_bin_offset;
+                        latest.mer_db = item.summary.mer_db;
+                        latest.residual_carrier_offset_hz =
+                            item.summary.residual_carrier_offset_hz;
+                        latest.pilot_phase_discontinuities +=
+                            item.summary.pilot_phase_discontinuities;
+                        latest.ofdm_symbols += item.summary.ofdm_symbols;
+                        latest.transport_bytes += byte_count;
+                        latest.transport = decoder->stats();
+                        latest.processing_realtime_ratio =
+                            wall_seconds / item.summary.input_seconds;
+                        latest.resample_time_ms = item.summary.resample_time_ms;
+                        latest.acquisition_time_ms =
+                            item.summary.acquisition_time_ms;
+                        latest.equalization_time_ms =
+                            item.summary.equalization_time_ms;
+                        latest.fec_time_ms = fec_work_ms;
+                        latest.symbol_workers = item.summary.symbol_workers;
+                        latest.demap_time_ms = item.summary.demap_time_ms;
+                        latest.deinterleave_time_ms =
+                            item.summary.deinterleave_time_ms;
+                        latest.depuncture_time_ms =
+                            item.summary.depuncture_time_ms;
+                        latest.transport_time_ms =
+                            decoder->timing().transport_time_ms;
+                        latest.resample_workers = item.summary.resample_workers;
+                    }
+                }
+            }
+            {
+                const std::scoped_lock guard(mutex);
+                fec_worker_busy = false;
+            }
+            idle.notify_all();
+        }
     }
 
     void run() {
@@ -538,35 +929,74 @@ struct StreamDecoder::Impl {
             {
                 std::unique_lock lock(mutex);
                 ready.wait(lock, [this] {
-                    return stopping || reset_requested || !queue.empty();
+                    return stopping || reset_requested || flush_requested ||
+                           !queue.empty();
                 });
                 if (stopping) {
                     return;
                 }
                 if (reset_requested) {
                     queue.clear();
+                    fec_queue.clear();
+                    queued_complex_samples = 0;
                     accumulated.clear();
+                    stable_mode.reset();
+                    stable_guard.reset();
                     latest = {};
+                    ++latest_generation;
                     reset_requested = false;
+                    flush_requested = false;
+                    cancel_requested = false;
+                    input_not_full.notify_all();
+                    fec_not_full.notify_all();
                 }
                 if (queue.empty()) {
-                    continue;
+                    if (flush_requested) {
+                        flush_requested = false;
+                        worker_busy = true;
+                    } else {
+                        idle.notify_all();
+                        continue;
+                    }
+                } else {
+                    block = std::move(queue.front());
+                    queue.pop_front();
+                    queued_complex_samples -= block.samples.size() / 2;
+                    input_not_full.notify_one();
+                    ++latest.input_blocks;
+                    worker_busy = true;
                 }
-                block = std::move(queue.front());
-                queue.pop_front();
-                ++latest.input_blocks;
             }
-            accumulated.insert(accumulated.end(), block.samples.begin(),
-                               block.samples.end());
-            const std::size_t scalar_chunk = decode_chunk_samples * 2;
+            if (!block.samples.empty()) {
+                if (!accumulated.empty() &&
+                    (accumulated_rate != block.rate ||
+                     accumulated_bandwidth != block.bandwidth)) {
+                    accumulated.clear();
+                }
+                accumulated_rate = block.rate;
+                accumulated_bandwidth = block.bandwidth;
+                accumulated.insert(accumulated.end(), block.samples.begin(),
+                                   block.samples.end());
+            }
+            const std::size_t scalar_chunk = processing_chunk_samples * 2;
             while (accumulated.size() >= scalar_chunk) {
                 decode_chunk(std::span(accumulated).first(scalar_chunk),
-                             block.rate, block.bandwidth);
+                             accumulated_rate, accumulated_bandwidth);
                 accumulated.erase(
                     accumulated.begin(),
                     accumulated.begin() +
                         static_cast<std::ptrdiff_t>(scalar_chunk));
             }
+            if (block.samples.empty() && !accumulated.empty()) {
+                decode_chunk(accumulated, accumulated_rate,
+                             accumulated_bandwidth);
+                accumulated.clear();
+            }
+            {
+                const std::scoped_lock guard(mutex);
+                worker_busy = false;
+            }
+            idle.notify_all();
         }
     }
 };
@@ -574,26 +1004,91 @@ struct StreamDecoder::Impl {
 StreamDecoder::StreamDecoder() : impl_(std::make_unique<Impl>()) {}
 StreamDecoder::~StreamDecoder() noexcept = default;
 
-void StreamDecoder::submit(const std::span<const std::int16_t> iq,
-                           const std::uint32_t rate,
-                           const std::uint32_t bandwidth) {
-    if (iq.empty() || rate == 0 || (iq.size() % 2) != 0) {
+void StreamDecoder::submit(const std::span<const std::int16_t> interleaved_iq,
+                           const std::uint32_t sample_rate_hz,
+                           const std::uint32_t channel_bandwidth_hz) {
+    if (interleaved_iq.empty() || sample_rate_hz == 0 ||
+        (interleaved_iq.size() % 2) != 0) {
         return;
     }
     const std::scoped_lock lock(impl_->mutex);
-    if (impl_->queue.size() >= max_queued_blocks) {
+    const std::size_t incoming_samples = interleaved_iq.size() / 2;
+    impl_->input_queue_capacity_samples =
+        std::max(buffered_input_samples(sample_rate_hz), incoming_samples);
+    if (impl_->queued_complex_samples + incoming_samples >
+        impl_->input_queue_capacity_samples) {
         ++impl_->latest.dropped_blocks;
         return;
     }
-    impl_->queue.push_back(
-        {std::vector<std::int16_t>(iq.begin(), iq.end()), rate, bandwidth});
+    impl_->queue.push_back({std::vector<std::int16_t>(interleaved_iq.begin(),
+                                                      interleaved_iq.end()),
+                            sample_rate_hz, channel_bandwidth_hz});
+    impl_->queued_complex_samples += incoming_samples;
     impl_->ready.notify_one();
 }
 
-void StreamDecoder::reset() {
-    const std::scoped_lock lock(impl_->mutex);
-    impl_->reset_requested = true;
+void StreamDecoder::submit_blocking(
+    const std::span<const std::int16_t> interleaved_iq,
+    const std::uint32_t sample_rate_hz,
+    const std::uint32_t channel_bandwidth_hz) {
+    if (interleaved_iq.empty() || sample_rate_hz == 0 ||
+        (interleaved_iq.size() % 2) != 0) {
+        return;
+    }
+    std::unique_lock lock(impl_->mutex);
+    const std::size_t incoming_samples = interleaved_iq.size() / 2;
+    impl_->input_queue_capacity_samples =
+        std::max(buffered_input_samples(sample_rate_hz), incoming_samples);
+    impl_->input_not_full.wait(lock, [this, incoming_samples] {
+        return impl_->stopping ||
+               impl_->queued_complex_samples + incoming_samples <=
+                   impl_->input_queue_capacity_samples;
+    });
+    if (impl_->stopping) {
+        return;
+    }
+    impl_->queue.push_back({std::vector<std::int16_t>(interleaved_iq.begin(),
+                                                      interleaved_iq.end()),
+                            sample_rate_hz, channel_bandwidth_hz});
+    impl_->queued_complex_samples += incoming_samples;
     impl_->ready.notify_one();
+}
+
+void StreamDecoder::flush() {
+    {
+        const std::scoped_lock lock(impl_->mutex);
+        impl_->flush_requested = true;
+    }
+    impl_->ready.notify_one();
+    wait_until_idle();
+}
+
+void StreamDecoder::wait_until_idle() {
+    std::unique_lock lock(impl_->mutex);
+    impl_->idle.wait(lock, [this] {
+        return impl_->queue.empty() && !impl_->worker_busy &&
+               !impl_->flush_requested && !impl_->reset_requested &&
+               impl_->fec_queue.empty() && !impl_->fec_worker_busy;
+    });
+}
+
+void StreamDecoder::reset() {
+    impl_->cancel_requested = true;
+    {
+        const std::scoped_lock lock(impl_->mutex);
+        impl_->reset_requested = true;
+    }
+    impl_->fec_not_full.notify_all();
+    impl_->ready.notify_one();
+}
+
+void StreamDecoder::set_parameters(const ReceiverParameters &parameters) {
+    {
+        const std::scoped_lock lock(impl_->mutex);
+        impl_->parameters = parameters;
+    }
+    reset();
+    wait_until_idle();
 }
 
 void StreamDecoder::set_transport_callback(TransportCallback callback) {
@@ -608,7 +1103,17 @@ void StreamDecoder::set_equalized_callback(EqualizedCallback callback) {
 
 StreamDecoderStats StreamDecoder::stats() const {
     const std::scoped_lock lock(impl_->mutex);
-    return impl_->latest;
+    auto statistics = impl_->latest;
+    statistics.queued_blocks = impl_->queue.size();
+    statistics.queued_input_samples = impl_->queued_complex_samples;
+    statistics.input_queue_capacity_samples =
+        impl_->input_queue_capacity_samples;
+    statistics.queued_symbols = impl_->fec_queue.size();
+    statistics.symbol_queue_capacity = impl_->fec_queue_capacity;
+    statistics.fec_processing = impl_->fec_worker_busy;
+    statistics.processing = impl_->worker_busy || impl_->fec_worker_busy ||
+                            !impl_->queue.empty() || !impl_->fec_queue.empty();
+    return statistics;
 }
 
 } // namespace airspy_tv::dvbt

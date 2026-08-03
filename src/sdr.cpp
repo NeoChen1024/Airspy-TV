@@ -1,16 +1,14 @@
 #include "airspy_tv/sdr.hpp"
 
+#include "airspy_tv/iq_file.hpp"
+
 #include <SoapySDR/Constants.h>
 #include <SoapySDR/Device.hpp>
 #include <SoapySDR/Errors.hpp>
 #include <SoapySDR/Formats.h>
-#include <libairspy/airspy.h>
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -19,6 +17,7 @@
 #include <format>
 #include <fstream>
 #include <iomanip>
+#include <libairspy/airspy.h>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -53,15 +52,6 @@ std::string argument_value(const std::map<std::string, std::string> &arguments,
                            const std::string_view key) {
     const auto item = arguments.find(std::string(key));
     return item == arguments.end() ? std::string{} : item->second;
-}
-
-bool is_json_path(const std::filesystem::path &path) {
-    std::string extension = path.extension().string();
-    std::ranges::transform(extension, extension.begin(), [](const char value) {
-        return static_cast<char>(
-            std::tolower(static_cast<unsigned char>(value)));
-    });
-    return extension == ".json";
 }
 
 } // namespace
@@ -199,6 +189,9 @@ struct SdrDevice::Impl {
                 static_cast<double>(active_sample_rate.load()));
             std::this_thread::sleep_until(started_at + elapsed);
         }
+        if (streaming) {
+            stream_decoder.flush();
+        }
         if (streaming.exchange(false)) {
             set_async_error("I/Q file playback finished");
         }
@@ -206,6 +199,12 @@ struct SdrDevice::Impl {
 
     void stop_source() {
         const bool was_streaming = streaming.exchange(false);
+        // Cancel queued/active DSP immediately. In particular, the native
+        // DVB-T worker may otherwise continue decoding a large chunk while
+        // the UI is already tearing down after a window-close request.
+        analyzer.reset();
+        signal_analyzer.reset();
+        stream_decoder.reset();
         if (current.backend == SdrBackend::AirspyNative && airspy != nullptr &&
             was_streaming) {
             airspy_stop_rx(airspy);
@@ -221,9 +220,6 @@ struct SdrDevice::Impl {
             soapy->closeStream(soapy_stream);
             soapy_stream = nullptr;
         }
-        analyzer.reset();
-        signal_analyzer.reset();
-        stream_decoder.reset();
     }
 
     void stop_all() {
@@ -375,86 +371,23 @@ bool SdrDevice::open(const DeviceDescriptor &descriptor, std::string &error) {
 bool SdrDevice::open_iq_file(const std::filesystem::path &path,
                              SourceSettings &settings, std::string &error) {
     close();
-    if (path.empty()) {
-        error = "I/Q source path is empty";
+    IqFileInfo info;
+    if (!resolve_iq_file(path, settings.sample_rate_hz,
+                         settings.center_frequency_hz, info, error)) {
         return false;
     }
-
-    std::filesystem::path data_path = path;
-    std::string source = "airspy_rx INT16_IQ";
-    try {
-        if (is_json_path(path)) {
-            std::ifstream sidecar(path);
-            if (!sidecar) {
-                error = "Unable to open I/Q metadata: " + path.string();
-                return false;
-            }
-            const nlohmann::json metadata = nlohmann::json::parse(sidecar);
-            if (metadata.value("datatype", std::string{}) != "ci16_le" ||
-                metadata.value("iq_order", std::string{}) != "IQ") {
-                error = "Only ci16_le metadata with IQ ordering is supported";
-                return false;
-            }
-
-            const std::string data_file = metadata.value("data_file", "");
-            if (data_file.empty()) {
-                data_path = path;
-                data_path.replace_extension();
-            } else {
-                const std::filesystem::path relative(data_file);
-                if (relative.is_absolute() || relative.has_parent_path() ||
-                    relative.filename() != relative) {
-                    error = "I/Q metadata data_file must be a filename in the "
-                            "same directory";
-                    return false;
-                }
-                data_path = path.parent_path() / relative;
-            }
-
-            const auto sample_rate =
-                metadata.at("sample_rate").get<std::uint64_t>();
-            if (sample_rate == 0 ||
-                sample_rate > std::numeric_limits<std::uint32_t>::max()) {
-                error = "I/Q metadata sample_rate is out of range";
-                return false;
-            }
-            settings.sample_rate_hz = static_cast<std::uint32_t>(sample_rate);
-            settings.center_frequency_hz =
-                metadata.value("center_frequency", std::uint64_t{});
-            source = metadata.value("source", std::string{"Recorded I/Q"});
-        } else if (settings.sample_rate_hz == 0) {
-            error = "A positive sample rate is required for raw INT16_IQ";
-            return false;
-        }
-
-        if (!std::filesystem::is_regular_file(data_path)) {
-            error = "I/Q data file was not found: " + data_path.string();
-            return false;
-        }
-        const std::uintmax_t file_size = std::filesystem::file_size(data_path);
-        if (file_size == 0 || file_size % (sizeof(std::int16_t) * 2) != 0) {
-            error = "I/Q data file must contain complete interleaved INT16 I/Q "
-                    "samples";
-            return false;
-        }
-    } catch (const nlohmann::json::exception &exception) {
-        error = std::string("Invalid I/Q metadata: ") + exception.what();
-        return false;
-    } catch (const std::filesystem::filesystem_error &exception) {
-        error =
-            std::string("Unable to inspect I/Q source: ") + exception.what();
-        return false;
-    }
-
-    impl_->file_path = data_path;
+    settings.sample_rate_hz = info.sample_rate_hz;
+    settings.center_frequency_hz = info.center_frequency_hz;
+    impl_->file_path = info.data_path;
     impl_->rates = {settings.sample_rate_hz};
     impl_->current = {
         .backend = SdrBackend::File,
-        .id = "file:" + data_path.string(),
-        .display_name = data_path.filename().string() + " [I/Q file]",
+        .id = "file:" + info.data_path.string(),
+        .display_name = info.data_path.filename().string() + " [I/Q file]",
         .driver = "file",
         .serial = {},
-        .arguments = {{"source", source}, {"path", data_path.string()}},
+        .arguments = {{"source", info.source},
+                      {"path", info.data_path.string()}},
     };
     impl_->async_error.clear();
     impl_->opened = true;
@@ -701,6 +634,12 @@ void SdrDevice::set_display_smoothing(const bool fft_enabled,
     impl_->analyzer.set_smoothing(fft_enabled, fft_speed, snr_enabled,
                                   snr_speed);
     impl_->signal_analyzer.set_snr_smoothing(snr_enabled, snr_speed);
+}
+
+void SdrDevice::set_dvbt_parameters(
+    const dvbt::ReceiverParameters &parameters) {
+    impl_->signal_analyzer.set_parameters(parameters);
+    impl_->stream_decoder.set_parameters(parameters);
 }
 
 bool SdrDevice::start_recording(const std::filesystem::path &path,

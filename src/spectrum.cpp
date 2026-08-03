@@ -18,6 +18,7 @@
 #include <ranges>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace airspy_tv {
 namespace {
@@ -30,6 +31,17 @@ constexpr float fft_rate_hz =
     1000.0F / static_cast<float>(capture_interval.count());
 constexpr float dvbt_channel_bandwidth_hz = 6'000'000.0F;
 constexpr std::size_t notch_smoothing_radius = 4;
+constexpr std::size_t notch_lower_percentile_divisor = 100;
+
+[[nodiscard]] float lower_percentile(std::vector<float> &values) {
+    const std::size_t index =
+        std::min(values.size() - 1,
+                 std::max<std::size_t>(1, values.size() /
+                                              notch_lower_percentile_divisor));
+    auto percentile = values.begin() + static_cast<std::ptrdiff_t>(index);
+    std::ranges::nth_element(values, percentile);
+    return *percentile;
+}
 
 void update_channel_metrics(SpectrumSnapshot &snapshot,
                             const std::span<const float> averaged_power) {
@@ -93,12 +105,13 @@ void update_channel_metrics(SpectrumSnapshot &snapshot,
     if (smoothed_channel.empty()) {
         return;
     }
-    auto middle = smoothed_channel.begin() +
-                  static_cast<std::ptrdiff_t>(smoothed_channel.size() / 2);
-    std::ranges::nth_element(smoothed_channel, middle);
+    auto baseline_values = smoothed_channel;
+    auto middle = baseline_values.begin() +
+                  static_cast<std::ptrdiff_t>(baseline_values.size() / 2);
+    std::ranges::nth_element(baseline_values, middle);
     const float median = *middle;
-    const float minimum = *std::ranges::min_element(smoothed_channel);
-    snapshot.deepest_notch_db = std::clamp(minimum - median, -80.0F, 0.0F);
+    const float lower = lower_percentile(smoothed_channel);
+    snapshot.deepest_notch_db = std::clamp(lower - median, -80.0F, 0.0F);
     snapshot.channel_metrics_valid = true;
 }
 

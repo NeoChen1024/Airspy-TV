@@ -1,5 +1,6 @@
 #include "airspy_tv/dvbt/decoder.hpp"
 
+#include <chrono>
 #include <complex>
 #include <cstddef>
 #include <memory>
@@ -13,7 +14,7 @@ struct Decoder::Impl {
     explicit Impl(const DecoderParameters selected_parameters)
         : parameters(selected_parameters), demapper(parameters.constellation),
           symbol_deinterleaver(parameters.mode),
-          transport_decoder(parameters.code_rate) {
+          transport_decoder(parameters.code_rate, parameters.viterbi_workers) {
         const std::size_t metric_count =
             payload_carrier_count(parameters.mode) *
             bits_per_symbol(parameters.constellation);
@@ -34,11 +35,58 @@ struct Decoder::Impl {
         }
 
         const std::size_t bits = bits_per_symbol(parameters.constellation);
+        const auto demap_started_at = std::chrono::steady_clock::now();
         demapper.demap(equalized_carriers, reliability, demapped);
+        const auto deinterleave_started_at = std::chrono::steady_clock::now();
         symbol_deinterleaver.process(demapped, bits, symbol_index,
                                      symbol_metrics);
         bit_deinterleave(symbol_metrics, bits, bit_metrics);
-        return transport_decoder.process(bit_metrics);
+        const auto transport_started_at = std::chrono::steady_clock::now();
+        auto output = transport_decoder.process(bit_metrics);
+        const auto finished_at = std::chrono::steady_clock::now();
+        timing.demap_time_ms += std::chrono::duration<float, std::milli>(
+                                    deinterleave_started_at - demap_started_at)
+                                    .count();
+        timing.deinterleave_time_ms +=
+            std::chrono::duration<float, std::milli>(transport_started_at -
+                                                     deinterleave_started_at)
+                .count();
+        timing.transport_time_ms += std::chrono::duration<float, std::milli>(
+                                        finished_at - transport_started_at)
+                                        .count();
+        return output;
+    }
+
+    [[nodiscard]] std::vector<std::uint8_t>
+    process_metrics(const std::span<const float> punctured_llrs) {
+        if (punctured_llrs.size() != bit_metrics.size()) {
+            throw std::invalid_argument(
+                "DVB-T punctured metric count mismatch");
+        }
+        const auto started_at = std::chrono::steady_clock::now();
+        auto output = transport_decoder.process(punctured_llrs);
+        timing.transport_time_ms +=
+            std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - started_at)
+                .count();
+        return output;
+    }
+
+    [[nodiscard]] std::vector<std::uint8_t>
+    process_soft_metrics(const std::span<const std::uint8_t> mother_metrics) {
+        const std::size_t expected =
+            depunctured_size(bit_metrics.size(), parameters.code_rate);
+        if (mother_metrics.size() != expected) {
+            throw std::invalid_argument(
+                "DVB-T mother-code metric count mismatch");
+        }
+        const auto started_at = std::chrono::steady_clock::now();
+        auto output = transport_decoder.process_soft(mother_metrics);
+        timing.transport_time_ms +=
+            std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - started_at)
+                .count();
+        return output;
     }
 
     DecoderParameters parameters;
@@ -48,6 +96,7 @@ struct Decoder::Impl {
     std::vector<float> demapped;
     std::vector<float> symbol_metrics;
     std::vector<float> bit_metrics;
+    DecoderTiming timing;
 };
 
 Decoder::Decoder(const DecoderParameters parameters)
@@ -57,7 +106,10 @@ Decoder::~Decoder() noexcept = default;
 Decoder::Decoder(Decoder &&) noexcept = default;
 Decoder &Decoder::operator=(Decoder &&) noexcept = default;
 
-void Decoder::reset() { impl_->transport_decoder.reset(); }
+void Decoder::reset() {
+    impl_->transport_decoder.reset();
+    impl_->timing = {};
+}
 
 std::vector<std::uint8_t> Decoder::process_symbol(
     const std::span<const std::complex<float>> equalized_carriers,
@@ -65,12 +117,34 @@ std::vector<std::uint8_t> Decoder::process_symbol(
     return impl_->process_symbol(equalized_carriers, reliability, symbol_index);
 }
 
+std::vector<std::uint8_t>
+Decoder::process_metrics(const std::span<const float> punctured_llrs) {
+    return impl_->process_metrics(punctured_llrs);
+}
+
+std::vector<std::uint8_t> Decoder::process_soft_metrics(
+    const std::span<const std::uint8_t> mother_metrics) {
+    return impl_->process_soft_metrics(mother_metrics);
+}
+
 DecoderParameters Decoder::parameters() const noexcept {
     return impl_->parameters;
 }
 
+DecoderTiming Decoder::timing() const noexcept { return impl_->timing; }
+
 TransportDecoderStats Decoder::stats() const {
     return impl_->transport_decoder.stats();
+}
+
+std::vector<std::uint8_t> Decoder::flush() {
+    const auto started_at = std::chrono::steady_clock::now();
+    auto output = impl_->transport_decoder.flush();
+    impl_->timing.transport_time_ms +=
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - started_at)
+            .count();
+    return output;
 }
 
 } // namespace airspy_tv::dvbt

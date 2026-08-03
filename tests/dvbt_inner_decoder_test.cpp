@@ -1,4 +1,5 @@
 #include "airspy_tv/dvbt/inner_decoder.hpp"
+#include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 #include "airspy_tv/dvbt/soft_demapper.hpp"
 
 #include <algorithm>
@@ -6,12 +7,16 @@
 #include <cmath>
 #include <complex>
 #include <cstddef>
+#include <cstdint>
 #include <iostream>
+#include <limits>
 #include <numeric>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -19,6 +24,7 @@ namespace {
 using airspy_tv::dvbt::CodeRate;
 using airspy_tv::dvbt::Constellation;
 using airspy_tv::dvbt::MaxLogDemapper;
+using airspy_tv::dvbt::ReceiverParameters;
 using airspy_tv::dvbt::SymbolDeinterleaver;
 using airspy_tv::dvbt::TransmissionMode;
 
@@ -63,6 +69,107 @@ void test_constellations() {
         require(std::ranges::all_of(
                     llrs, [](const float llr) { return llr == 0.0F; }),
                 "zero reliability must erase a carrier");
+    }
+}
+
+void test_separable_max_log_matches_exhaustive_reference() {
+    std::mt19937 generator{0x44564254U};
+    std::uniform_real_distribution<float> sample_distribution{-2.0F, 2.0F};
+    std::uniform_real_distribution<float> reliability_distribution{0.0F, 20.0F};
+    constexpr std::size_t carrier_count = 4097;
+
+    for (const auto constellation :
+         {Constellation::qpsk, Constellation::qam16, Constellation::qam64}) {
+        const MaxLogDemapper demapper{constellation};
+        const auto points = demapper.constellation_points();
+        const std::size_t bit_count = demapper.bits_per_symbol();
+        std::vector<std::complex<float>> carriers(carrier_count);
+        std::vector<std::complex<float>> sliced(carrier_count);
+        std::vector<float> reliability(carrier_count);
+        for (std::size_t index = 0; index < carrier_count; ++index) {
+            carriers[index] = {sample_distribution(generator),
+                               sample_distribution(generator)};
+            reliability[index] = reliability_distribution(generator);
+        }
+        demapper.slice_nearest(carriers, sliced);
+        reliability.front() = 0.0F;
+
+        std::vector<float> actual(carrier_count * bit_count);
+        demapper.demap(carriers, reliability, actual);
+        for (std::size_t carrier = 0; carrier < carrier_count; ++carrier) {
+            float exhaustive_nearest = std::numeric_limits<float>::infinity();
+            for (const auto point : points) {
+                exhaustive_nearest = std::min(
+                    exhaustive_nearest, std::norm(carriers[carrier] - point));
+            }
+            const float sliced_nearest =
+                std::norm(carriers[carrier] - sliced[carrier]);
+            require(std::abs(sliced_nearest - exhaustive_nearest) < 1.0e-6F,
+                    "square-QAM slicer must match exhaustive nearest point");
+            require(sliced[carrier] ==
+                        demapper.nearest_constellation_point(carriers[carrier]),
+                    "batch and scalar square-QAM slicers must agree");
+            for (std::size_t bit = 0; bit < bit_count; ++bit) {
+                float minimum_zero = std::numeric_limits<float>::infinity();
+                float minimum_one = std::numeric_limits<float>::infinity();
+                const std::size_t mask = std::size_t{1}
+                                         << (bit_count - bit - 1);
+                for (std::size_t label = 0; label < points.size(); ++label) {
+                    const float distance =
+                        std::norm(carriers[carrier] - points[label]);
+                    float &minimum =
+                        (label & mask) == 0U ? minimum_zero : minimum_one;
+                    minimum = std::min(minimum, distance);
+                }
+                const float expected =
+                    reliability[carrier] * (minimum_zero - minimum_one);
+                const float tolerance =
+                    2.0e-5F * std::max(std::abs(expected), 1.0F);
+                require(std::abs(actual[(carrier * bit_count) + bit] -
+                                 expected) <= tolerance,
+                        "separable Max-Log must match exhaustive reference");
+            }
+        }
+    }
+}
+
+void test_shared_ofdm_acquisition() {
+    std::mt19937 generator{0x4f46444dU};
+    std::uniform_real_distribution<float> sample_distribution{-1.0F, 1.0F};
+    for (const auto mode : {TransmissionMode::k2, TransmissionMode::k8}) {
+        const std::size_t fft_size = mode == TransmissionMode::k2 ? 2048 : 8192;
+        for (const auto [guard, divisor] :
+             {std::pair{airspy_tv::dvbt::GuardInterval::gi_1_32, 32U},
+              std::pair{airspy_tv::dvbt::GuardInterval::gi_1_16, 16U},
+              std::pair{airspy_tv::dvbt::GuardInterval::gi_1_8, 8U},
+              std::pair{airspy_tv::dvbt::GuardInterval::gi_1_4, 4U}}) {
+            const std::size_t guard_size = fft_size / divisor;
+            std::vector<std::complex<float>> samples;
+            samples.reserve(14 * (fft_size + guard_size));
+            for (std::size_t symbol = 0; symbol < 14; ++symbol) {
+                std::vector<std::complex<float>> useful(fft_size);
+                for (auto &sample : useful) {
+                    sample = {sample_distribution(generator),
+                              sample_distribution(generator)};
+                }
+                samples.insert(samples.end(),
+                               useful.end() -
+                                   static_cast<std::ptrdiff_t>(guard_size),
+                               useful.end());
+                samples.insert(samples.end(), useful.begin(), useful.end());
+            }
+
+            const auto acquisition =
+                airspy_tv::dvbt::acquire_ofdm(samples, ReceiverParameters{});
+            require(acquisition.mode == mode, "shared acquisition mode");
+            require(acquisition.guard == guard, "shared acquisition guard");
+            require(acquisition.fft_size == fft_size,
+                    "shared acquisition FFT size");
+            require(acquisition.guard_size == guard_size,
+                    "shared acquisition guard size");
+            require(acquisition.score > 0.99F,
+                    "shared acquisition CP correlation");
+        }
     }
 }
 
@@ -165,16 +272,38 @@ void test_depuncturer() {
             "DVB-T 2/3 puncture pattern");
 }
 
+void test_partitioned_resampler() {
+    constexpr std::size_t complex_samples = 35 * 257;
+    std::mt19937 generator{0x5253504CU};
+    std::uniform_int_distribution<int> sample_distribution{-32768, 32767};
+    std::vector<std::int16_t> input(complex_samples * 2);
+    for (auto &sample : input) {
+        sample = static_cast<std::int16_t>(sample_distribution(generator));
+    }
+
+    const auto serial =
+        airspy_tv::dvbt::resample_cs16(input, 10'000'000, 6'000'000, 1);
+    for (const std::size_t workers : {2U, 4U, 16U}) {
+        const auto partitioned = airspy_tv::dvbt::resample_cs16(
+            input, 10'000'000, 6'000'000, workers);
+        require(partitioned == serial,
+                "partitioned resampler must be bit-identical to serial");
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         test_constellations();
+        test_separable_max_log_matches_exhaustive_reference();
+        test_shared_ofdm_acquisition();
         test_symbol_deinterleaver(TransmissionMode::k2);
         test_symbol_deinterleaver(TransmissionMode::k8);
         test_symbol_permutation_prefixes();
         test_bit_deinterleaver();
         test_depuncturer();
+        test_partitioned_resampler();
     } catch (const std::exception &error) {
         std::cerr << "DVB-T inner decoder test failed: " << error.what()
                   << '\n';

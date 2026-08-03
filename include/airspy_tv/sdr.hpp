@@ -66,6 +66,7 @@ class SdrDevice {
     bool set_bias_tee(bool enabled, std::string &error);
     void set_display_smoothing(bool fft_enabled, int fft_speed,
                                bool snr_enabled, int snr_speed);
+    void set_dvbt_parameters(const dvbt::ReceiverParameters &parameters);
 
     bool start_recording(const std::filesystem::path &path,
                          const SourceSettings &settings, std::string &error);

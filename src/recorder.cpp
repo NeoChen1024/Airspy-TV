@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -15,7 +16,11 @@
 namespace airspy_tv {
 namespace {
 
-constexpr std::size_t max_queued_blocks = 64;
+constexpr std::size_t recorder_buffer_seconds = 5;
+// 24 MiB holds more than five seconds at DVB-T's maximum useful
+// transport-stream rate while keeping the capacity independent of callback
+// block boundaries.
+constexpr std::size_t transport_queue_capacity_bytes = 24U << 20U;
 
 } // namespace
 
@@ -28,6 +33,8 @@ struct RawIqRecorder::Impl {
     std::filesystem::path path;
     RecordingMetadata metadata;
     std::chrono::steady_clock::time_point started_at;
+    std::size_t queued_complex_samples{};
+    std::size_t queue_capacity_samples{};
     bool stopping{};
     std::atomic<bool> active;
     std::atomic<std::uint64_t> elapsed_milliseconds;
@@ -47,6 +54,7 @@ struct RawIqRecorder::Impl {
                 }
                 block = std::move(queue.front());
                 queue.pop_front();
+                queued_complex_samples -= block.size() / 2;
             }
 
             const auto byte_count = static_cast<std::streamsize>(
@@ -110,6 +118,10 @@ bool RawIqRecorder::start(const std::filesystem::path &path,
     impl_->path = path;
     impl_->metadata = std::move(metadata);
     impl_->stopping = false;
+    impl_->queued_complex_samples = 0;
+    impl_->queue_capacity_samples = std::max<std::size_t>(
+        1, static_cast<std::size_t>(impl_->metadata.sample_rate_hz) *
+               recorder_buffer_seconds);
     impl_->started_at = std::chrono::steady_clock::now();
     impl_->complex_samples = 0;
     impl_->elapsed_milliseconds = 0;
@@ -127,11 +139,16 @@ void RawIqRecorder::submit(std::span<const std::int16_t> interleaved_iq) {
     }
 
     const std::scoped_lock lock(impl_->mutex);
-    if (impl_->queue.size() >= max_queued_blocks) {
+    const std::size_t incoming_samples = interleaved_iq.size() / 2;
+    impl_->queue_capacity_samples =
+        std::max(impl_->queue_capacity_samples, incoming_samples);
+    if (impl_->queued_complex_samples + incoming_samples >
+        impl_->queue_capacity_samples) {
         ++impl_->dropped_blocks;
         return;
     }
     impl_->queue.emplace_back(interleaved_iq.begin(), interleaved_iq.end());
+    impl_->queued_complex_samples += incoming_samples;
     impl_->ready.notify_one();
 }
 
@@ -157,6 +174,7 @@ void RawIqRecorder::stop() noexcept {
     impl_->output.close();
     impl_->write_sidecar();
     impl_->queue.clear();
+    impl_->queued_complex_samples = 0;
 }
 
 RecordingStats RawIqRecorder::stats() const {
@@ -184,6 +202,8 @@ struct TransportStreamRecorder::Impl {
     std::ofstream output;
     std::thread worker;
     std::chrono::steady_clock::time_point started_at;
+    std::size_t queued_bytes{};
+    std::size_t queue_capacity_bytes{transport_queue_capacity_bytes};
     bool stopping{};
     std::atomic<bool> active;
     std::atomic<std::uint64_t> elapsed_milliseconds;
@@ -201,6 +221,7 @@ struct TransportStreamRecorder::Impl {
                 }
                 block = std::move(queue.front());
                 queue.pop_front();
+                queued_bytes -= block.size();
             }
             output.write(reinterpret_cast<const char *>(block.data()),
                          static_cast<std::streamsize>(block.size()));
@@ -232,6 +253,8 @@ bool TransportStreamRecorder::start(const std::filesystem::path &path,
         return false;
     }
     impl_->stopping = false;
+    impl_->queued_bytes = 0;
+    impl_->queue_capacity_bytes = transport_queue_capacity_bytes;
     impl_->started_at = std::chrono::steady_clock::now();
     impl_->elapsed_milliseconds = 0;
     impl_->bytes_written = 0;
@@ -247,11 +270,15 @@ void TransportStreamRecorder::submit(
         return;
     }
     const std::scoped_lock lock(impl_->mutex);
-    if (impl_->queue.size() >= max_queued_blocks) {
+    impl_->queue_capacity_bytes =
+        std::max(impl_->queue_capacity_bytes, transport_stream.size());
+    if (impl_->queued_bytes + transport_stream.size() >
+        impl_->queue_capacity_bytes) {
         ++impl_->dropped_blocks;
         return;
     }
     impl_->queue.emplace_back(transport_stream.begin(), transport_stream.end());
+    impl_->queued_bytes += transport_stream.size();
     impl_->ready.notify_one();
 }
 
@@ -272,6 +299,7 @@ void TransportStreamRecorder::stop() noexcept {
             .count());
     impl_->output.close();
     impl_->queue.clear();
+    impl_->queued_bytes = 0;
 }
 
 TransportRecordingStats TransportStreamRecorder::stats() const {

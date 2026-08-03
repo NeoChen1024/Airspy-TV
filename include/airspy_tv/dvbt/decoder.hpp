@@ -17,6 +17,16 @@ struct DecoderParameters {
     TransmissionMode mode{TransmissionMode::k8};
     Constellation constellation{Constellation::qam64};
     CodeRate code_rate{CodeRate::rate_2_3};
+    // Zero selects default_viterbi_worker_count().
+    std::size_t viterbi_workers{};
+
+    bool operator==(const DecoderParameters &) const = default;
+};
+
+struct DecoderTiming {
+    float demap_time_ms{};
+    float deinterleave_time_ms{};
+    float transport_time_ms{};
 };
 
 // Native DVB-T data path beginning at the equalized payload-carrier boundary.
@@ -38,7 +48,13 @@ class Decoder {
     process_symbol(std::span<const std::complex<float>> equalized_carriers,
                    std::span<const float> reliability,
                    std::size_t symbol_index);
+    [[nodiscard]] std::vector<std::uint8_t>
+    process_metrics(std::span<const float> punctured_llrs);
+    [[nodiscard]] std::vector<std::uint8_t>
+    process_soft_metrics(std::span<const std::uint8_t> mother_metrics);
+    [[nodiscard]] std::vector<std::uint8_t> flush();
     [[nodiscard]] DecoderParameters parameters() const noexcept;
+    [[nodiscard]] DecoderTiming timing() const noexcept;
     [[nodiscard]] TransportDecoderStats stats() const;
 
   private:

@@ -232,7 +232,8 @@ std::vector<std::uint8_t> make_transport_stream() {
     return stream;
 }
 
-void test_transport_decoder(const CodeRate rate) {
+void test_transport_decoder(const CodeRate rate,
+                            const std::size_t viterbi_workers = 1) {
     const auto expected = make_transport_stream();
     const auto randomized = energy_scramble(expected);
     const auto rs = rs_encode(randomized);
@@ -240,7 +241,7 @@ void test_transport_decoder(const CodeRate rate) {
     const auto encoded = convolutional_encode(interleaved);
     const auto metrics = make_metrics(encoded, rate);
 
-    TransportDecoder decoder{rate};
+    TransportDecoder decoder{rate, viterbi_workers};
     std::vector<std::uint8_t> recovered;
     constexpr std::size_t chunk_size = 997;
     for (std::size_t offset = 0; offset < metrics.size();
@@ -250,6 +251,8 @@ void test_transport_decoder(const CodeRate rate) {
                 offset, std::min(chunk_size, metrics.size() - offset)));
         recovered.insert(recovered.end(), decoded.begin(), decoded.end());
     }
+    const auto tail = decoder.flush();
+    recovered.insert(recovered.end(), tail.begin(), tail.end());
 
     if (recovered.empty()) {
         const auto failed_stats = decoder.stats();
@@ -278,6 +281,42 @@ void test_transport_decoder(const CodeRate rate) {
     require(stats.rs_uncorrectable_packets == 0, "no RS failures");
     require(stats.ts_packets == recovered.size() / ts_packet_size,
             "TS packet statistics");
+    require(stats.viterbi_workers == viterbi_workers,
+            "Viterbi worker statistics");
+}
+
+void test_prepared_soft_transport() {
+    constexpr CodeRate rate = CodeRate::rate_2_3;
+    const auto expected = make_transport_stream();
+    const auto randomized = energy_scramble(expected);
+    const auto rs = rs_encode(randomized);
+    const auto interleaved = outer_interleave(rs);
+    const auto encoded = convolutional_encode(interleaved);
+    const auto metrics = make_metrics(encoded, rate);
+    require(metrics.size() % 3 == 0, "prepared puncture-period alignment");
+
+    std::vector<float> mother(
+        airspy_tv::dvbt::depunctured_size(metrics.size(), rate));
+    airspy_tv::dvbt::depuncture(metrics, rate, mother);
+    std::vector<std::uint8_t> soft(mother.size());
+    for (std::size_t index = 0; index < mother.size(); ++index) {
+        const float value =
+            std::clamp(127.5F + (mother[index] * 8.0F), 0.0F, 255.0F);
+        soft[index] = static_cast<std::uint8_t>(value + 0.5F);
+    }
+
+    TransportDecoder float_decoder{rate, 4};
+    auto float_output = float_decoder.process(metrics);
+    const auto float_tail = float_decoder.flush();
+    float_output.insert(float_output.end(), float_tail.begin(),
+                        float_tail.end());
+
+    TransportDecoder soft_decoder{rate, 4};
+    auto soft_output = soft_decoder.process_soft(soft);
+    const auto soft_tail = soft_decoder.flush();
+    soft_output.insert(soft_output.end(), soft_tail.begin(), soft_tail.end());
+    require(soft_output == float_output,
+            "prepared soft metrics must match float transport path");
 }
 
 void test_equalized_symbol_decoder(const DecoderParameters parameters) {
@@ -322,6 +361,8 @@ void test_equalized_symbol_decoder(const DecoderParameters parameters) {
             decoder.process_symbol(equalized, reliability, symbol % 68);
         recovered.insert(recovered.end(), output.begin(), output.end());
     }
+    const auto tail = decoder.flush();
+    recovered.insert(recovered.end(), tail.begin(), tail.end());
 
     require(!recovered.empty(), "equalized symbols produced TS");
     const auto match = std::search(expected.begin(), expected.end(),
@@ -340,10 +381,13 @@ int main() {
         test_transport_decoder(CodeRate::rate_3_4);
         test_transport_decoder(CodeRate::rate_5_6);
         test_transport_decoder(CodeRate::rate_7_8);
+        test_transport_decoder(CodeRate::rate_2_3, 4);
+        test_prepared_soft_transport();
         test_equalized_symbol_decoder(
-            {TransmissionMode::k2, Constellation::qpsk, CodeRate::rate_1_2});
-        test_equalized_symbol_decoder(
-            {TransmissionMode::k8, Constellation::qam64, CodeRate::rate_2_3});
+            {TransmissionMode::k2, Constellation::qpsk, CodeRate::rate_1_2, 1});
+        test_equalized_symbol_decoder({TransmissionMode::k8,
+                                       Constellation::qam64, CodeRate::rate_2_3,
+                                       4});
     } catch (const std::exception &error) {
         std::cerr << "DVB-T transport decoder test failed: " << error.what()
                   << '\n';

@@ -20,14 +20,20 @@ struct TransportDecoderStats {
     std::uint32_t outer_rs_evidence{};
     bool rs_synchronized{};
     bool energy_synchronized{};
+    std::size_t viterbi_workers{};
 };
+
+// Zero in user-facing configuration means this portable hardware-concurrency
+// default. std::thread reports logical processors and may return zero.
+[[nodiscard]] std::size_t default_viterbi_worker_count() noexcept;
 
 // Streaming DVB-T inner/outer FEC after soft bit deinterleaving. Input contains
 // the punctured convolutional-code metrics in transmission order. Positive LLR
 // values favour one; zero is an erasure.
 class TransportDecoder {
   public:
-    explicit TransportDecoder(CodeRate code_rate);
+    explicit TransportDecoder(CodeRate code_rate,
+                              std::size_t viterbi_workers = 0);
     ~TransportDecoder() noexcept;
 
     TransportDecoder(const TransportDecoder &) = delete;
@@ -38,6 +44,9 @@ class TransportDecoder {
     void reset();
     [[nodiscard]] std::vector<std::uint8_t>
     process(std::span<const float> punctured_llrs);
+    [[nodiscard]] std::vector<std::uint8_t>
+    process_soft(std::span<const std::uint8_t> mother_metrics);
+    [[nodiscard]] std::vector<std::uint8_t> flush();
     [[nodiscard]] TransportDecoderStats stats() const;
 
   private:

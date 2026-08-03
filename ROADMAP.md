@@ -4,32 +4,35 @@ Airspy TV is being developed in stages so that RF acquisition, DVB-T PHY
 decoding, transport-stream handling, and video playback can be validated
 independently.
 
-## Current milestone
+## Implemented foundation
 
-- SDL3 and Dear ImGui application shell.
-- Native Airspy and generic SoapySDR sources.
-- CS16 live recording and file playback.
-- Live spectrum, waterfall, and signal-power telemetry.
-- Mock decoder metrics, constellation, transport-stream recorder, and video
-  surface.
+- SDL3 and Dear ImGui single-window receiver UI with a scrollable diagnostics
+  sidebar and reserved video surface.
+- Native Airspy and generic SoapySDR sources, including Airspy gain profiles,
+  Bias-T control, device-loss reporting, and source shutdown.
+- CS16 recording with JSON sidecars, raw `airspy_rx` INT16_IQ compatibility,
+  file playback, and decoder-paced offline extraction.
+- Live FFT spectrum, waterfall, signal-power telemetry, constellation, OFDM
+  lock, carrier offset, MER, CP-SNR, deepest-notch, and decoder CPU status.
+- Native raw-I/Q-to-MPEG-TS decoding and TS recording through the same
+  `StreamDecoder` used by GUI and CLI sources.
 
 ## DVB-T reference receiver
 
-- Normalize live and file sources to a common complex-sample stream.
-- Resample a centered 6 MHz channel to 48/7 MSPS.
-- Implement 2K/8K OFDM acquisition, carrier and sample-clock tracking, pilot
-  channel estimation, equalization, and TPS decoding.
+- Live and file sources already use a common CS16 stream boundary and exact
+  rational resampling; the tested centered 6 MHz path runs at 48/7 MSPS.
+- Native 2K/8K cyclic-prefix acquisition, carrier tracking, pilot channel
+  estimation, and equalization feed the complete soft-decoding chain.
+- Finish continuous sample-clock tracking and standards-validated TPS decoding.
 - Cover 5, 6, 7, and 8 MHz channel raster rates and guard intervals 1/4, 1/8,
   1/16, and 1/32. The initial Taiwan regression path remains centered 6 MHz.
-- Use `liquid-dsp` as a proof-of-concept backend for soft QAM demapping and
-  punctured K=7 convolutional decoding. Before adopting it in the release
-  decoder, verify DVB-T constellation bit ordering, puncturing patterns, and
-  continuous-trellis/reset semantics against known vectors and captured IQ.
+- Continue improving continuous carrier, channel, and sample-clock tracking so
+  the frontend remains locked on weak, multipath, and SFN captures.
 
 ## Production soft-decoding pipeline
 
-The long-term decoder should not depend on a generic modem abstraction at its
-core. Its inner-decoder path is intended to be:
+The native decoder does not depend on a generic modem abstraction at its core.
+Its inner-decoder path is:
 
 ```text
 equalized DVB-T carriers + per-carrier reliability
@@ -62,7 +65,7 @@ Implementation requirements:
 - Keep the decoder API independent of Airspy, SoapySDR, the UI, and the
   transport-stream consumer.
 
-Initial native implementation:
+Current native implementation:
 
 - `airspy-tv-dvbt` provides normalized QPSK, 16-QAM, and 64-QAM Max-Log LLR
   demapping with explicit per-carrier reliability.
@@ -97,50 +100,109 @@ Initial native implementation:
   routed to the MPEG-TS recorder without running DSP in a source callback.
 - A deterministic GNU Radio reference transmitter now exercises the complete
   raw-IQ boundary with a centered 10 MSPS CS16 6 MHz, 8K, guard-1/4, 64-QAM,
-  rate-2/3 waveform. The native frontend recovers 6,695 byte-identical TS
-  packets from a one-second fixture, with zero TEI flags, zero uncorrectable RS
-  packets, and a valid PAT/PMT. This exposed and fixed an FFT-window error where
-  cyclic-prefix acquisition was incorrectly treated as the start of useful
-  symbol data.
+  rate-2/3 waveform. The native frontend deterministically recovers
+  packet-aligned TS with a valid PAT/PMT. This exposed and fixed an FFT-window
+  error where cyclic-prefix acquisition was incorrectly treated as the start
+  of useful symbol data.
 - The older 557 MHz capture remains a weak/multipath robustness case rather
   than the functional baseline. It needs to be re-evaluated after continuous
   sample-clock/channel tracking is implemented; ideal-signal lock does not yet
   imply reliable field reception.
+- New Airspy field captures validate the native raw-IQ path beyond the ideal
+  fixture: the horizontal 557 MHz recording and three 581 MHz recordings
+  recover thousands of aligned TS packets. The vertical 557 MHz recording has
+  materially lower MER and still fails RS, making it a useful
+  antenna/multipath regression case.
+- Offline raw-I/Q extraction is exposed by the main `airspy-tv --decode-iq`
+  command and uses the same `StreamDecoder` and JSON/raw-file resolver as GUI
+  playback. The older equalized-carrier, soft-byte, and separate raw-IQ debug
+  executables have been removed so they cannot diverge into alternate decoder
+  paths.
+- The displayed deepest-notch estimate excludes active-channel filter skirts
+  and uses the lower first percentile relative to the median channel response.
+  This avoids reporting a single noisy pilot or FFT-bin outlier as a deep fade.
+- The GUI reports OFDM-monitor lock, TS-decoder lock, and native-decoder CPU
+  load independently. CPU load is measured as decoder wall time divided by the
+  duration of its input samples, with raw-block queue depth and drops exposed so
+  scheduler overload cannot be mistaken for RF unlock. Transient FEC queue
+  bursts are displayed for diagnostics but are not treated as CPU overload;
+  overload requires slower-than-realtime processing, a nearly full raw-input
+  queue, or an actual dropped block.
+- Bounded queues are provisioned by stream duration, not item count. Raw I/Q,
+  OFDM-symbol/FEC, and Viterbi-window pipeline stages retain approximately 200
+  ms. Disk recorders use independent buffers of at least five seconds. The
+  spectrum and quality monitors remain latest-snapshot mailboxes because
+  buffering old displays would only increase GUI latency.
+- GUI monitoring and the complete CLI/TS decoder share the same liquid-dsp
+  CS16 resampler and CP acquisition implementation. Once automatic acquisition
+  validates a mode and guard interval, both paths retain that configuration
+  across transient misses; full searching resumes only after an explicit
+  source, tuning, or parameter reset. The GUI keeps a separate one-symbol
+  equalizer worker so the slower FEC path cannot stall interactive diagnostics.
+- Viterbi decoding uses a bounded CPU window pool. Each worker owns an
+  independent libcorrect context, overlapping windows may complete out of
+  order, and an ordered join preserves the original byte stream before outer
+  deinterleaving. The pool intentionally trades latency for throughput.
+- A bounded symbol postprocessing pool now moves the independent
+  decision-directed gain, MER/error, per-carrier reliability, Max-Log
+  demapping, symbol/bit deinterleaving, depuncturing, and soft-byte quantization
+  off the serial OFDM tracking loop. Results may finish out of order but
+  mother-code metric blocks are joined by sequence before the stateful
+  transport decoder. The logical-CPU worker budget is split between this pool
+  and the Viterbi pool and is immutable while a source is open.
+  Carrier topology is cached per mode/phase, the CFO NCO uses a normalized
+  complex recurrence, and CS16 conversion uses VOLK. The liquid-dsp rational
+  resampler is partitioned at exact input/output block boundaries; each worker
+  restores the preceding 12-block FIR history, producing bit-identical output
+  while reusing the full worker budget during this otherwise serial phase. On
+  the 0.7-second 557 MHz field fixture, Release wall time fell from about 0.68
+  seconds to about 0.16 seconds with a 16-thread budget while retaining
+  byte-identical TS output across 1/2/4/8/16-thread configurations.
 - Spectrum and quality smoothing follow SDR++'s speed model
   (`alpha = min(speed / (update_rate * 10), 1)`). Raw FFT rows reach the
   waterfall before FFT smoothing is applied to the spectrum trace.
 
-Acceptance criteria:
+## Verification status
 
-- Decode synthetic standard vectors and the ideal raw-IQ fixture without
-  uncorrected RS errors.
-- Recover valid PAT and PMT tables from the 557 MHz regression capture, with
-  plausible PIDs and a low transport-error rate.
-- Track acquisition time, TPS lock, MER, pre-Viterbi BER, post-Viterbi BER,
-  corrected RS packets, and uncorrectable packets as regression metrics.
-- Compare hard- and soft-decision paths on clean, weak-signal, multipath, and
-  discontinuous captures.
+Completed checks:
+
+- Synthetic inner/FEC vectors cover all five code rates, both transmission
+  modes, and representative QPSK/16-QAM/64-QAM paths.
+- The ideal raw-IQ fixture and clean Airspy field captures deterministically
+  recover packet-aligned TS with valid service tables.
+- Serial and partitioned resampling are bit-identical, and offline decoding is
+  byte-identical across tested 1/2/4/8/16-thread budgets.
+- Optimized Debug and Release builds run the same decoder tests and raw-IQ
+  pipeline.
+
+Remaining receiver validation:
+
+- Track TPS lock, pre-Viterbi BER, post-Viterbi BER, corrected RS packets, and
+  uncorrectable packets consistently across processing chunks.
+- Compare hard- and soft-decision behavior on clean, weak-signal, multipath,
+  SFN, and discontinuous captures.
+- Add long-running live reception regressions for Airspy and selected SoapySDR
+  devices.
 
 Next decoder step:
 
-- Promote the diagnostic cyclic-prefix/pilot analyzer into a continuous
-  native frontend that emits exactly 1512/6048 payload carriers per symbol.
-- Add continual-pilot common-phase correction and carrier/sample-clock loops;
-  the current scattered-pilot-only equalizer is measurably below the reference
-  receiver on the captured multipath channel.
+- Add continuous sample-clock and channel tracking across processing chunks;
+  the current frontend is measurably less robust on captured multipath signals
+  than the reference receiver.
 - Add TPS differential demodulation, BCH validation, frame/superframe index,
   modulation/code-rate discovery, and deterministic decoder reset tags.
-- Add continuous carrier and sample-clock tracking before connecting live/file
-  CS16 sources directly to the validated equalized-carrier decoder.
+- Eliminate duplicated GUI-monitor/frontend work by publishing constellation
+  and quality snapshots from the complete decoder where practical.
+- Profile a modern AVX2 Viterbi implementation; libcorrect's SSE decoder is now
+  the dominant CPU hotspot after the ordered-pipeline optimizations.
 
 ## Transport stream and playback
 
 - Parse PAT, PMT, SDT, and EIT and expose service selection.
-- Record the recovered MPEG-TS with duration, size, and throughput telemetry.
 - Feed a selected service to libmpv and render video into the application-owned
   OpenGL framebuffer.
-- Reset decoder and playback state cleanly after source discontinuities,
-  retunes, or service changes.
+- Reset playback state cleanly after source discontinuities, retunes, or
+  service changes.
 
 ## Possible future work
 

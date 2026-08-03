@@ -7,6 +7,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(AIRSPY_TV_NATIVE_ARCH
+       "Optimize generated code for the build host CPU" ON)
+if(AIRSPY_TV_NATIVE_ARCH AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options(-march=native)
+endif()
+
+# Keep full Debug symbols while optimizing DSP hot paths and disabling runtime
+# assertions, matching Release throughput as closely as an optimized debugger
+# build can. Set this option OFF when assertion-heavy diagnostics are needed.
+option(AIRSPY_TV_OPTIMIZED_DEBUG
+       "Enable -O3/-DNDEBUG while retaining Debug symbols" ON)
+if(AIRSPY_TV_OPTIMIZED_DEBUG AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options("$<$<CONFIG:Debug>:-O3;-DNDEBUG>")
+endif()
+
 find_package(OpenGL REQUIRED)
 find_package(PkgConfig REQUIRED)
 find_package(SDL3 CONFIG REQUIRED)
@@ -33,6 +48,11 @@ add_subdirectory(contrib/liquid-dsp EXCLUDE_FROM_ALL)
 # selected build type unchanged.
 set(AIRSPY_TV_BUILD_TYPE "${CMAKE_BUILD_TYPE}")
 set(CMAKE_BUILD_TYPE Release)
+# libcorrect caches a failed SIMD probe across build-policy changes. Re-run it
+# so an existing Debug tree does not remain permanently pinned to scalar
+# Viterbi after switching to optimized Debug flags.
+unset(HAVE_SSE)
+unset(HAVE_SSE CACHE)
 add_subdirectory(contrib/libcorrect EXCLUDE_FROM_ALL)
 set(CMAKE_BUILD_TYPE "${AIRSPY_TV_BUILD_TYPE}")
 unset(AIRSPY_TV_BUILD_TYPE)
@@ -65,6 +85,7 @@ target_link_libraries(imgui PUBLIC SDL3::SDL3 OpenGL::GL)
 add_library(airspy-tv-dvbt STATIC
     src/dvbt/decoder.cpp
     src/dvbt/inner_decoder.cpp
+    src/dvbt/ofdm_acquisition.cpp
     src/dvbt/stream_decoder.cpp
     src/dvbt/signal_analyzer.cpp
     src/dvbt/soft_demapper.cpp
@@ -74,44 +95,15 @@ target_include_directories(airspy-tv-dvbt PUBLIC include)
 target_include_directories(airspy-tv-dvbt SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libcorrect/include")
 target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F Threads::Threads
-    PRIVATE correct_static liquid::liquid)
+    PRIVATE correct_static liquid::liquid PkgConfig::VOLK)
 
 add_executable(airspy-tv
+    src/iq_file.cpp
     src/main.cpp
     src/recorder.cpp
     src/sdr.cpp
     src/spectrum.cpp
 )
-
-add_executable(airspy-tv-dvbt-equalized
-    tools/dvbt_native_equalized.cpp
-)
-target_include_directories(airspy-tv-dvbt-equalized PRIVATE include)
-target_link_libraries(airspy-tv-dvbt-equalized PRIVATE airspy-tv-dvbt)
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(airspy-tv-dvbt-equalized PRIVATE
-        -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-endif()
-
-add_executable(airspy-tv-dvbt-soft
-    tools/dvbt_native_soft.cpp
-)
-target_include_directories(airspy-tv-dvbt-soft PRIVATE include)
-target_include_directories(airspy-tv-dvbt-soft SYSTEM PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libcorrect/include")
-target_link_libraries(airspy-tv-dvbt-soft PRIVATE
-    airspy-tv-dvbt correct_static)
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(airspy-tv-dvbt-soft PRIVATE
-        -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-endif()
-
-add_executable(airspy-tv-dvbt-iq tools/dvbt_native_iq.cpp)
-target_link_libraries(airspy-tv-dvbt-iq PRIVATE airspy-tv-dvbt)
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(airspy-tv-dvbt-iq PRIVATE
-        -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-endif()
 target_include_directories(airspy-tv PRIVATE include)
 target_link_libraries(airspy-tv PRIVATE
     airspy-tv-dvbt
