@@ -1,5 +1,6 @@
 #include "airspy_tv/sdr.hpp"
 
+#include "airspy_tv/epg.hpp"
 #include "airspy_tv/iq_file.hpp"
 #include "airspy_tv/mpv_player.hpp"
 
@@ -22,6 +23,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -42,6 +44,9 @@ namespace {
 using airspy_tv::AirspyGainMode;
 using airspy_tv::DeviceDescriptor;
 using airspy_tv::EnumerationResult;
+using airspy_tv::EpgEvent;
+using airspy_tv::EpgModel;
+using airspy_tv::EpgSnapshot;
 using airspy_tv::IqFileInfo;
 using airspy_tv::MpvPlayer;
 using airspy_tv::SdrBackend;
@@ -180,6 +185,8 @@ struct AppState {
         std::make_shared<FileDialogState>()};
     std::shared_ptr<FileDialogState> iq_source_dialog{
         std::make_shared<FileDialogState>()};
+    EpgModel epg;
+    const DeviceDescriptor *last_source_descriptor{};
 };
 
 void SDLCALL save_file_callback(void *userdata, const char *const *filelist,
@@ -1238,6 +1245,151 @@ void draw_recorder_panel(AppState &state) {
     ImGui::PopID();
 }
 
+void draw_epg_panel(AppState &state) {
+    if (!ImGui::CollapsingHeader("EPG", ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+    ImGui::PushID("epg-panel");
+    if (state.services.empty()) {
+        draw_disabled_wrapped("No DVB-T services detected");
+        ImGui::PopID();
+        return;
+    }
+
+    const auto selected_service = std::ranges::find_if(
+        state.services, [&state](const TransportService &service) {
+            return state.selected_service_id == service.service_id;
+        });
+    const std::string preview =
+        selected_service == state.services.end()
+            ? "Select service"
+            : (selected_service->name.empty()
+                   ? std::format("Service {}", selected_service->service_id)
+                   : std::format("{}  ({})", selected_service->name,
+                                 selected_service->service_id));
+    ImGui::SetNextItemWidth(-1.0F);
+    if (ImGui::BeginCombo("##epg-service", preview.c_str())) {
+        for (const auto &service : state.services) {
+            const std::string label =
+                service.name.empty()
+                    ? std::format("Service {}", service.service_id)
+                    : std::format("{}  ({})", service.name, service.service_id);
+            const bool is_selected =
+                state.selected_service_id == service.service_id;
+            if (ImGui::Selectable(label.c_str(), is_selected)) {
+                state.selected_service_id = service.service_id;
+                state.status = "Selected " + label;
+            }
+            if (is_selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    if (!state.selected_service_id.has_value()) {
+        draw_disabled_wrapped("Select a service to show EPG");
+        ImGui::PopID();
+        return;
+    }
+    const EpgSnapshot snapshot = state.epg.snapshot(*state.selected_service_id);
+    if (snapshot.events.empty()) {
+        draw_disabled_wrapped("Waiting for EIT p/f data...");
+        ImGui::PopID();
+        return;
+    }
+    const std::uint64_t now_utc = snapshot.utc_now.value_or(
+        static_cast<std::uint64_t>(std::chrono::system_clock::to_time_t(
+            std::chrono::system_clock::now())));
+    const auto now_event =
+        std::ranges::find_if(snapshot.events, [now_utc](const EpgEvent &event) {
+            return now_utc >= event.start_time_utc &&
+                   now_utc < event.start_time_utc + event.duration_seconds;
+        });
+    const auto next_event =
+        std::ranges::find_if(snapshot.events, [now_utc](const EpgEvent &event) {
+            return event.start_time_utc > now_utc;
+        });
+
+    const auto format_time = [](const std::uint64_t unix_seconds) {
+        const std::time_t when = static_cast<std::time_t>(unix_seconds);
+        const std::tm *local = std::localtime(&when);
+        char buffer[32] = "---- --:--";
+        if (local != nullptr) {
+            std::strftime(buffer, sizeof(buffer), "%m-%d %H:%M", local);
+        }
+        return std::string(buffer);
+    };
+    // Broadcasters pad DVB text with regular and full-width spaces; trim them
+    // for display so the panel matches what a TV would show.
+    const auto trimmed = [](const std::string &text) {
+        constexpr std::string_view full_width_space = "\xE3\x80\x80";
+        std::size_t begin = 0;
+        std::size_t end = text.size();
+        const auto is_space = [&full_width_space](const std::string &value,
+                                                  const std::size_t at) {
+            return value[at] == ' ' || value[at] == '\t' ||
+                   (at + full_width_space.size() <= value.size() &&
+                    value.compare(at, full_width_space.size(),
+                                  full_width_space) == 0);
+        };
+        while (begin < end && is_space(text, begin)) {
+            begin += text[begin] == ' ' || text[begin] == '\t' ? 1
+                                                                : full_width_space.size();
+        }
+        while (end > begin) {
+            const std::size_t previous = end - (text[end - 1] == ' ' ||
+                                                        text[end - 1] == '\t'
+                                                    ? 1
+                                                    : full_width_space.size());
+            if (!is_space(text, previous)) {
+                break;
+            }
+            end = previous;
+        }
+        return text.substr(begin, end - begin);
+    };
+    const auto draw_event = [&format_time, &trimmed](const char *tag,
+                                                     const EpgEvent &event,
+                                                     const bool is_now) {
+        ImGui::TextDisabled("%s", tag);
+        const std::string start = format_time(event.start_time_utc);
+        const std::string end =
+            format_time(event.start_time_utc + event.duration_seconds);
+        const std::string name = trimmed(event.name);
+        const std::string description = trimmed(event.description);
+        ImGui::Text("  %s - %s", start.c_str(), end.c_str());
+        ImGui::SameLine();
+        if (is_now) {
+            ImGui::TextColored(ImVec4(0.35F, 0.88F, 0.55F, 1.0F), ">> %s",
+                               name.c_str());
+        } else {
+            ImGui::Text("%s", name.c_str());
+        }
+        if (!event.genre.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("[%s]", event.genre.c_str());
+        }
+        if (!description.empty() && description != name) {
+            ImGui::TextWrapped("%s", description.c_str());
+        }
+    };
+    if (now_event != snapshot.events.end()) {
+        draw_event("NOW", *now_event, true);
+    } else {
+        ImGui::TextDisabled("NOW");
+        ImGui::TextDisabled("  (no event currently running)");
+    }
+    ImGui::Separator();
+    if (next_event != snapshot.events.end()) {
+        draw_event("NEXT", *next_event, false);
+    } else {
+        ImGui::TextDisabled("NEXT");
+        ImGui::TextDisabled("  (no upcoming event)");
+    }
+    ImGui::PopID();
+}
+
 void draw_ts_recorder_panel(AppState &state) {
     if (!ImGui::CollapsingHeader("MPEG-TS Stream Recorder",
                                  ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1740,6 +1892,7 @@ void draw_sidebar(AppState &state) {
         ImGui::PopID();
     }
 
+    draw_epg_panel(state);
     draw_ts_recorder_panel(state);
     draw_recorder_panel(state);
 }
@@ -1859,6 +2012,11 @@ void draw_video_panel(AppState &state) {
 
 void draw_application(AppState &state) {
     state.player.set_source_active(state.receiver.is_streaming());
+    const DeviceDescriptor *source_descriptor = state.receiver.descriptor();
+    if (source_descriptor != state.last_source_descriptor) {
+        state.epg.reset();
+        state.last_source_descriptor = source_descriptor;
+    }
     state.player.poll_events();
     state.spectrum = state.receiver.spectrum_snapshot();
     state.signal_analysis = state.receiver.signal_analysis_snapshot();
@@ -2423,8 +2581,9 @@ int main(const int argc, char **argv) {
         return 1;
     }
     state.receiver.set_transport_sink(
-        [&player = state.player](const std::span<const std::uint8_t> ts) {
-            player.submit(ts);
+        [&state](const std::span<const std::uint8_t> ts) {
+            state.epg.consume(ts);
+            state.player.submit(ts);
         });
     refresh_devices(state);
     bool running = true;

@@ -101,11 +101,13 @@ target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F Threads::Threads
     PRIVATE correct_static liquid::liquid PkgConfig::VOLK)
 
 add_executable(airspy-tv
+    src/epg.cpp
     src/iq_file.cpp
     src/main.cpp
     src/mpv_player.cpp
     src/recorder.cpp
     src/sdr.cpp
+    src/si_common.cpp
     src/spectrum.cpp
     src/transport_stream.cpp
 )
@@ -154,6 +156,18 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME dvbt-transport-decoder COMMAND dvbt-transport-decoder-test)
+
+    add_executable(epg-model-test
+        tests/epg_model_test.cpp
+        src/epg.cpp
+        src/si_common.cpp
+    )
+    target_include_directories(epg-model-test PRIVATE include src)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(epg-model-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME epg-model COMMAND epg-model-test)
 endif()
 
 install(TARGETS airspy-tv RUNTIME DESTINATION bin)
