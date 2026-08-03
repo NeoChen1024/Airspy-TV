@@ -86,10 +86,10 @@ class StreamDecoder : public Demodulator {
                 std::uint32_t channel_bandwidth_hz = 6'000'000) override;
     // Decoder-paced file input: wait for queue capacity instead of dropping an
     // input block. Live SDR callbacks should continue to use submit().
-    void submit_blocking(std::span<const std::int16_t> interleaved_iq,
-                         std::uint32_t sample_rate_hz,
-                         std::uint32_t channel_bandwidth_hz = 6'000'000)
-        override;
+    void
+    submit_blocking(std::span<const std::int16_t> interleaved_iq,
+                    std::uint32_t sample_rate_hz,
+                    std::uint32_t channel_bandwidth_hz = 6'000'000) override;
     // Process any final partial chunk, then wait until all queued input has
     // completed. This is intended for finite, decoder-paced file input.
     void flush() override;

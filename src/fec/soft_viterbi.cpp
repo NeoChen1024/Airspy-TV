@@ -367,8 +367,8 @@ SoftViterbi::process(const std::span<const float> llrs) {
     return impl_->process(llrs);
 }
 
-std::vector<std::uint8_t> SoftViterbi::process_soft(
-    const std::span<const std::uint8_t> soft_metrics) {
+std::vector<std::uint8_t>
+SoftViterbi::process_soft(const std::span<const std::uint8_t> soft_metrics) {
     return impl_->process_soft(soft_metrics);
 }
 
@@ -378,8 +378,7 @@ std::size_t SoftViterbi::worker_count() const noexcept {
     return impl_->worker_count();
 }
 
-std::pair<std::uint64_t, std::uint64_t>
-SoftViterbi::error_counts() const {
+std::pair<std::uint64_t, std::uint64_t> SoftViterbi::error_counts() const {
     return impl_->error_counts();
 }
 
