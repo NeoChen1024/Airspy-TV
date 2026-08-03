@@ -6,9 +6,12 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <span>
 #include <stdexcept>
@@ -25,71 +28,209 @@ constexpr unsigned int resampler_semi_length = 12;
 
 } // namespace
 
+struct Cs16Resampler::Impl {
+    explicit Impl(const std::size_t requested_workers)
+        : worker_count(std::max<std::size_t>(requested_workers, 1)),
+          errors(worker_count) {
+        workers.reserve(worker_count);
+        try {
+            for (std::size_t index = 0; index < worker_count; ++index) {
+                workers.emplace_back([this, index] { run(index); });
+            }
+        } catch (...) {
+            stop_and_join();
+            throw;
+        }
+    }
+
+    ~Impl() { stop_and_join(); }
+
+    [[nodiscard]] std::vector<std::complex<float>>
+    process(const std::span<const std::int16_t> interleaved_iq,
+            const std::uint32_t sample_rate_hz,
+            const std::uint32_t channel_bandwidth_hz) {
+        if (interleaved_iq.empty() || interleaved_iq.size() % 2 != 0 ||
+            sample_rate_hz == 0 || channel_bandwidth_hz == 0) {
+            return {};
+        }
+        const std::uint64_t interpolation =
+            static_cast<std::uint64_t>(channel_bandwidth_hz) * 8U;
+        const std::uint64_t decimation =
+            static_cast<std::uint64_t>(sample_rate_hz) * 7U;
+        const std::uint64_t divisor = std::gcd(interpolation, decimation);
+        const unsigned int next_p =
+            static_cast<unsigned int>(interpolation / divisor);
+        const unsigned int next_q =
+            static_cast<unsigned int>(decimation / divisor);
+        const std::size_t complex_count = interleaved_iq.size() / 2;
+        const std::size_t next_blocks = complex_count / next_q;
+        if (next_blocks == 0) {
+            return {};
+        }
+
+        std::vector<std::complex<float>> next_input(next_blocks * next_q);
+        volk_16i_s32f_convert_32f(
+            reinterpret_cast<float *>(next_input.data()), interleaved_iq.data(),
+            input_scale, static_cast<unsigned int>(next_input.size() * 2));
+        std::vector<std::complex<float>> next_output(next_blocks * next_p);
+
+        {
+            std::scoped_lock lock(mutex);
+            input = next_input.data();
+            output = next_output.data();
+            p = next_p;
+            q = next_q;
+            blocks = next_blocks;
+            active_workers = std::min(worker_count, blocks);
+            remaining_workers = worker_count;
+            std::ranges::fill(errors, nullptr);
+            ++generation;
+        }
+        work_ready.notify_all();
+
+        {
+            std::unique_lock lock(mutex);
+            work_done.wait(lock, [this] { return remaining_workers == 0; });
+            input = nullptr;
+            output = nullptr;
+        }
+        for (const auto &error : errors) {
+            if (error) {
+                std::rethrow_exception(error);
+            }
+        }
+        return next_output;
+    }
+
+    void run(const std::size_t index) noexcept {
+        std::uint64_t observed_generation = 0;
+        rresamp_crcf filter = nullptr;
+        unsigned int filter_p = 0;
+        unsigned int filter_q = 0;
+        while (true) {
+            std::complex<float> *job_input = nullptr;
+            std::complex<float> *job_output = nullptr;
+            unsigned int job_p = 0;
+            unsigned int job_q = 0;
+            std::size_t begin = 0;
+            std::size_t end = 0;
+            {
+                std::unique_lock lock(mutex);
+                work_ready.wait(lock, [this, observed_generation] {
+                    return stopping || generation != observed_generation;
+                });
+                if (stopping) {
+                    break;
+                }
+                observed_generation = generation;
+                job_input = input;
+                job_output = output;
+                job_p = p;
+                job_q = q;
+                if (index < active_workers) {
+                    begin = blocks * index / active_workers;
+                    end = blocks * (index + 1) / active_workers;
+                }
+            }
+
+            if (index < active_workers) {
+                try {
+                    if (filter == nullptr || filter_p != job_p ||
+                        filter_q != job_q) {
+                        if (filter != nullptr) {
+                            rresamp_crcf_destroy(filter);
+                        }
+                        filter = rresamp_crcf_create_kaiser(
+                            job_p, job_q, resampler_semi_length, -1.0F, 60.0F);
+                        if (filter == nullptr) {
+                            throw std::runtime_error(
+                                "failed to create CS16 resampler");
+                        }
+                        filter_p = job_p;
+                        filter_q = job_q;
+                    } else {
+                        rresamp_crcf_reset(filter);
+                    }
+                    const std::size_t warmup =
+                        std::min<std::size_t>(resampler_semi_length, begin);
+                    for (std::size_t block = begin - warmup; block < begin;
+                         ++block) {
+                        rresamp_crcf_write(filter, job_input + (block * job_q));
+                    }
+                    rresamp_crcf_execute_block(
+                        filter, job_input + (begin * job_q),
+                        static_cast<unsigned int>(end - begin),
+                        job_output + (begin * job_p));
+                } catch (...) {
+                    errors[index] = std::current_exception();
+                }
+            }
+            {
+                std::scoped_lock lock(mutex);
+                if (--remaining_workers == 0) {
+                    work_done.notify_one();
+                }
+            }
+        }
+        if (filter != nullptr) {
+            rresamp_crcf_destroy(filter);
+        }
+    }
+
+    void stop_and_join() noexcept {
+        {
+            const std::scoped_lock lock(mutex);
+            stopping = true;
+        }
+        work_ready.notify_all();
+        for (auto &worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    const std::size_t worker_count;
+    std::vector<std::thread> workers;
+    std::vector<std::exception_ptr> errors;
+    std::mutex mutex;
+    std::condition_variable work_ready;
+    std::condition_variable work_done;
+    std::complex<float> *input{};
+    std::complex<float> *output{};
+    unsigned int p{};
+    unsigned int q{};
+    std::size_t blocks{};
+    std::size_t active_workers{};
+    std::size_t remaining_workers{};
+    std::uint64_t generation{};
+    bool stopping{};
+};
+
+Cs16Resampler::Cs16Resampler(const std::size_t worker_count)
+    : impl_(std::make_unique<Impl>(worker_count)) {}
+
+Cs16Resampler::~Cs16Resampler() noexcept = default;
+
+std::vector<std::complex<float>>
+Cs16Resampler::process(const std::span<const std::int16_t> interleaved_iq,
+                       const std::uint32_t sample_rate_hz,
+                       const std::uint32_t channel_bandwidth_hz) {
+    return impl_->process(interleaved_iq, sample_rate_hz, channel_bandwidth_hz);
+}
+
+std::size_t Cs16Resampler::worker_count() const noexcept {
+    return impl_->worker_count;
+}
+
 std::vector<std::complex<float>>
 resample_cs16(const std::span<const std::int16_t> interleaved_iq,
               const std::uint32_t sample_rate_hz,
               const std::uint32_t channel_bandwidth_hz,
               const std::size_t requested_workers) {
-    if (interleaved_iq.empty() || interleaved_iq.size() % 2 != 0 ||
-        sample_rate_hz == 0 || channel_bandwidth_hz == 0) {
-        return {};
-    }
-    const std::uint64_t interpolation =
-        static_cast<std::uint64_t>(channel_bandwidth_hz) * 8U;
-    const std::uint64_t decimation =
-        static_cast<std::uint64_t>(sample_rate_hz) * 7U;
-    const std::uint64_t divisor = std::gcd(interpolation, decimation);
-    const unsigned int p = static_cast<unsigned int>(interpolation / divisor);
-    const unsigned int q = static_cast<unsigned int>(decimation / divisor);
-    const std::size_t complex_count = interleaved_iq.size() / 2;
-    const std::size_t blocks = complex_count / q;
-    if (blocks == 0) {
-        return {};
-    }
-
-    std::vector<std::complex<float>> input(blocks * q);
-    volk_16i_s32f_convert_32f(reinterpret_cast<float *>(input.data()),
-                              interleaved_iq.data(), input_scale,
-                              static_cast<unsigned int>(input.size() * 2));
-    std::vector<std::complex<float>> output(blocks * p);
-    const std::size_t worker_count =
-        std::min(std::max<std::size_t>(requested_workers, 1), blocks);
-    std::vector<std::exception_ptr> errors(worker_count);
-    std::vector<std::jthread> workers;
-    workers.reserve(worker_count);
-    for (std::size_t worker = 0; worker < worker_count; ++worker) {
-        const std::size_t begin = blocks * worker / worker_count;
-        const std::size_t end = blocks * (worker + 1) / worker_count;
-        workers.emplace_back([&, worker, begin, end] {
-            try {
-                rresamp_crcf filter = rresamp_crcf_create_kaiser(
-                    p, q, resampler_semi_length, -1.0F, 60.0F);
-                if (filter == nullptr) {
-                    throw std::runtime_error("failed to create CS16 resampler");
-                }
-                const std::size_t warmup =
-                    std::min<std::size_t>(resampler_semi_length, begin);
-                for (std::size_t block = begin - warmup; block < begin;
-                     ++block) {
-                    rresamp_crcf_write(filter, input.data() + (block * q));
-                }
-                rresamp_crcf_execute_block(
-                    filter, input.data() + (begin * q),
-                    static_cast<unsigned int>(end - begin),
-                    output.data() + (begin * p));
-                rresamp_crcf_destroy(filter);
-            } catch (...) {
-                errors[worker] = std::current_exception();
-            }
-        });
-    }
-    workers.clear();
-    for (const auto &error : errors) {
-        if (error) {
-            std::rethrow_exception(error);
-        }
-    }
-    return output;
+    Cs16Resampler resampler(requested_workers);
+    return resampler.process(interleaved_iq, sample_rate_hz,
+                             channel_bandwidth_hz);
 }
 
 OfdmAcquisition acquire_ofdm(const std::span<const std::complex<float>> samples,

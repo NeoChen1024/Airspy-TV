@@ -5,6 +5,7 @@
 #include <complex>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -18,6 +19,28 @@ struct OfdmAcquisition {
     float score{};
     TransmissionMode mode{TransmissionMode::k8};
     GuardInterval guard{GuardInterval::gi_1_4};
+};
+
+// Reusable partitioned CS16 resampler. Worker threads and liquid-dsp filter
+// instances remain alive across process() calls; process() itself is
+// synchronous and must only be called by one producer at a time.
+class Cs16Resampler {
+  public:
+    explicit Cs16Resampler(std::size_t worker_count = 1);
+    ~Cs16Resampler() noexcept;
+    Cs16Resampler(const Cs16Resampler &) = delete;
+    Cs16Resampler &operator=(const Cs16Resampler &) = delete;
+    Cs16Resampler(Cs16Resampler &&) = delete;
+    Cs16Resampler &operator=(Cs16Resampler &&) = delete;
+
+    [[nodiscard]] std::vector<std::complex<float>>
+    process(std::span<const std::int16_t> interleaved_iq,
+            std::uint32_t sample_rate_hz, std::uint32_t channel_bandwidth_hz);
+    [[nodiscard]] std::size_t worker_count() const noexcept;
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 // Common CS16 frontend used by both the interactive monitor and the complete

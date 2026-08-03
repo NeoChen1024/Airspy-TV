@@ -252,7 +252,8 @@ class SymbolPostprocessorPool {
                             const std::size_t queue_capacity)
         : worker_count_(requested_workers == 0 ? default_viterbi_worker_count()
                                                : requested_workers),
-          reference_(constellation), symbol_deinterleaver_(mode),
+          mode_(mode), constellation_(constellation), reference_(constellation),
+          symbol_deinterleaver_(mode),
           bits_per_carrier_(bits_per_symbol(constellation)),
           code_rate_(code_rate), maximum_queued_(std::max<std::size_t>(
                                      queue_capacity, worker_count_ * 2)) {
@@ -271,6 +272,16 @@ class SymbolPostprocessorPool {
     SymbolPostprocessorPool(const SymbolPostprocessorPool &) = delete;
     SymbolPostprocessorPool &
     operator=(const SymbolPostprocessorPool &) = delete;
+
+    [[nodiscard]] bool
+    compatible(const std::size_t worker_count, const TransmissionMode mode,
+               const Constellation constellation, const CodeRate code_rate,
+               const std::size_t queue_capacity) const noexcept {
+        return worker_count_ == worker_count && mode_ == mode &&
+               constellation_ == constellation && code_rate_ == code_rate &&
+               maximum_queued_ ==
+                   std::max<std::size_t>(queue_capacity, worker_count * 2);
+    }
 
     void submit(std::vector<std::complex<float>> carriers,
                 std::vector<float> equalizer_power,
@@ -477,6 +488,8 @@ class SymbolPostprocessorPool {
     }
 
     const std::size_t worker_count_;
+    const TransmissionMode mode_;
+    const Constellation constellation_;
     const MaxLogDemapper reference_;
     const SymbolDeinterleaver symbol_deinterleaver_;
     const std::size_t bits_per_carrier_;
@@ -515,6 +528,7 @@ struct StreamDecoder::Impl {
         std::uint64_t ofdm_symbols{};
         float input_seconds{};
         float overlap_input_seconds{};
+        std::size_t input_samples{};
         float resample_time_ms{};
         float acquisition_time_ms{};
         float equalization_time_ms{};
@@ -563,6 +577,8 @@ struct StreamDecoder::Impl {
     std::atomic<std::uint64_t> latest_generation{};
     std::uint32_t accumulated_rate{};
     std::uint32_t accumulated_bandwidth{};
+    std::unique_ptr<Cs16Resampler> resampler;
+    std::unique_ptr<SymbolPostprocessorPool> symbol_postprocessor;
     std::thread worker;
     std::thread fec_worker;
 
@@ -620,7 +636,10 @@ struct StreamDecoder::Impl {
             selected_parameters.worker_threads == 0
                 ? default_viterbi_worker_count()
                 : selected_parameters.worker_threads;
-        auto samples = resample_cs16(iq, rate, bandwidth, resample_workers);
+        if (!resampler || resampler->worker_count() != resample_workers) {
+            resampler = std::make_unique<Cs16Resampler>(resample_workers);
+        }
+        auto samples = resampler->process(iq, rate, bandwidth);
         const auto resampled_at = std::chrono::steady_clock::now();
         if (cancel_requested || samples.size() < acquisition_samples) {
             return;
@@ -703,7 +722,7 @@ struct StreamDecoder::Impl {
         float depuncture_time_sum = 0.0F;
         const WorkerAllocation workers =
             allocate_workers(selected_parameters.worker_threads);
-        std::unique_ptr<SymbolPostprocessorPool> postprocessor;
+        SymbolPostprocessorPool *postprocessor = nullptr;
         const auto start_decoder = [&]() {
             if (!decoder_parameters || postprocessor) {
                 return true;
@@ -716,10 +735,23 @@ struct StreamDecoder::Impl {
                               .summary = {}})) {
                 return false;
             }
-            postprocessor = std::make_unique<SymbolPostprocessorPool>(
-                workers.symbol, acquisition.mode,
-                decoder_parameters->constellation,
-                decoder_parameters->code_rate, symbol_queue_capacity);
+            if (!symbol_postprocessor ||
+                !symbol_postprocessor->compatible(
+                    workers.symbol, acquisition.mode,
+                    decoder_parameters->constellation,
+                    decoder_parameters->code_rate, symbol_queue_capacity)) {
+                symbol_postprocessor =
+                    std::make_unique<SymbolPostprocessorPool>(
+                        workers.symbol, acquisition.mode,
+                        decoder_parameters->constellation,
+                        decoder_parameters->code_rate, symbol_queue_capacity);
+            } else {
+                // A cancelled chunk can leave completed symbols that belong to
+                // its generation. Drain and discard them before reusing the
+                // pool so no stale result crosses a chunk boundary.
+                static_cast<void>(symbol_postprocessor->flush());
+            }
+            postprocessor = symbol_postprocessor.get();
             return true;
         };
         if (decoder_parameters && !start_decoder()) {
@@ -953,6 +985,7 @@ struct StreamDecoder::Impl {
             .overlap_input_seconds =
                 static_cast<float>((iq.size() / 2) - new_complex_samples) /
                 static_cast<float>(rate),
+            .input_samples = new_complex_samples,
             .resample_time_ms = std::chrono::duration<float, std::milli>(
                                     resampled_at - started_at)
                                     .count(),
@@ -1118,6 +1151,9 @@ struct StreamDecoder::Impl {
                             item.summary.residual_carrier_offset_hz;
                         latest.pilot_phase_discontinuities +=
                             item.summary.pilot_phase_discontinuities;
+                        ++latest.processed_chunks;
+                        latest.processed_input_samples +=
+                            item.summary.input_samples;
                         latest.ofdm_symbols += item.summary.ofdm_symbols;
                         latest.transport_bytes += byte_count;
                         latest.ts_overlap_packets += overlap_packets;

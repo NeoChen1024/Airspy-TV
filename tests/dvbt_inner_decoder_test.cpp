@@ -283,6 +283,7 @@ void test_partitioned_resampler() {
         sample = static_cast<std::int16_t>(sample_distribution(generator));
     }
 
+    airspy_tv::dvbt::Cs16Resampler reusable{16};
     for (const std::uint32_t bandwidth :
          {5'000'000U, 6'000'000U, 7'000'000U, 8'000'000U}) {
         const auto serial =
@@ -294,6 +295,10 @@ void test_partitioned_resampler() {
             require(partitioned == serial,
                     "partitioned resampler must be bit-identical to serial");
         }
+        const auto first = reusable.process(input, 10'000'000, bandwidth);
+        const auto second = reusable.process(input, 10'000'000, bandwidth);
+        require(first == serial && second == serial,
+                "reusable resampler must reset filters between calls");
     }
 }
 

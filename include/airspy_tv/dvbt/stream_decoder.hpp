@@ -39,6 +39,8 @@ struct StreamDecoderStats {
     std::size_t symbol_workers{};
     std::uint64_t pilot_phase_discontinuities{};
     std::uint64_t input_blocks{};
+    std::uint64_t processed_chunks{};
+    std::uint64_t processed_input_samples{};
     std::uint64_t dropped_blocks{};
     std::uint64_t ofdm_symbols{};
     std::uint64_t transport_bytes{};

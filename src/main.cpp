@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -2110,12 +2111,14 @@ int decode_iq_cli(const std::filesystem::path &source,
                           : decoder_threads)
                   << (decoder_threads == 0 ? " (auto)\n" : "\n");
     }
-    bool output_failed = false;
+    std::atomic_bool output_failed{};
     decoder.set_transport_callback(
         [&output, &output_failed](const std::span<const std::uint8_t> ts) {
             output.write(reinterpret_cast<const char *>(ts.data()),
                          static_cast<std::streamsize>(ts.size()));
-            output_failed = output_failed || !output;
+            if (!output) {
+                output_failed.store(true, std::memory_order_relaxed);
+            }
         });
 
     const auto started_at = std::chrono::steady_clock::now();
@@ -2123,19 +2126,21 @@ int decode_iq_cli(const std::filesystem::path &source,
         StreamDecoder::processing_chunk_samples * 2;
     std::vector<std::int16_t> block(scalar_samples);
     std::uint64_t input_complex_samples = 0;
-    std::uint64_t reported_complex_samples = 0;
+    std::uint64_t reported_processed_chunks = 0;
+    std::uint64_t reported_processed_samples = 0;
+    std::uint64_t reported_transport_bytes = 0;
     std::uint64_t reported_overlap_packets = 0;
     std::uint64_t reported_join_failures = 0;
-    std::size_t chunk_count = 0;
     const auto report_chunk = [&](const StreamDecoderStats &stats) {
-        ++chunk_count;
-        reported_complex_samples = input_complex_samples;
+        reported_processed_chunks = stats.processed_chunks;
+        reported_processed_samples = stats.processed_input_samples;
+        reported_transport_bytes = stats.transport_bytes;
         const float realtime_speed =
             stats.processing_realtime_ratio > 0.0F
                 ? 1.0F / stats.processing_realtime_ratio
                 : 0.0F;
-        std::cerr << "chunk=" << chunk_count
-                  << " input=" << input_complex_samples
+        std::cerr << "chunk=" << stats.processed_chunks
+                  << " input=" << stats.processed_input_samples
                   << " samples TS=" << stats.transport_bytes
                   << " bytes realtime-speed=" << realtime_speed << "x\n";
         if (debug) {
@@ -2182,7 +2187,7 @@ int decode_iq_cli(const std::filesystem::path &source,
         reported_overlap_packets = stats.ts_overlap_packets;
         reported_join_failures = stats.ts_overlap_join_failures;
     };
-    while (input && !output_failed) {
+    while (input && !output_failed.load(std::memory_order_relaxed)) {
         input.read(
             reinterpret_cast<char *>(block.data()),
             static_cast<std::streamsize>(block.size() * sizeof(block.front())));
@@ -2196,15 +2201,18 @@ int decode_iq_cli(const std::filesystem::path &source,
         decoder.submit_blocking(std::span(block).first(scalar_count),
                                 info.sample_rate_hz);
         if (scalar_count == block.size()) {
-            decoder.wait_until_idle();
-            report_chunk(decoder.stats());
+            const auto progress = decoder.stats();
+            if (progress.processed_chunks != reported_processed_chunks) {
+                report_chunk(progress);
+            }
         }
     }
     decoder.flush();
     output.flush();
 
     const auto stats = decoder.stats();
-    if (reported_complex_samples != input_complex_samples) {
+    if (reported_processed_samples != stats.processed_input_samples ||
+        reported_transport_bytes != stats.transport_bytes) {
         report_chunk(stats);
     }
     const double input_seconds = static_cast<double>(input_complex_samples) /
@@ -2226,7 +2234,7 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << ", join-failures=" << stats.ts_overlap_join_failures
                   << '\n';
     }
-    if (output_failed || !output) {
+    if (output_failed.load(std::memory_order_relaxed) || !output) {
         std::cerr << "Failed while writing MPEG-TS output\n";
         return 1;
     }
