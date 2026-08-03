@@ -1255,42 +1255,27 @@ void draw_epg_panel(AppState &state) {
         ImGui::PopID();
         return;
     }
-
+    // The EPG follows the service selected in the DVB-T panel; there is no
+    // second selector here.
+    if (!state.selected_service_id.has_value()) {
+        draw_disabled_wrapped("Select a service in the DVB-T panel");
+        ImGui::PopID();
+        return;
+    }
     const auto selected_service = std::ranges::find_if(
         state.services, [&state](const TransportService &service) {
             return state.selected_service_id == service.service_id;
         });
-    const std::string preview =
-        selected_service == state.services.end()
-            ? "Select service"
-            : (selected_service->name.empty()
-                   ? std::format("Service {}", selected_service->service_id)
-                   : std::format("{}  ({})", selected_service->name,
-                                 selected_service->service_id));
-    ImGui::SetNextItemWidth(-1.0F);
-    if (ImGui::BeginCombo("##epg-service", preview.c_str())) {
-        for (const auto &service : state.services) {
-            const std::string label =
-                service.name.empty()
-                    ? std::format("Service {}", service.service_id)
-                    : std::format("{}  ({})", service.name, service.service_id);
-            const bool is_selected =
-                state.selected_service_id == service.service_id;
-            if (ImGui::Selectable(label.c_str(), is_selected)) {
-                state.selected_service_id = service.service_id;
-                state.status = "Selected " + label;
-            }
-            if (is_selected) {
-                ImGui::SetItemDefaultFocus();
-            }
-        }
-        ImGui::EndCombo();
-    }
-
-    if (!state.selected_service_id.has_value()) {
-        draw_disabled_wrapped("Select a service to show EPG");
-        ImGui::PopID();
-        return;
+    if (selected_service != state.services.end()) {
+        ImGui::TextDisabled("%s",
+                            selected_service->name.empty()
+                                ? std::format("Service {}",
+                                              selected_service->service_id)
+                                      .c_str()
+                                : std::format("{}  ({})",
+                                              selected_service->name,
+                                              selected_service->service_id)
+                                      .c_str());
     }
     const EpgSnapshot snapshot = state.epg.snapshot(*state.selected_service_id);
     if (snapshot.events.empty()) {
