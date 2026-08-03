@@ -3,7 +3,7 @@
 Airspy TV is a standalone C++20 DVB-T receiver and diagnostics application.
 The current implementation provides:
 
-- a single-window SDL3 + Dear ImGui interface;
+- a single-window SDL3 + Dear ImGui interface with embedded libmpv playback;
 - an always-centered, per-digit mouse-wheel frequency control;
 - selectable 5/6/7/8 MHz DVB-T channel bandwidth applied consistently to
   spectrum metrics, OFDM monitoring, and transport decoding;
@@ -40,10 +40,13 @@ packets, and emitted only once. This preserves multiplex continuity across
 internal processing chunks without making file input lossy; `--debug` reports
 the joined-packet and failed-join counters.
 
-The right-side video surface is reserved for future libmpv playback. PAT, PMT,
-and SDT are parsed into the service drop-down, but selection does not yet filter
-the multiplex or control a player. TS recording therefore still writes the full
-MPTS, which can be opened with an external player.
+The right-side video surface feeds the decoded transport stream to libmpv
+through a bounded custom stream and renders video into an application-owned
+OpenGL framebuffer. PAT, PMT, and SDT populate the service drop-down; selecting
+a service restarts playback with only its PMT, PCR, audio, and video PIDs while
+retaining the required PSI/SI packets. Volume and mute are controlled directly
+from the video footer. TS recording intentionally continues to write the full
+MPTS.
 
 ## Build
 
@@ -62,8 +65,8 @@ Builds also default to `-march=native` so FFT/equalizer/demapper code can use
 the build host's instruction set. Use `-DAIRSPY_TV_NATIVE_ARCH=OFF` for a
 portable binary intended to run on other CPUs.
 
-Required system libraries are SDL3, OpenGL, libairspy, SoapySDR, FFTW3f, VOLK,
-and a C++20 compiler.
+Required system libraries are SDL3, OpenGL, libairspy, SoapySDR, libmpv,
+Fontconfig, FFTW3f, VOLK, and a C++20 compiler.
 Dear ImGui, nlohmann/json, tinycolormap, liquid-dsp, and libcorrect are pinned
 submodules under `contrib/`. The native decoder uses libcorrect for soft
 Viterbi and shortened Reed-Solomon decoding, and liquid-dsp for exact rational

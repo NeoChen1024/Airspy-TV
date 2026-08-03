@@ -11,6 +11,8 @@ namespace airspy_tv {
 struct TransportStreamComponent {
     std::uint16_t pid{};
     std::uint8_t stream_type{};
+
+    bool operator==(const TransportStreamComponent &) const = default;
 };
 
 struct TransportService {

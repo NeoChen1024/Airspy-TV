@@ -1,10 +1,12 @@
 #include "airspy_tv/sdr.hpp"
 
 #include "airspy_tv/iq_file.hpp"
+#include "airspy_tv/mpv_player.hpp"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_dialog.h>
 #include <SDL3/SDL_opengl.h>
+#include <fontconfig/fontconfig.h>
 #include <imgui.h>
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl3.h>
@@ -40,6 +42,7 @@ using airspy_tv::AirspyGainMode;
 using airspy_tv::DeviceDescriptor;
 using airspy_tv::EnumerationResult;
 using airspy_tv::IqFileInfo;
+using airspy_tv::MpvPlayer;
 using airspy_tv::SdrBackend;
 using airspy_tv::SdrDevice;
 using airspy_tv::SourceSettings;
@@ -146,6 +149,7 @@ struct WaterfallDisplay {
 };
 
 struct AppState {
+    MpvPlayer player;
     SdrDevice receiver;
     EnumerationResult enumeration;
     SourceSettings settings;
@@ -212,6 +216,75 @@ void apply_dark_theme() {
     style.Colors[ImGuiCol_ButtonHovered] = accent;
     style.Colors[ImGuiCol_CheckMark] = accent;
     style.Colors[ImGuiCol_SliderGrab] = accent;
+}
+
+[[nodiscard]] bool load_system_monospace_font(ImGuiIO &io, std::string &error) {
+    if (FcInit() == FcFalse) {
+        error = "Fontconfig initialization failed";
+        return false;
+    }
+
+    FcPattern *pattern = FcPatternCreate();
+    if (pattern == nullptr) {
+        error = "Fontconfig could not create a font query";
+        return false;
+    }
+
+    const auto *family = reinterpret_cast<const FcChar8 *>("monospace");
+    if (FcPatternAddString(pattern, FC_FAMILY, family) == FcFalse ||
+        FcConfigSubstitute(nullptr, pattern, FcMatchPattern) == FcFalse) {
+        FcPatternDestroy(pattern);
+        error = "Fontconfig could not prepare the system monospace query";
+        return false;
+    }
+    FcDefaultSubstitute(pattern);
+
+    FcResult result = FcResultNoMatch;
+    FcFontSet *matches = FcFontSort(nullptr, pattern, FcTrue, nullptr, &result);
+    FcPatternDestroy(pattern);
+    if (matches == nullptr || result != FcResultMatch) {
+        if (matches != nullptr) {
+            FcFontSetDestroy(matches);
+        }
+        error = "Fontconfig could not resolve the system monospace font";
+        return false;
+    }
+
+    // Dear ImGui does not consult the platform font fallback mechanism. Merge
+    // the first few fonts from Fontconfig's coverage-trimmed system fallback
+    // order to provide the behavior desktop toolkits normally supply. The
+    // query intentionally carries no language or character-set requirement.
+    constexpr int maximum_font_sources = 6;
+    int loaded_sources = 0;
+    for (int match_index = 0;
+         match_index < matches->nfont && loaded_sources < maximum_font_sources;
+         ++match_index) {
+        FcChar8 *font_file = nullptr;
+        FcPattern *match = matches->fonts[match_index];
+        if (FcPatternGetString(match, FC_FILE, 0, &font_file) !=
+                FcResultMatch ||
+            font_file == nullptr) {
+            continue;
+        }
+
+        int font_index = 0;
+        static_cast<void>(FcPatternGetInteger(match, FC_INDEX, 0, &font_index));
+        const std::string font_path{reinterpret_cast<const char *>(font_file)};
+
+        ImFontConfig font_config;
+        font_config.FontNo = font_index;
+        font_config.MergeMode = loaded_sources != 0;
+        if (io.Fonts->AddFontFromFileTTF(font_path.c_str(), 13.0F,
+                                         &font_config) != nullptr) {
+            ++loaded_sources;
+        }
+    }
+    FcFontSetDestroy(matches);
+    if (loaded_sources == 0) {
+        error = "Dear ImGui could not load any system monospace fonts";
+        return false;
+    }
+    return true;
 }
 
 void refresh_devices(AppState &state) {
@@ -585,8 +658,7 @@ void draw_disabled_wrapped(const std::string_view text) {
     ImGui::PopStyleColor();
 }
 
-void draw_status_indicator(const char *label, const ImVec4 colour,
-                           const char *detail = nullptr) {
+void draw_status_indicator(const char *label, const ImVec4 colour) {
     const ImVec2 cursor = ImGui::GetCursorScreenPos();
     const ImVec2 indicator_position{
         cursor.x + 5.0F, cursor.y + (ImGui::GetTextLineHeight() * 0.5F)};
@@ -595,9 +667,6 @@ void draw_status_indicator(const char *label, const ImVec4 colour,
     ImGui::Dummy(ImVec2(12.0F, ImGui::GetTextLineHeight()));
     ImGui::SameLine();
     ImGui::TextColored(colour, "%s", label);
-    if (detail != nullptr) {
-        draw_disabled_wrapped(detail);
-    }
 }
 
 void draw_bipolar_metric(const char *label, const char *value,
@@ -641,6 +710,59 @@ std::string format_recording_duration(const std::uint64_t milliseconds) {
 
 bool file_dialog_is_open(const std::shared_ptr<FileDialogState> &dialog);
 
+void draw_source_gain_controls(AppState &state) {
+    const DeviceDescriptor *descriptor = state.receiver.descriptor();
+    if (descriptor == nullptr || descriptor->backend == SdrBackend::File) {
+        return;
+    }
+
+    ImGui::SeparatorText("SDR gain");
+    if (descriptor->backend == SdrBackend::AirspyNative) {
+        bool gain_changed = false;
+        const int mode =
+            state.settings.airspy_gain_mode == AirspyGainMode::Sensitivity ? 0
+                                                                           : 1;
+        if (ImGui::RadioButton("Sensitivity", mode == 0)) {
+            state.settings.airspy_gain_mode = AirspyGainMode::Sensitivity;
+            gain_changed = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Linearity", mode == 1)) {
+            state.settings.airspy_gain_mode = AirspyGainMode::Linearity;
+            gain_changed = true;
+        }
+        gain_changed |= ImGui::SliderInt("Profile gain",
+                                         &state.settings.airspy_gain, 0, 21);
+        if (gain_changed) {
+            std::string error;
+            state.status = state.receiver.set_gain(state.settings, error)
+                               ? "Airspy gain applied"
+                               : error;
+        }
+        if (ImGui::Checkbox("Bias-T", &state.settings.bias_tee)) {
+            std::string error;
+            if (state.receiver.set_bias_tee(state.settings.bias_tee, error)) {
+                state.status = state.settings.bias_tee ? "Bias-T enabled"
+                                                       : "Bias-T disabled";
+            } else {
+                state.status = error;
+            }
+        }
+    } else if (const auto range = state.receiver.gain_range();
+               range.has_value()) {
+        if (ImGui::SliderScalar("Generic gain", ImGuiDataType_Double,
+                                &state.settings.soapy_gain, &range->first,
+                                &range->second, "%.1f")) {
+            std::string error;
+            state.status = state.receiver.set_gain(state.settings, error)
+                               ? "Soapy gain applied"
+                               : error;
+        }
+        draw_disabled_wrapped(
+            "Soapy driver-defined gain; not comparable across devices.");
+    }
+}
+
 void draw_source_panel(AppState &state) {
     if (!ImGui::CollapsingHeader("Source", ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
@@ -659,10 +781,8 @@ void draw_source_panel(AppState &state) {
         state.receiver.set_dvbt_parameters(state.dvbt_parameters);
     }
     ImGui::EndDisabled();
-    draw_disabled_wrapped(std::format(
-        "0 = Auto ({} logical CPUs); fixed while a source is open. Budget is "
-        "split across symbol and Viterbi pools.",
-        airspy_tv::dvbt::default_viterbi_worker_count()));
+    ImGui::TextDisabled("0 = Auto (%zu logical CPUs)",
+                        airspy_tv::dvbt::default_viterbi_worker_count());
 
     std::optional<std::string> selected_iq_source;
     {
@@ -850,6 +970,8 @@ void draw_source_panel(AppState &state) {
         }
     }
 
+    draw_source_gain_controls(state);
+
     for (const std::string &warning : state.enumeration.warnings) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.64F, 0.25F, 1.0F));
         ImGui::TextWrapped("%s", warning.c_str());
@@ -858,7 +980,8 @@ void draw_source_panel(AppState &state) {
 }
 
 void draw_receiver_panel(AppState &state) {
-    if (!ImGui::CollapsingHeader("Receiver", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (!ImGui::CollapsingHeader("DVB-T Mode",
+                                 ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
 
@@ -1008,58 +1131,6 @@ void draw_receiver_panel(AppState &state) {
         state.receiver.set_dvbt_parameters(state.dvbt_parameters);
         state.status = "DVB-T parameters updated; receiver reacquiring";
     }
-    draw_disabled_wrapped(
-        "Auto mode/guard begins with cyclic-prefix acquisition. Modulation "
-        "and code rate are taken from BCH-validated TPS before transport "
-        "decoding starts; manual values override their TPS fields.");
-    ImGui::Separator();
-
-    const DeviceDescriptor *descriptor = state.receiver.descriptor();
-    if (descriptor != nullptr &&
-        descriptor->backend == SdrBackend::AirspyNative) {
-        bool gain_changed = false;
-        const int mode =
-            state.settings.airspy_gain_mode == AirspyGainMode::Sensitivity ? 0
-                                                                           : 1;
-        if (ImGui::RadioButton("Sensitivity", mode == 0)) {
-            state.settings.airspy_gain_mode = AirspyGainMode::Sensitivity;
-            gain_changed = true;
-        }
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Linearity", mode == 1)) {
-            state.settings.airspy_gain_mode = AirspyGainMode::Linearity;
-            gain_changed = true;
-        }
-        gain_changed |= ImGui::SliderInt("Profile gain",
-                                         &state.settings.airspy_gain, 0, 21);
-        if (gain_changed) {
-            std::string error;
-            state.status = state.receiver.set_gain(state.settings, error)
-                               ? "Airspy gain applied"
-                               : error;
-        }
-        if (ImGui::Checkbox("Bias-T", &state.settings.bias_tee)) {
-            std::string error;
-            if (state.receiver.set_bias_tee(state.settings.bias_tee, error)) {
-                state.status = state.settings.bias_tee ? "Bias-T enabled"
-                                                       : "Bias-T disabled";
-            } else {
-                state.status = error;
-            }
-        }
-    } else if (const auto range = state.receiver.gain_range();
-               range.has_value()) {
-        if (ImGui::SliderScalar("Generic gain", ImGuiDataType_Double,
-                                &state.settings.soapy_gain, &range->first,
-                                &range->second, "%.1f")) {
-            std::string error;
-            state.status = state.receiver.set_gain(state.settings, error)
-                               ? "Soapy gain applied"
-                               : error;
-        }
-        draw_disabled_wrapped(
-            "Soapy driver-defined gain; not comparable across devices.");
-    }
 }
 
 void consume_file_dialog_result(AppState &state,
@@ -1162,7 +1233,6 @@ void draw_recorder_panel(AppState &state) {
 
 void draw_sidebar(AppState &state) {
     draw_source_panel(state);
-    draw_receiver_panel(state);
 
     if (ImGui::CollapsingHeader("Spectrum & Waterfall",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1235,7 +1305,7 @@ void draw_sidebar(AppState &state) {
             "SDR++ speed model; FFT smoothing affects spectrum only.");
     }
 
-    draw_recorder_panel(state);
+    draw_receiver_panel(state);
 
     if (ImGui::CollapsingHeader("DVB-T Constellation",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1247,12 +1317,20 @@ void draw_sidebar(AppState &state) {
         const bool locked = state.signal_analysis.locked;
         const ImVec4 lock_colour = locked ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
                                           : ImVec4(1.0F, 0.38F, 0.25F, 1.0F);
-        draw_status_indicator(
-            locked ? "OFDM MONITOR LOCKED" : "OFDM MONITOR UNLOCKED",
-            lock_colour, locked ? nullptr : "Constellation paused");
+        draw_status_indicator(locked ? "OFDM MONITOR LOCKED"
+                                     : "OFDM MONITOR UNLOCKED",
+                              lock_colour);
 
         const bool transport_locked = state.decoder.transport.rs_synchronized &&
                                       state.decoder.transport.ts_packets != 0;
+        const auto &transport = state.decoder.transport;
+        const bool pre_viterbi_available =
+            transport.pre_viterbi_compared_bits != 0;
+        const double pre_viterbi_ber =
+            pre_viterbi_available
+                ? static_cast<double>(transport.pre_viterbi_error_bits) /
+                      static_cast<double>(transport.pre_viterbi_compared_bits)
+                : 0.0;
         const bool decoder_active = state.decoder.processing ||
                                     state.decoder.ofdm_locked ||
                                     state.decoder.input_blocks != 0;
@@ -1273,17 +1351,32 @@ void draw_sidebar(AppState &state) {
             state.decoder.input_queue_capacity_samples != 0 &&
             state.decoder.queued_input_samples * 4 >=
                 state.decoder.input_queue_capacity_samples * 3;
+        const bool fec_queue_near_full =
+            state.decoder.symbol_queue_capacity != 0 &&
+            state.decoder.queued_symbols * 4 >=
+                state.decoder.symbol_queue_capacity * 3;
         const bool cpu_slow =
             ratio_available && state.decoder.processing_realtime_ratio > 1.0F;
+        const bool fec_signal_limited =
+            !transport_locked && fec_queue_near_full && pre_viterbi_available &&
+            pre_viterbi_ber >= 0.10;
         const bool cpu_overload =
-            input_queue_near_full || state.decoder.dropped_blocks != 0;
-        const ImVec4 cpu_colour =
-            cpu_overload
-                ? ImVec4(1.0F, 0.38F, 0.25F, 1.0F)
-                : (cpu_slow
-                       ? ImVec4(1.0F, 0.72F, 0.22F, 1.0F)
-                       : (ratio_available ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
-                                          : ImVec4(0.55F, 0.62F, 0.70F, 1.0F)));
+            !fec_signal_limited && cpu_slow && input_queue_near_full;
+        const char *pipeline_status = "CPU LOAD";
+        ImVec4 pipeline_colour{0.55F, 0.62F, 0.70F, 1.0F};
+        if (fec_signal_limited) {
+            pipeline_status = "FEC SIGNAL LIMITED";
+            pipeline_colour = ImVec4(1.0F, 0.72F, 0.22F, 1.0F);
+        } else if (cpu_overload) {
+            pipeline_status = "CPU OVERLOAD";
+            pipeline_colour = ImVec4(1.0F, 0.38F, 0.25F, 1.0F);
+        } else if (cpu_slow) {
+            pipeline_status = "CPU SLOW";
+            pipeline_colour = ImVec4(1.0F, 0.72F, 0.22F, 1.0F);
+        } else if (ratio_available) {
+            pipeline_status = "CPU REALTIME";
+            pipeline_colour = ImVec4(0.35F, 0.88F, 0.55F, 1.0F);
+        }
         const float input_queue_percent =
             state.decoder.input_queue_capacity_samples == 0
                 ? 0.0F
@@ -1291,31 +1384,41 @@ void draw_sidebar(AppState &state) {
                       static_cast<float>(state.decoder.queued_input_samples) /
                       static_cast<float>(
                           state.decoder.input_queue_capacity_samples);
-        const std::string cpu_detail =
-            ratio_available
-                ? std::format(
-                      "{:.2f}x input | IQ {:.0f}% | FEC {} | drops {} | "
-                      "RSP {} SYM {} VIT {}",
-                      state.decoder.processing_realtime_ratio,
-                      input_queue_percent, state.decoder.queued_symbols,
-                      state.decoder.dropped_blocks,
-                      state.decoder.resample_workers,
-                      state.decoder.symbol_workers,
-                      state.decoder.transport.viterbi_workers)
-                : std::format("measuring | IQ {:.0f}% | FEC {} | drops {} | "
-                              "RSP {} SYM {} "
-                              "VIT {}",
-                              input_queue_percent, state.decoder.queued_symbols,
-                              state.decoder.dropped_blocks,
-                              state.decoder.resample_workers,
-                              state.decoder.symbol_workers,
-                              state.decoder.transport.viterbi_workers);
-        draw_status_indicator(
-            cpu_overload
-                ? "CPU OVERLOAD"
-                : (cpu_slow ? "CPU SLOW"
-                            : (ratio_available ? "CPU REALTIME" : "CPU LOAD")),
-            cpu_colour, cpu_detail.c_str());
+        draw_status_indicator(pipeline_status, pipeline_colour);
+        if (ImGui::BeginTable("cpu-diagnostics", 4,
+                              ImGuiTableFlags_SizingStretchProp |
+                                  ImGuiTableFlags_PadOuterX)) {
+            ImGui::TableSetupColumn("label-left",
+                                    ImGuiTableColumnFlags_WidthFixed, 72.0F);
+            ImGui::TableSetupColumn("value-left",
+                                    ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("label-right",
+                                    ImGuiTableColumnFlags_WidthFixed, 72.0F);
+            ImGui::TableSetupColumn("value-right",
+                                    ImGuiTableColumnFlags_WidthStretch);
+            const auto cell = [](const char *label, const auto &value) {
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", label);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(value.c_str());
+            };
+            cell("Load",
+                 ratio_available
+                     ? std::format("{:.2f}x input",
+                                   state.decoder.processing_realtime_ratio)
+                     : std::string{"Measuring"});
+            cell("IQ queue",
+                 std::format("{:3.0f}%",
+                             std::clamp(input_queue_percent, 0.0F, 100.0F)));
+            cell("FEC queue", std::to_string(state.decoder.queued_symbols));
+            cell("Drops", std::to_string(state.decoder.dropped_blocks));
+            cell("Resample", std::to_string(state.decoder.resample_workers));
+            cell("Symbol", std::to_string(state.decoder.symbol_workers));
+            cell("Viterbi",
+                 std::to_string(state.decoder.transport.viterbi_workers));
+            cell("", std::string{});
+            ImGui::EndTable();
+        }
         ImGui::Separator();
 
         const std::string power =
@@ -1399,14 +1502,6 @@ void draw_sidebar(AppState &state) {
                        : std::clamp(static_cast<float>(-std::log10(ber) / 7.0),
                                     0.0F, 1.0F);
         };
-        const auto &transport = state.decoder.transport;
-        const bool pre_viterbi_available =
-            transport.pre_viterbi_compared_bits != 0;
-        const double pre_viterbi_ber =
-            pre_viterbi_available
-                ? static_cast<double>(transport.pre_viterbi_error_bits) /
-                      static_cast<double>(transport.pre_viterbi_compared_bits)
-                : 0.0;
         const std::string pre_viterbi_text =
             pre_viterbi_available ? std::format("{:.2e}", pre_viterbi_ber)
                                   : "--";
@@ -1576,6 +1671,8 @@ void draw_sidebar(AppState &state) {
                   "out-of-channel noise; MER and constellation require OFDM "
                   "lock.");
     }
+
+    draw_recorder_panel(state);
 }
 
 void draw_video_panel(AppState &state) {
@@ -1586,13 +1683,31 @@ void draw_video_panel(AppState &state) {
     const auto ts_stats = state.receiver.ts_recording_stats();
 
     const ImVec2 available = ImGui::GetContentRegionAvail();
-    ImGui::InvisibleButton("video-surface", available);
+    ImGui::Dummy(available);
     const ImVec2 origin = ImGui::GetItemRectMin();
     const ImVec2 extent = ImGui::GetItemRectMax();
     ImDrawList *draw = ImGui::GetWindowDrawList();
     draw->AddRectFilled(origin, extent, IM_COL32(5, 8, 13, 255), 5.0F);
 
     const float header_height = 46.0F;
+    const float footer_height = 142.0F;
+    const ImVec2 footer_origin{origin.x, extent.y - footer_height};
+    const ImVec2 video_origin{origin.x, origin.y + header_height};
+    const ImVec2 video_extent{extent.x, footer_origin.y};
+    const float pixel_density = state.window == nullptr
+                                    ? 1.0F
+                                    : SDL_GetWindowPixelDensity(state.window);
+    const int video_width = static_cast<int>(
+        std::max(1.0F, (video_extent.x - video_origin.x) * pixel_density));
+    const int video_height = static_cast<int>(
+        std::max(1.0F, (video_extent.y - video_origin.y) * pixel_density));
+    const std::uint32_t video_texture =
+        state.player.render(video_width, video_height);
+    if (video_texture != 0 && state.player.ready()) {
+        draw->AddImage(static_cast<ImTextureID>(video_texture), video_origin,
+                       video_extent);
+    }
+
     draw->AddRectFilled(origin, ImVec2(extent.x, origin.y + header_height),
                         IM_COL32(15, 24, 35, 255), 5.0F);
     const auto selected_service = std::ranges::find_if(
@@ -1612,33 +1727,31 @@ void draw_video_panel(AppState &state) {
     draw->AddText(ImVec2(extent.x - 165.0F, origin.y + 14.0F),
                   IM_COL32(90, 205, 255, 255), "VIDEO PREVIEW");
 
-    const float footer_height = 142.0F;
-    const ImVec2 footer_origin{origin.x, extent.y - footer_height};
     const ImVec2 center{(origin.x + extent.x) * 0.5F,
                         (origin.y + footer_origin.y) * 0.5F};
-    draw->AddCircle(center, 54.0F, IM_COL32(55, 78, 102, 255), 0, 2.0F);
-    draw->AddTriangleFilled(ImVec2(center.x - 14.0F, center.y - 24.0F),
-                            ImVec2(center.x - 14.0F, center.y + 24.0F),
-                            ImVec2(center.x + 28.0F, center.y),
-                            IM_COL32(65, 175, 235, 230));
-    const char *message = "libmpv video surface placeholder";
-    const ImVec2 text_size = ImGui::CalcTextSize(message);
-    draw->AddText(ImVec2(center.x - (text_size.x * 0.5F), center.y + 74.0F),
-                  IM_COL32(130, 150, 170, 255), message);
+    const std::string player_status = state.player.status();
+    if (!state.player.ready()) {
+        draw->AddCircle(center, 54.0F, IM_COL32(55, 78, 102, 255), 0, 2.0F);
+        draw->AddTriangleFilled(ImVec2(center.x - 14.0F, center.y - 24.0F),
+                                ImVec2(center.x - 14.0F, center.y + 24.0F),
+                                ImVec2(center.x + 28.0F, center.y),
+                                IM_COL32(65, 175, 235, 230));
+        const ImVec2 text_size = ImGui::CalcTextSize(player_status.c_str());
+        draw->AddText(ImVec2(center.x - (text_size.x * 0.5F), center.y + 74.0F),
+                      IM_COL32(130, 150, 170, 255), player_status.c_str());
+    }
 
     draw->AddRectFilled(footer_origin, extent, IM_COL32(13, 20, 30, 245), 5.0F);
-    draw->AddText(ImVec2(extent.x - 260.0F, footer_origin.y + 13.0F),
-                  IM_COL32(145, 160, 176, 255),
-                  state.services.empty() ? "Waiting for service tables"
-                                         : "MPTS service list available");
 
     constexpr float horizontal_padding = 18.0F;
     constexpr float browse_width = 86.0F;
     constexpr float record_width = 104.0F;
+    constexpr float mute_width = 72.0F;
     constexpr float control_spacing = 8.0F;
     ImGui::SetCursorScreenPos(
         ImVec2(footer_origin.x + horizontal_padding, footer_origin.y + 8.0F));
-    ImGui::SetNextItemWidth(std::max(180.0F, available.x * 0.48F));
+    const float service_width = std::max(180.0F, available.x * 0.48F);
+    ImGui::SetNextItemWidth(service_width);
     const std::string service_preview =
         selected_service == state.services.end()
             ? "No DVB-T services"
@@ -1657,6 +1770,7 @@ void draw_video_panel(AppState &state) {
                 state.selected_service_id == service.service_id;
             if (ImGui::Selectable(label.c_str(), selected)) {
                 state.selected_service_id = service.service_id;
+                state.player.select_service(service);
                 state.status = "Selected " + label;
             }
             if (selected) {
@@ -1666,6 +1780,20 @@ void draw_video_panel(AppState &state) {
         ImGui::EndCombo();
     }
     ImGui::EndDisabled();
+    ImGui::SameLine(0.0F, control_spacing);
+    if (ImGui::Button(state.player.muted() ? "Unmute" : "Mute",
+                      ImVec2(mute_width, 0.0F))) {
+        state.player.set_muted(!state.player.muted());
+    }
+    ImGui::SameLine(0.0F, control_spacing);
+    float volume = state.player.volume();
+    ImGui::SetNextItemWidth(std::max(
+        100.0F, available.x - (horizontal_padding * 2.0F) - service_width -
+                    mute_width - (control_spacing * 2.0F)));
+    if (ImGui::SliderFloat("##playback-volume", &volume, 0.0F, 100.0F,
+                           "Volume %.0f%%")) {
+        state.player.set_volume(volume);
+    }
 
     const float input_width = std::max(
         120.0F, available.x - (horizontal_padding * 2.0F) - browse_width -
@@ -1715,6 +1843,8 @@ void draw_video_panel(AppState &state) {
 }
 
 void draw_application(AppState &state) {
+    state.player.set_source_active(state.receiver.is_streaming());
+    state.player.poll_events();
     state.spectrum = state.receiver.spectrum_snapshot();
     state.signal_analysis = state.receiver.signal_analysis_snapshot();
     state.decoder = state.receiver.decoder_stats();
@@ -1724,6 +1854,17 @@ void draw_application(AppState &state) {
             return state.selected_service_id == service.service_id;
         })) {
         state.selected_service_id = state.services.front().service_id;
+    }
+    if (state.selected_service_id.has_value()) {
+        const auto service = std::ranges::find_if(
+            state.services, [&state](const TransportService &candidate) {
+                return candidate.service_id == *state.selected_service_id;
+            });
+        if (service != state.services.end()) {
+            state.player.select_service(*service);
+        }
+    } else {
+        state.player.clear_service();
     }
     const ImGuiViewport *viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
@@ -2014,8 +2155,7 @@ int decode_iq_cli(const std::filesystem::path &source,
             std::cerr << "  chunk join: overlap="
                       << stats.ts_overlap_packets - reported_overlap_packets
                       << " TS packets, failures="
-                      << stats.ts_overlap_join_failures -
-                             reported_join_failures
+                      << stats.ts_overlap_join_failures - reported_join_failures
                       << '\n';
             if (stats.transport.pre_viterbi_compared_bits != 0) {
                 const double pre_viterbi_ber =
@@ -2083,8 +2223,8 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << ", TEI=" << stats.transport.tei_packets
                   << ", packets=" << stats.transport.ts_packets
                   << ", joined-overlap=" << stats.ts_overlap_packets
-                  << ", join-failures="
-                  << stats.ts_overlap_join_failures << '\n';
+                  << ", join-failures=" << stats.ts_overlap_join_failures
+                  << '\n';
     }
     if (output_failed || !output) {
         std::cerr << "Failed while writing MPEG-TS output\n";
@@ -2241,6 +2381,11 @@ int main(const int argc, char **argv) {
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = nullptr;
+    std::string font_error;
+    if (!load_system_monospace_font(io, font_error)) {
+        std::cerr << "warning: " << font_error << '\n';
+        io.Fonts->AddFontDefault();
+    }
     apply_dark_theme();
 
     ImGui_ImplSDL3_InitForOpenGL(window, gl_context);
@@ -2248,6 +2393,21 @@ int main(const int argc, char **argv) {
 
     AppState state;
     state.window = window;
+    std::string player_error;
+    if (!state.player.initialize(player_error)) {
+        std::cerr << player_error << '\n';
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+        SDL_GL_DestroyContext(gl_context);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    state.receiver.set_transport_sink(
+        [&player = state.player](const std::span<const std::uint8_t> ts) {
+            player.submit(ts);
+        });
     refresh_devices(state);
     bool running = true;
     while (running) {
@@ -2281,7 +2441,9 @@ int main(const int argc, char **argv) {
         SDL_GL_SwapWindow(window);
     }
 
+    state.receiver.set_transport_sink({});
     state.receiver.close();
+    state.player.shutdown();
     state.waterfall.destroy();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();

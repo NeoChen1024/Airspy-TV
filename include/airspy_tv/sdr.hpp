@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -45,6 +46,8 @@ struct SourceSettings {
 
 class SdrDevice {
   public:
+    using TransportSink = std::function<void(std::span<const std::uint8_t>)>;
+
     SdrDevice();
     ~SdrDevice() noexcept;
 
@@ -75,6 +78,7 @@ class SdrDevice {
     bool start_ts_recording(const std::filesystem::path &path,
                             std::string &error);
     void stop_ts_recording();
+    void set_transport_sink(TransportSink sink);
 
     [[nodiscard]] bool is_open() const;
     [[nodiscard]] bool is_streaming() const;

@@ -29,6 +29,8 @@ find_package(SoapySDR CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(AIRSPY REQUIRED IMPORTED_TARGET libairspy)
 pkg_check_modules(FFTW3F REQUIRED IMPORTED_TARGET fftw3f)
+pkg_check_modules(FONTCONFIG REQUIRED IMPORTED_TARGET fontconfig)
+pkg_check_modules(MPV REQUIRED IMPORTED_TARGET mpv)
 pkg_check_modules(VOLK REQUIRED IMPORTED_TARGET volk)
 
 set(JSON_BuildTests OFF CACHE INTERNAL "Disable nlohmann/json tests")
@@ -101,6 +103,7 @@ target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F Threads::Threads
 add_executable(airspy-tv
     src/iq_file.cpp
     src/main.cpp
+    src/mpv_player.cpp
     src/recorder.cpp
     src/sdr.cpp
     src/spectrum.cpp
@@ -114,6 +117,8 @@ target_link_libraries(airspy-tv PRIVATE
     tinycolormap
     PkgConfig::AIRSPY
     PkgConfig::FFTW3F
+    PkgConfig::FONTCONFIG
+    PkgConfig::MPV
     PkgConfig::VOLK
     SoapySDR
     Threads::Threads

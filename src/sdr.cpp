@@ -78,12 +78,18 @@ struct SdrDevice::Impl {
     std::atomic<std::uint32_t> active_channel_bandwidth{6'000'000};
     mutable std::mutex error_mutex;
     std::string async_error;
+    mutable std::mutex transport_sink_mutex;
+    TransportSink transport_sink;
 
     Impl() {
         stream_decoder.set_transport_callback(
             [this](const std::span<const std::uint8_t> ts) {
                 transport_model.consume(ts);
                 ts_recorder.submit(ts);
+                const std::scoped_lock lock(transport_sink_mutex);
+                if (transport_sink) {
+                    transport_sink(ts);
+                }
             });
     }
 
@@ -694,6 +700,11 @@ bool SdrDevice::start_ts_recording(const std::filesystem::path &path,
 }
 
 void SdrDevice::stop_ts_recording() { impl_->ts_recorder.stop(); }
+
+void SdrDevice::set_transport_sink(TransportSink sink) {
+    const std::scoped_lock lock(impl_->transport_sink_mutex);
+    impl_->transport_sink = std::move(sink);
+}
 
 bool SdrDevice::is_open() const { return impl_->opened; }
 
