@@ -102,6 +102,7 @@ struct TpsDecoder::Impl {
     std::vector<std::complex<float>> previous;
     std::deque<std::uint8_t> bits;
     TpsSnapshot latest;
+    bool previously_valid{};
 };
 
 TpsDecoder::TpsDecoder() : impl_(std::make_unique<Impl>()) {}
@@ -127,8 +128,14 @@ TpsDecoder::process(const std::span<const std::complex<float>> carriers) {
         }
         if (const auto parameters = decode(impl_->bits); parameters) {
             impl_->latest = {
-                .locked = true, .symbol_index = 67, .parameters = *parameters};
-        } else if (impl_->latest.locked) {
+                .ever_locked = true,
+                .currently_valid = true,
+                .symbol_index = 67,
+                .parameters = *parameters};
+        } else if (impl_->latest.ever_locked) {
+            // A later frame failed its BCH/sync check: the parameters stay
+            // fixed (fix-once), but the lock is no longer currently healthy.
+            impl_->latest.currently_valid = false;
             impl_->latest.symbol_index = (impl_->latest.symbol_index + 1) % 68;
         }
     }

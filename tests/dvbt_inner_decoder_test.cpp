@@ -349,7 +349,8 @@ void test_tps_decoder() {
         static_cast<void>(decoder.process(carriers));
     }
     const auto snapshot = decoder.snapshot();
-    require(snapshot.locked, "TPS BCH and synchronization lock");
+    require(snapshot.ever_locked && snapshot.currently_valid,
+            "TPS BCH and synchronization lock");
     require(snapshot.symbol_index == 67, "TPS frame-end symbol index");
     require(snapshot.parameters.constellation == Constellation::qam64,
             "TPS constellation");

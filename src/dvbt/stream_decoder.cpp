@@ -711,6 +711,10 @@ struct StreamDecoder::Impl {
         frontend.just_seeded = false;
         frontend.tps_decoder.reset();
         frontend.tps_snapshot = {};
+        // The fade-recovery carrier grid is per-stream: a grid captured from
+        // one frequency or file must never be restored in a later stream.
+        frontend.stable_carrier_offset = std::numeric_limits<int>::max();
+        frontend.stable_phase = -1;
     }
 
     [[nodiscard]] bool enqueue_fec(FecItem item) {
@@ -772,6 +776,7 @@ struct StreamDecoder::Impl {
                     ++latest_generation;
                     current_bandwidth = 0;
                     resampler = StreamingResampler{};
+                    reset_frontend_state();
                     input_not_full.notify_all();
                     fec_not_full.notify_all();
                     ring_data.notify_all();
@@ -823,6 +828,14 @@ struct StreamDecoder::Impl {
                         current_bandwidth = block.bandwidth;
                         sync.valid = false;
                         ++sync.version;
+                        // A retune is a receiver reset: the TPS-fixed
+                        // parameters and the fade-recovery grid captured from
+                        // the previous frequency must not carry over.
+                        stable_mode.reset();
+                        stable_guard.reset();
+                        frontend.stable_carrier_offset =
+                            std::numeric_limits<int>::max();
+                        frontend.stable_phase = -1;
                     }
                     ring_data.notify_all();
                 }
@@ -1312,7 +1325,7 @@ struct StreamDecoder::Impl {
                               (2.0F * std::numbers::pi_v<float>);
                 const std::scoped_lock lock(mutex);
                 latest.ofdm_locked = true;
-                latest.tps_locked = frontend.tps_snapshot.locked;
+                latest.tps_locked = frontend.tps_snapshot.currently_valid;
                 latest.tps_constellation =
                     frontend.tps_snapshot.parameters.constellation;
                 latest.tps_code_rate =
@@ -1661,30 +1674,44 @@ struct StreamDecoder::Impl {
                             // outer sync can false-lock). Re-arms after each
                             // attempt.
                             fade_symbol_count = 0;
-                            if (run_event_acquisition() >= 0.20F &&
-                                frontend.stable_carrier_offset !=
+                            if (run_event_acquisition() >= 0.20F) {
+                                if (frontend.stable_carrier_offset !=
                                     std::numeric_limits<int>::max()) {
-                                // Restore the carrier grid from the stable
-                                // reference: the LO never moves, so the true
-                                // offset is the pre-fade one, while the
-                                // narrow lock can latch a multipath alias
-                                // (the observed off=2 at the 581 fade) whose
-                                // pilot pattern passes the scatter verify.
-                                // Restore the offset and the scattered-pilot
-                                // phase from the absolute frame position
-                                // ((first_lock_phase + symbol_count) mod 4,
-                                // deterministic and immune to the rotation a
-                                // stale channel estimate carries, which the
-                                // MER cannot see), then re-lock the TPS on the
-                                // healthy grid.
-                                frontend.carrier_offset =
-                                    frontend.stable_carrier_offset;
-                                frontend.previous_phase = static_cast<int>(
-                                    (frontend.stable_phase + symbol_count) % 4);
-                                // Hold the restored grid for one symbol so
-                                // the lock cannot immediately flip the
-                                // correct phase onto a noise-latched one.
-                                lock_hold = 1;
+                                    // Restore the carrier grid from the stable
+                                    // reference: the LO never moves, so the
+                                    // true offset is the pre-fade one, while
+                                    // the narrow lock can latch a multipath
+                                    // alias (the observed off=2 at the 581
+                                    // fade) whose pilot pattern passes the
+                                    // scatter verify. Restore the offset and
+                                    // the scattered-pilot phase from the
+                                    // absolute frame position
+                                    // ((first_lock_phase + symbol_count) mod
+                                    // 4, deterministic and immune to the
+                                    // rotation a stale channel estimate
+                                    // carries, which the MER cannot see),
+                                    // then re-lock the TPS on the healthy
+                                    // grid.
+                                    frontend.carrier_offset =
+                                        frontend.stable_carrier_offset;
+                                    frontend.previous_phase =
+                                        static_cast<int>(
+                                            (frontend.stable_phase +
+                                             symbol_count) %
+                                            4);
+                                    // Hold the restored grid for one symbol
+                                    // so the lock cannot immediately flip the
+                                    // correct phase onto a noise-latched one.
+                                    lock_hold = 1;
+                                }
+                                // The acquisition republished the grid: the
+                                // in-flight symbol's FFT window was read from
+                                // the pre-anchor boundary, so combining it
+                                // with the newly anchored grid would corrupt
+                                // its channel estimate and payload. Discard
+                                // it and restart from the published
+                                // next_symbol_start at the loop head.
+                                continue;
                             }
                         }
                         fade_phase_count = (fade_phase_count + 1) % 4;
@@ -1777,15 +1804,22 @@ struct StreamDecoder::Impl {
                     frontend.tps_snapshot =
                         frontend.tps_decoder.process(tps_values);
                     const bool matching_tps =
-                        frontend.tps_snapshot.locked &&
+                        frontend.tps_snapshot.ever_locked &&
                         frontend.tps_snapshot.parameters.mode ==
                             frontend.mode &&
                         frontend.tps_snapshot.parameters.guard_interval ==
                             frontend.guard;
-                    if (frontend.tps_snapshot.locked && !matching_tps) {
+                    if (frontend.tps_snapshot.ever_locked && !matching_tps) {
                         if (++tps_mismatch_symbols >= 1400) {
                             tps_mismatch_symbols = 0;
-                            run_event_acquisition();
+                            if (run_event_acquisition() >= 0.20F) {
+                                // The grid was republished (the TPS decoded a
+                                // mode/guard that disagrees with the current
+                                // grid): the in-flight symbol predates the new
+                                // grid. Discard it and restart from the
+                                // published boundary at the loop head.
+                                continue;
+                            }
                         }
                     } else {
                         tps_mismatch_symbols = 0;
