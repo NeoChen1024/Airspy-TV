@@ -59,6 +59,46 @@ add_subdirectory(contrib/libcorrect EXCLUDE_FROM_ALL)
 set(CMAKE_BUILD_TYPE "${AIRSPY_TV_BUILD_TYPE}")
 unset(AIRSPY_TV_BUILD_TYPE)
 
+# ViterbiDecoderCpp (LGPL-2.1, header-only) AVX2 soft Viterbi backend. The
+# decoder type is a compile-time template choice; its AVX2 intrinsics require
+# -mavx2 (implied by the default AIRSPY_TV_NATIVE_ARCH=-march=native). When
+# AVX2 is unavailable at compile time, soft_viterbi.cpp falls back to
+# libcorrect's convolutional decoder automatically.
+option(AIRSPY_TV_USE_AVX2_VITERBI
+       "Use ViterbiDecoderCpp AVX2 for the soft Viterbi decoder" ON)
+if(AIRSPY_TV_USE_AVX2_VITERBI)
+    add_library(viterbi-decoder INTERFACE)
+    target_include_directories(viterbi-decoder SYSTEM INTERFACE
+        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/viterbi-decoder-cpp/include")
+    target_compile_features(viterbi-decoder INTERFACE cxx_std_17)
+    # The AVX2 intrinsics only compile when the translation unit is built with
+    # -mavx2 (implied by the default -march=native). Warn when the current
+    # target cannot provide it, so the silent libcorrect fallback in
+    # soft_viterbi.cpp is not mistaken for an AVX2 build. try_compile does not
+    # inherit add_compile_options, so mirror the TU's actual flags here.
+    include(CheckCXXSourceCompiles)
+    unset(AIRSPY_TV_HAVE_AVX2)
+    unset(AIRSPY_TV_HAVE_AVX2 CACHE)
+    set(_airspy_tv_check_flags "")
+    if(AIRSPY_TV_NATIVE_ARCH AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        # Mirror the TU's actual flags: with -march=native the probe result
+        # matches what soft_viterbi.cpp sees via __AVX2__, including on hosts
+        # whose CPU lacks AVX2 (where the TU silently falls back).
+        set(_airspy_tv_check_flags "-march=native")
+    endif()
+    set(CMAKE_REQUIRED_FLAGS "${_airspy_tv_check_flags}")
+    check_cxx_source_compiles("
+        #include <immintrin.h>
+        int main() { __m256i x = _mm256_setzero_si256(); (void)x; return 0; }
+    " AIRSPY_TV_HAVE_AVX2)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(NOT AIRSPY_TV_HAVE_AVX2)
+        message(WARNING "AIRSPY_TV_USE_AVX2_VITERBI is ON but the compiler "
+                        "target lacks AVX2 (e.g. AIRSPY_TV_NATIVE_ARCH=OFF); "
+                        "soft_viterbi.cpp will fall back to libcorrect.")
+    endif()
+endif()
+
 set(TINYCOLORMAP_BUILD_TOOLS OFF CACHE INTERNAL
     "Disable tinycolormap optional tools")
 add_subdirectory(contrib/tinycolormap EXCLUDE_FROM_ALL)
@@ -93,6 +133,11 @@ target_include_directories(airspy-tv-common SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libcorrect/include")
 target_link_libraries(airspy-tv-common PUBLIC Threads::Threads
     PRIVATE correct_static)
+if(AIRSPY_TV_USE_AVX2_VITERBI)
+    target_link_libraries(airspy-tv-common PRIVATE viterbi-decoder)
+    target_compile_definitions(airspy-tv-common PRIVATE
+        AIRSPY_TV_USE_AVX2_VITERBI=1)
+endif()
 
 add_library(airspy-tv-dvbt STATIC
     src/dvbt/decoder.cpp

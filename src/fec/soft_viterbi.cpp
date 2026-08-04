@@ -1,11 +1,16 @@
 #include "airspy_tv/fec/soft_viterbi.hpp"
 
+#if defined(AIRSPY_TV_USE_AVX2_VITERBI) && defined(__AVX2__)
+#include "viterbi/viterbi_decoder_core.h"
+#include "viterbi/x86/viterbi_decoder_avx_u16.h"
+#else
 extern "C" {
 #include <correct.h>
 #if defined(HAVE_SSE)
 #include <correct-sse.h>
 #endif
 }
+#endif
 
 #include <algorithm>
 #include <array>
@@ -182,10 +187,84 @@ struct SoftViterbi::Impl {
         std::uint64_t compared_metrics{};
     };
 
-#if defined(HAVE_SSE)
-    using DecoderHandle = correct_convolutional_sse;
+#if defined(AIRSPY_TV_USE_AVX2_VITERBI) && defined(__AVX2__)
+    static constexpr std::size_t constraint_length = 7;
+    using DecoderHandle =
+        ViterbiDecoder_Core<constraint_length, convolutional_rate,
+                            std::uint16_t, std::int16_t>;
+    using DecoderType =
+        ViterbiDecoder_AVX_u16<constraint_length, convolutional_rate>;
+    using BranchTable =
+        ViterbiBranchTable<constraint_length, convolutional_rate,
+                           std::int16_t>;
+
+    // DVB-T generator polynomials (171, 133 octal) in the libfec reversed
+    // convention — the same values as libcorrect's {0117, 0155}. The branch
+    // table is read-only once built, so all workers share one instance.
+    static BranchTable &shared_branch_table() {
+        static constexpr std::array<std::uint8_t, 2> polynomials{79, 109};
+        static BranchTable table(polynomials.data(), 127, -127);
+        return table;
+    }
+
+    // soft_decision_max_error = (127 - (-127)) * R = 508; a margin of five
+    // max errors keeps the u16 accumulator far from saturation between
+    // renormalisations (mirrors the upstream SOFT16 example).
+    static ViterbiDecoder_Config<std::uint16_t> decoder_config() {
+        constexpr std::uint16_t max_error =
+            static_cast<std::uint16_t>(254U * convolutional_rate);
+        constexpr std::uint16_t error_margin =
+            static_cast<std::uint16_t>(max_error * 5U);
+        return {max_error, 0U, error_margin,
+                static_cast<std::uint16_t>(65'535U - error_margin)};
+    }
+
+    static DecoderHandle *create_decoder() {
+        auto *decoder =
+            new DecoderHandle(shared_branch_table(), decoder_config());
+        decoder->set_traceback_length(viterbi_window_bits);
+        return decoder;
+    }
+
+    static void destroy_decoder(DecoderHandle *decoder) { delete decoder; }
+
+    static Result decode(DecoderHandle *decoder, const Task &task) {
+        // ViterbiDecoderCpp consumes signed soft decisions in [-127, +127];
+        // the pipeline stores unsigned 0..255 metrics with 128 as the neutral
+        // puncture value, so subtract 128 and clamp to keep the domain
+        // symmetric with the +-127 branch references.
+        thread_local std::vector<std::int16_t> soft;
+        // ViterbiDecoderCpp's chainback needs (K-1) more stored decisions
+        // than the output bits it returns, so pad the window with (K-1)
+        // neutral (0) symbols. Their decoded bits fall inside the discarded
+        // back margin, and a constant soft value contributes the same branch
+        // error to every state, so the 7680-bit output is unaffected. The
+        // pad length must stay in lockstep with
+        // set_traceback_length(viterbi_window_bits) in create_decoder():
+        // update() feeds window + (K-1) bits into a buffer sized for
+        // window + (K-1).
+        constexpr std::size_t tail_symbols =
+            (constraint_length - 1U) * convolutional_rate;
+        soft.assign(task.metrics.size() + tail_symbols, 0);
+        for (std::size_t index = 0; index < task.metrics.size(); ++index) {
+            soft[index] = static_cast<std::int16_t>(std::clamp(
+                static_cast<int>(task.metrics[index]) - 128, -127, 127));
+        }
+        // reset() starts each window from state 0; the 256-bit leading margin
+        // gives the trellis room to converge before the kept output begins.
+        decoder->reset(0);
+        static_cast<void>(DecoderType::template update<std::uint64_t>(
+            *decoder, soft.data(), soft.size()));
+        std::array<std::uint8_t, viterbi_window_bits / 8> decoded{};
+        decoder->chainback(decoded.data(), viterbi_window_bits);
+        return extract_output(decoded, task);
+    }
 #else
-    using DecoderHandle = correct_convolutional;
+    using DecoderHandle =
+#if defined(HAVE_SSE)
+        correct_convolutional_sse;
+#else
+        correct_convolutional;
 #endif
 
     static DecoderHandle *create_decoder() {
@@ -217,19 +296,30 @@ struct SoftViterbi::Impl {
         const ssize_t decoded_bytes = correct_convolutional_decode_soft(
             decoder, task.metrics.data(), task.metrics.size(), decoded.data());
 #endif
-        constexpr std::size_t margin_bytes = viterbi_margin_bits / 8;
-        constexpr std::size_t output_bytes = viterbi_output_bits / 8;
-        if (decoded_bytes < static_cast<ssize_t>(margin_bytes + output_bytes)) {
+        if (decoded_bytes < static_cast<ssize_t>(
+                                (viterbi_margin_bits + viterbi_output_bits) /
+                                8)) {
             throw std::runtime_error("libcorrect Viterbi decode failed");
         }
+        return extract_output(decoded, task);
+    }
+#endif
+
+    // Shared by both backends: slice the 7680-bit output out of the 8192-bit
+    // window and estimate the pre-Viterbi BER by re-encoding the survivor
+    // path against the received mother-code metrics. The traceback margins
+    // establish encoder state and are not counted. Metric 128 is the neutral
+    // value inserted for punctures.
+    static Result
+    extract_output(const std::array<std::uint8_t, viterbi_window_bits / 8>
+                       &decoded,
+                   const Task &task) {
+        constexpr std::size_t margin_bytes = viterbi_margin_bits / 8;
+        constexpr std::size_t output_bytes = viterbi_output_bits / 8;
         Result result;
         result.bytes.assign(decoded.begin() + margin_bytes,
                             decoded.begin() + margin_bytes + output_bytes);
 
-        // Estimate pre-Viterbi BER by re-encoding the survivor path and
-        // comparing it with hard decisions from the received mother-code
-        // metrics. The traceback margins establish encoder state and are not
-        // counted. Metric 128 is the neutral value inserted for punctures.
         constexpr std::array<std::uint8_t, 2> polynomials{0117, 0155};
         std::uint8_t shift_register = 0;
         for (std::size_t bit = 0; bit < viterbi_window_bits; ++bit) {
@@ -265,7 +355,7 @@ struct SoftViterbi::Impl {
         if (decoder == nullptr) {
             const std::scoped_lock lock(mutex_);
             worker_error_ = std::make_exception_ptr(
-                std::runtime_error("failed to create libcorrect Viterbi"));
+                std::runtime_error("failed to create Viterbi decoder"));
             all_finished_.notify_all();
             queue_space_.notify_all();
             return;

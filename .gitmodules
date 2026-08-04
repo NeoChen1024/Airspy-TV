@@ -13,3 +13,6 @@
 [submodule "contrib/libcorrect"]
 	path = contrib/libcorrect
 	url = https://github.com/quiet/libcorrect.git
+[submodule "contrib/viterbi-decoder-cpp"]
+	path = contrib/viterbi-decoder-cpp
+	url = https://github.com/williamyang98/ViterbiDecoderCpp.git
