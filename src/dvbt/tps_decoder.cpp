@@ -127,11 +127,10 @@ TpsDecoder::process(const std::span<const std::complex<float>> carriers) {
             impl_->bits.pop_front();
         }
         if (const auto parameters = decode(impl_->bits); parameters) {
-            impl_->latest = {
-                .ever_locked = true,
-                .currently_valid = true,
-                .symbol_index = 67,
-                .parameters = *parameters};
+            impl_->latest = {.ever_locked = true,
+                             .currently_valid = true,
+                             .symbol_index = 67,
+                             .parameters = *parameters};
         } else if (impl_->latest.ever_locked) {
             // A later frame failed its BCH/sync check: the parameters stay
             // fixed (fix-once), but the lock is no longer currently healthy.

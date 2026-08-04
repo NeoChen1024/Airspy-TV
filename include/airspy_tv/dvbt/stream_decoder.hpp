@@ -5,6 +5,7 @@
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
 #include "airspy_tv/dvbt/transport_decoder.hpp"
 
+#include <algorithm>
 #include <complex>
 #include <cstddef>
 #include <cstdint>
@@ -74,7 +75,19 @@ struct StreamDecoderStats {
 // from the same input on submit().
 class StreamDecoder : public Demodulator {
   public:
-    static constexpr std::size_t processing_chunk_samples = 7'000'000;
+    // Ingestion budget: input is submitted in ~0.2 s spans and the input
+    // queue retains about that much, bounding end-to-end latency for live
+    // streams. Chunk sizes are derived from the sample rate — the historical
+    // fixed 7 M-sample (0.7 s at 10 MHz) constant was removed so chunking
+    // never defines DSP latency or queue behaviour.
+    static constexpr std::uint32_t input_budget_denominator = 5;
+    static std::size_t
+    chunk_samples_for(const std::uint32_t sample_rate_hz) noexcept {
+        return std::max<std::size_t>(
+            1, (static_cast<std::size_t>(sample_rate_hz) +
+                input_budget_denominator - 1) /
+                   input_budget_denominator);
+    }
 
     using TransportCallback =
         std::function<void(std::span<const std::uint8_t>)>;

@@ -2342,8 +2342,11 @@ int decode_iq_cli(const std::filesystem::path &source,
         });
 
     const auto started_at = std::chrono::steady_clock::now();
-    constexpr std::size_t scalar_samples =
-        StreamDecoder::processing_chunk_samples * 2;
+    // Submit in ~0.2 s spans (the decoder's ingestion budget) rather than a
+    // fixed 0.7 s block: the queue and ring are sized from the same budget,
+    // so chunking must not exceed it or it silently becomes the latency.
+    const std::size_t scalar_samples =
+        StreamDecoder::chunk_samples_for(info.sample_rate_hz) * 2;
     std::vector<std::int16_t> block(scalar_samples);
     std::uint64_t input_complex_samples = 0;
     std::uint64_t reported_processed_chunks = 0;

@@ -35,15 +35,18 @@
 
 ## Pipeline pacing and playback
 
-- [ ] Make 0.2 seconds the common ingestion and jitter budget.  Keep large
+- [x] Make 0.2 seconds the common ingestion and jitter budget.  Keep large
   file reads if they improve I/O efficiency, but split them into
-  `sample_rate / 5` complex-sample spans before `submit_blocking()`.  Remove
-  the historical 0.7-second `processing_chunk_samples` constant from the
-  decoder API; it should not define DSP latency or queue behaviour.
+  `sample_rate / 5` complex-sample spans before `submit_blocking()`.  The
+  historical 0.7-second `processing_chunk_samples` constant was removed;
+  `StreamDecoder::chunk_samples_for(rate)` derives the span from the sample
+  rate so chunking never defines DSP latency or queue behaviour.
 
-- [ ] Size the resampled sample ring from the active DVB-T baseband rate so it
-  also retains approximately 0.2 seconds.  The fixed 1 Mi-sample ring is only
-  about 146 ms at 6 MHz and 109 ms at 8 MHz.
+- [x] Size the resampled sample ring from the active DVB-T baseband rate so it
+  also retains approximately 0.2 seconds.  The ring grows at run time to
+  ~0.2 s of the input rate (the baseband is always <= input), floored at the
+  proven 1 Mi behaviour; it only resizes while empty so the absolute
+  read/write counters never corrupt the wrap.
 
 - [ ] Define and propagate transport discontinuity semantics to playback.
   FEC-region resets, source drops, and retunes must be distinguishable from

@@ -44,12 +44,23 @@ constexpr std::size_t buffer_duration_denominator = 5;
 constexpr std::size_t initial_symbol_queue_capacity = 256;
 constexpr std::size_t ts_packet_size = 188;
 // Resampled-sample ring shared by the front-end thread (producer) and the
-// demod thread (consumer): 1 Mi complex samples = 8 MiB, ~150 ms at the
-// nominal 8K/guard-1/4 rate, enough slack for the acquisition window and
-// scheduling jitter without ever blocking the front-end for long.
-constexpr std::size_t ring_capacity_samples = 1'048'576;
+// demod thread (consumer). The ring is sized at run time from the input rate
+// to retain ~0.2 s of baseband (the baseband rate is always <= the input
+// rate), floored at the acquisition window plus a couple of symbols of
+// lookahead and scheduling jitter — the proven 1 Mi behaviour for low input
+// rates.
+constexpr std::size_t ring_minimum_samples = 1'048'576;
+
+[[nodiscard]] std::size_t
+ring_capacity_for(const std::uint32_t sample_rate_hz) noexcept {
+    return std::max(ring_minimum_samples,
+                    (static_cast<std::size_t>(sample_rate_hz) +
+                     buffer_duration_denominator - 1) /
+                        buffer_duration_denominator);
+}
 // Demod statistics window: 400 OFDM symbols (~0.6 s at 8K/guard-1/4), the
-// report cadence for the CLI (previously one per 7M-sample chunk).
+// report cadence for the CLI (the demod no longer reports once per submitted
+// input chunk).
 constexpr std::size_t stats_window_symbols = 400;
 // MER gate window: one TPS superframe (68 symbols). Windows whose mean MER
 // falls below the constellation's decode floor are dropped and bracket a
@@ -685,7 +696,7 @@ struct StreamDecoder::Impl {
     std::thread fec_thread;
 
     Impl()
-        : ring(ring_capacity_samples),
+        : ring(ring_minimum_samples),
           frontend_thread([this] { run_frontend(); }),
           demod_thread([this] { run_demod(); }),
           fec_thread([this] { run_fec(); }) {}
@@ -826,6 +837,17 @@ struct StreamDecoder::Impl {
                     }
                     ring_data.notify_all();
                 }
+                {
+                    const std::scoped_lock lock(mutex);
+                    // Size the ring for ~0.2 s of this block's rate. Only
+                    // resize while the ring is empty: the read/write
+                    // positions are absolute counters wrapped by the size,
+                    // so a mid-stream resize would corrupt the wrap.
+                    if (ring_read_pos == ring_write_pos &&
+                        ring.size() != ring_capacity_for(block.rate)) {
+                        ring.resize(ring_capacity_for(block.rate));
+                    }
+                }
                 if (resampler.configured() &&
                     (resampler.rate() != block.rate ||
                      resampler.bandwidth() != block.bandwidth)) {
@@ -860,9 +882,10 @@ struct StreamDecoder::Impl {
                 const auto resample_started_at =
                     std::chrono::steady_clock::now();
                 resampler.process(convert_buffer, resample_buffer);
-                // Push to the ring incrementally: the ring (1 Mi samples) is
-                // smaller than a block (~4.8 Mi), so each iteration pushes
-                // only what fits and waits for the demod to free space. A
+                // Push to the ring incrementally: the ring (sized to ~0.2 s
+                // of the input rate) holds no more than a block, so each
+                // iteration pushes only what fits and waits for the demod to
+                // free space. A
                 // flush or reset arriving mid-push abandons the push instead
                 // of blocking forever behind a demod that is not consuming
                 // (e.g. a stream whose acquisition can never succeed): the
@@ -886,7 +909,8 @@ struct StreamDecoder::Impl {
                     // the push so no submitted data is dropped at the end of
                     // a stream.
                     if (reset_requested ||
-                        (flush_requested && !demod_busy && !acquisition_pending &&
+                        (flush_requested && !demod_busy &&
+                         !acquisition_pending &&
                          ring_write_pos - ring_read_pos >= ring.size())) {
                         break;
                     }
@@ -1364,11 +1388,9 @@ struct StreamDecoder::Impl {
                     // constant, and accumulate it into the fractional timing
                     // the symbol advance consumes. Bounded so a pathological
                     // estimate cannot walk the window far off grid.
-                    const double drift =
-                        static_cast<double>(timing_offset) -
-                        last_windowed_timing;
-                    last_windowed_timing =
-                        static_cast<double>(timing_offset);
+                    const double drift = static_cast<double>(timing_offset) -
+                                         last_windowed_timing;
+                    last_windowed_timing = static_cast<double>(timing_offset);
                     smoothed_timing_drift =
                         0.02 * drift + 0.98 * smoothed_timing_drift;
                     fractional_timing += 0.25 * smoothed_timing_drift;
@@ -1512,12 +1534,12 @@ struct StreamDecoder::Impl {
                         // and close the ring so the stream ends cleanly
                         // instead of deadlocking.
                         std::unique_lock lock(mutex);
-                        ring_data.wait_for(
-                            lock, std::chrono::milliseconds(100),
-                            [this, &seen_sync_version] {
-                                return stopping ||
-                                       sync.version != seen_sync_version;
-                            });
+                        ring_data.wait_for(lock, std::chrono::milliseconds(100),
+                                           [this, &seen_sync_version] {
+                                               return stopping ||
+                                                      sync.version !=
+                                                          seen_sync_version;
+                                           });
                         if (stopping) {
                             return;
                         }
@@ -1784,11 +1806,9 @@ struct StreamDecoder::Impl {
                                     // grid.
                                     frontend.carrier_offset =
                                         frontend.stable_carrier_offset;
-                                    frontend.previous_phase =
-                                        static_cast<int>(
-                                            (frontend.stable_phase +
-                                             symbol_count) %
-                                            4);
+                                    frontend.previous_phase = static_cast<int>(
+                                        (frontend.stable_phase + symbol_count) %
+                                        4);
                                     // Hold the restored grid for one symbol
                                     // so the lock cannot immediately flip the
                                     // correct phase onto a noise-latched one.
@@ -2004,8 +2024,8 @@ struct StreamDecoder::Impl {
                                 // (the only thing the deinterleave needs is
                                 // the parity), never from the TPS frame index.
                                 const std::size_t symbol_index =
-                                    (static_cast<std::size_t>(lock.phase) +
-                                     68 - (distance % 68)) %
+                                    (static_cast<std::size_t>(lock.phase) + 68 -
+                                     (distance % 68)) %
                                     68;
                                 postprocessor->submit(
                                     std::move(pending.payload),
