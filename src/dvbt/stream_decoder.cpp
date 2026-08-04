@@ -901,7 +901,6 @@ struct StreamDecoder::Impl {
             struct PendingSymbol {
                 std::vector<std::complex<float>> payload;
                 std::vector<float> equalizer_power;
-                std::size_t fallback_index{};
             };
             std::deque<PendingSymbol> pending_symbols;
             std::deque<PostprocessedSymbol> gate_buffer;
@@ -921,7 +920,6 @@ struct StreamDecoder::Impl {
             // fixed cadence forces a fresh deterministic sync-word search on
             // the current (healthy) grid; the re-lock gap is absorbed
             // losslessly by the pending buffer.
-            std::uint64_t tps_reset_symbols = 0;
             // Event-driven mode-change detection: a persistent TPS-locked
             // mismatch (a station switch without a fade) re-runs the
             // acquisition so the grid rebuilds for the new mode.
@@ -1589,12 +1587,6 @@ struct StreamDecoder::Impl {
                                 best_phase != frontend.previous_phase) {
                                 lock = PilotLock{best_phase, frozen_offset};
                                 frontend.previous_phase = best_phase;
-                                // The TPS superframe sync is stale after a
-                                // long fade; re-lock it (BCH frame sync +
-                                // symbol index) so the deinterleaver aligns
-                                // again.
-                                frontend.tps_decoder.reset();
-                                frontend.tps_snapshot = {};
                             } else {
                                 lock = PilotLock{
                                     static_cast<int>(frontend.previous_phase),
@@ -1644,8 +1636,6 @@ struct StreamDecoder::Impl {
                                     frontend.stable_carrier_offset;
                                 frontend.previous_phase = static_cast<int>(
                                     (frontend.stable_phase + symbol_count) % 4);
-                                frontend.tps_decoder.reset();
-                                frontend.tps_snapshot = {};
                                 // Hold the restored grid for one symbol so
                                 // the lock cannot immediately flip the
                                 // correct phase onto a noise-latched one.
@@ -1725,19 +1715,17 @@ struct StreamDecoder::Impl {
                                 channel[k]);
                         }
                     }
-                    // Unconditional periodic TPS re-seed (option B): a TPS
-                    // frame sync that locked while the carrier grid was
-                    // briefly wrong stays "locked" with a corrupted symbol
-                    // index, silently scrambling the deinterleave even after
-                    // the demod recovers. Re-seeding on a fixed cadence forces
-                    // a fresh deterministic sync-word search on the current
-                    // (healthy) grid; the re-lock gap is absorbed losslessly
-                    // by the pending buffer below.
-                    if (++tps_reset_symbols >= 1400) {
-                        tps_reset_symbols = 0;
-                        frontend.tps_decoder.reset();
-                        frontend.tps_snapshot = {};
-                    }
+                    // The TPS decodes once (the first matching lock) and its
+                    // parameters are fixed for the life of the stream — no
+                    // periodic re-seed: the differential decode stays locked
+                    // through healthy periods, re-locks naturally after a
+                    // fade breaks it, and a mid-stream unlock is invisible to
+                    // the decode (the deinterleave needs only the parity,
+                    // which comes from the measured pilot phase below, not
+                    // from the TPS frame index). Forced resets created the
+                    // very unlock windows and re-lock risk they were meant to
+                    // cure, and a corrupted re-lock could flip the deinterleave
+                    // parity.
                     // TPS state carries continuously across the whole stream
                     // (contiguous symbols), so the differential decoder locks
                     // once and stays locked through re-anchors.
@@ -1810,15 +1798,12 @@ struct StreamDecoder::Impl {
                     if (postprocessor == nullptr) {
                         pending_symbols.push_back(
                             {.payload = std::move(payload),
-                             .equalizer_power = std::move(equalizer_power),
-                             .fallback_index =
-                                 static_cast<std::size_t>(lock.phase)});
+                             .equalizer_power = std::move(equalizer_power)});
                         if (pending_symbols.size() > 272) {
-                            // Two TPS re-lock periods of margin: the
-                            // differential re-lock takes ~68-101 symbols but
-                            // can run longer on marginal signal; dropping
-                            // here would lose the recovering symbols that the
-                            // back-computed indices could still decode.
+                            // The first TPS lock can take ~68-101 symbols on
+                            // marginal signal; the back-computed parity
+                            // indices can still decode the buffered symbols,
+                            // so keep a generous margin before dropping.
                             pending_symbols.pop_front();
                         }
                     } else {
@@ -1830,12 +1815,13 @@ struct StreamDecoder::Impl {
                                     std::move(pending_symbols.front());
                                 pending_symbols.pop_front();
                                 const std::size_t distance = count - index;
+                                // Back-computed from the measured pilot phase
+                                // (the only thing the deinterleave needs is
+                                // the parity), never from the TPS frame index.
                                 const std::size_t symbol_index =
-                                    matching_tps
-                                        ? (frontend.tps_snapshot.symbol_index +
-                                           68 - (distance % 68)) %
-                                              68
-                                        : pending.fallback_index;
+                                    (static_cast<std::size_t>(lock.phase) +
+                                     68 - (distance % 68)) %
+                                    68;
                                 postprocessor->submit(
                                     std::move(pending.payload),
                                     std::move(pending.equalizer_power),
@@ -1843,8 +1829,7 @@ struct StreamDecoder::Impl {
                             }
                         }
                         const std::size_t symbol_index =
-                            matching_tps ? frontend.tps_snapshot.symbol_index
-                                         : static_cast<std::size_t>(lock.phase);
+                            static_cast<std::size_t>(lock.phase);
                         postprocessor->submit(std::move(payload),
                                               std::move(equalizer_power),
                                               symbol_index);
