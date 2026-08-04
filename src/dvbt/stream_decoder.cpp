@@ -668,6 +668,15 @@ struct StreamDecoder::Impl {
     bool flush_requested{};
     bool frontend_busy{};
     bool demod_busy{};
+    // True while the demod is at the stream head approaching a first-anchor
+    // acquisition (including the wait for acquisition data): the front-end's
+    // push-abandon keys off this in addition to !demod_busy so it never fires
+    // in the window between the head wait waking and the acquisition marking
+    // itself busy (a ring full of fresh data with a flush arriving mid-push
+    // used to abandon the push there, dropping the first block's remainder
+    // and starving small files). It is cleared when the demod parks in the
+    // retry back-off, the end-of-stream wait, or the drain.
+    bool acquisition_pending{};
     bool fec_worker_busy{};
     std::atomic<std::uint64_t> latest_generation{};
     std::unique_ptr<SymbolPostprocessorPool> symbol_postprocessor;
@@ -877,7 +886,7 @@ struct StreamDecoder::Impl {
                     // the push so no submitted data is dropped at the end of
                     // a stream.
                     if (reset_requested ||
-                        (flush_requested && !demod_busy &&
+                        (flush_requested && !demod_busy && !acquisition_pending &&
                          ring_write_pos - ring_read_pos >= ring.size())) {
                         break;
                     }
@@ -966,6 +975,17 @@ struct StreamDecoder::Impl {
             float depuncture_time_sum = 0.0F;
             double timing_acc = 0.0;
             std::uint64_t timing_count = 0;
+            // Closed-loop sample-clock tracking: the windowed mean tau is
+            // dominated by the channel's mean group delay (multipath) plus a
+            // slow sample-clock drift, so a P-loop on the absolute value
+            // would chase the channel. Track only the slow DRIFT between
+            // consecutive stats windows (the sample-clock offset), heavily
+            // filtered (tau ~ 50 windows), and accumulate it into a
+            // fractional timing that nudges the symbol period by +/-1 sample
+            // when it crosses +/-0.5.
+            double last_windowed_timing = 0.0;
+            double smoothed_timing_drift = 0.0;
+            double fractional_timing = 0.0;
             auto window_started_at = std::chrono::steady_clock::now();
 
             const auto cold_seed = [&]() {
@@ -1041,6 +1061,8 @@ struct StreamDecoder::Impl {
                     have_grid = false;
                     frontend.valid = false;
                     frontend.just_seeded = false;
+                    fractional_timing = 0.0;
+                    smoothed_timing_drift = 0.0;
                     return true;
                 }
                 const bool mode_changed =
@@ -1088,6 +1110,11 @@ struct StreamDecoder::Impl {
                     nco_phase = frontend.tracked_cfo_phase *
                                 static_cast<float>(next_symbol_start);
                     last_reanchor_carried = false;
+                    // The timing loop's reference grid changed: its residual
+                    // fraction and drift state have no meaning against the
+                    // new boundary.
+                    fractional_timing = 0.0;
+                    smoothed_timing_drift = 0.0;
                     have_grid = true;
                     demod_busy = true;
                     return true;
@@ -1122,6 +1149,10 @@ struct StreamDecoder::Impl {
                 next_symbol_start = new_next;
                 last_reanchor_carried = carried;
                 fade_symbol_count = 0;
+                // The boundary moved: the timing loop restarts against the
+                // newly anchored grid.
+                fractional_timing = 0.0;
+                smoothed_timing_drift = 0.0;
                 return true;
             };
 
@@ -1323,6 +1354,27 @@ struct StreamDecoder::Impl {
                               timing_acc / static_cast<double>(timing_count)) *
                               static_cast<float>(fft_size) /
                               (2.0F * std::numbers::pi_v<float>);
+                if (timing_count != 0) {
+                    // Closed-loop sample-clock tracking: the windowed mean
+                    // tau is dominated by the channel's mean group delay
+                    // (multipath), so a P-loop on the absolute value would
+                    // chase the channel (a constant ~+35 samples at the 581
+                    // capture). Track only the slow drift between consecutive
+                    // windows — the sample-clock offset — with a long time
+                    // constant, and accumulate it into the fractional timing
+                    // the symbol advance consumes. Bounded so a pathological
+                    // estimate cannot walk the window far off grid.
+                    const double drift =
+                        static_cast<double>(timing_offset) -
+                        last_windowed_timing;
+                    last_windowed_timing =
+                        static_cast<double>(timing_offset);
+                    smoothed_timing_drift =
+                        0.02 * drift + 0.98 * smoothed_timing_drift;
+                    fractional_timing += 0.25 * smoothed_timing_drift;
+                    fractional_timing =
+                        std::clamp(fractional_timing, -4.0, 4.0);
+                }
                 const std::scoped_lock lock(mutex);
                 latest.ofdm_locked = true;
                 latest.tps_locked = frontend.tps_snapshot.currently_valid;
@@ -1377,6 +1429,19 @@ struct StreamDecoder::Impl {
                 //     resume of a flushed stream ---
                 {
                     std::unique_lock lock(mutex);
+                    // While working toward a first anchor (including the wait
+                    // for acquisition data), mark the demod as acquisition-
+                    // pending: the front-end's push-abandon must not fire in
+                    // the window between this wait waking and the acquisition
+                    // marking itself busy — a ring full of fresh data with a
+                    // flush arriving mid-push used to abandon the push there,
+                    // dropping the first block's remainder and starving small
+                    // files before the TPS could lock. It may fire only once
+                    // the demod parks in the retry back-off (never-lockable
+                    // streams) or the end-of-stream wait.
+                    if (!have_grid) {
+                        acquisition_pending = true;
+                    }
                     ring_data.wait(lock, [this, &seen_sync_version,
                                           &have_grid] {
                         return stopping || sync.version != seen_sync_version ||
@@ -1399,9 +1464,26 @@ struct StreamDecoder::Impl {
                 if (!have_grid) {
                     // First anchor: event-driven acquisition (acquisition no
                     // longer runs on a fixed cadence; the only other events
-                    // are the long-fade re-anchor and a TPS mode change).
+                    // are the long-fade re-anchor and a TPS mode change). The
+                    // demod is genuinely busy while it acquires, so
+                    // wait_until_idle blocks until it finishes (bounded work),
+                    // while the push-abandon still sees acquisition_pending
+                    // and never fires mid-acquisition.
+                    {
+                        const std::scoped_lock lock(mutex);
+                        demod_busy = true;
+                    }
                     const float score = run_event_acquisition();
+                    if (!have_grid) {
+                        const std::scoped_lock lock(mutex);
+                        demod_busy = false;
+                        acquisition_pending = false;
+                    }
                     if (!have_grid && ring_closed) {
+                        {
+                            const std::scoped_lock lock(mutex);
+                            demod_busy = false;
+                        }
                         // The stream ended without a signal. Stay alive for
                         // the next stream: a reset bumps the sync version and
                         // a reopened ring refills the data.
@@ -1416,11 +1498,19 @@ struct StreamDecoder::Impl {
                             return;
                         }
                     } else if (score == 0.0F) {
+                        {
+                            const std::scoped_lock lock(mutex);
+                            demod_busy = false;
+                            acquisition_pending = false;
+                        }
                         // No signal yet (or the acquisition can never succeed
                         // for this stream): back off so the retry cannot
                         // busy-loop and stall the ring in front of the
                         // front-end. The flush/reset notifications still wake
-                        // this wait.
+                        // this wait. Parked here with demod_busy false, a
+                        // flush can abandon the front-end push (ring full)
+                        // and close the ring so the stream ends cleanly
+                        // instead of deadlocking.
                         std::unique_lock lock(mutex);
                         ring_data.wait_for(
                             lock, std::chrono::milliseconds(100),
@@ -1851,15 +1941,31 @@ struct StreamDecoder::Impl {
                                           channel[k]);
                         equalizer_power.push_back(std::norm(channel[k]));
                     }
-                    if (payload.size() !=
-                        payload_carrier_count(frontend.mode)) {
+                    // Symbol-period advance with the closed-loop sample-clock
+                    // correction: the accumulated fractional timing error
+                    // carries into a +/-1-sample step on the period when it
+                    // crosses +/-0.5, keeping the FFT window on the true
+                    // symbol start.
+                    const auto advance_symbol = [&]() {
                         next_symbol_start += period;
-                        ++symbol_count;
-                        ++window_symbol_count;
+                        if (fractional_timing >= 0.5) {
+                            ++next_symbol_start;
+                            fractional_timing -= 1.0;
+                        } else if (fractional_timing <= -0.5) {
+                            --next_symbol_start;
+                            fractional_timing += 1.0;
+                        }
                         nco_phase = std::remainder(
                             nco_phase + (frontend.tracked_cfo_phase *
                                          static_cast<float>(period)),
                             2.0F * std::numbers::pi_v<float>);
+                    };
+
+                    if (payload.size() !=
+                        payload_carrier_count(frontend.mode)) {
+                        advance_symbol();
+                        ++symbol_count;
+                        ++window_symbol_count;
                         if (window_symbol_count >= stats_window_symbols) {
                             publish_stats_window();
                             window_started_at =
@@ -1916,11 +2022,7 @@ struct StreamDecoder::Impl {
                     }
                     ++symbol_count;
                     ++window_symbol_count;
-                    nco_phase =
-                        std::remainder(nco_phase + (frontend.tracked_cfo_phase *
-                                                    static_cast<float>(period)),
-                                       2.0F * std::numbers::pi_v<float>);
-                    next_symbol_start += period;
+                    advance_symbol();
                     if (window_symbol_count >= stats_window_symbols) {
                         publish_stats_window();
                         static_cast<void>(
@@ -2012,6 +2114,7 @@ struct StreamDecoder::Impl {
                 {
                     const std::scoped_lock lock(mutex);
                     demod_busy = false;
+                    acquisition_pending = false;
                 }
                 idle.notify_all();
             }
