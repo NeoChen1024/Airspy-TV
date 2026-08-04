@@ -55,7 +55,6 @@ constexpr std::size_t stats_window_symbols = 400;
 // falls below the constellation's decode floor are dropped and bracket a
 // fresh FEC trellis at the region edges.
 constexpr std::size_t gate_window_symbols = 68;
-constexpr std::size_t acquisition_monitor_interval_ms = 2000;
 constexpr std::size_t resampler_semi_length = 12;
 
 constexpr std::array continual_2k{
@@ -651,6 +650,10 @@ struct StreamDecoder::Impl {
     std::uint64_t ring_read_pos{};
     bool ring_closed{};
     SyncState sync;
+    // The most recent block's bandwidth, published by the front-end; the demod
+    // reads it when it runs its event-driven acquisitions (the resampled rate
+    // = bandwidth * 8/7 feeds the sync + realtime stats).
+    std::uint32_t current_bandwidth{};
     TransportCallback callback;
     EqualizedCallback equalized_callback;
     ReceiverParameters parameters;
@@ -663,13 +666,6 @@ struct StreamDecoder::Impl {
     bool stopping{};
     bool reset_requested{};
     bool flush_requested{};
-    // Set by the demod thread when its tracking has been lost for a long
-    // fade; the front-end responds with an immediate fresh acquisition whose
-    // publish forces a cold re-anchor (CP-phase CFO seed + wide carrier lock
-    // + TPS re-lock), mirroring the per-chunk re-acquisition of the old
-    // chunked pipeline.
-    bool reacquisition_requested{};
-    std::uint64_t reacquisition_generation{};
     bool frontend_busy{};
     bool demod_busy{};
     bool fec_worker_busy{};
@@ -744,9 +740,6 @@ struct StreamDecoder::Impl {
         StreamingResampler resampler;
         std::vector<std::complex<float>> convert_buffer;
         std::vector<std::complex<float>> resample_buffer;
-        std::vector<std::complex<float>> acquisition_window;
-        bool need_acquisition = true;
-        auto last_monitor = std::chrono::steady_clock::now();
         while (true) {
             Block block;
             bool close_ring = false;
@@ -777,8 +770,7 @@ struct StreamDecoder::Impl {
                     stable_guard.reset();
                     latest = {};
                     ++latest_generation;
-                    acquisition_window.clear();
-                    need_acquisition = true;
+                    current_bandwidth = 0;
                     resampler = StreamingResampler{};
                     input_not_full.notify_all();
                     fec_not_full.notify_all();
@@ -823,11 +815,16 @@ struct StreamDecoder::Impl {
                 if (resampler.configured() &&
                     (resampler.rate() != block.rate ||
                      resampler.bandwidth() != block.bandwidth)) {
-                    // Retune: drop the filter state and re-acquire from
-                    // scratch (the demod will cold-start on the new sync).
+                    // Retune: drop the filter state and invalidate the sync;
+                    // the demod re-acquires itself on the new rate.
                     resampler = StreamingResampler{};
-                    acquisition_window.clear();
-                    need_acquisition = true;
+                    {
+                        const std::scoped_lock lock(mutex);
+                        current_bandwidth = block.bandwidth;
+                        sync.valid = false;
+                        ++sync.version;
+                    }
+                    ring_data.notify_all();
                 }
                 if (!resampler.configured()) {
                     resampler.configure(block.rate, block.bandwidth);
@@ -841,37 +838,6 @@ struct StreamDecoder::Impl {
                 const auto resample_started_at =
                     std::chrono::steady_clock::now();
                 resampler.process(convert_buffer, resample_buffer);
-                const std::uint64_t block_base = [&] {
-                    const std::scoped_lock lock(mutex);
-                    return ring_write_pos;
-                }();
-                // First acquisition: the head of this resampled block, the
-                // same window the old chunked pipeline acquired on. The demod
-                // needs the samples at this position, so the sync is published
-                // BEFORE the ring push; the ring push below is incremental
-                // (the ring is much smaller than a block) and paces itself
-                // against the demod's consumption.
-                if (need_acquisition &&
-                    resample_buffer.size() >= acquisition_samples) {
-                    acquire_and_publish(
-                        std::span(resample_buffer).first(acquisition_samples),
-                        block_base, block.bandwidth);
-                    need_acquisition = false;
-                    last_monitor = std::chrono::steady_clock::now();
-                }
-                // Rolling acquisition window (for monitor re-acquisitions):
-                // keep the most recent acquisition_samples of resampled data.
-                acquisition_window.insert(acquisition_window.end(),
-                                          resample_buffer.begin(),
-                                          resample_buffer.end());
-                if (acquisition_window.size() > acquisition_samples) {
-                    const std::size_t excess =
-                        acquisition_window.size() - acquisition_samples;
-                    acquisition_window.erase(
-                        acquisition_window.begin(),
-                        acquisition_window.begin() +
-                            static_cast<std::ptrdiff_t>(excess));
-                }
                 // Push to the ring incrementally: the ring (1 Mi samples) is
                 // smaller than a block (~4.8 Mi), so each iteration pushes
                 // only what fits and waits for the demod to free space.
@@ -900,29 +866,7 @@ struct StreamDecoder::Impl {
                     const std::scoped_lock lock(mutex);
                     latest.processed_input_samples += complex_count;
                     latest.resample_time_ms = duration_ms(resample_started_at);
-                }
-                const auto now = std::chrono::steady_clock::now();
-                bool force_acquisition = false;
-                {
-                    const std::scoped_lock lock(mutex);
-                    if (reacquisition_requested) {
-                        force_acquisition = true;
-                        reacquisition_requested = false;
-                    }
-                }
-                if (force_acquisition ||
-                    (!need_acquisition &&
-                     now - last_monitor >=
-                         std::chrono::milliseconds(
-                             acquisition_monitor_interval_ms))) {
-                    last_monitor = now;
-                    const std::uint64_t window_base = [&] {
-                        const std::scoped_lock lock(mutex);
-                        return ring_write_pos - acquisition_window.size();
-                    }();
-                    acquire_and_publish(
-                        std::span(acquisition_window).last(acquisition_samples),
-                        window_base, block.bandwidth, force_acquisition);
+                    current_bandwidth = block.bandwidth;
                 }
             }
             {
@@ -930,81 +874,6 @@ struct StreamDecoder::Impl {
                 frontend_busy = false;
             }
             idle.notify_all();
-        }
-    }
-
-    void acquire_and_publish(const std::span<const std::complex<float>> window,
-                             const std::uint64_t base_pos,
-                             const std::uint32_t bandwidth,
-                             const bool forced = false) {
-        if (window.size() < acquisition_samples) {
-            return;
-        }
-        const auto acquired_at = std::chrono::steady_clock::now();
-        ReceiverParameters acquisition_parameters;
-        {
-            const std::scoped_lock lock(mutex);
-            acquisition_parameters = parameters;
-        }
-        const auto span = window.first(acquisition_samples);
-        const OfdmAcquisition acquisition =
-            acquire_ofdm(span, acquisition_parameters);
-        const float acquisition_ms = duration_ms(acquired_at);
-        if (acquisition.score < 0.20F) {
-            return; // keep the current sync; the demod keeps tracking
-        }
-        const std::uint64_t start_pos = base_pos + acquisition.start;
-        const float resampled_rate =
-            static_cast<float>(bandwidth) * (8.0F / 7.0F);
-        std::uint64_t new_version = 0;
-        {
-            const std::scoped_lock lock(mutex);
-            stable_mode = acquisition.mode;
-            stable_guard = acquisition.guard;
-            latest.acquisition_score = acquisition.score;
-            latest.acquisition_time_ms = acquisition_ms;
-            latest.fft_size = static_cast<std::uint32_t>(acquisition.fft_size);
-            latest.guard_size =
-                static_cast<std::uint32_t>(acquisition.guard_size);
-            const bool same_parameters = sync.valid &&
-                                         sync.mode == acquisition.mode &&
-                                         sync.guard == acquisition.guard;
-            const std::uint64_t period =
-                acquisition.fft_size + acquisition.guard_size;
-            const std::uint64_t aligned_distance = [&] {
-                if (!sync.valid) {
-                    return std::uint64_t{0};
-                }
-                const std::uint64_t delta = sync.start_pos > start_pos
-                                                ? sync.start_pos - start_pos
-                                                : start_pos - sync.start_pos;
-                return std::min(delta % period, period - delta % period);
-            }();
-            sync.valid = true;
-            sync.start_pos = start_pos;
-            sync.phase = acquisition.phase;
-            sync.score = acquisition.score;
-            sync.mode = acquisition.mode;
-            sync.guard = acquisition.guard;
-            sync.fft_size = acquisition.fft_size;
-            sync.guard_size = acquisition.guard_size;
-            sync.bandwidth = bandwidth;
-            sync.resampled_rate = resampled_rate;
-            // The demod re-anchors only on parameter changes or boundary
-            // moves beyond a symbol's alignment tolerance; a silent refresh
-            // (drift + estimator noise) does not disturb continuous tracking.
-            // A forced re-acquisition always publishes so the demod can cold
-            // re-anchor from the fresh CP-phase CFO seed.
-            if (!same_parameters || aligned_distance >= 64 || forced) {
-                ++sync.version;
-                if (forced) {
-                    ++reacquisition_generation;
-                }
-                new_version = sync.version;
-            }
-        }
-        if (new_version != 0) {
-            ring_data.notify_all();
         }
     }
 
@@ -1039,13 +908,24 @@ struct StreamDecoder::Impl {
             bool in_hopeless_region = false;
             bool last_reanchor_carried = false;
             std::uint64_t seen_sync_version = 0;
-            std::uint64_t seen_reacquisition_generation = 0;
             bool have_grid = false;
             std::uint64_t next_symbol_start = 0;
             float nco_phase = 0.0F;
             std::uint64_t symbol_count = 0;
             std::uint64_t frozen_symbol_count = 0;
             std::uint64_t fade_symbol_count = 0;
+            // Unconditional periodic TPS re-seed (option B): a TPS frame sync
+            // that locked while the carrier grid was briefly wrong stays
+            // "locked" with a corrupted symbol index, silently scrambling the
+            // deinterleave even after the demod recovers. Re-seeding on a
+            // fixed cadence forces a fresh deterministic sync-word search on
+            // the current (healthy) grid; the re-lock gap is absorbed
+            // losslessly by the pending buffer.
+            std::uint64_t tps_reset_symbols = 0;
+            // Event-driven mode-change detection: a persistent TPS-locked
+            // mismatch (a station switch without a fade) re-runs the
+            // acquisition so the grid rebuilds for the new mode.
+            std::uint64_t tps_mismatch_symbols = 0;
             // Uncapped fade duration mod 4: the scattered-pilot phase rotates
             // once per symbol, so a cold re-anchor must restore the phase
             // advanced by the full fade length, not the capped counter.
@@ -1118,11 +998,6 @@ struct StreamDecoder::Impl {
             // abandoned). Called with the mutex held.
             const auto handle_sync_change = [&]() {
                 seen_sync_version = sync.version;
-                // A forced re-acquisition (long fade) always cold-reanchors
-                // even when the boundary looks aligned.
-                const bool forced =
-                    reacquisition_generation != seen_reacquisition_generation;
-                seen_reacquisition_generation = reacquisition_generation;
                 if (!sync.valid) {
                     // Reset: abandon the stream. The FEC generation has already
                     // advanced, so any stale queued items are dropped by the
@@ -1197,61 +1072,95 @@ struct StreamDecoder::Impl {
                                                 : new_start - next_symbol_start;
                 const std::uint64_t aligned_distance =
                     std::min(delta % period, period - delta % period);
-                if (aligned_distance < 64 && !forced) {
+                if (aligned_distance < 64) {
                     return false; // aligned: keep the grid and the tracking
                 }
                 // Re-anchor: the boundary moved (signal drop/recovery or a
                 // first anchor estimate error). Tracking carries when the
                 // mode/guard are unchanged. Never read past the samples the
-                // ring has freed. When the tracking was lost for a long fade
-                // (the forced re-acquisition the front-end just published),
-                // cold-start instead: re-seed the CFO from the fresh CP-phase
-                // estimate, widen the carrier search, and re-lock the TPS
-                // superframe — the same recovery the old chunked pipeline got
-                // from its per-chunk re-acquisition.
+                // ring has freed.
                 const bool carried = frontend.valid;
-                const bool stale_tracking = forced;
                 std::uint64_t new_next = new_start;
                 while (new_next < ring_read_pos) {
                     new_next += period;
                 }
-                if (stale_tracking) {
-                    cold_seed();
-                    // Restore the pre-fade carrier grid instead of trusting
-                    // the ambiguous wide pilot lock; the phase advances one
-                    // step per symbol across the fade (the uncapped counter
-                    // keeps the mod-4 phase information).
-                    if (frontend.stable_carrier_offset !=
-                        std::numeric_limits<int>::max()) {
-                        frontend.carrier_offset =
-                            frontend.stable_carrier_offset;
-                        frontend.previous_phase =
-                            (frontend.stable_phase +
-                             static_cast<int>(fade_phase_count)) %
-                            4;
-                        // Hold the restored grid for one symbol so the lock
-                        // cannot immediately flip the correct phase onto a
-                        // noise-latched one; the channel estimate and CFO
-                        // re-establish first.
-                        lock_hold = 1;
-                    }
-                }
-                nco_phase =
-                    stale_tracking
-                        ? frontend.tracked_cfo_phase *
-                              static_cast<float>(new_next)
-                        : std::remainder(
-                              nco_phase +
-                                  frontend.tracked_cfo_phase *
-                                      static_cast<float>(
-                                          static_cast<std::int64_t>(new_next) -
-                                          static_cast<std::int64_t>(
-                                              next_symbol_start)),
-                              2.0F * std::numbers::pi_v<float>);
+                nco_phase = std::remainder(
+                    nco_phase +
+                        frontend.tracked_cfo_phase *
+                            static_cast<float>(
+                                static_cast<std::int64_t>(new_next) -
+                                static_cast<std::int64_t>(next_symbol_start)),
+                    2.0F * std::numbers::pi_v<float>);
                 next_symbol_start = new_next;
-                last_reanchor_carried = carried && !stale_tracking;
+                last_reanchor_carried = carried;
                 fade_symbol_count = 0;
                 return true;
+            };
+
+            // Event-driven acquisition, owned by the demod (the front-end
+            // no longer acquires at all). Runs on the ring's window
+            // [ring_read_pos, ring_read_pos + acquisition_samples): read-side
+            // positions are deterministic, and the window is AHEAD of the
+            // demod's consumption, so the ring never frees it. Publishes into
+            // the shared sync so handle_sync_change can act (first anchor:
+            // grid build + cold seed; re-anchor: carried tracking + boundary
+            // move; mode change: full rebuild).
+            const auto run_event_acquisition = [&]() -> float {
+                std::vector<std::complex<float>> window;
+                ReceiverParameters acquisition_parameters;
+                std::uint64_t base = 0;
+                {
+                    const std::scoped_lock lock(mutex);
+                    const std::uint64_t available =
+                        ring_write_pos - ring_read_pos;
+                    // Adaptive window: acquire on everything available when
+                    // the stream is shorter than one acquisition window (the
+                    // first block of a small fixture resamples to less than
+                    // acquisition_samples). The CP correlation needs at most
+                    // a couple of symbol periods.
+                    const std::uint64_t window_size =
+                        std::min<std::uint64_t>(available, acquisition_samples);
+                    if (window_size < 2 * 10240) {
+                        return 0.0F;
+                    }
+                    base = ring_read_pos;
+                    window.reserve(static_cast<std::size_t>(window_size));
+                    for (std::uint64_t p = base; p < base + window_size; ++p) {
+                        window.push_back(ring[p % ring.size()]);
+                    }
+                    acquisition_parameters = parameters;
+                }
+                const OfdmAcquisition acquisition =
+                    acquire_ofdm(std::span(window), acquisition_parameters);
+                if (acquisition.score < 0.20F) {
+                    return 0.0F; // no signal: keep the current state and retry
+                }
+                const std::uint32_t bandwidth = [&] {
+                    const std::scoped_lock lock(mutex);
+                    return current_bandwidth;
+                }();
+                const float resampled_rate =
+                    static_cast<float>(bandwidth) * (8.0F / 7.0F);
+                {
+                    const std::scoped_lock lock(mutex);
+                    stable_mode = acquisition.mode;
+                    stable_guard = acquisition.guard;
+                    sync.valid = true;
+                    sync.start_pos = base + acquisition.start;
+                    sync.phase = acquisition.phase;
+                    sync.score = acquisition.score;
+                    sync.mode = acquisition.mode;
+                    sync.guard = acquisition.guard;
+                    sync.fft_size = acquisition.fft_size;
+                    sync.guard_size = acquisition.guard_size;
+                    sync.bandwidth = bandwidth;
+                    sync.resampled_rate = resampled_rate;
+                    latest.acquisition_score = acquisition.score;
+                    latest.acquisition_time_ms = 0.0F;
+                    ++sync.version;
+                    static_cast<void>(handle_sync_change());
+                }
+                return acquisition.score;
             };
 
             // MER gate floor per constellation.
@@ -1435,15 +1344,19 @@ struct StreamDecoder::Impl {
             };
 
             while (true) {
-                // --- wait for a sync publish (first anchor / re-anchor / the
-                //     resume of a flushed stream) ---
+                // --- wait for first-anchor data, a reset (the front-end
+                //     only invalidates the sync on retune/reset), or the
+                //     resume of a flushed stream ---
                 {
                     std::unique_lock lock(mutex);
-                    ring_data.wait(lock, [this, &seen_sync_version, &have_grid,
-                                          &next_symbol_start] {
+                    ring_data.wait(lock, [this, &seen_sync_version,
+                                          &have_grid] {
                         return stopping || sync.version != seen_sync_version ||
                                (have_grid && !ring_closed &&
-                                ring_write_pos > next_symbol_start);
+                                ring_write_pos > ring_read_pos) ||
+                               (!have_grid && ring_closed) ||
+                               (!have_grid && ring_write_pos - ring_read_pos >=
+                                                  acquisition_samples);
                     });
                     if (stopping) {
                         return;
@@ -1456,7 +1369,14 @@ struct StreamDecoder::Impl {
                     }
                 }
                 if (!have_grid) {
-                    continue; // reset: wait for the next stream
+                    // First anchor: event-driven acquisition (acquisition no
+                    // longer runs on a fixed cadence; the only other events
+                    // are the long-fade re-anchor and a TPS mode change).
+                    run_event_acquisition();
+                    if (!have_grid && ring_closed) {
+                        return; // end of stream without a signal
+                    }
+                    continue;
                 }
                 // --- contiguous symbol stream ---
                 while (true) {
@@ -1600,63 +1520,85 @@ struct StreamDecoder::Impl {
                         }
                         frontend.previous_phase = lock.phase;
                         frontend.carrier_offset = lock.offset;
-                        frontend.stable_phase = lock.phase;
-                        frontend.stable_carrier_offset = lock.offset;
+                        // Capture the stable grid only once: the carrier grid
+                        // is fixed for the life of the stream (the LO never
+                        // moves), so the pre-fade reference the fade re-anchor
+                        // restores must be the first healthy lock, never a
+                        // later multipath-influenced one.
+                        if (frontend.stable_carrier_offset ==
+                            std::numeric_limits<int>::max()) {
+                            frontend.stable_phase = lock.phase;
+                            frontend.stable_carrier_offset = lock.offset;
+                        }
                         frozen_symbol_count = 0;
                         fade_symbol_count = 0;
                         fade_phase_count = 0;
                     } else {
                         if (++frozen_symbol_count >= 68) {
                             frozen_symbol_count = 0;
-                            // Wide re-lock: search the full pilot grid (the
-                            // narrow +/-2-bin lock cannot escape a noise
-                            // latch). Verify the candidate against the
-                            // phase-coherent scattered-pilot correlation: the
-                            // true grid shows a strong, phase-matched
-                            // correlation even through multipath, while
-                            // noise-latched grids do not. Accept only a
-                            // verified grid, otherwise keep the carried values
-                            // and retry next cycle.
-                            const PilotLock fresh =
-                                lock_pilots(fft_out, maximum,
-                                            std::numeric_limits<int>::max());
-                            std::complex<double> verify{};
-                            std::size_t verify_count = 0;
-                            for (std::size_t pilot =
-                                     static_cast<std::size_t>(fresh.phase * 3);
-                                 pilot <= maximum; pilot += 12) {
-                                const float value = prbs[pilot] == 0U
-                                                        ? 4.0F / 3.0F
-                                                        : -4.0F / 3.0F;
-                                verify +=
-                                    static_cast<std::complex<double>>(value) *
-                                    std::conj(static_cast<std::complex<double>>(
-                                        carrier(fft_out, pilot, maximum,
-                                                fresh.offset)));
-                                ++verify_count;
+                            // Phase-only re-lock at the frozen carrier offset.
+                            // The carrier grid is fixed for the life of the
+                            // stream (the LO never moves), so the only thing a
+                            // fade can disturb is the mod-4 scattered-pilot
+                            // phase. Searching the offset dimension is
+                            // actively harmful: through multipath the pilot
+                            // pattern aliases (offset+3n is the same grid as
+                            // phase+n), and an accepted alias pins the channel
+                            // estimate to data bins, silently scrambling the
+                            // payload even while the signal is back — the
+                            // corruption seen on the 581 tail. Verify each
+                            // phase at the frozen offset; the true phase
+                            // correlates with the scattered pilots, the other
+                            // three land on data carriers and do not. This is
+                            // the core fade-recovery mechanism: the moment the
+                            // signal returns, the payload decodes again
+                            // (no acquisition needed).
+                            const int frozen_offset = frontend.carrier_offset;
+                            int best_phase = -1;
+                            float best_verified = 0.0F;
+                            for (int candidate = 0; candidate < 4;
+                                 ++candidate) {
+                                std::complex<double> verify{};
+                                std::size_t verify_count = 0;
+                                for (std::size_t pilot =
+                                         static_cast<std::size_t>(candidate *
+                                                                  3);
+                                     pilot <= maximum; pilot += 12) {
+                                    const float value = prbs[pilot] == 0U
+                                                            ? 4.0F / 3.0F
+                                                            : -4.0F / 3.0F;
+                                    verify +=
+                                        static_cast<std::complex<double>>(
+                                            value) *
+                                        std::conj(
+                                            static_cast<std::complex<double>>(
+                                                carrier(fft_out, pilot, maximum,
+                                                        frozen_offset)));
+                                    ++verify_count;
+                                }
+                                const float verified =
+                                    static_cast<float>(std::abs(verify)) /
+                                    static_cast<float>(
+                                        std::max(verify_count, std::size_t{1}));
+                                if (verified > best_verified) {
+                                    best_verified = verified;
+                                    best_phase = candidate;
+                                }
                             }
-                            const float verified =
-                                std::abs(verify) /
-                                static_cast<float>(
-                                    std::max(verify_count, std::size_t{1}));
-                            if (verified >= 0.40F) {
-                                lock = fresh;
-                                frontend.previous_phase = lock.phase;
-                                frontend.carrier_offset = lock.offset;
-                                frontend.stable_phase = lock.phase;
-                                frontend.stable_carrier_offset = lock.offset;
+                            if (best_verified >= 0.40F &&
+                                best_phase != frontend.previous_phase) {
+                                lock = PilotLock{best_phase, frozen_offset};
+                                frontend.previous_phase = best_phase;
                                 // The TPS superframe sync is stale after a
                                 // long fade; re-lock it (BCH frame sync +
                                 // symbol index) so the deinterleaver aligns
-                                // again. The following ~68 symbols decode on
-                                // the fallback index and are rejected by the
-                                // Viterbi/RS rather than silently scrambled.
+                                // again.
                                 frontend.tps_decoder.reset();
                                 frontend.tps_snapshot = {};
                             } else {
                                 lock = PilotLock{
                                     static_cast<int>(frontend.previous_phase),
-                                    frontend.carrier_offset};
+                                    frozen_offset};
                             }
                         } else {
                             lock = PilotLock{
@@ -1664,14 +1606,51 @@ struct StreamDecoder::Impl {
                                 frontend.carrier_offset};
                         }
                         if (++fade_symbol_count >= 1400) {
-                            // ~2.1 s of continuous fade: request an immediate
-                            // fresh acquisition. Re-arms after each attempt so
-                            // a long fade keeps probing; a lower threshold
-                            // re-locks TPS too often and loses more payload
-                            // than the faster recovery gains.
+                            // ~2.1 s of continuous fade: event-driven
+                            // re-acquisition (acquisition no longer runs on a
+                            // fixed cadence). The wideband CP correlation —
+                            // unlike the continual-carrier correlation —
+                            // survives the multipath that keeps fade_indicator
+                            // collapsed, so it confirms the signal's return
+                            // and refreshes the absolute boundary, correcting
+                            // any counter-grid drift. The re-anchor keeps the
+                            // continuous tracking (the frozen offset/CFO are
+                            // already the pre-fade values). On a confirmed
+                            // return, also restore the mod-4 scattered-pilot
+                            // phase: the carried phase is the pre-fade value,
+                            // and the payload would decode rotated through a
+                            // stale channel estimate (the MER cannot see the
+                            // rotation, so the RS silently fails and the
+                            // outer sync can false-lock). Re-arms after each
+                            // attempt.
                             fade_symbol_count = 0;
-                            const std::scoped_lock guard(mutex);
-                            reacquisition_requested = true;
+                            if (run_event_acquisition() >= 0.20F &&
+                                frontend.stable_carrier_offset !=
+                                    std::numeric_limits<int>::max()) {
+                                // Restore the carrier grid from the stable
+                                // reference: the LO never moves, so the true
+                                // offset is the pre-fade one, while the
+                                // narrow lock can latch a multipath alias
+                                // (the observed off=2 at the 581 fade) whose
+                                // pilot pattern passes the scatter verify.
+                                // Restore the offset and the scattered-pilot
+                                // phase from the absolute frame position
+                                // ((first_lock_phase + symbol_count) mod 4,
+                                // deterministic and immune to the rotation a
+                                // stale channel estimate carries, which the
+                                // MER cannot see), then re-lock the TPS on the
+                                // healthy grid.
+                                frontend.carrier_offset =
+                                    frontend.stable_carrier_offset;
+                                frontend.previous_phase = static_cast<int>(
+                                    (frontend.stable_phase + symbol_count) % 4);
+                                frontend.tps_decoder.reset();
+                                frontend.tps_snapshot = {};
+                                // Hold the restored grid for one symbol so
+                                // the lock cannot immediately flip the
+                                // correct phase onto a noise-latched one.
+                                lock_hold = 1;
+                            }
                         }
                         fade_phase_count = (fade_phase_count + 1) % 4;
                     }
@@ -1746,6 +1725,19 @@ struct StreamDecoder::Impl {
                                 channel[k]);
                         }
                     }
+                    // Unconditional periodic TPS re-seed (option B): a TPS
+                    // frame sync that locked while the carrier grid was
+                    // briefly wrong stays "locked" with a corrupted symbol
+                    // index, silently scrambling the deinterleave even after
+                    // the demod recovers. Re-seeding on a fixed cadence forces
+                    // a fresh deterministic sync-word search on the current
+                    // (healthy) grid; the re-lock gap is absorbed losslessly
+                    // by the pending buffer below.
+                    if (++tps_reset_symbols >= 1400) {
+                        tps_reset_symbols = 0;
+                        frontend.tps_decoder.reset();
+                        frontend.tps_snapshot = {};
+                    }
                     // TPS state carries continuously across the whole stream
                     // (contiguous symbols), so the differential decoder locks
                     // once and stays locked through re-anchors.
@@ -1757,6 +1749,14 @@ struct StreamDecoder::Impl {
                             frontend.mode &&
                         frontend.tps_snapshot.parameters.guard_interval ==
                             frontend.guard;
+                    if (frontend.tps_snapshot.locked && !matching_tps) {
+                        if (++tps_mismatch_symbols >= 1400) {
+                            tps_mismatch_symbols = 0;
+                            run_event_acquisition();
+                        }
+                    } else {
+                        tps_mismatch_symbols = 0;
+                    }
                     if (!decoder_parameters && matching_tps &&
                         frontend.tps_snapshot.parameters.hierarchy == 0U) {
                         decoder_parameters = DecoderParameters{
@@ -1813,7 +1813,12 @@ struct StreamDecoder::Impl {
                              .equalizer_power = std::move(equalizer_power),
                              .fallback_index =
                                  static_cast<std::size_t>(lock.phase)});
-                        if (pending_symbols.size() > 136) {
+                        if (pending_symbols.size() > 272) {
+                            // Two TPS re-lock periods of margin: the
+                            // differential re-lock takes ~68-101 symbols but
+                            // can run longer on marginal signal; dropping
+                            // here would lose the recovering symbols that the
+                            // back-computed indices could still decode.
                             pending_symbols.pop_front();
                         }
                     } else {

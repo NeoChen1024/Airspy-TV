@@ -276,6 +276,7 @@ struct OuterFec::Impl {
         }
         energy_descrambler.reset();
         statistics = {};
+        uncorrectable_since_sync = 0;
     }
 
     [[nodiscard]] std::vector<std::uint8_t>
@@ -337,7 +338,14 @@ struct OuterFec::Impl {
                 candidates_full) {
                 for (std::size_t phase = 0; phase < evidence.size(); ++phase) {
                     const auto &candidate_evidence = evidence[phase];
-                    if (candidate_evidence.sync_distance > 20) {
+                    // The sync-distance-only heuristic must still show at
+                    // least one successful RS codeword. Locking onto a
+                    // zero-evidence phase (a random 0x47 alignment through
+                    // fade garbage) silently scrambles every subsequent
+                    // packet; keep searching until the sliding window picks
+                    // up a genuinely decodable run.
+                    if (candidate_evidence.rs_successes == 0 ||
+                        candidate_evidence.sync_distance > 20) {
                         continue;
                     }
                     if (selected_phase == outer_interleaver_branches ||
@@ -383,6 +391,23 @@ struct OuterFec::Impl {
             ++statistics.rs_packets;
             if (!valid) {
                 ++statistics.rs_uncorrectable_packets;
+                if (++uncorrectable_since_sync >= 100) {
+                    // ~7 symbols of consecutive RS failures: the selected
+                    // outer phase is almost certainly wrong (a false lock
+                    // from a fade-corrupted search window). Drop it and let
+                    // the sliding-window search re-select from the data that
+                    // has accumulated since; the healthy phase re-locks with
+                    // real RS evidence once the garbage has slid out.
+                    uncorrectable_since_sync = 0;
+                    selected_outer_phase = outer_interleaver_branches;
+                    rs_bytes.clear();
+                    for (std::size_t phase = 0; phase < outer_candidates.size();
+                         ++phase) {
+                        outer_candidates[phase].clear();
+                    }
+                    statistics.rs_synchronized = false;
+                    break;
+                }
                 std::array<std::uint8_t, ts_packet_size> packet{};
                 if (energy_descrambler.process_corrupt(received_randomized,
                                                        packet)) {
@@ -393,6 +418,7 @@ struct OuterFec::Impl {
                 }
                 continue;
             }
+            uncorrectable_since_sync = 0;
             std::array<std::uint8_t, ts_packet_size> packet{};
             if (energy_descrambler.process(randomized, packet)) {
                 statistics.corrected_payload_bits += corrected_payload_bits;
@@ -415,6 +441,12 @@ struct OuterFec::Impl {
     EnergyDescrambler energy_descrambler;
     std::vector<std::uint8_t> rs_bytes;
     OuterFecStats statistics;
+    // Consecutive uncorrectable RS packets since the last selection. A false
+    // sync lock (a zero-evidence phase selected from fade garbage) would
+    // otherwise stay latched forever; after a sustained failure run the
+    // selection is dropped and the sliding-window search resumes on the
+    // current (healthier) data.
+    std::size_t uncorrectable_since_sync{};
 };
 
 OuterFec::OuterFec() : impl_(std::make_unique<Impl>()) {}
