@@ -66,6 +66,13 @@ using airspy_tv::dvbt::SignalAnalysisSnapshot;
 using airspy_tv::dvbt::StreamDecoder;
 using airspy_tv::dvbt::StreamDecoderStats;
 using airspy_tv::dvbt::TransmissionMode;
+using airspy_tv::dvbt::WorkerState;
+
+// Decoder diagnostics helpers (defined in the anonymous namespace below):
+// forward declarations so the GUI panels and the periodic dump can use them
+// before the definitions.
+[[nodiscard]] const char *worker_state_name(const WorkerState state);
+void dump_decoder_diagnostics(const StreamDecoderStats &stats);
 
 constexpr ImVec4 accent{0.12F, 0.58F, 0.92F, 1.0F};
 constexpr float panel_width = 410.0F;
@@ -1735,10 +1742,16 @@ void draw_sidebar(AppState &state) {
                 ImGui::TextUnformatted(value.c_str());
             };
             cell("Load",
-                 ratio_available
-                     ? std::format("{:.2f}x input",
-                                   state.decoder.processing_realtime_ratio)
+                 state.decoder.cpu_load > 0.0F
+                     ? std::format("{:.0f}% busy",
+                                   std::clamp(state.decoder.cpu_load * 100.0F,
+                                              0.0F, 999.0F))
                      : std::string{"Measuring"});
+            cell("Threads",
+                 std::format("{} / {} / {}",
+                             worker_state_name(state.decoder.frontend_state),
+                             worker_state_name(state.decoder.demod_state),
+                             worker_state_name(state.decoder.fec_state)));
             cell("IQ queue",
                  std::format("{:3.0f}%",
                              std::clamp(input_queue_percent, 0.0F, 100.0F)));
@@ -2199,6 +2212,11 @@ void draw_video_panel(AppState &state) {
     }
 }
 
+// Decoder diagnostics helpers (defined below draw_application): forward
+// declarations so the GUI panels and the periodic dump can use them.
+[[nodiscard]] const char *worker_state_name(const WorkerState state);
+void dump_decoder_diagnostics(const StreamDecoderStats &stats);
+
 void draw_application(AppState &state) {
     state.player.set_source_active(state.receiver.is_streaming());
     const DeviceDescriptor *source_descriptor = state.receiver.descriptor();
@@ -2210,6 +2228,16 @@ void draw_application(AppState &state) {
     state.spectrum = state.receiver.spectrum_snapshot();
     state.signal_analysis = state.dvbt_demod->analysis_snapshot();
     state.decoder = state.dvbt_demod->stats();
+    // Periodic diagnostics: dump thread states and queue/ring watermarks every
+    // few seconds so a mid-stream stall is visible in the terminal.
+    {
+        static auto last_diag = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_diag >= std::chrono::seconds(10)) {
+            last_diag = now;
+            dump_decoder_diagnostics(state.decoder);
+        }
+    }
     state.services = state.receiver.transport_services();
     if (!state.services.empty() &&
         std::ranges::none_of(state.services, [&state](const auto &service) {
@@ -2516,7 +2544,13 @@ int decode_iq_cli(const std::filesystem::path &source,
         std::cerr << "chunk=" << stats.processed_chunks
                   << " input=" << stats.processed_input_samples
                   << " samples TS=" << stats.transport_bytes
-                  << " bytes realtime-speed=" << realtime_speed << "x";
+                  << " bytes diag=[fe=" << worker_state_name(stats.frontend_state)
+                  << " dm=" << worker_state_name(stats.demod_state)
+                  << " fec=" << worker_state_name(stats.fec_state)
+                  << " cpu=" << static_cast<int>(stats.cpu_load * 100.0F)
+                  << "% ring=" << stats.ring_used_samples << "/"
+                  << stats.ring_capacity_samples << "]"
+                  << " realtime-speed=" << realtime_speed << "x";
         if (stats.mer_db != 0.0F) {
             std::cerr << " MER=" << stats.mer_db << " dB";
         }
@@ -2624,6 +2658,98 @@ int decode_iq_cli(const std::filesystem::path &source,
         return 1;
     }
     return stats.transport_bytes == 0 ? 2 : 0;
+}
+
+// ------------------------------------------------------------------------ //
+// Decoder diagnostics: where the pipeline threads are parked, queue/ring
+// watermarks, and stall warnings. The GUI calls this every few seconds so a
+// mid-stream stall ("TS stopped, CPU dropped") is visible in the terminal as
+// which thread is parked where instead of as a silent hang.
+// ------------------------------------------------------------------------ //
+
+[[nodiscard]] const char *worker_state_name(const WorkerState state) {
+    switch (state) {
+    case WorkerState::idle:
+        return "idle";
+    case WorkerState::processing:
+        return "busy";
+    case WorkerState::waiting_input:
+        return "wait-input";
+    case WorkerState::waiting_ring_space:
+        return "wait-ring-space";
+    case WorkerState::waiting_ring_data:
+        return "wait-ring-data";
+    case WorkerState::waiting_sync:
+        return "wait-sync";
+    case WorkerState::waiting_acquisition:
+        return "wait-acq";
+    case WorkerState::waiting_fec_item:
+        return "wait-fec";
+    case WorkerState::exited:
+        return "EXITED";
+    }
+    return "?";
+}
+
+void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
+    const float iq_percent =
+        stats.input_queue_capacity_samples == 0
+            ? 0.0F
+            : 100.0F * static_cast<float>(stats.queued_input_samples) /
+                  static_cast<float>(stats.input_queue_capacity_samples);
+    const float ring_percent =
+        stats.ring_capacity_samples == 0
+            ? 0.0F
+            : 100.0F * static_cast<float>(stats.ring_used_samples) /
+                  static_cast<float>(stats.ring_capacity_samples);
+    std::cerr << "[diag] fe=" << worker_state_name(stats.frontend_state)
+              << " dm=" << worker_state_name(stats.demod_state)
+              << " fec=" << worker_state_name(stats.fec_state)
+              << " iq=" << static_cast<int>(std::clamp(iq_percent, 0.0F, 100.0F))
+              << "% ring=" << static_cast<int>(std::clamp(ring_percent, 0.0F, 100.0F))
+              << "% fecq=" << stats.queued_symbols
+              << " ofdm=" << stats.ofdm_locked << " tps=" << stats.tps_locked
+              << " mer=" << stats.mer_db << "dB"
+              << " drop=" << stats.dropped_blocks
+              << " cpu=" << static_cast<int>(stats.cpu_load * 100.0F) << "%";
+    if (stats.processing_realtime_ratio > 0.0F) {
+        std::cerr << " rt=" << (1.0F / stats.processing_realtime_ratio) << "x";
+    }
+    std::cerr << '\n';
+
+    // Stall fingerprints: a worker parked on a wait whose predicate can never
+    // be satisfied while the buffer in front of it is full.
+    const bool ring_full = stats.ring_capacity_samples != 0 &&
+                           stats.ring_used_samples >=
+                               stats.ring_capacity_samples * 3 / 4;
+    const bool iq_full = stats.input_queue_capacity_samples != 0 &&
+                         stats.queued_input_samples * 4 >=
+                             stats.input_queue_capacity_samples * 3;
+    const bool fec_full = stats.symbol_queue_capacity != 0 &&
+                          stats.queued_symbols * 4 >=
+                              stats.symbol_queue_capacity * 3;
+    if (stats.frontend_state == WorkerState::waiting_ring_space && ring_full) {
+        std::cerr << "[diag] WARNING front-end waiting for ring space while "
+                     "ring is full (demod not consuming?)\n";
+    }
+    if (stats.demod_state == WorkerState::waiting_ring_data && ring_full) {
+        std::cerr << "[diag] WARNING demod waiting for symbol data while ring "
+                     "is full (stale stream position?)\n";
+    }
+    if (stats.demod_state == WorkerState::waiting_sync && iq_full) {
+        std::cerr << "[diag] WARNING demod waiting for sync while input queue "
+                     "is full (acquisition starved?)\n";
+    }
+    if (stats.fec_state == WorkerState::waiting_fec_item && fec_full) {
+        std::cerr << "[diag] WARNING FEC waiting for items while FEC queue is "
+                     "full (symbol gate stuck?)\n";
+    }
+    if (stats.frontend_state == WorkerState::exited ||
+        stats.demod_state == WorkerState::exited ||
+        stats.fec_state == WorkerState::exited) {
+        std::cerr << "[diag] WARNING a decoder worker thread exited (only "
+                     "expected on stop)\n";
+    }
 }
 
 } // namespace

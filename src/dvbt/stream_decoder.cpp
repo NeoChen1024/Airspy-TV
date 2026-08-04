@@ -691,6 +691,15 @@ struct StreamDecoder::Impl {
     FrontendState frontend;
     StreamDecoderStats latest;
     std::atomic<bool> cancel_requested{};
+    // Where each pipeline thread is parked, for diagnostics (see
+    // WorkerState). Written by the owning thread, read lock-free by stats().
+    std::atomic<int> frontend_state{static_cast<int>(WorkerState::idle)};
+    std::atomic<int> demod_state{static_cast<int>(WorkerState::idle)};
+    std::atomic<int> fec_state{static_cast<int>(WorkerState::idle)};
+    // Demod symbol-processing wall time accumulated over the current stats
+    // window (written by the demod thread, consumed by publish_stats_window
+    // on the same thread).
+    double window_busy_ms{};
     bool stopping{};
     bool reset_requested{};
     bool flush_requested{};
@@ -809,11 +818,14 @@ struct StreamDecoder::Impl {
             bool close_ring = false;
             {
                 std::unique_lock lock(mutex);
+                frontend_state.store(
+                    static_cast<int>(WorkerState::waiting_input));
                 input_ready.wait(lock, [this] {
                     return stopping || reset_requested || flush_requested ||
                            !queue.empty();
                 });
                 if (stopping) {
+                    frontend_state.store(static_cast<int>(WorkerState::exited));
                     return;
                 }
                 if (reset_requested) {
@@ -822,6 +834,8 @@ struct StreamDecoder::Impl {
                     // drops items whose generation is stale.
                     reset_requested = false;
                     cancel_requested = false;
+                    frontend_state.store(
+                        static_cast<int>(WorkerState::processing));
                     queue.clear();
                     fec_queue.clear();
                     queued_complex_samples = 0;
@@ -835,6 +849,7 @@ struct StreamDecoder::Impl {
                     latest = {};
                     ++latest_generation;
                     current_bandwidth = 0;
+                    window_busy_ms = 0.0;
                     resampler = StreamingResampler{};
                     reset_frontend_state();
                     input_not_full.notify_all();
@@ -934,6 +949,8 @@ struct StreamDecoder::Impl {
                 std::size_t pushed = 0;
                 while (pushed < resample_buffer.size()) {
                     std::unique_lock lock(mutex);
+                    frontend_state.store(
+                        static_cast<int>(WorkerState::waiting_ring_space));
                     ring_space.wait(lock, [this] {
                         return stopping || reset_requested || flush_requested ||
                                ring_write_pos - ring_read_pos < ring.size();
@@ -1039,6 +1056,9 @@ struct StreamDecoder::Impl {
             float depuncture_time_sum = 0.0F;
             double timing_acc = 0.0;
             std::uint64_t timing_count = 0;
+            // Wall-clock start of the current symbol's processing segment
+            // (FFT through payload), for the CPU-load estimate.
+            std::chrono::steady_clock::time_point symbol_busy_start{};
             // Closed-loop sample-clock tracking: the windowed mean tau is
             // dominated by the channel's mean group delay (multipath) plus a
             // slow sample-clock drift, so a P-loop on the absolute value
@@ -1566,6 +1586,16 @@ struct StreamDecoder::Impl {
                     input_seconds > 0.0F
                         ? (window_wall / 1000.0F) / input_seconds
                         : 0.0F;
+                // CPU load: the demod's busy time inside the wall-clock
+                // window. Unlike processing_realtime_ratio it is not pinned
+                // near 1.0 by a live source feeding at real-time rate — busy
+                // time only accumulates while symbols are actually processed.
+                latest.cpu_load =
+                    window_wall > 0.0F
+                        ? static_cast<float>(
+                              window_busy_ms / static_cast<double>(window_wall))
+                        : 0.0F;
+                window_busy_ms = 0.0;
                 latest.equalization_time_ms = window_wall;
                 latest.demap_time_ms = demap_time_sum;
                 latest.deinterleave_time_ms = deinterleave_time_sum;
@@ -1598,6 +1628,8 @@ struct StreamDecoder::Impl {
                     if (!have_grid) {
                         acquisition_pending = true;
                     }
+                    demod_state.store(
+                        static_cast<int>(WorkerState::waiting_sync));
                     ring_data.wait(lock, [this, &seen_sync_version,
                                           &have_grid] {
                         return stopping || sync.version != seen_sync_version ||
@@ -1611,6 +1643,8 @@ struct StreamDecoder::Impl {
                                                   acquisition_samples);
                     });
                     if (stopping) {
+                        demod_state.store(
+                            static_cast<int>(WorkerState::exited));
                         return;
                     }
                 }
@@ -1642,6 +1676,8 @@ struct StreamDecoder::Impl {
                         const std::scoped_lock lock(mutex);
                         demod_busy = true;
                     }
+                    demod_state.store(
+                        static_cast<int>(WorkerState::processing));
                     const float score = run_event_acquisition();
                     if (!have_grid) {
                         const std::scoped_lock lock(mutex);
@@ -1664,6 +1700,8 @@ struct StreamDecoder::Impl {
                         // the next stream: a reset bumps the sync version and
                         // a reopened ring refills the data.
                         std::unique_lock lock(mutex);
+                        demod_state.store(
+                            static_cast<int>(WorkerState::waiting_sync));
                         ring_data.wait(lock, [this, &seen_sync_version] {
                             return stopping ||
                                    sync.version != seen_sync_version ||
@@ -1671,6 +1709,8 @@ struct StreamDecoder::Impl {
                                     ring_write_pos > ring_read_pos);
                         });
                         if (stopping) {
+                            demod_state.store(
+                                static_cast<int>(WorkerState::exited));
                             return;
                         }
                     } else if (score == 0.0F) {
@@ -1688,13 +1728,17 @@ struct StreamDecoder::Impl {
                         // and close the ring so the stream ends cleanly
                         // instead of deadlocking.
                         std::unique_lock lock(mutex);
-                        ring_data.wait_for(lock, std::chrono::milliseconds(100),
-                                           [this, &seen_sync_version] {
-                                               return stopping ||
-                                                      sync.version !=
-                                                          seen_sync_version;
-                                           });
+                        demod_state.store(static_cast<int>(
+                            WorkerState::waiting_acquisition));
+                        ring_data.wait_for(
+                            lock, std::chrono::milliseconds(100),
+                            [this, &seen_sync_version] {
+                                return stopping ||
+                                       sync.version != seen_sync_version;
+                            });
                         if (stopping) {
+                            demod_state.store(
+                                static_cast<int>(WorkerState::exited));
                             return;
                         }
                     }
@@ -1722,6 +1766,8 @@ struct StreamDecoder::Impl {
                         static_cast<std::uint64_t>(fft_size);
                     {
                         std::unique_lock lock(mutex);
+                        demod_state.store(static_cast<int>(
+                            WorkerState::waiting_ring_data));
                         ring_data.wait(lock, [this, needed, &seen_sync_version] {
                             return stopping ||
                                    sync.version != seen_sync_version ||
@@ -1748,6 +1794,9 @@ struct StreamDecoder::Impl {
                         const std::uint64_t position = next_symbol_start + i;
                         fft_in[i] = ring[position % ring.size()];
                     }
+                    demod_state.store(
+                        static_cast<int>(WorkerState::processing));
+                    symbol_busy_start = std::chrono::steady_clock::now();
                     {
                         const std::scoped_lock lock(mutex);
                         ring_read_pos = needed;
@@ -2304,6 +2353,7 @@ struct StreamDecoder::Impl {
                             timing_acc = 0.0;
                             timing_count = 0;
                         }
+                        window_busy_ms += duration_ms(symbol_busy_start);
                         continue;
                     }
                     if (postprocessor == nullptr) {
@@ -2349,6 +2399,7 @@ struct StreamDecoder::Impl {
                     ++symbol_count;
                     ++window_symbol_count;
                     advance_symbol();
+                    window_busy_ms += duration_ms(symbol_busy_start);
                     if (window_symbol_count >= stats_window_symbols) {
                         publish_stats_window();
                         cir_off_window_begin = applied_cir_offset;
@@ -2456,8 +2507,23 @@ struct StreamDecoder::Impl {
                 idle.notify_all();
             }
         } catch (const std::exception &exception) {
+            // An unexpected exception here would terminate the process (the
+            // thread is joined in ~Impl). Dump the pipeline state before the
+            // crash so a mid-stream stall/exit is diagnosable.
+            std::fprintf(stderr,
+                         "[decoder] demod thread exception: %s "
+                         "(sync=%d locked=%d ring=%llu/%llu iq=%zu/%zu "
+                         "fec=%zu/%zu)\n",
+                         exception.what(), sync.version,
+                         static_cast<int>(sync.valid),
+                         static_cast<unsigned long long>(ring_write_pos -
+                                                         ring_read_pos),
+                         static_cast<unsigned long long>(ring.size()),
+                         queue.size(), input_queue_capacity_samples,
+                         fec_queue.size(), fec_queue_capacity);
             throw;
         } catch (...) {
+            std::fprintf(stderr, "[decoder] demod thread exception: unknown\n");
             throw;
         }
     }
@@ -2478,11 +2544,14 @@ struct StreamDecoder::Impl {
             FecItem item;
             {
                 std::unique_lock lock(mutex);
+                fec_state.store(static_cast<int>(WorkerState::waiting_fec_item));
                 fec_ready.wait(
                     lock, [this] { return stopping || !fec_queue.empty(); });
                 if (stopping) {
+                    fec_state.store(static_cast<int>(WorkerState::exited));
                     return;
                 }
+                fec_state.store(static_cast<int>(WorkerState::processing));
                 item = std::move(fec_queue.front());
                 fec_queue.pop_front();
                 fec_worker_busy = true;
@@ -2743,6 +2812,13 @@ StreamDecoderStats StreamDecoder::stats() const {
         impl_->input_queue_capacity_samples;
     statistics.queued_symbols = impl_->fec_queue.size();
     statistics.symbol_queue_capacity = impl_->fec_queue_capacity;
+    statistics.ring_used_samples = impl_->ring_write_pos - impl_->ring_read_pos;
+    statistics.ring_capacity_samples = impl_->ring.size();
+    statistics.frontend_state =
+        static_cast<WorkerState>(impl_->frontend_state.load());
+    statistics.demod_state =
+        static_cast<WorkerState>(impl_->demod_state.load());
+    statistics.fec_state = static_cast<WorkerState>(impl_->fec_state.load());
     statistics.fec_processing = impl_->fec_worker_busy;
     statistics.processing = impl_->frontend_busy || impl_->demod_busy ||
                             impl_->fec_worker_busy || !impl_->queue.empty() ||

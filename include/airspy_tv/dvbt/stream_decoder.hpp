@@ -15,6 +15,22 @@
 
 namespace airspy_tv::dvbt {
 
+// Where each pipeline worker thread currently is, for diagnostics: the GUI
+// dumps these plus the queue/ring watermarks every few seconds so a stall
+// (a worker parked on a wait that can never be satisfied) is visible instead
+// of presenting as "TS stopped and CPU dropped".
+enum class WorkerState : int {
+    idle = 0,
+    processing,
+    waiting_input,       // front-end: input queue
+    waiting_ring_space,  // front-end: ring full
+    waiting_ring_data,   // demod: next symbol not in the ring yet
+    waiting_sync,        // demod: first anchor / sync version change
+    waiting_acquisition, // demod: retry back-off between acquisition attempts
+    waiting_fec_item,    // FEC: fec queue empty
+    exited,              // thread returned (only expected on stop)
+};
+
 struct StreamDecoderStats {
     bool ofdm_locked{};
     bool tps_locked{};
@@ -30,6 +46,11 @@ struct StreamDecoderStats {
     float mer_db{};
     float residual_carrier_offset_hz{};
     float processing_realtime_ratio{};
+    // Fraction of the stats window the demod was actually busy processing
+    // symbols (busy wall time / window wall time), i.e. the pipeline CPU
+    // load. Unlike processing_realtime_ratio it is not clamped to ~1.0 by a
+    // live source feeding at real-time rate.
+    float cpu_load{};
     float resample_time_ms{};
     float acquisition_time_ms{};
     float equalization_time_ms{};
@@ -59,6 +80,13 @@ struct StreamDecoderStats {
     std::size_t input_queue_capacity_samples{};
     std::size_t queued_symbols{};
     std::size_t symbol_queue_capacity{};
+    // Ring buffer watermark (resampled samples not yet consumed by the demod).
+    std::uint64_t ring_used_samples{};
+    std::uint64_t ring_capacity_samples{};
+    // Where each pipeline thread is parked (see WorkerState).
+    WorkerState frontend_state{WorkerState::idle};
+    WorkerState demod_state{WorkerState::idle};
+    WorkerState fec_state{WorkerState::idle};
     bool processing{};
     bool fec_processing{};
     TransportDecoderStats transport{};
