@@ -447,7 +447,27 @@ float spectrum_column_peak(const std::span<const float> bins,
     return *std::ranges::max_element(bins.subspan(begin, end - begin));
 }
 
+void draw_bandwidth_overlay(ImDrawList &draw, const ImVec2 plot_origin,
+                            const ImVec2 extent,
+                            const std::uint32_t sample_rate_hz,
+                            const std::uint32_t channel_bandwidth_hz) {
+    if (sample_rate_hz == 0 || channel_bandwidth_hz == 0) {
+        return;
+    }
+    const float bandwidth_fraction = std::min(
+        static_cast<float>(channel_bandwidth_hz) /
+            static_cast<float>(sample_rate_hz),
+        1.0F);
+    const float overlay_width = (extent.x - plot_origin.x) * bandwidth_fraction;
+    const float center = (plot_origin.x + extent.x) * 0.5F;
+    draw.AddRectFilled(
+        ImVec2(center - (overlay_width * 0.5F), plot_origin.y),
+        ImVec2(center + (overlay_width * 0.5F), extent.y),
+        IM_COL32(255, 255, 255, 87));
+}
+
 void draw_spectrum(const ImVec2 size, const SpectrumSnapshot &spectrum,
+                   const std::uint32_t channel_bandwidth_hz,
                    const float floor_dbfs, const float ceiling_dbfs) {
     ImVec2 canvas_size = size;
     if (canvas_size.x <= 0.0F) {
@@ -470,10 +490,10 @@ void draw_spectrum(const ImVec2 size, const SpectrumSnapshot &spectrum,
         const float y = origin.y + (canvas_size.y * fraction);
         draw->AddLine(ImVec2(origin.x, y), ImVec2(extent.x, y),
                       IM_COL32(38, 51, 65, 160));
-        draw->AddText(ImVec2(origin.x + 3.0F,
-                             y + (grid == grid_divisions ? -14.0F : 2.0F)),
-                      IM_COL32(118, 133, 148, 220),
-                      std::format("{:.0f}", level).c_str());
+         draw->AddText(ImVec2(origin.x + 3.0F,
+                     y + (grid == grid_divisions ? -14.0F : 2.0F)),
+                 IM_COL32(118, 133, 148, 220),
+                 std::format("{:.0f}", level).c_str());
     }
     for (int index = 0; index <= 4; ++index) {
         const float x =
@@ -481,6 +501,8 @@ void draw_spectrum(const ImVec2 size, const SpectrumSnapshot &spectrum,
         draw->AddLine(ImVec2(x, origin.y), ImVec2(x, extent.y),
                       IM_COL32(38, 51, 65, 160));
     }
+    draw_bandwidth_overlay(*draw, plot_origin, extent, spectrum.sample_rate_hz,
+                           channel_bandwidth_hz);
 
     if (spectrum.valid) {
         const auto column_count =
@@ -602,8 +624,9 @@ void update_waterfall(WaterfallDisplay &waterfall,
 
 void draw_waterfall(const ImVec2 size, WaterfallDisplay &waterfall,
                     const SpectrumSnapshot &spectrum,
-                    const std::size_t colormap_index, const float floor_dbfs,
-                    const float ceiling_dbfs) {
+                    const std::size_t colormap_index,
+                    const std::uint32_t channel_bandwidth_hz,
+                    const float floor_dbfs, const float ceiling_dbfs) {
     ImVec2 canvas_size = size;
     if (canvas_size.x <= 0.0F) {
         canvas_size.x = ImGui::GetContentRegionAvail().x;
@@ -618,6 +641,8 @@ void draw_waterfall(const ImVec2 size, WaterfallDisplay &waterfall,
     draw->AddRectFilled(origin, extent, IM_COL32(4, 9, 15, 255));
     draw->AddImage(ImTextureRef(static_cast<ImTextureID>(waterfall.texture)),
                    plot_origin, extent);
+    draw_bandwidth_overlay(*draw, plot_origin, extent, spectrum.sample_rate_hz,
+                           channel_bandwidth_hz);
     draw->AddText(ImVec2(plot_origin.x + 8.0F, origin.y + 6.0F), IM_COL32_WHITE,
                   "Waterfall");
 }
@@ -787,6 +812,9 @@ void draw_source_panel(AppState &state) {
     ImGui::PushID("source-panel");
 
     const bool source_open = state.receiver.is_open();
+    const DeviceDescriptor *source_descriptor = state.receiver.descriptor();
+    const bool file_source = source_descriptor != nullptr &&
+                             source_descriptor->backend == SdrBackend::File;
     std::uint32_t decoder_threads =
         static_cast<std::uint32_t>(state.dvbt_parameters.worker_threads);
     ImGui::BeginDisabled(source_open);
@@ -803,6 +831,47 @@ void draw_source_panel(AppState &state) {
     ImGui::EndDisabled();
     ImGui::TextDisabled("0 = Auto (%zu logical CPUs)",
                         airspy_tv::dvbt::default_viterbi_worker_count());
+
+    ImGui::SeparatorText("Frequency correction");
+    if (file_source) {
+        ImGui::BeginDisabled();
+    }
+    ImGui::TextDisabled("Hardware LO = nominal × (1 + ppm / 1e6)");
+    ImGui::SetNextItemWidth(-1.0F);
+    if (ImGui::InputDouble("SDR correction (ppm)",
+                           &state.settings.frequency_correction_ppm, 0.1, 1.0,
+                           "%.3f")) {
+        if (!std::isfinite(state.settings.frequency_correction_ppm)) {
+            state.settings.frequency_correction_ppm = 0.0;
+        }
+        state.settings.frequency_correction_ppm =
+            std::clamp(state.settings.frequency_correction_ppm,
+                       -airspy_tv::max_frequency_correction_ppm,
+                       airspy_tv::max_frequency_correction_ppm);
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip(
+            "Positive values tune the hardware LO higher than the nominal "
+            "frequency. Applying a new value while streaming retunes the SDR "
+            "and resets decoder tracking.");
+    }
+    if (ImGui::Button("Apply frequency correction", ImVec2(-1.0F, 0.0F))) {
+        if (!source_open) {
+            state.status = "Frequency correction will apply when source starts";
+        } else {
+            std::string error;
+            state.status = state.receiver.set_frequency_correction_ppm(
+                               state.settings.frequency_correction_ppm, error)
+                               ? "Frequency correction applied"
+                               : error;
+        }
+    }
+    if (file_source) {
+        ImGui::EndDisabled();
+        draw_disabled_wrapped(
+            "I/Q file frequency is fixed by its metadata; correction applies "
+            "to live SDR sources only.");
+    }
 
     std::optional<std::string> selected_iq_source;
     {
@@ -1187,9 +1256,13 @@ void draw_receiver_panel(AppState &state) {
                   code_rate_values[static_cast<std::size_t>(code_rate - 1)]};
 
     if (parameters_changed) {
-        state.dvbt_demod->set_parameters(state.dvbt_parameters);
+        // Publish the new input bandwidth before resetting the demodulator so
+        // blocks arriving during the reset are tagged with the same rate as
+        // the new decoder configuration. set_parameters() is synchronous,
+        // but live input must remain free to continue feeding the source.
         state.receiver.set_channel_bandwidth(
             state.dvbt_parameters.channel_bandwidth_hz);
+        state.dvbt_demod->set_parameters(state.dvbt_parameters);
         state.status = "DVB-T parameters updated; receiver reacquiring";
     }
     ImGui::PopID();
@@ -1508,10 +1581,12 @@ void draw_sidebar(AppState &state) {
             ImGui::SetTooltip("Waterfall colormap");
         }
         draw_spectrum(ImVec2(-1.0F, 150.0F), state.spectrum,
+                      state.dvbt_parameters.channel_bandwidth_hz,
                       state.display_floor_dbfs, state.display_ceiling_dbfs);
         draw_waterfall(ImVec2(-1.0F, 150.0F), state.waterfall, state.spectrum,
-                       state.selected_colormap, state.display_floor_dbfs,
-                       state.display_ceiling_dbfs);
+                       state.selected_colormap,
+                       state.dvbt_parameters.channel_bandwidth_hz,
+                       state.display_floor_dbfs, state.display_ceiling_dbfs);
 
         ImGui::TextDisabled("Display range");
         const float ceiling_min =
@@ -1939,22 +2014,19 @@ void draw_sidebar(AppState &state) {
 }
 
 void draw_playback_panel(AppState &state) {
-    if (!ImGui::CollapsingHeader("Playback",
-                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (!ImGui::CollapsingHeader("Playback", ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
     const auto telemetry = state.player.telemetry();
     const bool playing = state.player.ready() && !telemetry.paused;
     draw_status_indicator(
-        playing ? "PLAYING"
-                : (state.player.ready() ? "PAUSED" : "PLAYER IDLE"),
+        playing ? "PLAYING" : (state.player.ready() ? "PAUSED" : "PLAYER IDLE"),
         playing ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
                 : (state.player.ready() ? ImVec4(0.95F, 0.72F, 0.30F, 1.0F)
                                         : ImVec4(0.55F, 0.62F, 0.70F, 1.0F)));
     std::string position = "--:--:--";
     if (telemetry.playback_time_s > 0.0) {
-        const auto total =
-            static_cast<std::int64_t>(telemetry.playback_time_s);
+        const auto total = static_cast<std::int64_t>(telemetry.playback_time_s);
         position = std::format("{:02}:{:02}:{:02}", total / 3600,
                                (total % 3600) / 60, total % 60);
     }
@@ -1966,7 +2038,7 @@ void draw_playback_panel(AppState &state) {
     draw_metric(
         "A/V sync", av_sync.c_str(),
         std::clamp(1.0F - static_cast<float>(std::abs(telemetry.avsync_ms)) /
-                               50.0F,
+                              50.0F,
                    0.0F, 1.0F),
         std::abs(telemetry.avsync_ms) < 20.0
             ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
@@ -1980,19 +2052,18 @@ void draw_playback_panel(AppState &state) {
             "clock problem; RF loss instead shows up as discontinuity growth "
             "and a queued-buffer dip.");
     }
-    const std::string buffer = std::format(
-        "{:.1f} / {:.1f} MiB",
-        static_cast<double>(telemetry.queued_bytes) /
-            static_cast<double>(1U << 20U),
-        static_cast<double>(telemetry.queue_capacity) /
-            static_cast<double>(1U << 20U));
+    const std::string buffer =
+        std::format("{:.1f} / {:.1f} MiB",
+                    static_cast<double>(telemetry.queued_bytes) /
+                        static_cast<double>(1U << 20U),
+                    static_cast<double>(telemetry.queue_capacity) /
+                        static_cast<double>(1U << 20U));
     draw_metric(
         "TS buffer", buffer.c_str(),
         telemetry.queue_capacity == 0
             ? 0.0F
-            : static_cast<float>(
-                  static_cast<double>(telemetry.queued_bytes) /
-                  static_cast<double>(telemetry.queue_capacity)),
+            : static_cast<float>(static_cast<double>(telemetry.queued_bytes) /
+                                 static_cast<double>(telemetry.queue_capacity)),
         ImVec4(0.52F, 0.82F, 1.0F, 1.0F));
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         ImGui::SetTooltip(

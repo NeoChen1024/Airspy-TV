@@ -34,8 +34,13 @@ struct EnumerationResult {
     std::vector<std::string> warnings;
 };
 
+inline constexpr double max_frequency_correction_ppm = 1000.0;
+
 struct SourceSettings {
     std::uint64_t center_frequency_hz{545'000'000};
+    // Software LO correction applied as
+    // hardware_frequency = nominal_frequency * (1 + ppm / 1e6).
+    double frequency_correction_ppm{};
     std::uint32_t sample_rate_hz{10'000'000};
     AirspyGainMode airspy_gain_mode{AirspyGainMode::Sensitivity};
     int airspy_gain{10};
@@ -65,6 +70,7 @@ class SdrDevice {
     bool start_stream(const SourceSettings &settings, std::string &error);
     void stop_stream();
     bool set_center_frequency(std::uint64_t frequency_hz, std::string &error);
+    bool set_frequency_correction_ppm(double ppm, std::string &error);
     bool set_gain(const SourceSettings &settings, std::string &error);
     bool set_bias_tee(bool enabled, std::string &error);
     void set_display_smoothing(bool fft_enabled, int fft_speed,

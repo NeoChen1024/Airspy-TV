@@ -11,6 +11,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -54,6 +55,20 @@ std::string argument_value(const std::map<std::string, std::string> &arguments,
     return item == arguments.end() ? std::string{} : item->second;
 }
 
+[[nodiscard]] bool valid_frequency_correction(const double ppm) noexcept {
+    return std::isfinite(ppm) && std::abs(ppm) <= max_frequency_correction_ppm;
+}
+
+[[nodiscard]] std::uint64_t corrected_frequency(const std::uint64_t nominal_hz,
+                                                const double ppm) noexcept {
+    const long double factor =
+        1.0L + static_cast<long double>(ppm) / 1'000'000.0L;
+    const long double corrected = static_cast<long double>(nominal_hz) * factor;
+    return corrected <= 0.0L
+               ? 0
+               : static_cast<std::uint64_t>(std::round(corrected));
+}
+
 } // namespace
 
 struct SdrDevice::Impl {
@@ -72,6 +87,8 @@ struct SdrDevice::Impl {
     std::thread soapy_worker;
     std::thread file_worker;
     std::filesystem::path file_path;
+    std::uint64_t center_frequency_hz{};
+    double frequency_correction_ppm{};
     std::atomic<bool> streaming;
     std::atomic<std::uint32_t> active_sample_rate;
     std::atomic<std::uint32_t> active_channel_bandwidth{6'000'000};
@@ -419,6 +436,8 @@ void SdrDevice::close() {
     }
     impl_->opened = false;
     impl_->file_path.clear();
+    impl_->center_frequency_hz = 0;
+    impl_->frequency_correction_ppm = 0.0;
     impl_->rates.clear();
     impl_->soapy_gain_range.reset();
     impl_->transport_model.reset();
@@ -433,6 +452,12 @@ bool SdrDevice::configure(const SourceSettings &settings, std::string &error) {
         error = "Stop recording before changing receiver settings";
         return false;
     }
+    if (!valid_frequency_correction(settings.frequency_correction_ppm)) {
+        error = "Frequency correction must be finite and within +/-1000 ppm";
+        return false;
+    }
+    impl_->center_frequency_hz = settings.center_frequency_hz;
+    impl_->frequency_correction_ppm = settings.frequency_correction_ppm;
 
     if (impl_->current.backend == SdrBackend::File) {
         return true;
@@ -459,8 +484,9 @@ bool SdrDevice::configure(const SourceSettings &settings, std::string &error) {
                                        settings.sample_rate_hz)) ||
             !run("airspy_set_freq",
                  airspy_set_freq(impl_->airspy,
-                                 static_cast<std::uint32_t>(
-                                     settings.center_frequency_hz)))) {
+                                 static_cast<std::uint32_t>(corrected_frequency(
+                                     settings.center_frequency_hz,
+                                     settings.frequency_correction_ppm))))) {
             return false;
         }
         return set_bias_tee(settings.bias_tee, error) &&
@@ -469,8 +495,10 @@ bool SdrDevice::configure(const SourceSettings &settings, std::string &error) {
 
     try {
         impl_->soapy->setSampleRate(SOAPY_SDR_RX, 0, settings.sample_rate_hz);
-        impl_->soapy->setFrequency(
-            SOAPY_SDR_RX, 0, static_cast<double>(settings.center_frequency_hz));
+        impl_->soapy->setFrequency(SOAPY_SDR_RX, 0,
+                                   static_cast<double>(corrected_frequency(
+                                       settings.center_frequency_hz,
+                                       settings.frequency_correction_ppm)));
         return set_gain(settings, error);
     } catch (const std::exception &exception) {
         error = std::string("SoapySDR configure: ") + exception.what();
@@ -586,12 +614,14 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
     }
 
     if (impl_->current.backend == SdrBackend::AirspyNative) {
-        if (frequency_hz > std::numeric_limits<std::uint32_t>::max()) {
+        const auto tuned_frequency =
+            corrected_frequency(frequency_hz, impl_->frequency_correction_ppm);
+        if (tuned_frequency > std::numeric_limits<std::uint32_t>::max()) {
             error = "Airspy center frequency is out of range";
             return false;
         }
         const int result = airspy_set_freq(
-            impl_->airspy, static_cast<std::uint32_t>(frequency_hz));
+            impl_->airspy, static_cast<std::uint32_t>(tuned_frequency));
         if (result != AIRSPY_SUCCESS) {
             error = format_airspy_error("airspy_set_freq", result);
             return false;
@@ -601,6 +631,7 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
             impl_->demodulator->reset();
         }
         impl_->transport_model.reset();
+        impl_->center_frequency_hz = frequency_hz;
         return true;
     }
 
@@ -610,19 +641,49 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
     }
 
     try {
-        impl_->soapy->setFrequency(SOAPY_SDR_RX, 0,
-                                   static_cast<double>(frequency_hz));
+        impl_->soapy->setFrequency(
+            SOAPY_SDR_RX, 0,
+            static_cast<double>(corrected_frequency(
+                frequency_hz, impl_->frequency_correction_ppm)));
         impl_->analyzer.reset();
         if (impl_->demodulator) {
             impl_->demodulator->reset();
         }
         impl_->transport_model.reset();
+        impl_->center_frequency_hz = frequency_hz;
         return true;
     } catch (const std::exception &exception) {
         error =
             std::string("SoapySDR set center frequency: ") + exception.what();
         return false;
     }
+}
+
+bool SdrDevice::set_frequency_correction_ppm(const double ppm,
+                                             std::string &error) {
+    if (!valid_frequency_correction(ppm)) {
+        error = "Frequency correction must be finite and within +/-1000 ppm";
+        return false;
+    }
+    if (!impl_->opened) {
+        error = "No SDR device is open";
+        return false;
+    }
+    if (impl_->current.backend == SdrBackend::File) {
+        error = "File source frequency correction is fixed by its metadata";
+        return false;
+    }
+
+    const double previous = impl_->frequency_correction_ppm;
+    impl_->frequency_correction_ppm = ppm;
+    if (impl_->center_frequency_hz == 0) {
+        return true;
+    }
+    if (set_center_frequency(impl_->center_frequency_hz, error)) {
+        return true;
+    }
+    impl_->frequency_correction_ppm = previous;
+    return false;
 }
 
 bool SdrDevice::set_bias_tee(const bool enabled, std::string &error) {

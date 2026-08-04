@@ -236,13 +236,12 @@ symbol_interleave(const std::span<const float> input,
             (symbol_index & 1U) != 0U ? carrier : permutation[carrier];
         const std::size_t output_carrier =
             (symbol_index & 1U) != 0U ? permutation[carrier] : carrier;
-        std::copy(
-            input.begin() +
-                static_cast<std::ptrdiff_t>(output_carrier * bits_per_carrier),
-            input.begin() + static_cast<std::ptrdiff_t>(
-                                (output_carrier + 1) * bits_per_carrier),
-            output.begin() +
-                static_cast<std::ptrdiff_t>(input_carrier * bits_per_carrier));
+        std::copy(input.begin() + static_cast<std::ptrdiff_t>(output_carrier *
+                                                              bits_per_carrier),
+                  input.begin() + static_cast<std::ptrdiff_t>(
+                                      (output_carrier + 1) * bits_per_carrier),
+                  output.begin() + static_cast<std::ptrdiff_t>(
+                                       input_carrier * bits_per_carrier));
     }
     return output;
 }

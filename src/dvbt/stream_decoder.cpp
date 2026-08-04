@@ -1038,6 +1038,7 @@ struct StreamDecoder::Impl {
             double last_windowed_timing = 0.0;
             double smoothed_timing_drift = 0.0;
             double fractional_timing = 0.0;
+            float acquisition_time_ms = 0.0F;
             auto window_started_at = std::chrono::steady_clock::now();
 
             const auto cold_seed = [&]() {
@@ -1224,6 +1225,7 @@ struct StreamDecoder::Impl {
                 std::vector<std::complex<float>> window;
                 ReceiverParameters acquisition_parameters;
                 std::uint64_t base = 0;
+                std::uint64_t acquisition_generation = 0;
                 {
                     const std::scoped_lock lock(mutex);
                     const std::uint64_t available =
@@ -1239,25 +1241,45 @@ struct StreamDecoder::Impl {
                         return 0.0F;
                     }
                     base = ring_read_pos;
+                    acquisition_generation = latest_generation;
                     window.reserve(static_cast<std::size_t>(window_size));
                     for (std::uint64_t p = base; p < base + window_size; ++p) {
                         window.push_back(ring[p % ring.size()]);
                     }
                     acquisition_parameters = parameters;
                 }
+                const auto acquisition_started_at =
+                    std::chrono::steady_clock::now();
                 const OfdmAcquisition acquisition =
                     acquire_ofdm(std::span(window), acquisition_parameters);
+                const float acquisition_elapsed_ms =
+                    duration_ms(acquisition_started_at);
                 if (acquisition.score < 0.20F) {
+                    const std::scoped_lock lock(mutex);
+                    if (acquisition_generation == latest_generation &&
+                        !reset_requested) {
+                        acquisition_time_ms = acquisition_elapsed_ms;
+                    }
                     return 0.0F; // no signal: keep the current state and retry
                 }
-                const std::uint32_t bandwidth = [&] {
-                    const std::scoped_lock lock(mutex);
-                    return current_bandwidth;
-                }();
-                const float resampled_rate =
-                    static_cast<float>(bandwidth) * (8.0F / 7.0F);
+                std::uint32_t bandwidth{};
+                float resampled_rate{};
                 {
                     const std::scoped_lock lock(mutex);
+                    // Acquisition runs outside the decoder mutex. A reset or
+                    // bandwidth change may therefore invalidate the copied
+                    // window while acquire_ofdm() is running. Never publish a
+                    // stale result after the reset generation has advanced;
+                    // doing so can resurrect the old grid and leave the GUI
+                    // waiting forever for the reset to become idle.
+                    if (stopping || reset_requested || cancel_requested ||
+                        acquisition_generation != latest_generation) {
+                        return 0.0F;
+                    }
+                    bandwidth = current_bandwidth;
+                    resampled_rate =
+                        static_cast<float>(bandwidth) * (8.0F / 7.0F);
+                    acquisition_time_ms = acquisition_elapsed_ms;
                     stable_mode = acquisition.mode;
                     stable_guard = acquisition.guard;
                     sync.valid = true;
@@ -1271,7 +1293,6 @@ struct StreamDecoder::Impl {
                     sync.bandwidth = bandwidth;
                     sync.resampled_rate = resampled_rate;
                     latest.acquisition_score = acquisition.score;
-                    latest.acquisition_time_ms = 0.0F;
                     ++sync.version;
                     static_cast<void>(handle_sync_change());
                 }
@@ -1472,11 +1493,13 @@ struct StreamDecoder::Impl {
                 latest.demap_time_ms = demap_time_sum;
                 latest.deinterleave_time_ms = deinterleave_time_sum;
                 latest.depuncture_time_ms = depuncture_time_sum;
+                latest.acquisition_time_ms = acquisition_time_ms;
                 latest.symbol_workers = workers.symbol;
                 latest.resample_workers = 1;
                 latest.state_carried = last_reanchor_carried;
                 latest.fec_skipped = in_hopeless_region;
                 ++latest.processed_chunks;
+                acquisition_time_ms = 0.0F;
             };
 
             while (true) {
@@ -2224,6 +2247,7 @@ struct StreamDecoder::Impl {
         std::uint64_t decoder_generation = 0;
         float fec_work_ms = 0.0F;
         std::uint64_t window_transport_bytes = 0;
+        float decoder_transport_time_ms = 0.0F;
         while (true) {
             FecItem item;
             {
@@ -2241,13 +2265,15 @@ struct StreamDecoder::Impl {
 
             if (item.generation == latest_generation) {
                 if (item.kind == FecItem::Kind::begin) {
-                    if (!decoder || decoder_generation != item.generation ||
-                        decoder->parameters() != item.parameters) {
-                        // A new stream/region (the reset path is signalled by
-                        // the demod directly) or a mid-stream parameter change
-                        // (a TPS mode/constellation/code-rate switch): only
-                        // the parameter change is a seam here — the FEC state
-                        // was re-seeded while the packet stream continues.
+                    const bool parameters_match =
+                        decoder != nullptr &&
+                        decoder->parameters() == item.parameters;
+                    if (!parameters_match) {
+                        // A mode/constellation/code-rate change requires a
+                        // new Decoder configuration. A generation change by
+                        // itself does not: the Decoder owns a long-lived
+                        // Viterbi worker pool, and reset() is sufficient to
+                        // discard the old stream state.
                         if (decoder != nullptr &&
                             decoder_generation == item.generation) {
                             fire_discontinuity(
@@ -2255,13 +2281,18 @@ struct StreamDecoder::Impl {
                         }
                         decoder = std::make_unique<Decoder>(item.parameters);
                     } else {
-                        // A gated (hopeless) region ended and the decoder was
-                        // reset for the recovered tail: the packet stream has
-                        // a gap (continuity counters jump).
-                        fire_discontinuity(
-                            TransportDiscontinuity::fec_region_reset);
+                        // A new generation (retune/source reset) or a gated
+                        // region ended. Keep the Viterbi threads and reset
+                        // only the decoder state; generation filtering above
+                        // already prevents stale FEC items from crossing the
+                        // seam.
+                        if (decoder_generation == item.generation) {
+                            fire_discontinuity(
+                                TransportDiscontinuity::fec_region_reset);
+                        }
                         decoder->reset();
                     }
+                    decoder_transport_time_ms = 0.0F;
                     decoder_generation = item.generation;
                 } else if (item.kind == FecItem::Kind::symbol && decoder &&
                            decoder_generation == item.generation) {
@@ -2298,25 +2329,35 @@ struct StreamDecoder::Impl {
                             sink(ts);
                         }
                     }
+                    const float total_transport_time_ms =
+                        decoder->timing().transport_time_ms;
+                    const float window_transport_time_ms =
+                        std::max(0.0F, total_transport_time_ms -
+                                           decoder_transport_time_ms);
+                    decoder_transport_time_ms = total_transport_time_ms;
                     const std::scoped_lock guard(mutex);
                     if (item.generation == latest_generation) {
                         latest.fec_time_ms = fec_work_ms;
                         latest.transport_bytes += window_transport_bytes;
                         latest.transport = decoder->stats();
-                        latest.transport_time_ms =
-                            decoder->timing().transport_time_ms;
+                        latest.transport_time_ms = window_transport_time_ms;
                     }
                     fec_work_ms = 0.0F;
                     window_transport_bytes = 0;
                 } else if (item.kind == FecItem::Kind::stats && decoder &&
                            decoder_generation == item.generation) {
+                    const float total_transport_time_ms =
+                        decoder->timing().transport_time_ms;
+                    const float window_transport_time_ms =
+                        std::max(0.0F, total_transport_time_ms -
+                                           decoder_transport_time_ms);
+                    decoder_transport_time_ms = total_transport_time_ms;
                     const std::scoped_lock guard(mutex);
                     if (item.generation == latest_generation) {
                         latest.fec_time_ms = fec_work_ms;
                         latest.transport_bytes += window_transport_bytes;
                         latest.transport = decoder->stats();
-                        latest.transport_time_ms =
-                            decoder->timing().transport_time_ms;
+                        latest.transport_time_ms = window_transport_time_ms;
                     }
                     fec_work_ms = 0.0F;
                     window_transport_bytes = 0;
@@ -2392,6 +2433,8 @@ void StreamDecoder::flush() {
         impl_->flush_requested = true;
     }
     impl_->input_ready.notify_one();
+    impl_->ring_space.notify_all();
+    impl_->ring_data.notify_all();
     wait_until_idle();
 }
 
@@ -2402,7 +2445,8 @@ void StreamDecoder::wait_until_idle() {
                !impl_->demod_busy && !impl_->fec_worker_busy &&
                !impl_->flush_requested && !impl_->reset_requested &&
                impl_->fec_queue.empty() &&
-               impl_->ring_read_pos == impl_->ring_write_pos;
+               (!impl_->ring_closed ||
+                impl_->ring_read_pos == impl_->ring_write_pos);
     });
 }
 
@@ -2415,6 +2459,8 @@ void StreamDecoder::reset() {
     }
     impl_->fec_not_full.notify_all();
     impl_->input_ready.notify_one();
+    impl_->ring_space.notify_all();
+    impl_->ring_data.notify_all();
 }
 
 void StreamDecoder::set_parameters(const ReceiverParameters &parameters) {
@@ -2423,8 +2469,18 @@ void StreamDecoder::set_parameters(const ReceiverParameters &parameters) {
         const std::scoped_lock lock(impl_->mutex);
         impl_->parameters = parameters;
     }
+
+    // A live SDR producer never becomes globally idle: it may keep filling the
+    // input queue/ring while the GUI changes a demodulator setting. Wait only
+    // for the frontend reset generation to be acknowledged, not for the
+    // entire live pipeline to drain. Finite streams still use flush() and the
+    // full wait_until_idle() path.
+    const auto generation = impl_->latest_generation.load();
     reset();
-    wait_until_idle();
+    std::unique_lock lock(impl_->mutex);
+    impl_->idle.wait(lock, [this, generation] {
+        return impl_->stopping || impl_->latest_generation.load() != generation;
+    });
 }
 
 void StreamDecoder::set_transport_callback(TransportCallback callback) {

@@ -287,6 +287,90 @@ Remaining:
 - Add long-running live reception regressions for Airspy and selected SoapySDR
   devices; add StreamDecoder integration tests over synthetic I/Q.
 
+## Implementation status and follow-up
+
+The following completed items are pending final review and acceptance. The
+listed commits are implementation references; review should verify the code,
+regressions, and acceptance evidence.
+
+### Continuous DVB-T pipeline correctness
+
+- [x] Reset all per-stream front-end state on every reset, retune, and source
+  replacement. (`938e5b1` / `e51c7eb`) The fade-recovery grid, stable carrier
+  state, CFO, continual reference, pilot phase, TPS state, and related counters
+  are cleared so state cannot leak between frequencies or files.
+- [x] Make event-driven re-anchor an explicit symbol-loop boundary.
+  (`e51c7eb`) A successful mid-symbol acquisition discards the in-flight symbol
+  and restarts at the published `next_symbol_start`.
+- [x] Implement closed-loop sample-clock/timing correction. (`938e5b1`)
+  Pilot phase-slope drift nudges the symbol period by +/-1 sample, bounded to
+  +/-4 samples and reset on grid rebuild, re-anchor, and reset.
+- [x] Split TPS lock state into `ever_locked` and `currently_valid`.
+  (`e51c7eb`) Parameters remain fixed after the first valid lock while later
+  failed checks no longer report a healthy current lock.
+
+### Pipeline pacing and playback
+
+- [x] Use a common 0.2-second ingestion/jitter budget. (`c0e9f27`) File reads
+  are split into `sample_rate / 5` complex-sample spans before submission.
+- [x] Size the resampled ring from the active rate. (`c0e9f27`) The ring holds
+  approximately 0.2 seconds of input/baseband data, has a 1 Mi-sample floor,
+  and resizes only while empty.
+- [x] Expose SDR frequency correction in the Source panel. Airspy Native and
+  SoapySDR use `hardware_frequency = nominal_frequency * (1 + ppm / 1e6)` with
+  correction bounded to +/-1000 ppm; applying it live retunes and resets
+  decoder tracking, while I/Q metadata remains unchanged.
+- [x] Define and propagate transport discontinuity semantics. (`87e912b`)
+  `TransportDiscontinuity` events are out-of-band and distinct from per-packet
+  TEI marking; retune, stream-end, and FEC-region recovery are handled
+  independently by `MpvPlayer` and the demuxer.
+- [x] Add initial playback telemetry. (`87e912b`) Libmpv playback time, A/V
+  offset, dropped frames, pause state, TS queue depth, and decoder
+  discontinuity count are shown in the GUI Playback panel.
+
+### Verification and documentation
+
+- [x] Complete the first 8K `StreamDecoder` integration-test slice. (`b5d325a`)
+  Coverage includes synthetic 8K/GI-1/4/QPSK/1/2 signals, persistent
+  resampling, arbitrary CS16 boundaries, acquisition/demodulation/FEC/TS
+  output, finite-stream flush, reset, retune, stream end, queue drain, and a
+  non-acquirable zero-I/Q stream. Verification: CTest 4/4 and 10 repeated
+  integration runs.
+- [x] Synchronize architecture documentation. (`87e912b`)
+  `docs/worker-pools-and-dataflow.md` and this roadmap document event-driven
+  acquisition, phase-only re-lock, TPS fix-once, closed-loop sample clock,
+  bounded buffering, deterministic recovery, discontinuities, and playback
+  telemetry.
+
+### Remaining implementation
+
+- [ ] Extend synthetic `StreamDecoder` integration coverage beyond the 8K
+  clean/lifecycle slice:
+  - 2K mode and its guard intervals;
+  - explicit timing offset, sample-clock drift, carrier-frequency offset, and
+    residual CFO convergence;
+  - deep fades, MER gating, phase-only re-lock, and long-fade re-anchor;
+  - transport continuity and exact TS output for error-free synthetic input;
+  - repeated block-boundary/reset combinations under parallel worker load.
+
+### Playback telemetry follow-up
+
+- [ ] Add PCR/PTS/DTS monotonicity and discontinuity tracking inside the TS
+  parser, including timestamp-wrap handling.
+- [ ] Add multi-hour live/file playback regressions with explicit bounds on
+  sustained A/V offset, queue growth, decoder stalls, and intentional live
+  catch-up drops.
+
+### Performance and hardware coverage
+
+- [ ] Add long-running live-reception regressions for Airspy R2 and selected
+  SoapySDR devices.
+- [ ] Profile a modern AVX2 Viterbi implementation; libcorrect's SSE decoder
+  remains the dominant CPU hotspot after the ordered-pipeline optimizations.
+- [ ] Ensure the TS buffer maintains approximately 1.5 MiB of data after the
+  signal returns following a dropout.
+- [ ] Continue improving decoder robustness as a long-term target.
+
 ## Transport stream and playback
 
 - PAT, PMT, and SDT section assembly, CRC validation, and service/component
