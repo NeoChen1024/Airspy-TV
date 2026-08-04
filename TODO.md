@@ -2,25 +2,33 @@
 
 ## Continuous DVB-T pipeline correctness
 
-- [ ] Reset all per-stream front-end state on every reset, retune, and source
-  replacement.  In particular, clear the saved fade-recovery carrier grid
+- [x] Reset all per-stream front-end state on every reset, retune, and source
+  replacement. (`938e5b1`/`e51c7eb`: `reset_frontend_state()` now clears the
+  fade-recovery grid and is called by the reset handler; a retune clears the
+  grid and the TPS-fixed mode/guard.)  In particular, clear the saved fade-recovery carrier grid
   (`stable_carrier_offset` / `stable_phase`) as well as the CFO, continual
   reference, pilot phase, TPS state, and related counters.  A grid captured
   from one frequency or file must never be restored in a later stream.
 
-- [ ] Make an event-driven re-anchor an explicit symbol-loop boundary.  If
+- [x] Make an event-driven re-anchor an explicit symbol-loop boundary.
+  (`e51c7eb`: a successful mid-symbol acquisition discards the in-flight
+  symbol and restarts from the published `next_symbol_start`.)  If
   acquisition changes the grid while a symbol is being processed, discard that
   in-flight symbol and restart from the newly published `next_symbol_start`.
   Do not combine the old symbol's payload/NCO advancement with the newly
   anchored grid.
 
-- [ ] Implement a closed-loop sample-clock / timing correction path.  The
+- [x] Implement a closed-loop sample-clock / timing correction path.
+  (`938e5b1`: the pilot phase-slope drift between stats windows feeds a
+  fractional timing accumulator that nudges the symbol period +/-1 sample;
+  bounded +/-4 samples, reset on grid rebuild/re-anchor/reset. The absolute
+  tau is multipath-biased and must not be used as a P-loop error.)  The
   pilot phase-slope estimate is currently diagnostic-only while symbol starts
   advance by a fixed integer period.  Feed a filtered timing-error estimate
   into a fractional timing accumulator and resampler-rate or interpolator
   control, with bounded corrections and reset/reacquisition behaviour.
 
-- [ ] Split TPS state into `ever_locked` and `currently_valid` (or equivalent
+- [x] Split TPS state into `ever_locked` and `currently_valid` (or equivalent
   confidence/state fields).  Fixed parameters after an initial valid TPS lock
   are acceptable, but a failed later BCH/sync check must not be reported as a
   currently healthy TPS lock.
