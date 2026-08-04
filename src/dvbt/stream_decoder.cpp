@@ -610,6 +610,18 @@ struct StreamDecoder::Impl {
         bool just_seeded{false};
         TpsDecoder tps_decoder;
         TpsSnapshot tps_snapshot;
+        // CIR / delay-spread estimation for adaptive FFT-window placement.
+        // Updated once per TPS frame (68 symbols) from the scattered pilots,
+        // so the added work is negligible; `cir_offset` is the smoothed FFT
+        // window offset (samples, <= 0) relative to the effective symbol
+        // start (start_pos + guard_size), sliding the window toward the
+        // latest strong tap when the delay spread leaves guard margin.
+        std::vector<std::complex<float>> cir_grid;
+        std::vector<std::complex<float>> cir_response;
+        fftwf_plan cir_plan{nullptr};
+        std::size_t cir_n{0};
+        float cir_offset{0.0F};
+        int cir_symbol_count{0};
     };
 
     // Acquisition result published by the front-end thread. `version` is
@@ -1038,6 +1050,17 @@ struct StreamDecoder::Impl {
             double last_windowed_timing = 0.0;
             double smoothed_timing_drift = 0.0;
             double fractional_timing = 0.0;
+            // Window-averaged CIR offset of the previous stats window: the
+            // drift estimate is computed in window-position-invariant
+            // coordinates so the adaptive FFT-window slides do not read as
+            // sample-clock steps.
+            double last_windowed_cir_avg = 0.0;
+            int cir_off_window_begin = 0;
+            // Integer CIR window offset currently applied to
+            // `next_symbol_start`; the per-frame estimate only nudges the
+            // anchor by the difference, so mid-stream updates move the FFT
+            // window by a few samples at most instead of re-anchoring.
+            int applied_cir_offset = 0;
             float acquisition_time_ms = 0.0F;
             auto window_started_at = std::chrono::steady_clock::now();
 
@@ -1091,6 +1114,25 @@ struct StreamDecoder::Impl {
                     reinterpret_cast<fftwf_complex *>(fft_in.data()),
                     reinterpret_cast<fftwf_complex *>(fft_out.data()),
                     FFTW_FORWARD, FFTW_ESTIMATE);
+                // CIR estimation grid: one tap per scattered-pilot slot (12
+                // sub-carriers), so the impulse response spans Tu/12 and tap i
+                // is delayed i * fft_size / (12 * N) samples after the window.
+                frontend.cir_n = fft_size == 8192 ? 1024 : 256;
+                frontend.cir_grid.assign(frontend.cir_n,
+                                         std::complex<float>{});
+                frontend.cir_response.assign(frontend.cir_n,
+                                             std::complex<float>{});
+                if (frontend.cir_plan != nullptr) {
+                    fftwf_destroy_plan(frontend.cir_plan);
+                    frontend.cir_plan = nullptr;
+                }
+                frontend.cir_plan = fftwf_plan_dft_1d(
+                    static_cast<int>(frontend.cir_n),
+                    reinterpret_cast<fftwf_complex *>(
+                        frontend.cir_grid.data()),
+                    reinterpret_cast<fftwf_complex *>(
+                        frontend.cir_response.data()),
+                    FFTW_BACKWARD, FFTW_ESTIMATE);
             };
 
             std::size_t symbol_queue_capacity = initial_symbol_queue_capacity;
@@ -1099,6 +1141,16 @@ struct StreamDecoder::Impl {
             // abandoned). Called with the mutex held.
             const auto handle_sync_change = [&]() {
                 seen_sync_version = sync.version;
+                // Effective symbol start (acquisition boundary + guard) plus
+                // the adaptive CIR window offset (<= 0 samples, sliding the
+                // FFT window toward the latest strong tap).
+                const auto anchored_start = [&]() -> std::uint64_t {
+                    return static_cast<std::uint64_t>(
+                        static_cast<std::int64_t>(sync.start_pos +
+                                                  sync.guard_size) +
+                        static_cast<std::int64_t>(
+                            std::lround(frontend.cir_offset)));
+                };
                 if (!sync.valid) {
                     // Reset: abandon the stream. The FEC generation has already
                     // advanced, so any stale queued items are dropped by the
@@ -1120,6 +1172,11 @@ struct StreamDecoder::Impl {
                     frontend.just_seeded = false;
                     fractional_timing = 0.0;
                     smoothed_timing_drift = 0.0;
+                    frontend.cir_offset = 0.0F;
+                    frontend.cir_symbol_count = 0;
+                    applied_cir_offset = 0;
+                    last_windowed_cir_avg = 0.0;
+                    cir_off_window_begin = 0;
                     return true;
                 }
                 const bool mode_changed =
@@ -1163,22 +1220,25 @@ struct StreamDecoder::Impl {
                     pending_symbols.clear();
                     gate_buffer.clear();
                     in_hopeless_region = false;
-                    next_symbol_start = sync.start_pos + sync.guard_size;
+                    next_symbol_start = anchored_start();
                     nco_phase = frontend.tracked_cfo_phase *
                                 static_cast<float>(next_symbol_start);
                     last_reanchor_carried = false;
+                    applied_cir_offset = static_cast<int>(
+                        std::lround(frontend.cir_offset));
                     // The timing loop's reference grid changed: its residual
                     // fraction and drift state have no meaning against the
                     // new boundary.
                     fractional_timing = 0.0;
                     smoothed_timing_drift = 0.0;
+                    last_windowed_cir_avg = 0.0;
+                    cir_off_window_begin = applied_cir_offset;
                     have_grid = true;
                     demod_busy = true;
                     return true;
                 }
                 // Same mode/guard: is the new boundary on the current grid?
-                const std::uint64_t new_start =
-                    sync.start_pos + sync.guard_size;
+                const std::uint64_t new_start = anchored_start();
                 const std::uint64_t delta = next_symbol_start > new_start
                                                 ? next_symbol_start - new_start
                                                 : new_start - next_symbol_start;
@@ -1204,12 +1264,16 @@ struct StreamDecoder::Impl {
                                 static_cast<std::int64_t>(next_symbol_start)),
                     2.0F * std::numbers::pi_v<float>);
                 next_symbol_start = new_next;
+                applied_cir_offset = static_cast<int>(
+                    std::lround(frontend.cir_offset));
                 last_reanchor_carried = carried;
                 fade_symbol_count = 0;
                 // The boundary moved: the timing loop restarts against the
                 // newly anchored grid.
                 fractional_timing = 0.0;
                 smoothed_timing_drift = 0.0;
+                last_windowed_cir_avg = 0.0;
+                cir_off_window_begin = applied_cir_offset;
                 return true;
             };
 
@@ -1440,10 +1504,23 @@ struct StreamDecoder::Impl {
                     // windows — the sample-clock offset — with a long time
                     // constant, and accumulate it into the fractional timing
                     // the symbol advance consumes. Bounded so a pathological
-                    // estimate cannot walk the window far off grid.
-                    const double drift = static_cast<double>(timing_offset) -
-                                         last_windowed_timing;
+                    // estimate cannot walk the window far off grid. The CIR
+                    // window slides shift tau by exactly the slide, so both
+                    // references are expressed relative to the window's
+                    // average position, keeping the drift estimate blind to
+                    // the adaptive placement. (A window slide of d samples
+                    // moves the measured timing offset by -d, so the offset
+                    // is rebased onto the window's average position by
+                    // adding the slide back.)
+                    const double window_cir_avg =
+                        0.5 * (static_cast<double>(cir_off_window_begin) +
+                               static_cast<double>(applied_cir_offset));
+                    const double drift =
+                        (static_cast<double>(timing_offset) +
+                         window_cir_avg) -
+                        (last_windowed_timing + last_windowed_cir_avg);
                     last_windowed_timing = static_cast<double>(timing_offset);
+                    last_windowed_cir_avg = window_cir_avg;
                     smoothed_timing_drift =
                         0.02 * drift + 0.98 * smoothed_timing_drift;
                     fractional_timing += 0.25 * smoothed_timing_drift;
@@ -1951,6 +2028,142 @@ struct StreamDecoder::Impl {
                             ++timing_count;
                         }
                     }
+                    // CIR / delay-spread estimate (scattered pilots -> IFFT ->
+                    // impulse response) for adaptive FFT-window placement.
+                    // Once per TPS frame: negligible cost. When the measured
+                    // delay spread is significant (>= guard/4) the window
+                    // slides toward the middle of the ISI-free range
+                    // [spread, guard], balancing the pre/post-ISI margins;
+                    // the offset steps by at most +/-4 samples per frame so
+                    // the timing loop is never perturbed by a jump.
+                    if (++frontend.cir_symbol_count >= 68) {
+                        frontend.cir_symbol_count = 0;
+                        if (fade_indicator > 0.25F &&
+                            frontend.cir_plan != nullptr) {
+                            std::fill(frontend.cir_grid.begin(),
+                                      frontend.cir_grid.end(),
+                                      std::complex<float>{});
+                            const std::size_t phase =
+                                static_cast<std::size_t>(lock.phase);
+                            std::size_t slot = 0;
+                            for (std::size_t k = phase * 3; k <= maximum;
+                                 k += 12) {
+                                if (slot >= frontend.cir_grid.size()) {
+                                    break;
+                                }
+                                frontend.cir_grid[slot] = channel[k];
+                                ++slot;
+                            }
+                            fftwf_execute(frontend.cir_plan);
+                            const std::size_t n =
+                                frontend.cir_response.size();
+                            std::vector<double> energy(n, 0.0);
+                            double total = 0.0;
+                            std::size_t peak = 0;
+                            double peak_energy = -1.0;
+                            for (std::size_t i = 0; i < n; ++i) {
+                                energy[i] = static_cast<double>(std::norm(
+                                    frontend.cir_response[i]));
+                                total += energy[i];
+                                if (energy[i] > peak_energy) {
+                                    peak_energy = energy[i];
+                                    peak = i;
+                                }
+                            }
+                            // Only trust a structured response: the peak tap
+                            // must hold a meaningful share of the energy, so
+                            // a noise-driven CIR cannot drag the window.
+                            if (total > 0.0 &&
+                                peak_energy / total > 0.05) {
+                                // Contiguous main lobe: taps above 1% of the
+                                // peak, wrapping the IFFT window (taps that
+                                // arrive before the FFT window fold to its
+                                // tail). Underestimating the spread is safe:
+                                // the offset only moves the window inside
+                                // the ISI-free range [d_max, G + d_min].
+                                const double lobe_threshold =
+                                    peak_energy * 0.01;
+                                std::size_t lo = peak;
+                                std::size_t hi = peak;
+                                while (energy[(lo + n - 1) % n] >=
+                                           lobe_threshold &&
+                                       (lo + n - 1) % n != hi) {
+                                    lo = (lo + n - 1) % n;
+                                }
+                                while (energy[(hi + 1) % n] >=
+                                           lobe_threshold &&
+                                       (hi + 1) % n != lo) {
+                                    hi = (hi + 1) % n;
+                                }
+                                const std::size_t lobe_width =
+                                    (hi + n - lo) % n + 1;
+                                const double scale =
+                                    static_cast<double>(fft_size) /
+                                    static_cast<double>(12 * frontend.cir_n);
+                                const double spread_samples =
+                                    static_cast<double>(lobe_width) * scale;
+                                // Slide the window to the middle of the
+                                // ISI-free range [spread, guard] (in offset
+                                // coordinates relative to the effective
+                                // symbol start), balancing the pre- and
+                                // post-ISI margins. Only act when the delay
+                                // spread is significant: for a single-path /
+                                // short-delay channel the current anchor is
+                                // already inside the (wide) ISI-free range,
+                                // and sliding the window there buys nothing
+                                // while perturbing the timing loop.
+                                const double spread_threshold =
+                                    0.25 * static_cast<double>(guard_size);
+                                const double target =
+                                    spread_samples > spread_threshold
+                                        ? std::clamp(
+                                              (spread_samples -
+                                               static_cast<double>(
+                                                   guard_size)) /
+                                                  2.0,
+                                              -static_cast<double>(
+                                                  guard_size),
+                                              0.0)
+                                        : 0.0;
+                                frontend.cir_offset = static_cast<float>(
+                                    0.9 * static_cast<double>(
+                                              frontend.cir_offset) +
+                                    0.1 * target);
+                                const int applied = static_cast<int>(
+                                    std::lround(frontend.cir_offset));
+                                // Step the anchor by at most +/-4 samples per
+                                // frame. The timing loop is now rebased onto
+                                // the window's average position (so slides do
+                                // not read as sample-clock steps), but the
+                                // step bound still limits how often the CFO
+                                // update is skipped by the boundary crossing
+                                // and keeps a mis-estimated target from
+                                // sliding far into the ISI region in one
+                                // frame.
+                                const int delta = std::clamp(
+                                    applied - applied_cir_offset, -4, 4);
+                                if (delta != 0) {
+                                    if (delta > 0) {
+                                        next_symbol_start +=
+                                            static_cast<std::uint64_t>(delta);
+                                    } else {
+                                        next_symbol_start -=
+                                            static_cast<std::uint64_t>(-delta);
+                                    }
+                                    applied_cir_offset += delta;
+                                    // The window moved mid-stream: advance
+                                    // the mixer phase by the skipped samples
+                                    // and let the contiguous-pair gate skip
+                                    // the CFO update for this boundary.
+                                    nco_phase = std::remainder(
+                                        nco_phase +
+                                            (frontend.tracked_cfo_phase *
+                                             static_cast<float>(delta)),
+                                        2.0F * std::numbers::pi_v<float>);
+                                }
+                            }
+                        }
+                    }
                     for (std::size_t i = 1; i < pilots.size(); ++i) {
                         const std::size_t left = pilots[i - 1];
                         const std::size_t right = pilots[i];
@@ -2070,6 +2283,7 @@ struct StreamDecoder::Impl {
                         ++window_symbol_count;
                         if (window_symbol_count >= stats_window_symbols) {
                             publish_stats_window();
+                            cir_off_window_begin = applied_cir_offset;
                             window_started_at =
                                 std::chrono::steady_clock::now();
                             window_symbol_count = 0;
@@ -2127,6 +2341,7 @@ struct StreamDecoder::Impl {
                     advance_symbol();
                     if (window_symbol_count >= stats_window_symbols) {
                         publish_stats_window();
+                        cir_off_window_begin = applied_cir_offset;
                         static_cast<void>(
                             enqueue_fec({.kind = FecItem::Kind::stats,
                                          .generation = latest_generation,
@@ -2208,6 +2423,7 @@ struct StreamDecoder::Impl {
                 // Publish a final partial-window stats snapshot.
                 if (window_symbol_count != 0 || mer_sum != 0.0) {
                     publish_stats_window();
+                    cir_off_window_begin = applied_cir_offset;
                     window_started_at = std::chrono::steady_clock::now();
                     window_symbol_count = 0;
                     mer_sum = 0.0;

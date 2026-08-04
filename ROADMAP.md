@@ -353,6 +353,71 @@ regressions, and acceptance evidence.
   - transport continuity and exact TS output for error-free synthetic input;
   - repeated block-boundary/reset combinations under parallel worker load.
 
+### Robustness and security-review follow-up (2026-08)
+
+Findings from a read-only security review of the DVB-T receiver (raw-IQ
+frontend, demodulator, FEC, TS/SI, and playback paths). No memory-corruption,
+injection, or authentication issues were found; the items below are
+robustness/availability defects. File/line references are current as of the
+audit.
+
+- [x] Handle multipath path length / delay spread in the OFDM frontend.
+  (MEDIUM, RF-side DoS vector: a delay spread approaching the guard interval
+  silently degrades or kills decoding — the code history records both
+  "permanent lock loss" and "silent payload scrambling".) **Implemented
+  (2026-08):** per-TPS-frame CIR / delay-spread estimation (scattered-pilot
+  channel estimate -> 1024/256-point IFFT -> main-lobe width) with adaptive
+  FFT-window placement — the window slides to the middle of the ISI-free
+  range [spread, guard] in steps of at most +/-4 samples per frame, only
+  when the measured spread reaches guard/4, EMA-smoothed
+  (`stream_decoder.cpp:2031-2166`, window offset applied at the
+  `anchored_start()` sites `:1223`, `:1241`). Verified: 581mhz
+  capture decodes byte-identical to the pre-change build (178,362,556
+  bytes); synthetic 8K fixtures pass. **Known limitations, unresolved:** (a)
+  the scattered-pilot spacing (12 carriers) caps the observable delay at
+  Tu/12, so longer echoes alias into the window; (b) the main-lobe spread
+  estimate misses well-separated echo clusters, so a 1200-sample synthetic
+  echo reads as spread ~3. **Resolved (2026-08) — decoupled the window
+  slides from the timing loop:** a CIR slide of d samples shifts the pilot
+  phase-slope estimate of tau by exactly d, so the drift estimate read the
+  slides as fake sample-clock steps. Both references are now expressed
+  relative to the window's average position (window-averaged CIR offset,
+  `stream_decoder.cpp:1507-1523`), making the adaptive placement invisible
+  to the sample-clock loop. Measured on the 581 capture with forced
+  slides: the per-window drift injected by the slides dropped from +24 to
+  +2 samples (the residual is the step-vs-linear window-average
+  approximation, at most one slide, absorbed by the 0.02 smoothing); the
+  normal path is bit-identical to the pre-decoupling build (178,362,556
+  bytes). The conservative guard/4 threshold means none of the current
+  test signals trigger the adaptive path (557M is deep-fade multipath, not
+  long-delay); the mechanism is in place but unproven on real long-delay
+  multipath. Forced-slide experiments on 581 also confirmed the
+  threshold's necessity: the main-lobe spread estimate reads ~4 samples on
+  a channel with longer echoes, so sliding to the computed target moved
+  the window into the ISI region (MER 24->5 dB, ~2/3 of TS lost); the CIR
+  estimate itself is side-effect-free (estimate-only runs are
+  byte-identical to no-estimate runs). The 581 capture's deep fades
+  (MER 24 -> 1.8 dB, ~26 s of degraded periods across the 121 s file)
+  also exercised fade robustness: deep fades skip the estimate via the
+  `fade_indicator` gate, and during shallower fades the noise-inflated
+  spread (main lobe 2.7-4 -> up to 20 samples) never crossed the guard/4
+  threshold, so the window never moved (delta=0 throughout).
+  Follow-up candidates: 90%-energy CDF spread estimate (fixes the
+  well-separated-echo underestimate), and re-test on a captured
+  long-delay (SFN-style) signal.
+- [x] Verify and fix the `rresamp_crcf_execute_block` `_n` argument at both
+  call sites. (LOW — **resolved as a false positive.**) The liquid-dsp API
+  documents `_n` as a *block count*, not an input-sample count: each block
+  consumes `Q` input samples and produces `P` output samples, with the input
+  buffer sized `Q*n` and the output buffer `P*n`
+  (`contrib/liquid-dsp/src/filter/src/rresamp.proto.c:329-341`,
+  `include/liquid.h:5039-5048`). Both call sites match that contract exactly:
+  `ofdm_acquisition.cpp:160-163` passes `end - begin` blocks with
+  `job_q`/`job_p` steps, and `stream_decoder.cpp:546-548` passes `blocks`
+  blocks with `decimation_`/`interpolation_` steps and erases exactly
+  `blocks * decimation_` input samples. No change needed; 557M/581M
+  byte-identical baselines were passing with this code as-is.
+
 ### Playback telemetry follow-up
 
 - [ ] Add PCR/PTS/DTS monotonicity and discontinuity tracking inside the TS
