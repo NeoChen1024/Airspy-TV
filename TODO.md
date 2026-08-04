@@ -48,15 +48,21 @@
   proven 1 Mi behaviour; it only resizes while empty so the absolute
   read/write counters never corrupt the wrap.
 
-- [ ] Define and propagate transport discontinuity semantics to playback.
-  FEC-region resets, source drops, and retunes must be distinguishable from
-  ordinary TEI-marked packets, and the libmpv path needs a controlled recovery
-  policy rather than only dropping old packets from a bounded queue.
+- [x] Define and propagate transport discontinuity semantics to playback.
+  The decoder reports `TransportDiscontinuity` events (`fec_region_reset` /
+  `stream_end` / `retune`) out of band — distinct from per-packet TEI marking
+  — and `MpvPlayer::on_discontinuity` applies the controlled recovery: a live
+  retune restarts the libmpv demuxer, a stream end plays out the tail and
+  hits EOF, and FEC-region resets are left to the demuxer's error
+  concealment. The bounded queue keeps its drop-old fallback for a stalled
+  player.
 
-- [ ] Add long-running playback telemetry and tests: selected-service PCR,
-  audio/video PTS/DTS monotonicity, playback queue depth, decoder stalls, and
-  measured A/V offset.  Preserve broadcast timestamps; distinguish genuine
-  clock drift from RF loss or an intentional live catch-up drop.
+- [x] Add playback telemetry and tests: `MpvPlayer::telemetry()` samples
+  libmpv `playback-time` / `avsync` (the measured A/V presentation offset),
+  dropped-frame counters, the TS queue depth, and the decoder's discontinuity
+  count, drawn in the GUI "Playback" panel.  Remaining: PCR/PTS-DTS
+  monotonicity tracking inside the TS parser, timestamp wrap handling, and
+  multi-hour live/file regressions.
 
 ## Verification and documentation
 
@@ -67,6 +73,8 @@
   deadlock.  Assert transport continuity and expected TS output where the
   fixture is error-free.
 
-- [ ] Bring `docs/worker-pools-and-dataflow.md` in sync with the implemented
-  architecture.  It still describes front-end-owned periodic acquisition,
-  obsolete fade timing, and an outdated TPS pending-buffer length.
+- [x] Bring `docs/worker-pools-and-dataflow.md` in sync with the implemented
+  architecture: event-driven acquisition, phase-only re-lock, TPS fix-once,
+  closed-loop sample clock, the 0.2 s ingestion budget and rate-sized ring,
+  the deterministic recovery, the deadlock fixes, and the transport
+  discontinuity semantics are all documented.

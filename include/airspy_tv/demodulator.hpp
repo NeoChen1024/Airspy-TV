@@ -1,5 +1,7 @@
 #pragma once
 
+#include "airspy_tv/transport_stream.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -39,6 +41,8 @@ class Demodulator {
   public:
     using TransportCallback =
         std::function<void(std::span<const std::uint8_t>)>;
+    using DiscontinuityCallback =
+        std::function<void(TransportDiscontinuity)>;
 
     virtual ~Demodulator() = default;
 
@@ -56,6 +60,11 @@ class Demodulator {
     virtual void flush() = 0;
     virtual void wait_until_idle() = 0;
     virtual void set_transport_callback(TransportCallback callback) = 0;
+    // Out-of-band stream-level events (see TransportDiscontinuity), fired by
+    // the demod threads as they happen. The callback must not block on the
+    // decoder or call back into it.
+    virtual void set_discontinuity_callback(DiscontinuityCallback callback) =
+        0;
     [[nodiscard]] virtual DemodulatorStats demodulator_stats() const = 0;
 };
 

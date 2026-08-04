@@ -238,55 +238,54 @@ Completed (validated 2026-08 on 557M/581mhz field captures):
   the normalized continual-carrier temporal correlation is a fade indicator;
   below 0.25 the CFO loop, pilot phase, and carrier lock freeze on their
   carried values (a noise-latched offset cannot escape the +/-2-bin lock and
-  permanently scrambled the channel estimate in early builds). After ~470
-  frozen symbols (~0.7 s, the old chunk cadence) the demod requests an
-  immediate fresh acquisition; its publish forces a cold re-anchor that
-  restores the pre-fade carrier grid (the LO never moves), re-seeds the CFO
-  from the CP phase, and re-locks TPS. Recovery is now deterministic: 4/4
-  full-capture runs decode byte-identical TS.
+  permanently scrambled the channel estimate in early builds). After 1400
+  frozen symbols (~2.1 s) the demod runs an event-driven re-anchor at a
+  symbol-loop boundary: it restores the pre-fade carrier grid (the LO never
+  moves), re-seeds the CFO from the CP phase, and re-locks TPS; the in-flight
+  symbol is discarded so no symbol is built from mixed grids. Recovery is now
+  deterministic: repeated full-capture runs decode byte-identical TS under
+  parallel-build load.
 - Windowed MER gate: 68-symbol windows (one TPS frame) whose mean MER falls
   below the constellation floor are dropped and bracket end/begin FEC resets;
   hopeless regions never grind the Viterbi, and faded-head/recovered-tail
-  regions still decode.
+  regions still decode. The outer FEC never locks a zero-evidence phase
+  (sync distance alone), and 100 consecutive uncorrectable RS codewords
+  trigger a fresh outer-phase search — a fade-corrupted false lock that
+  silently scrambled every later packet is gone.
+- Closed-loop sample-clock tracking: the pilot phase-slope estimate's
+  windowed mean is dominated by the channel's mean group delay (multipath
+  bias ~+35 samples on the 581), so only the slow drift between stats windows
+  is tracked and accumulated into a fractional timing that nudges the symbol
+  period by +/-1 sample (bounded +/-4, reset on grid rebuild / re-anchor /
+  reset). On the 581 MHz capture this keeps the FFT window centred against
+  the 0.5 ppm TCXO drift.
 
 Measured before/after (121 s 581 MHz + 135 s 557 MHz captures, 64-QAM):
 
 - 581 MHz (multipath valley 10.3-33.7 s): the old chunked pipeline decoded
-  183,999,360 bytes; the continuous pipeline decodes 171.9 MB deterministically
-  (93.5%) — the head and valley pockets match, and the mid/tail recovery
-  regions carry the remaining gap (fade-recovery latency: the re-acquisition
-  cycle re-locks TPS ~68 symbols per recovery, and the multipath-weighted
-  recording occasionally corrupts TPS frame sync for a few windows). Valley
+  183,999,360 bytes; the continuous pipeline decodes 178,362,556 bytes
+  (97%) deterministically — the sample-clock correction keeps the FFT
+  window centred and recovers the tail the clock drift was eroding. Valley
   gap ~23 s unchanged (signal physically undecodable). Wall time ~36 s at 8
-  threads (3.4x realtime).
-- 557 MHz (uniform MER 8-12 dB, ~10 dB below the 64-QAM threshold): TS 0
-  (physics — the gate spares the Viterbi); wall time ~150 s.
+  threads.
+- 557 MHz (uniform MER 8-12 dB, ~10 dB below the 64-QAM threshold): the
+  horizontal capture decodes 270,898,976 bytes with the closed-loop timing
+  (weak-signal regions lock where the absolute-tau P-loop churned); the
+  vertical capture stays TS 0 (physics — the gate spares the Viterbi).
 - Clean-signal regression: the 557-first-chunk fixture still decodes
   byte-identical (MD5 eabba87cccf3dd29a3ef18a8e23ecdd9); 3/3 ctest; the ideal
   synthetic fixture decodes within 16 packets of the old output (first-decode
   trellis warmup only).
+- Determinism: the 40 MB fixture decodes byte-identical across 30 consecutive
+  runs (MD5 df5549f0f0e16b7bb6feba819001c08d); full captures are byte-identical
+  across repeated runs and under parallel-build load.
 
 Remaining:
 
-- Shrink the fade-recovery latency: the verified re-lock and the forced
-  re-acquisition currently trade recovery speed against the risk of latching
-  a noise-driven offset while the channel is still fading; the 581's
-  multipath-weighted tail shows ~6 windows where the demod is healthy but the
-  FEC is silent (TPS frame sync corrupted by a bad latch). Options: verify a
-  re-locked grid over several symbols before accepting it, or re-seed the
-  TPS/carrier from the acquisition phase unconditionally on a cadence (the
-  old per-chunk behavior).
-- Add continuous sample-clock and channel tracking across processing chunks;
-  the current frontend is measurably less robust on captured multipath signals
-  than the reference receiver. (On Airspy R2 the 0.5 ppm TCXO drifts only
-  ~2.4 samples per chunk, so fractional timing is a SoapySDR-generic path
-  concern rather than an R2 one.)
-- Carry validated TPS frame/superframe index and cell ID across chunks, and add
-  deterministic decoder reset tags when TPS parameters change.
-- Eliminate duplicated GUI-monitor/frontend work by publishing constellation
-  and quality snapshots from the complete decoder where practical.
 - Profile a modern AVX2 Viterbi implementation; libcorrect's SSE decoder is now
   the dominant CPU hotspot after the ordered-pipeline optimizations.
+- Add long-running live reception regressions for Airspy and selected SoapySDR
+  devices; add StreamDecoder integration tests over synthetic I/Q.
 
 ## Transport stream and playback
 
@@ -307,16 +306,24 @@ Remaining:
 - Feed a selected service to libmpv and render video into the application-owned
   OpenGL framebuffer.
 - Reset playback state cleanly after source discontinuities, retunes, or
-  service changes.
-- Validate long-running libmpv playback against the selected service's PCR and
-  audio/video PTS/DTS clocks. Track PCR discontinuities, timestamp wrap and
-  monotonicity, TS queue depth, and the measured audio-versus-video presentation
-  offset so RF/sample loss, decoder stalls, and genuine A/V clock drift can be
-  distinguished. Keep the live custom stream blocking and bounded, preserve
-  broadcast timestamps instead of synthesizing a wall-clock timeline, and
-  perform a controlled libmpv stream reload when a discontinuity cannot be
-  recovered without unbounded drift. Add multi-hour live/file regressions with
-  an explicit bound on sustained A/V offset and queue growth.
+  service changes. Transport seams are now explicit: the decoder reports
+  `TransportDiscontinuity` events (`fec_region_reset` / `stream_end` /
+  `retune`) out of band — distinct from per-packet TEI marking — and
+  `MpvPlayer::on_discontinuity` applies the controlled recovery: a live
+  retune restarts the demuxer (the per-frame source-active toggle alone would
+  concatenate two unrelated streams), a stream end plays out the tail and
+  hits EOF, and FEC-region resets are left to the demuxer's error
+  concealment. The bounded TS queue keeps its drop-old fallback for a
+  stalled player.
+- Long-running libmpv playback is now observable against the selected
+  service's clocks: `MpvPlayer::telemetry()` samples `playback-time`,
+  `avsync` (the measured audio-versus-video presentation offset), libmpv's
+  dropped-frame counters, the TS queue depth, and the decoder's discontinuity
+  count, drawn in the GUI "Playback" panel — so RF/sample loss, decoder
+  stalls, and genuine A/V clock drift are distinguishable at a glance.
+  Remaining: PCR-discontinuity tracking inside the TS parser, timestamp wrap
+  handling, multi-hour live/file regressions with an explicit bound on
+  sustained A/V offset and queue growth.
 - Preserve uncorrectable RS codewords as cadence-correct TS packets with TEI
   set, expose their count, and let the demuxer discard corrupt payload instead
   of silently manufacturing continuity-counter gaps.

@@ -68,6 +68,9 @@ struct MpvPlayer::Impl {
     std::uint64_t generation{};
     bool source_active{};
     std::optional<TransportService> selected_service;
+    // Stream-level seams reported by the decoder (fec_region_reset,
+    // stream_end, retune). Monotonic; read by telemetry().
+    std::uint64_t discontinuity_count{};
 
     bool file_loaded{};
     float current_volume{100.0F};
@@ -385,6 +388,42 @@ void MpvPlayer::submit(const std::span<const std::uint8_t> transport_stream) {
     impl_->data_ready.notify_one();
 }
 
+void MpvPlayer::on_discontinuity(
+    const TransportDiscontinuity discontinuity) {
+    switch (discontinuity) {
+    case TransportDiscontinuity::fec_region_reset:
+        // A gated region was dropped and the FEC re-seeded: the demuxer sees
+        // a continuity jump and error-conceals it. The stream continues — no
+        // restart, no queue drop (the pre-seam bytes are still valid).
+        {
+            const std::scoped_lock lock(impl_->mutex);
+            ++impl_->discontinuity_count;
+        }
+        break;
+    case TransportDiscontinuity::stream_end:
+        // The input ended: the queued tail is still valid and plays out; the
+        // next read returns EOF and the demuxer ends cleanly instead of
+        // grinding through data that no longer has a source.
+        {
+            const std::scoped_lock lock(impl_->mutex);
+            ++impl_->discontinuity_count;
+        }
+        break;
+    case TransportDiscontinuity::retune:
+        // The content may have changed entirely (retune, source switch, or
+        // dropped-block recovery): restart so the demuxer re-parses the new
+        // channel's PAT/PMT instead of concatenating two unrelated streams
+        // (which the per-frame source-active toggle alone misses — a live
+        // retune keeps streaming).
+        {
+            const std::scoped_lock lock(impl_->mutex);
+            ++impl_->discontinuity_count;
+        }
+        impl_->restart_playback();
+        break;
+    }
+}
+
 void MpvPlayer::select_service(const TransportService &service) {
     {
         const std::scoped_lock lock(impl_->mutex);
@@ -460,6 +499,46 @@ void MpvPlayer::poll_events() {
 bool MpvPlayer::ready() const {
     const std::scoped_lock lock(impl_->mutex);
     return impl_->file_loaded;
+}
+
+PlaybackTelemetry MpvPlayer::telemetry() const {
+    PlaybackTelemetry result;
+    {
+        const std::scoped_lock lock(impl_->mutex);
+        result.queued_bytes = impl_->queued_bytes;
+        result.queue_capacity = playback_queue_capacity;
+        result.discontinuities = impl_->discontinuity_count;
+    }
+    if (impl_->handle == nullptr) {
+        return result;
+    }
+    double value = 0.0;
+    if (mpv_get_property(impl_->handle, "playback-time", MPV_FORMAT_DOUBLE,
+                         &value) >= 0) {
+        result.playback_time_s = value;
+    }
+    value = 0.0;
+    if (mpv_get_property(impl_->handle, "avsync", MPV_FORMAT_DOUBLE,
+                         &value) >= 0) {
+        // mpv reports the A/V difference in seconds; positive = audio ahead.
+        result.avsync_ms = value * 1e3;
+    }
+    std::int64_t count = 0;
+    if (mpv_get_property(impl_->handle, "frame-drop-count", MPV_FORMAT_INT64,
+                         &count) >= 0) {
+        result.dropped_frames = count;
+    }
+    count = 0;
+    if (mpv_get_property(impl_->handle, "vo-drop-frame-count",
+                         MPV_FORMAT_INT64, &count) >= 0) {
+        result.vo_dropped_frames = count;
+    }
+    int flag = 0;
+    if (mpv_get_property(impl_->handle, "pause", MPV_FORMAT_FLAG, &flag) >=
+        0) {
+        result.paused = flag != 0;
+    }
+    return result;
 }
 
 std::string MpvPlayer::status() const {

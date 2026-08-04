@@ -666,6 +666,11 @@ struct StreamDecoder::Impl {
     // = bandwidth * 8/7 feeds the sync + realtime stats).
     std::uint32_t current_bandwidth{};
     TransportCallback callback;
+    DiscontinuityCallback discontinuity_callback;
+    // Deferred by handle_sync_change (which runs with the mutex held) and
+    // fired by the caller once the lock is released, so a user callback is
+    // never invoked under an internal lock.
+    std::optional<TransportDiscontinuity> pending_discontinuity;
     EqualizedCallback equalized_callback;
     ReceiverParameters parameters;
     dvbt::SignalAnalyzer analyzer;
@@ -735,6 +740,29 @@ struct StreamDecoder::Impl {
         // one frequency or file must never be restored in a later stream.
         frontend.stable_carrier_offset = std::numeric_limits<int>::max();
         frontend.stable_phase = -1;
+    }
+
+    void fire_discontinuity(const TransportDiscontinuity discontinuity) {
+        DiscontinuityCallback sink;
+        {
+            const std::scoped_lock lock(mutex);
+            sink = discontinuity_callback;
+        }
+        if (sink) {
+            sink(discontinuity);
+        }
+    }
+
+    void fire_pending_discontinuity() {
+        std::optional<TransportDiscontinuity> pending;
+        {
+            const std::scoped_lock lock(mutex);
+            pending = pending_discontinuity;
+            pending_discontinuity.reset();
+        }
+        if (pending.has_value()) {
+            fire_discontinuity(*pending);
+        }
     }
 
     [[nodiscard]] bool enqueue_fec(FecItem item) {
@@ -1073,7 +1101,12 @@ struct StreamDecoder::Impl {
                 if (!sync.valid) {
                     // Reset: abandon the stream. The FEC generation has already
                     // advanced, so any stale queued items are dropped by the
-                    // worker.
+                    // worker. A reset means a retune, a source switch, or a
+                    // dropped-block recovery: the content may have changed
+                    // entirely, so playback must restart rather than
+                    // concatenate.
+                    pending_discontinuity =
+                        TransportDiscontinuity::retune;
                     if (postprocessor != nullptr) {
                         static_cast<void>(symbol_postprocessor->flush());
                     }
@@ -1483,6 +1516,7 @@ struct StreamDecoder::Impl {
                         static_cast<void>(handle_sync_change());
                     }
                 }
+                fire_pending_discontinuity();
                 if (!have_grid) {
                     // First anchor: event-driven acquisition (acquisition no
                     // longer runs on a fixed cadence; the only other events
@@ -1554,6 +1588,7 @@ struct StreamDecoder::Impl {
                             static_cast<void>(handle_sync_change());
                         }
                     }
+                    fire_pending_discontinuity();
                     if (!have_grid) {
                         break; // reset mid-stream: drain nothing, wait for a
                                // sync
@@ -2107,6 +2142,10 @@ struct StreamDecoder::Impl {
                                      .parameters = {},
                                      .mother_metrics = {},
                                      .symbol_index = 0}));
+                    // The input ended: the FEC flush emits the trellis tail
+                    // and the stream is over. Playback must not wait for more
+                    // data — it plays out the queued tail and hits EOF.
+                    fire_discontinuity(TransportDiscontinuity::stream_end);
                     // A flushed stream that is then resumed starts a fresh
                     // region so the replay's first symbols do not continue a
                     // flushed trellis.
@@ -2175,8 +2214,23 @@ struct StreamDecoder::Impl {
                 if (item.kind == FecItem::Kind::begin) {
                     if (!decoder || decoder_generation != item.generation ||
                         decoder->parameters() != item.parameters) {
+                        // A new stream/region (the reset path is signalled by
+                        // the demod directly) or a mid-stream parameter change
+                        // (a TPS mode/constellation/code-rate switch): only
+                        // the parameter change is a seam here — the FEC state
+                        // was re-seeded while the packet stream continues.
+                        if (decoder != nullptr &&
+                            decoder_generation == item.generation) {
+                            fire_discontinuity(
+                                TransportDiscontinuity::fec_region_reset);
+                        }
                         decoder = std::make_unique<Decoder>(item.parameters);
                     } else {
+                        // A gated (hopeless) region ended and the decoder was
+                        // reset for the recovered tail: the packet stream has
+                        // a gap (continuity counters jump).
+                        fire_discontinuity(
+                            TransportDiscontinuity::fec_region_reset);
                         decoder->reset();
                     }
                     decoder_generation = item.generation;
@@ -2346,6 +2400,12 @@ void StreamDecoder::set_parameters(const ReceiverParameters &parameters) {
 void StreamDecoder::set_transport_callback(TransportCallback callback) {
     const std::scoped_lock lock(impl_->mutex);
     impl_->callback = std::move(callback);
+}
+
+void StreamDecoder::set_discontinuity_callback(
+    DiscontinuityCallback callback) {
+    const std::scoped_lock lock(impl_->mutex);
+    impl_->discontinuity_callback = std::move(callback);
 }
 
 void StreamDecoder::set_equalized_callback(EqualizedCallback callback) {

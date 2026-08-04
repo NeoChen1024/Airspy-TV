@@ -8,6 +8,26 @@
 
 namespace airspy_tv {
 
+// Why the decoded transport stream may contain a seam. Ordinary per-packet
+// corruption stays invisible here — it is marked in-band by the TS
+// transport_error_indicator (TEI) bit and the demuxer discards those
+// payloads. These are stream-level events that bound clean regions and drive
+// the playback recovery policy.
+enum class TransportDiscontinuity {
+    // A gated/hopeless region was dropped and the FEC trellis + outer state
+    // were re-seeded: the packet stream has a gap (continuity counters
+    // jump). The demuxer error-conceals the seam; playback continues.
+    fec_region_reset,
+    // The input ended (EOF / source drop). The queued tail is still valid
+    // and plays out; the next read returns EOF and playback stops cleanly.
+    stream_end,
+    // The receiver was reset (retune, source switch, or dropped-block
+    // recovery): the content may have changed entirely. Playback must
+    // restart so the demuxer re-parses the new channel's tables instead of
+    // concatenating two unrelated streams.
+    retune,
+};
+
 struct TransportStreamComponent {
     std::uint16_t pid{};
     std::uint8_t stream_type{};

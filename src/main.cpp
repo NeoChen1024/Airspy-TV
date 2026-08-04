@@ -56,6 +56,7 @@ using airspy_tv::SdrBackend;
 using airspy_tv::SdrDevice;
 using airspy_tv::SourceSettings;
 using airspy_tv::SpectrumSnapshot;
+using airspy_tv::TransportDiscontinuity;
 using airspy_tv::TransportService;
 using airspy_tv::dvbt::CodeRate;
 using airspy_tv::dvbt::Constellation;
@@ -1478,6 +1479,8 @@ void draw_ts_recorder_panel(AppState &state) {
     ImGui::PopID();
 }
 
+void draw_playback_panel(AppState &state);
+
 void draw_sidebar(AppState &state) {
     draw_source_panel(state);
 
@@ -1929,9 +1932,87 @@ void draw_sidebar(AppState &state) {
         ImGui::PopID();
     }
 
+    draw_playback_panel(state);
     draw_epg_panel(state);
     draw_ts_recorder_panel(state);
     draw_recorder_panel(state);
+}
+
+void draw_playback_panel(AppState &state) {
+    if (!ImGui::CollapsingHeader("Playback",
+                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+    const auto telemetry = state.player.telemetry();
+    const bool playing = state.player.ready() && !telemetry.paused;
+    draw_status_indicator(
+        playing ? "PLAYING"
+                : (state.player.ready() ? "PAUSED" : "PLAYER IDLE"),
+        playing ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
+                : (state.player.ready() ? ImVec4(0.95F, 0.72F, 0.30F, 1.0F)
+                                        : ImVec4(0.55F, 0.62F, 0.70F, 1.0F)));
+    std::string position = "--:--:--";
+    if (telemetry.playback_time_s > 0.0) {
+        const auto total =
+            static_cast<std::int64_t>(telemetry.playback_time_s);
+        position = std::format("{:02}:{:02}:{:02}", total / 3600,
+                               (total % 3600) / 60, total % 60);
+    }
+    ImGui::TextUnformatted("Position");
+    ImGui::SameLine(115.0F);
+    ImGui::TextColored(ImVec4(0.52F, 0.82F, 1.0F, 1.0F), "%s",
+                       position.c_str());
+    const std::string av_sync = std::format("{:+.1f} ms", telemetry.avsync_ms);
+    draw_metric(
+        "A/V sync", av_sync.c_str(),
+        std::clamp(1.0F - static_cast<float>(std::abs(telemetry.avsync_ms)) /
+                               50.0F,
+                   0.0F, 1.0F),
+        std::abs(telemetry.avsync_ms) < 20.0
+            ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
+            : (std::abs(telemetry.avsync_ms) < 80.0
+                   ? ImVec4(0.95F, 0.72F, 0.30F, 1.0F)
+                   : ImVec4(0.95F, 0.38F, 0.28F, 1.0F)));
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip(
+            "Audio-vs-video presentation offset reported by libmpv. Positive "
+            "means audio is ahead of video. Sustained drift here is an A/V "
+            "clock problem; RF loss instead shows up as discontinuity growth "
+            "and a queued-buffer dip.");
+    }
+    const std::string buffer = std::format(
+        "{:.1f} / {:.1f} MiB",
+        static_cast<double>(telemetry.queued_bytes) /
+            static_cast<double>(1U << 20U),
+        static_cast<double>(telemetry.queue_capacity) /
+            static_cast<double>(1U << 20U));
+    draw_metric(
+        "TS buffer", buffer.c_str(),
+        telemetry.queue_capacity == 0
+            ? 0.0F
+            : static_cast<float>(
+                  static_cast<double>(telemetry.queued_bytes) /
+                  static_cast<double>(telemetry.queue_capacity)),
+        ImVec4(0.52F, 0.82F, 1.0F, 1.0F));
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip(
+            "Decoded TS bytes queued for libmpv vs the queue capacity; growth "
+            "here means playback is not keeping up (stalled audio device or a "
+            "paused player).");
+    }
+    ImGui::Text("Dropped frames  %lld   (VO %lld)",
+                static_cast<long long>(telemetry.dropped_frames),
+                static_cast<long long>(telemetry.vo_dropped_frames));
+    ImGui::Text("Discontinuities  %llu",
+                static_cast<unsigned long long>(telemetry.discontinuities));
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip(
+            "Stream-level seams: FEC-region resets (fade gaps), stream ends, "
+            "and retunes. These are out-of-band events reported by the "
+            "decoder, distinct from per-packet TEI corruption; retunes "
+            "restart the demuxer.");
+    }
+    ImGui::Separator();
 }
 
 void draw_video_panel(AppState &state) {
@@ -2648,6 +2729,10 @@ int main(const int argc, char **argv) {
         [&state](const std::span<const std::uint8_t> ts) {
             state.epg.consume(ts);
             state.player.submit(ts);
+        });
+    state.dvbt_demod->set_discontinuity_callback(
+        [&state](const TransportDiscontinuity discontinuity) {
+            state.player.on_discontinuity(discontinuity);
         });
     refresh_devices(state);
     bool running = true;

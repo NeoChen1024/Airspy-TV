@@ -29,9 +29,9 @@ I/Q file       ─┘        │ copies CS16 blocks, no DSP
         ┌─────────────────────────────────────────────────────────┐
         │ front-end thread (StreamDecoder::Impl::frontend_thread) │
         │   Stage 1  StreamingResampler (one persistent filter)   │
-        │   Stage 2  acquisition monitor (start + every ~2 s)     │
-        │            └─ publishes SyncState to the demod thread   │
-        │   ring buffer of resampled samples (1 Mi complex,       │
+        │   Stage 2  event-driven acquisition (first anchor only, │
+        │            then long-fade / mode-change re-anchors)     │
+        │   ring buffer of resampled samples (rate-sized ~0.2 s,  │
         │   absolute uint64 stream positions)                     │
         └─────────────────────────────────────────────────────────┘
                          ▼ ring
@@ -62,9 +62,13 @@ I/Q file       ─┘        │ copies CS16 blocks, no DSP
 
 The pipeline is **continuous**: the resampled symbol stream has no seams, so
 the CFO loop, integer carrier offset, continual reference, and TPS superframe
-decoder all carry for the life of a stream. There is no per-chunk re-acquisition
-(the monitor only re-anchors on boundary moves, mode/guard changes, resets, or
-long fades) and no TS overlap dedup.
+decoder all carry for the life of a stream. There is no per-chunk
+re-acquisition: acquisition is **event-driven** — it runs once for the first
+anchor, then only on a long fade or a TPS mode change (a rolling monitor was
+removed once tracking became self-sufficient). There is no TS overlap dedup.
+Transport seams still occur when a hopeless region is gated out, at the end of
+an input stream, and on receiver resets; those are reported out-of-band as
+`TransportDiscontinuity` events (§5.8).
 
 ## 2. Thread and pool inventory
 
@@ -152,23 +156,27 @@ incremented; the pipeline re-acquires cleanly instead of decoding garbage.
   7 M-sample chunk). Resampling is memory-bandwidth-bound, so the single
   serial filter is both simpler and correct.
 
-### 5.3 Stage 2 — acquisition monitor (`acquire_ofdm`)
+### 5.3 Stage 2 — event-driven acquisition (`acquire_ofdm`)
 
-- Runs once on the head of the first resampled block, then every ~2 s on the
-  last `acquisition_samples = 350,000` resampled samples (a rolling window).
+- Runs only on demand: the demod invokes it for the **first anchor**, then on
+  a **long fade** (1400 frozen symbols ≈ 2.1 s — the CP gate stays below 0.25
+  the whole time) and on a **TPS mode change** (`receiver_reset`). There is no
+  fixed cadence and no rolling window; the demod is self-sufficient between
+  events.
 - Searches cyclic-prefix periodicity across all allowed (or user-selected)
-  `TransmissionMode` × `GuardInterval` combinations, returning the best
-  `{start, fft_size, guard_size, phase, score}`.
+  `TransmissionMode` × `GuardInterval` combinations on the read side of the
+  ring (a deterministic window bounded by `acquisition_samples = 350,000`),
+  returning the best `{start, fft_size, guard_size, phase, score}`.
 - `score < 0.20` → keep the current sync (the demod keeps tracking).
-- The result is published to the demod thread as a `SyncState` with a version
-  counter. The version bumps only on mode/guard changes or a boundary move
-  beyond a symbol's alignment tolerance, so ordinary estimator drift is a
-  silent refresh and never disturbs continuous tracking. A validated
-  mode/guard is cached (`stable_mode`/`stable_guard`) and reused across
-  transient misses.
-- Long fades: when the demod has been frozen for ~470 symbols (~0.7 s, the old
-  chunk cadence) it requests an immediate forced acquisition; the publish
-  forces a cold re-anchor (§5.4.5).
+- A successful acquisition is published to the demod thread as a `SyncState`
+  with a version counter; the demod re-anchors at a **symbol-loop boundary**
+  (the in-flight symbol is discarded) so no symbol is built from mixed grids.
+- A validated mode/guard is cached (`stable_mode`/`stable_guard`); a retune
+  clears it so the new frequency re-searches from scratch.
+- The fade recovery restores the **pre-fade carrier grid** (the LO never
+  moves during a fade, so the restored offset/phase are deterministic) and
+  re-locks only the pilot **phase** every 68 frozen symbols — an ambiguous
+  wide pilot lock is never accepted while fading (§5.4.5).
 
 ### 5.4 Stage 3 — continuous per-symbol tracking loop (demod thread, serial)
 
@@ -194,19 +202,27 @@ grid. Per symbol:
 4. **Pilot lock**: correlate scattered pilots (PRBS-modulated, ±4/3) to find
    the 4-phase scattered-pilot phase and integer carrier offset (first lock
    ±48 bins, afterwards ±2). While frozen, the carried phase/offset are used
-   verbatim; every 68 frozen symbols a wide re-lock runs and is accepted only
-   if the phase-coherent scattered-pilot correlation verifies (≥ 0.40),
-   otherwise the carried values are kept.
+   verbatim; every 68 frozen symbols a phase-only re-lock runs and is accepted
+   only if the phase-coherent scattered-pilot correlation verifies (≥ 0.40),
+   otherwise the carried values are kept. (A verified *wide* re-lock is never
+   accepted during a fade: the offset alias `offset+3n ≡ phase+n` lets a
+   wide scatter-pilot correlation latch a wrong-but-phase-consistent grid,
+   which permanently scrambled the channel estimate until it was restricted
+   to the phase dimension.)
 5. **Channel estimation**: divide received pilots by the known PRBS value, then
    linearly interpolate between pilots per phase (pilot indices are cached per
    mode once per stream). Per-carrier `equalizer_power = |ĥ|²` is kept. A
-   fractional timing estimate (pilot phase slope) is measured per symbol as a
-   sample-clock diagnostic (not yet corrected — see ROADMAP).
+   fractional timing estimate (pilot phase slope) is measured per symbol; the
+   slow drift between statistics windows feeds the closed-loop sample-clock
+   correction (§5.4.6).
 6. **TPS**: decode the TPS carriers. The TPS decoder is **carried** (never
    reset except on cold starts), because the contiguous symbol sequence keeps
    its differential frame sync intact — the key weak-signal win over the
    per-chunk re-lock. If no manual constellation/code rate was set, a locked,
-   non-hierarchical TPS frame auto-selects the decoder parameters.
+   non-hierarchical TPS frame auto-selects the decoder parameters. TPS
+   parameters are **fixed once a frame decodes successfully** (until a
+   receiver reset), and lock health is split into `ever_locked` (drives the
+   decoder) and `currently_valid` (drives the display).
 7. **Payload extraction**: the 1512 (2K) or 6048 (8K) payload carriers are
    equalized (`× ĥ⁻¹`) and submitted to the symbol pool together with their
    reliability inputs. Before TPS lock, up to 136 symbols are buffered
@@ -216,15 +232,31 @@ grid. Per symbol:
 
 #### 5.4.5 Cold re-anchor (fade recovery)
 
-When the demod has been frozen for ~470 symbols it requests a forced
-acquisition. The front-end publishes the fresh sync (version bumped) and the
-demod cold-reanchors: the CFO is re-seeded from the acquisition's CP phase, the
-pre-fade carrier grid is restored (the LO never moves during a fade, so the
-restored offset/phase are deterministic — the ambiguous wide pilot lock is not
-trusted), the TPS superframe is reset for a clean re-lock, and the phase is
-advanced by the full fade length mod 4 (the scattered-pilot phase rotates once
-per symbol). This makes recovery deterministic: full-capture runs decode
-byte-identical TS.
+When the demod has been frozen (CP gate < 0.25) for 1400 symbols (~2.1 s) it
+re-runs the event-driven acquisition. On success the demod re-anchors at a
+symbol-loop boundary: the pre-fade carrier grid is restored (the LO never
+moves during a fade, so the restored offset/phase are deterministic — an
+ambiguous wide pilot lock is never trusted while fading), the CFO is
+re-seeded from the acquisition's CP phase, and the TPS superframe is reset for
+a clean re-lock. The phase is advanced by the full fade length mod 4 (the
+scattered-pilot phase rotates once per symbol). This makes recovery
+deterministic: full-capture runs decode byte-identical TS. A fade shorter
+than 1400 symbols is bridged by the carried state alone — the CFO loop, pilot
+phase, and carrier lock freeze on their last healthy values — so the first
+healthy lock after the fade needs no re-anchor at all.
+
+#### 5.4.6 Closed-loop sample-clock correction
+
+The pilot phase-slope estimate (`timing_offset_samples`) measures the symbol
+period error, but its windowed *mean* is dominated by the channel's mean
+group delay (multipath — a near-constant bias), so a P-loop on the absolute
+value would chase the channel. Instead only the slow **drift** between
+consecutive statistics windows is tracked (EMA, τ ≈ 50 windows) and
+accumulated into a fractional timing value that nudges the symbol period by
+±1 sample at each symbol advance when it crosses ±0.5. It is bounded to ±4
+samples and reset on grid rebuild, re-anchor, and receiver reset. On the 581
+MHz capture this keeps the FFT window centred against the 0.5 ppm TCXO drift,
+recovering the tail the drift was eroding.
 
 ### 5.5 Stage 4 — symbol postprocessing (`SymbolPostprocessorPool`)
 
@@ -300,6 +332,31 @@ stream end), and `stats` (publish transport counters for a stats window).
 after a flushed stream is resumed, so the stateful `Decoder` lives across
 whole regions instead of being torn down every 0.7 s.
 
+### 5.8 Transport discontinuity semantics
+
+Per-packet corruption is marked **in-band** by the TS `transport_error_indicator`
+(TEI) bit in the payload header (set by the energy descrambler's
+`process_corrupt` path) and invisible to the sink. Stream-level seams are
+reported **out-of-band** as `TransportDiscontinuity` events
+(`fec_region_reset` / `stream_end` / `retune`):
+
+- `fec_region_reset` — fired by the FEC thread when a `begin` resets an
+  existing decoder (a gated region's recovery tail, or a mid-stream decoder
+  parameter change). The packet stream has a gap; continuity counters jump.
+- `stream_end` — fired by the demod thread at the end-of-stream drain (EOF /
+  source drop). The queued tail is still valid and plays out.
+- `retune` — fired when the demod abandons an invalidated sync (receiver
+  reset: retune, source switch, or dropped-block recovery). The content may
+  have changed entirely.
+
+The GUI routes these to `MpvPlayer::on_discontinuity`: retunes restart the
+libmpv demuxer (`loadfile replace` — a live retune keeps streaming, so the
+per-frame source-active toggle alone would concatenate two unrelated
+streams); stream ends play out the tail and hit EOF; FEC-region resets are
+left to the demuxer's error concealment. The callback is never invoked under
+a decoder lock, and the queue keeps its bounded drop-old fallback for a
+stalled player.
+
 ## 6. Queues and backpressure
 
 All queues are **bounded by stream duration, not item count** (≈ 200 ms per
@@ -309,13 +366,14 @@ dropped blocks instead of unbounded growth:
 | Queue               | Capacity                                                                         | Producer → consumer               |
 | ------------------- | -------------------------------------------------------------------------------- | --------------------------------- |
 | Input blocks        | `sample_rate / 5` complex samples                                                | source thread → front-end thread  |
-| Resampled ring      | 1 Mi complex samples (~150 ms at 8K/guard-1/4) — the front-end pushes            | front-end → demod thread          |
-|                     | incrementally and paces itself against the demod's consumption                   |                                   |
+| Resampled ring      | rate-sized to ~0.2 s of input (≥ 1 Mi floor), resized only while          | front-end → demod thread          |
+|                     | empty; the front-end pushes incrementally and paces itself against the    |                                   |
+|                     | demod's consumption                                                       |                                   |
 | FEC items (symbols) | `buffered_symbol_count(bw, symbol_duration)` ≈ 1/5 s of symbols (initial 256)    | demod → FEC thread                |
 | Viterbi windows     | `max(2×workers, 1024)` windows                                                   | FEC thread → pool                 |
 | Raw I/Q recorder    | 5 s of samples                                                                   | source thread → writer thread     |
 | TS recorder         | 24 MiB                                                                           | FEC thread → writer thread        |
-| mpv playback        | 24 MiB                                                                           | FEC thread → mpv queue            |
+| mpv playback        | 24 MiB; drop-old fallback on overflow, controlled restart on `retune`            | FEC thread → mpv queue            |
 
 The ring holds absolute stream positions (`uint64`); the demod only frees what
 it has consumed (`ring_read_pos`), so the front-end can run ahead without ever
@@ -363,9 +421,11 @@ Quality counters: `mer_db`, pre/post-Viterbi BER (from survivor re-encoding and
 RS corrections), `rs_uncorrectable_packets`, `tei_packets`, `ts_packets`,
 `dropped_blocks`, `pilot_phase_discontinuities`,
 `tracked_carrier_offset_hz` (CFO loop estimate), `acquisition_start` (boundary
-phase within a symbol), `timing_offset_samples` (pilot-slope fractional timing
-diagnostic), plus live queue depths (`queued_input_samples`, `queued_symbols`,
-and their capacities).
+phase within a symbol), `timing_offset_samples` (the closed-loop drift
+measurement), plus live queue depths (`queued_input_samples`, `queued_symbols`,
+and their capacities). Playback telemetry (libmpv `playback-time` / `avsync` /
+dropped-frame counts, the TS queue depth, and the discontinuity counter) is
+exposed by `MpvPlayer::telemetry()` and drawn in the GUI "Playback" panel.
 
 ## 10. Live vs. offline usage
 
@@ -391,7 +451,8 @@ and their capacities).
 | Viterbi pool, outer deinterleave, RS, descrambler | `src/dvbt/transport_decoder.cpp`, `include/airspy_tv/dvbt/transport_decoder.hpp`     |
 | GUI one-symbol monitor                            | `src/dvbt/signal_analyzer.cpp`, `include/airspy_tv/dvbt/signal_analyzer.hpp`         |
 | Source fan-out, sinks, recorders                  | `src/sdr.cpp`, `include/airspy_tv/sdr.hpp`, `src/recorder.cpp`                       |
-| Playback queue                                    | `src/mpv_player.cpp`, `include/airspy_tv/mpv_player.hpp`                             |
+| Playback queue, telemetry, discontinuity policy | `src/mpv_player.cpp`, `include/airspy_tv/mpv_player.hpp`           |
+| Transport discontinuity semantics               | `include/airspy_tv/transport_stream.hpp` (`TransportDiscontinuity`) |
 
 Historical design notes, measured before/after numbers, and future work (e.g.
 shrinking fade-recovery latency, sample-clock tracking) live in `ROADMAP.md`.

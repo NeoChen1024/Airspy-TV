@@ -83,14 +83,16 @@ class StreamDecoder : public Demodulator {
     static constexpr std::uint32_t input_budget_denominator = 5;
     static std::size_t
     chunk_samples_for(const std::uint32_t sample_rate_hz) noexcept {
-        return std::max<std::size_t>(
-            1, (static_cast<std::size_t>(sample_rate_hz) +
-                input_budget_denominator - 1) /
-                   input_budget_denominator);
+        return std::max<std::size_t>(1,
+                                     (static_cast<std::size_t>(sample_rate_hz) +
+                                      input_budget_denominator - 1) /
+                                         input_budget_denominator);
     }
 
     using TransportCallback =
         std::function<void(std::span<const std::uint8_t>)>;
+    using DiscontinuityCallback =
+        std::function<void(TransportDiscontinuity)>;
     using EqualizedCallback =
         std::function<void(std::span<const std::complex<float>>,
                            std::span<const float>, std::size_t)>;
@@ -118,6 +120,10 @@ class StreamDecoder : public Demodulator {
     void wait_until_idle() override;
     void set_parameters(const ReceiverParameters &parameters);
     void set_transport_callback(TransportCallback callback) override;
+    // Out-of-band stream-level events (see TransportDiscontinuity). Fired
+    // from the demod / FEC threads as they happen; the callback must not
+    // block on the decoder or call back into it.
+    void set_discontinuity_callback(DiscontinuityCallback callback) override;
     void set_equalized_callback(EqualizedCallback callback);
     [[nodiscard]] DemodulatorStats demodulator_stats() const override;
     // DVB-T-specific GUI analysis (constellation, MER, CP SNR, TPS state),
