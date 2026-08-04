@@ -840,16 +840,33 @@ struct StreamDecoder::Impl {
                 resampler.process(convert_buffer, resample_buffer);
                 // Push to the ring incrementally: the ring (1 Mi samples) is
                 // smaller than a block (~4.8 Mi), so each iteration pushes
-                // only what fits and waits for the demod to free space.
+                // only what fits and waits for the demod to free space. A
+                // flush or reset arriving mid-push abandons the push instead
+                // of blocking forever behind a demod that is not consuming
+                // (e.g. a stream whose acquisition can never succeed): the
+                // flush then closes the ring and the demod drains what is
+                // there.
                 std::size_t pushed = 0;
                 while (pushed < resample_buffer.size()) {
                     std::unique_lock lock(mutex);
                     ring_space.wait(lock, [this] {
-                        return stopping ||
+                        return stopping || reset_requested || flush_requested ||
                                ring_write_pos - ring_read_pos < ring.size();
                     });
                     if (stopping) {
                         return;
+                    }
+                    // Abandon the push only when the demod is genuinely not
+                    // consuming (the ring is full AND it is not busy — the
+                    // acquisition-retry stall): then the flush/reset would
+                    // otherwise wait forever behind the push. If the demod is
+                    // keeping up (it frees ring space as it decodes), finish
+                    // the push so no submitted data is dropped at the end of
+                    // a stream.
+                    if (reset_requested ||
+                        (flush_requested && !demod_busy &&
+                         ring_write_pos - ring_read_pos >= ring.size())) {
+                        break;
                     }
                     const std::size_t used = ring_write_pos - ring_read_pos;
                     const std::size_t chunk = std::min(
@@ -1370,9 +1387,37 @@ struct StreamDecoder::Impl {
                     // First anchor: event-driven acquisition (acquisition no
                     // longer runs on a fixed cadence; the only other events
                     // are the long-fade re-anchor and a TPS mode change).
-                    run_event_acquisition();
+                    const float score = run_event_acquisition();
                     if (!have_grid && ring_closed) {
-                        return; // end of stream without a signal
+                        // The stream ended without a signal. Stay alive for
+                        // the next stream: a reset bumps the sync version and
+                        // a reopened ring refills the data.
+                        std::unique_lock lock(mutex);
+                        ring_data.wait(lock, [this, &seen_sync_version] {
+                            return stopping ||
+                                   sync.version != seen_sync_version ||
+                                   (!ring_closed &&
+                                    ring_write_pos > ring_read_pos);
+                        });
+                        if (stopping) {
+                            return;
+                        }
+                    } else if (score == 0.0F) {
+                        // No signal yet (or the acquisition can never succeed
+                        // for this stream): back off so the retry cannot
+                        // busy-loop and stall the ring in front of the
+                        // front-end. The flush/reset notifications still wake
+                        // this wait.
+                        std::unique_lock lock(mutex);
+                        ring_data.wait_for(
+                            lock, std::chrono::milliseconds(100),
+                            [this, &seen_sync_version] {
+                                return stopping ||
+                                       sync.version != seen_sync_version;
+                            });
+                        if (stopping) {
+                            return;
+                        }
                     }
                     continue;
                 }
