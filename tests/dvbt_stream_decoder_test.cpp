@@ -21,6 +21,7 @@ extern "C" {
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -403,6 +404,10 @@ void submit_in_blocks(StreamDecoder &decoder,
         const std::size_t requested = block_sizes[block % block_sizes.size()];
         const std::size_t complex_count =
             std::min(requested, (iq.size() - offset) / 2);
+        if (complex_count == 0) {
+            break; // only a stray scalar remains; do not spin on an empty
+                   // submit
+        }
         decoder.submit_blocking(iq.subspan(offset, complex_count * 2),
                                 sample_rate, channel_bandwidth);
         offset += complex_count * 2;
@@ -554,12 +559,109 @@ void test_8k_non_acquirable_stream_drains() {
             "non-acquirable 8K stream did not drain its queues");
 }
 
+void test_8k_reset_live_resume() {
+    // GUI live-session shape: a running stream is torn down with reset()
+    // and the *next* session starts submitting immediately — no flush and
+    // no wait_until_idle between stop and re-open. The reset must still
+    // produce a clean second run from the same signal.
+    const auto encoded = encode_transport();
+    const auto iq = make_iq(encoded.metrics);
+    constexpr std::array<std::size_t, 5> block_sizes{4097, 8191, 12345, 777,
+                                                     16384};
+
+    std::vector<std::uint8_t> output;
+    std::mutex callback_mutex;
+    StreamDecoder decoder;
+    decoder.set_parameters({.channel_bandwidth_hz = channel_bandwidth,
+                            .mode = TransmissionMode::k8,
+                            .guard_interval = GuardInterval::gi_1_4,
+                            .constellation = Constellation::qpsk,
+                            .code_rate = CodeRate::rate_1_2,
+                            .worker_threads = 4});
+    decoder.set_transport_callback(
+        [&output, &callback_mutex](const std::span<const std::uint8_t> bytes) {
+            const std::scoped_lock lock(callback_mutex);
+            output.insert(output.end(), bytes.begin(), bytes.end());
+        });
+
+    // First session: feed the first half, then tear down mid-stream (the
+    // GUI "close device" path) without draining.
+    const std::size_t half_samples = iq.size() / 2;
+    submit_in_blocks(decoder,
+                     std::span<const std::int16_t>{iq}.first(half_samples),
+                     block_sizes);
+    decoder.reset();
+
+    // Second session: immediately re-submit the full signal, exactly as a
+    // re-opened SDR source would, then end the stream.
+    submit_in_blocks(decoder, iq, block_sizes);
+    decoder.flush();
+    decoder.wait_until_idle();
+
+    require(has_known_run(output, encoded.transport),
+            "8K live reset did not produce a clean TS run after re-open");
+}
+
+void test_8k_reset_while_demod_waiting() {
+    // Rapid retune shape: the source stalls briefly (hardware frequency
+    // change), the demod consumes the ring down to nothing and parks in the
+    // inner ring_data.wait for the next symbol, and the reset lands while it
+    // is parked there. The wait must wake on the sync-version bump even
+    // though the rewound ring can never satisfy the stale read position;
+    // otherwise the demod blocks forever, the ring backs up, and live
+    // submit() starts dropping blocks (rising dropped_blocks, idle threads).
+    const auto encoded = encode_transport();
+    const auto iq = make_iq(encoded.metrics);
+    constexpr std::array<std::size_t, 3> block_sizes{12345, 8191, 16384};
+
+    std::vector<std::uint8_t> output;
+    std::mutex callback_mutex;
+    StreamDecoder decoder;
+    decoder.set_parameters({.channel_bandwidth_hz = channel_bandwidth,
+                            .mode = TransmissionMode::k8,
+                            .guard_interval = GuardInterval::gi_1_4,
+                            .constellation = Constellation::qpsk,
+                            .code_rate = CodeRate::rate_1_2,
+                            .worker_threads = 4});
+    decoder.set_transport_callback(
+        [&output, &callback_mutex](const std::span<const std::uint8_t> bytes) {
+            const std::scoped_lock lock(callback_mutex);
+            output.insert(output.end(), bytes.begin(), bytes.end());
+        });
+
+    // First session: 40 symbols — enough to trigger acquisition (the demod
+    // waits for acquisition_samples before its first anchor) but not to
+    // finish a TPS frame, so after the demod drains the ring it parks in the
+    // inner ring_data.wait for the next symbol (live source stall / rapid
+    // retune shape; no flush, no wait_until_idle).
+    const std::size_t first_scalars =
+        static_cast<std::size_t>(40) * symbol_size * 2;
+    submit_in_blocks(decoder,
+                     std::span<const std::int16_t>{iq}.first(first_scalars),
+                     block_sizes);
+    // Let the front-end consume the blocks and the demod drain the ring down
+    // to nothing, so it parks in the inner ring_data.wait for the next
+    // symbol (live source stall / rapid retune shape; no flush, no
+    // wait_until_idle).
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    decoder.reset();
+
+    // Second session: the full signal, as a re-opened source would send it.
+    submit_in_blocks(decoder, iq, block_sizes);
+    decoder.flush();
+    decoder.wait_until_idle();
+    require(has_known_run(output, encoded.transport),
+            "8K mid-wait reset did not produce a clean TS run after resume");
+}
+
 } // namespace
 
 int main() {
     try {
         test_8k_clean_signal();
         test_8k_reset_then_new_stream();
+        test_8k_reset_live_resume();
+        test_8k_reset_while_demod_waiting();
         test_8k_non_acquirable_stream_drains();
     } catch (const std::exception &error) {
         std::cerr << "DVB-T StreamDecoder integration test failed: "

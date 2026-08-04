@@ -1722,13 +1722,23 @@ struct StreamDecoder::Impl {
                         static_cast<std::uint64_t>(fft_size);
                     {
                         std::unique_lock lock(mutex);
-                        ring_data.wait(lock, [this, needed] {
+                        ring_data.wait(lock, [this, needed, &seen_sync_version] {
                             return stopping ||
+                                   sync.version != seen_sync_version ||
                                    (ring_closed && ring_write_pos < needed) ||
                                    ring_write_pos >= needed;
                         });
                         if (stopping) {
                             return;
+                        }
+                        if (sync.version != seen_sync_version) {
+                            // A reset or retune landed while this thread was
+                            // parked on a stale stream position: the reset
+                            // path rewinds the ring to zero, so the old
+                            // `needed` may never be reachable again. Re-run
+                            // the loop head, which sees the new sync version
+                            // and drops the grid (handle_sync_change).
+                            break;
                         }
                         if (ring_closed && ring_write_pos < needed) {
                             break; // end of stream
@@ -2677,6 +2687,16 @@ void StreamDecoder::reset() {
     impl_->input_ready.notify_one();
     impl_->ring_space.notify_all();
     impl_->ring_data.notify_all();
+    // Wait for the front-end to consume the reset. reset() is called when a
+    // source is closed or re-opened, and the caller may start submitting the
+    // next stream immediately after it returns: an asynchronous clear would
+    // race with those fresh submits and sweep the new data away (the
+    // queue.clear() in the reset path cannot tell pre-reset from post-reset
+    // blocks). Blocking here also lets live sources drop nothing: by the time
+    // the caller re-opens, the pipeline is already drained and parked.
+    std::unique_lock lock(impl_->mutex);
+    impl_->idle.wait(lock,
+                     [this] { return impl_->stopping || !impl_->reset_requested; });
 }
 
 void StreamDecoder::set_parameters(const ReceiverParameters &parameters) {
