@@ -42,6 +42,9 @@ struct StreamDecoderStats {
     std::uint64_t pilot_phase_discontinuities{};
     bool state_carried{};
     bool fec_skipped{};
+    float tracked_carrier_offset_hz{};
+    std::size_t acquisition_start{};
+    float timing_offset_samples{};
     std::uint64_t input_blocks{};
     std::uint64_t processed_chunks{};
     std::uint64_t processed_input_samples{};
@@ -60,8 +63,12 @@ struct StreamDecoderStats {
     TransportDecoderStats transport{};
 };
 
-// Asynchronous CS16-to-TS receiver. submit() only copies into a bounded queue;
-// the front-end uses partitioned resampling and ordered symbol workers, while a
+// Asynchronous CS16-to-TS receiver on a continuous three-stage pipeline:
+// a front-end thread runs the streaming resampler (one persistent liquid
+// filter state, no per-chunk warmup) and an event-driven acquisition monitor;
+// a demod thread extracts a fully contiguous symbol stream (carried CFO,
+// carrier, continual-reference, and TPS superframe state — re-seeded only on
+// cold starts) through ordered symbol workers and a windowed MER gate; a
 // stateful transport worker feeds the Viterbi pool, RS decoder, and TS output.
 // The demodulator owns its GUI analysis path (SignalAnalyzer), which is fed
 // from the same input on submit().

@@ -220,74 +220,67 @@ Next decoder step:
 
 Completed (validated 2026-08 on 557M/581mhz field captures):
 
-- Continuous front-end tracking across processing chunks: the CFO loop
-  (tracked_cfo_phase/residual_phase_ema), integer carrier offset, and
-  continual-carrier reference now carry across chunks; the per-chunk CP
-  acquisition is a monitor that re-anchors the window and verifies mode/guard.
-  Carrier-frequency tracking resumes warm instead of re-converging from the
-  noisy acquisition phase estimate every 0.7 s.
-- The CFO loop only updates from a contiguous symbol pair; the first symbol of
-  a chunk is ~65 symbols earlier than the previous chunk's last symbol (the
-  100 ms overlap), and feeding that rewind to the temporal-correlation loop
-  overshot the frequency by ~13x at every chunk head. A start-contiguity
-  guard (start == previous_symbol_start + period) skips the update instead.
-- TPS superframe state is deliberately NOT carried: the differential TPS
-  decoder is also sequence-sensitive, and the overlap rewind corrupts its
-  frame sync and symbol index for the whole chunk (locked stays true while
-  the index drifts). Each chunk re-locks TPS (~68 symbols) and the
-  pending-symbol buffer absorbs the gap losslessly.
-- MER gate: equalized symbols are buffered until the chunk's own symbol
-  quality is known, then enqueued to the FEC (or discarded). The gate skips
-  the Viterbi only when even the chunk's best-10% symbols fall below the
-  constellation floor (QPSK 5 / 16-QAM 10 / 64-QAM 14 dB + 4 dB margin), so
-  faded-head/recovered-tail chunks still decode while hopeless chunks are
-  spared the Viterbi grind. Front-end tracking continues regardless.
+- Continuous three-stage pipeline (this restructure): a front-end thread runs
+  one persistent streaming rational resampler (liquid rresamp, single filter
+  state across the whole capture — resampling is memory-bandwidth-bound, so
+  the old 16-way partition is gone) and an event-driven acquisition monitor;
+  a demod thread extracts a fully contiguous symbol stream through a 1 Mi-
+  sample ring (absolute uint64 stream positions); a stateful transport worker
+  feeds the Viterbi pool and emits continuous TS with no per-chunk begin/end
+  seams and no overlap dedup.
+- The carried states (CFO loop, integer carrier offset, continual reference,
+  AND the TPS superframe decoder) now carry for the life of a stream: the
+  symbol sequence is contiguous (no overlap rewind), so the differential TPS
+  decoder locks once instead of re-locking every chunk — the key weak-signal
+  win of this design.
+- Fade handling (the old pipeline was immune because a failed chunk
+  acquisition froze all tracking; the continuous demod must do it itself):
+  the normalized continual-carrier temporal correlation is a fade indicator;
+  below 0.25 the CFO loop, pilot phase, and carrier lock freeze on their
+  carried values (a noise-latched offset cannot escape the +/-2-bin lock and
+  permanently scrambled the channel estimate in early builds). After ~470
+  frozen symbols (~0.7 s, the old chunk cadence) the demod requests an
+  immediate fresh acquisition; its publish forces a cold re-anchor that
+  restores the pre-fade carrier grid (the LO never moves), re-seeds the CFO
+  from the CP phase, and re-locks TPS. Recovery is now deterministic: 4/4
+  full-capture runs decode byte-identical TS.
+- Windowed MER gate: 68-symbol windows (one TPS frame) whose mean MER falls
+  below the constellation floor are dropped and bracket end/begin FEC resets;
+  hopeless regions never grind the Viterbi, and faded-head/recovered-tail
+  regions still decode.
 
 Measured before/after (121 s 581 MHz + 135 s 557 MHz captures, 64-QAM):
 
-- 581 MHz (multipath valley 10.3-33.7 s): TS 183,999,360 bytes before and
-  after (identical), RS failures 4/4, join-failures 41/41, valley gap ~23 s
-  unchanged (signal physically undecodable there), carried state 155/157
-  chunks; wall time 171.5 s -> 25.1 s (6.8x) with the MER gate.
+- 581 MHz (multipath valley 10.3-33.7 s): the old chunked pipeline decoded
+  183,999,360 bytes; the continuous pipeline decodes 171.9 MB deterministically
+  (93.5%) — the head and valley pockets match, and the mid/tail recovery
+  regions carry the remaining gap (fade-recovery latency: the re-acquisition
+  cycle re-locks TPS ~68 symbols per recovery, and the multipath-weighted
+  recording occasionally corrupts TPS frame sync for a few windows). Valley
+  gap ~23 s unchanged (signal physically undecodable). Wall time ~36 s at 8
+  threads (3.4x realtime).
 - 557 MHz (uniform MER 8-12 dB, ~10 dB below the 64-QAM threshold): TS 0
-  before and after (physics), wall time 800 s -> 19.3 s (41x) via the gate.
+  (physics — the gate spares the Viterbi); wall time ~150 s.
 - Clean-signal regression: the 557-first-chunk fixture still decodes
-  byte-identical (MD5 eabba87cccf3dd29a3ef18a8e23ecdd9); 3/3 ctest.
+  byte-identical (MD5 eabba87cccf3dd29a3ef18a8e23ecdd9); 3/3 ctest; the ideal
+  synthetic fixture decodes within 16 packets of the old output (first-decode
+  trellis warmup only).
 
 Remaining:
 
-- Replace overlap-save reacquisition with persistent rational-resampler,
-  OFDM/TPS tracking, and FEC/outer-sync state where that improves throughput or
-  weak-signal robustness. Exact TS packet joining already prevents internal
-  chunk boundaries from creating multiplex-wide continuity gaps, so this is
-  now an optimization and tracking-quality task rather than an output-
-  correctness blocker.
+- Shrink the fade-recovery latency: the verified re-lock and the forced
+  re-acquisition currently trade recovery speed against the risk of latching
+  a noise-driven offset while the channel is still fading; the 581's
+  multipath-weighted tail shows ~6 windows where the demod is healthy but the
+  FEC is silent (TPS frame sync corrupted by a bad latch). Options: verify a
+  re-locked grid over several symbols before accepting it, or re-seed the
+  TPS/carrier from the acquisition phase unconditionally on a cadence (the
+  old per-chunk behavior).
 - Add continuous sample-clock and channel tracking across processing chunks;
   the current frontend is measurably less robust on captured multipath signals
   than the reference receiver. (On Airspy R2 the 0.5 ppm TCXO drifts only
   ~2.4 samples per chunk, so fractional timing is a SoapySDR-generic path
   concern rather than an R2 one.)
-- Turn the remaining stateful frontend into one continuous stream pipeline:
-
-  ```text
-  streaming rational resampler
-      -> sample-clock / fractional-timing loop
-      -> carrier NCO and residual-CFO loop
-      -> OFDM symbol extraction
-      -> time/frequency pilot-channel tracker
-      -> TPS frame/superframe state
-  ```
-
-  Preserve resampler phase and filter history, fractional symbol position,
-  sample-clock-rate estimate, and channel history across input blocks (carrier
-  phase/frequency already carries, with a contiguity guard; TPS cannot carry
-  while the overlap rewinds the symbol sequence). Keep this time-ordered
-  frontend serial (or use an explicit ordered state handoff), then dispatch
-  FFT/equalization/demapping and FEC work that is safe to parallelize. The
-  current 100 ms overlap remains the fallback reacquisition and discontinuity
-  bridge until this path is validated; afterwards reduce or remove routine
-  overlap and reserve full reacquisition for source drops, seeks, retunes,
-  parameter changes, and genuine lock loss.
 - Carry validated TPS frame/superframe index and cell ID across chunks, and add
   deterministic decoder reset tags when TPS parameters change.
 - Eliminate duplicated GUI-monitor/frontend work by publishing constellation

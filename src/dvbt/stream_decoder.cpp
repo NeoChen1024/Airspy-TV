@@ -1,11 +1,14 @@
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 
 #include "airspy_tv/dvbt/decoder.hpp"
+#include "airspy_tv/dvbt/inner_decoder.hpp"
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
 #include "airspy_tv/dvbt/tps_decoder.hpp"
 
 #include <fftw3.h>
+#include <liquid/liquid.h>
+#include <volk/volk.h>
 
 #include <algorithm>
 #include <array>
@@ -20,10 +23,12 @@
 #include <exception>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <numbers>
 #include <numeric>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <thread>
 #include <utility>
@@ -33,13 +38,25 @@ namespace airspy_tv::dvbt {
 namespace {
 
 constexpr float minimum_power = 1.0e-12F;
+constexpr float input_scale = 32768.0F;
 constexpr std::size_t acquisition_samples = 350'000;
 constexpr std::size_t buffer_duration_denominator = 5;
-constexpr std::size_t chunk_overlap_duration_denominator = 10;
 constexpr std::size_t initial_symbol_queue_capacity = 256;
 constexpr std::size_t ts_packet_size = 188;
-constexpr std::size_t retained_ts_packets = 32'768;
-constexpr std::size_t minimum_ts_overlap_packets = 32;
+// Resampled-sample ring shared by the front-end thread (producer) and the
+// demod thread (consumer): 1 Mi complex samples = 8 MiB, ~150 ms at the
+// nominal 8K/guard-1/4 rate, enough slack for the acquisition window and
+// scheduling jitter without ever blocking the front-end for long.
+constexpr std::size_t ring_capacity_samples = 1'048'576;
+// Demod statistics window: 400 OFDM symbols (~0.6 s at 8K/guard-1/4), the
+// report cadence for the CLI (previously one per 7M-sample chunk).
+constexpr std::size_t stats_window_symbols = 400;
+// MER gate window: one TPS superframe (68 symbols). Windows whose mean MER
+// falls below the constellation's decode floor are dropped and bracket a
+// fresh FEC trellis at the region edges.
+constexpr std::size_t gate_window_symbols = 68;
+constexpr std::size_t acquisition_monitor_interval_ms = 2000;
+constexpr std::size_t resampler_semi_length = 12;
 
 constexpr std::array continual_2k{
     0,    48,   54,   87,   141,  156,  192,  201,  255,  279,  282,  333,
@@ -165,82 +182,11 @@ buffered_input_samples(const std::uint32_t sample_rate) noexcept {
                                         buffer_duration_denominator);
 }
 
-[[nodiscard]] std::size_t
-chunk_overlap_samples(const std::uint32_t sample_rate) noexcept {
-    const std::size_t duration_samples =
-        (static_cast<std::size_t>(sample_rate) +
-         chunk_overlap_duration_denominator - 1) /
-        chunk_overlap_duration_denominator;
-    return std::min<std::size_t>(StreamDecoder::processing_chunk_samples / 2,
-                                 duration_samples);
-}
-
-[[nodiscard]] std::uint64_t
-packet_hash(const std::span<const std::uint8_t> packet) noexcept {
-    std::uint64_t hash = 1469598103934665603ULL;
-    for (const std::uint8_t byte : packet) {
-        hash = (hash ^ byte) * 1099511628211ULL;
-    }
-    return hash;
-}
-
-[[nodiscard]] std::size_t
-find_ts_overlap(const std::span<const std::uint8_t> history,
-                const std::span<const std::uint8_t> current,
-                const std::size_t expected_packets) {
-    if (history.size() % ts_packet_size != 0 ||
-        current.size() % ts_packet_size != 0 || history.empty() ||
-        current.empty()) {
-        return 0;
-    }
-    const std::size_t history_packets = history.size() / ts_packet_size;
-    const std::size_t current_packets = current.size() / ts_packet_size;
-    std::vector<std::uint64_t> pattern(current_packets);
-    for (std::size_t packet = 0; packet < current_packets; ++packet) {
-        pattern[packet] = packet_hash(
-            current.subspan(packet * ts_packet_size, ts_packet_size));
-    }
-    std::vector<std::size_t> prefix(current_packets);
-    for (std::size_t index = 1, matched = 0; index < current_packets; ++index) {
-        while (matched != 0 && pattern[index] != pattern[matched]) {
-            matched = prefix[matched - 1];
-        }
-        if (pattern[index] == pattern[matched]) {
-            ++matched;
-        }
-        prefix[index] = matched;
-    }
-    std::size_t matched = 0;
-    for (std::size_t packet = 0; packet < history_packets; ++packet) {
-        const auto hash = packet_hash(
-            history.subspan(packet * ts_packet_size, ts_packet_size));
-        while (matched != 0 && hash != pattern[matched]) {
-            matched = prefix[matched - 1];
-        }
-        if (hash == pattern[matched]) {
-            ++matched;
-        }
-        if (matched == current_packets && packet + 1 != history_packets) {
-            matched = prefix[matched - 1];
-        }
-    }
-    std::size_t best = 0;
-    std::size_t best_distance = std::numeric_limits<std::size_t>::max();
-    while (matched >= minimum_ts_overlap_packets) {
-        const auto history_suffix = history.last(matched * ts_packet_size);
-        const auto current_prefix = current.first(matched * ts_packet_size);
-        if (std::ranges::equal(history_suffix, current_prefix)) {
-            const std::size_t distance = matched > expected_packets
-                                             ? matched - expected_packets
-                                             : expected_packets - matched;
-            if (distance < best_distance) {
-                best = matched;
-                best_distance = distance;
-            }
-        }
-        matched = prefix[matched - 1];
-    }
-    return best;
+[[nodiscard]] float
+duration_ms(const std::chrono::steady_clock::time_point started_at) {
+    return std::chrono::duration<float, std::milli>(
+               std::chrono::steady_clock::now() - started_at)
+        .count();
 }
 
 class SymbolPostprocessorPool {
@@ -509,6 +455,109 @@ class SymbolPostprocessorPool {
     bool stopping_{};
 };
 
+// Single-threaded rational resampler with persistent filter state. The old
+// chunked pipeline recreated the filter (and its 16-worker partition) on every
+// 7M-sample chunk, forcing each chunk to re-warm the transient and re-run
+// acquisition; this object streams one continuous filter state across the
+// whole capture (resampling is memory-bandwidth-bound, so a thread split does
+// not help — one thread is the right granularity).
+class StreamingResampler {
+  public:
+    ~StreamingResampler() {
+        if (filter_ != nullptr) {
+            rresamp_crcf_destroy(filter_);
+        }
+    }
+    StreamingResampler() = default;
+    StreamingResampler(const StreamingResampler &) = delete;
+    StreamingResampler &operator=(const StreamingResampler &) = delete;
+    StreamingResampler(StreamingResampler &&other) noexcept {
+        *this = std::move(other);
+    }
+    StreamingResampler &operator=(StreamingResampler &&other) noexcept {
+        if (this != &other) {
+            if (filter_ != nullptr) {
+                rresamp_crcf_destroy(filter_);
+            }
+            filter_ = other.filter_;
+            rate_ = other.rate_;
+            bandwidth_ = other.bandwidth_;
+            other.filter_ = nullptr;
+        }
+        return *this;
+    }
+
+    void configure(const std::uint32_t rate, const std::uint32_t bandwidth) {
+        if (filter_ != nullptr && rate == rate_ && bandwidth == bandwidth_) {
+            return;
+        }
+        if (filter_ != nullptr) {
+            rresamp_crcf_destroy(filter_);
+            filter_ = nullptr;
+        }
+        // Nominal DVB-T output rate is bandwidth * 8 / 7 samples/second.
+        const std::uint64_t interpolation =
+            static_cast<std::uint64_t>(bandwidth) * 8U;
+        const std::uint64_t decimation = static_cast<std::uint64_t>(rate) * 7U;
+        const std::uint64_t divisor = std::gcd(interpolation, decimation);
+        const unsigned int p =
+            static_cast<unsigned int>(interpolation / divisor);
+        const unsigned int q = static_cast<unsigned int>(decimation / divisor);
+        filter_ = rresamp_crcf_create_kaiser(p, q, resampler_semi_length, -1.0F,
+                                             60.0F);
+        if (filter_ == nullptr) {
+            throw std::runtime_error("failed to create streaming resampler");
+        }
+        rate_ = rate;
+        bandwidth_ = bandwidth;
+        interpolation_ = p;
+        decimation_ = q;
+        accumulator_.clear();
+    }
+
+    // Consumes the input and appends the produced samples to `output`. The
+    // input is accumulated until a full decimation block is available, then
+    // executed through the persistent filter state (which carries the poly-
+    // phase delay line across calls, so the output is a continuous stream
+    // with no per-block transient). The residual input (< one block) stays
+    // in the accumulator for the next call.
+    void process(const std::span<const std::complex<float>> input,
+                 std::vector<std::complex<float>> &output) {
+        output.clear();
+        if (!configured()) {
+            return;
+        }
+        accumulator_.insert(accumulator_.end(), input.begin(), input.end());
+        const std::size_t blocks = accumulator_.size() / decimation_;
+        if (blocks == 0) {
+            return;
+        }
+        output.resize(blocks * interpolation_);
+        rresamp_crcf_execute_block(filter_, accumulator_.data(),
+                                   static_cast<unsigned int>(blocks),
+                                   output.data());
+        accumulator_.erase(accumulator_.begin(),
+                           accumulator_.begin() + static_cast<std::ptrdiff_t>(
+                                                      blocks * decimation_));
+    }
+
+    [[nodiscard]] bool configured() const noexcept {
+        return filter_ != nullptr;
+    }
+    [[nodiscard]] std::uint32_t rate() const noexcept { return rate_; }
+    [[nodiscard]] std::uint32_t bandwidth() const noexcept {
+        return bandwidth_;
+    }
+
+  private:
+    rresamp_crcf filter_{};
+    std::uint32_t rate_{};
+    std::uint32_t bandwidth_{};
+    std::size_t interpolation_{};
+    std::size_t decimation_{};
+    std::vector<std::complex<float>> accumulator_;
+};
+
 } // namespace
 
 struct StreamDecoder::Impl {
@@ -517,35 +566,15 @@ struct StreamDecoder::Impl {
         std::uint32_t rate{};
         std::uint32_t bandwidth{};
     };
-    struct ChunkSummary {
-        bool ofdm_locked{};
-        bool state_carried{};
-        bool fec_skipped{};
-        bool tps_locked{};
-        TpsParameters tps_parameters{};
-        int carrier_bin_offset{};
-        float mer_db{};
-        float residual_carrier_offset_hz{};
-        std::uint64_t pilot_phase_discontinuities{};
-        std::uint64_t ofdm_symbols{};
-        float input_seconds{};
-        float overlap_input_seconds{};
-        std::size_t input_samples{};
-        float resample_time_ms{};
-        float acquisition_time_ms{};
-        float equalization_time_ms{};
-        float demap_time_ms{};
-        float deinterleave_time_ms{};
-        float depuncture_time_ms{};
-        std::size_t resample_workers{};
-        std::size_t symbol_workers{};
-        std::chrono::steady_clock::time_point started_at{};
-    };
-    // Continuous front-end tracking state carried across processing chunks.
-    // The worker thread owns this; decode_chunk() reads and updates it
-    // directly. A chunk whose acquisition agrees with the carried mode/guard
-    // resumes tracking instead of cold-starting the CFO loop, carrier search,
-    // continual-carrier reference, and TPS superframe from scratch.
+
+    // Continuous front-end tracking state owned by the demod thread and
+    // carried for the life of a stream. The resampled symbol stream is
+    // contiguous (no overlap rewind), so the CFO loop, carrier search,
+    // continual-carrier reference, AND TPS superframe decoder all carry
+    // continuously; they are re-seeded only on cold starts (mode/guard
+    // changes or resets). The TPS carry is the key weak-signal win: with the
+    // old chunked pipeline every chunk re-locked TPS from scratch (~68
+    // symbols) and the per-chunk CFO boundary overshoot perturbed tracking.
     struct FrontendState {
         bool valid{false};
         TransmissionMode mode{TransmissionMode::k8};
@@ -555,39 +584,73 @@ struct StreamDecoder::Impl {
         float tracked_cfo_phase{0.0F};
         float residual_phase_ema{0.0F};
         int carrier_offset{std::numeric_limits<int>::max()};
+        // Values captured while the tracking was last healthy; a fade never
+        // moves the carrier grid (the LO is stable), so a cold re-anchor
+        // restores these instead of re-running the ambiguous wide pilot lock.
+        int stable_carrier_offset{std::numeric_limits<int>::max()};
+        int stable_phase{-1};
         std::vector<std::complex<float>> previous_continual;
         int previous_phase{-1};
         std::uint64_t phase_discontinuities{0};
-        std::size_t consecutive_acquisition_failures{0};
+        // Absolute stream position of the most recent processed symbol; the
+        // CFO loop only updates from contiguous symbol pairs (start ==
+        // last_symbol_start + period), so the first symbol after a re-anchor
+        // is skipped exactly like the first symbol of the old chunks.
+        std::uint64_t last_symbol_start{0};
+        bool just_seeded{false};
+        TpsDecoder tps_decoder;
+        TpsSnapshot tps_snapshot;
     };
-    // NOTE: TPS superframe state is deliberately NOT carried across chunks.
-    // The 100 ms overlap re-decodes ~65 symbols, so the first symbol of a
-    // chunk is always EARLIER than the previous chunk's last symbol; feeding
-    // that non-contiguous sequence to the differential TPS decoder corrupts
-    // the frame sync and symbol index. Each chunk re-locks TPS (~68 symbols)
-    // and the pending-symbol buffer absorbs the gap losslessly.
+
+    // Acquisition result published by the front-end thread. `version` is
+    // bumped only when the demod must act: mode/guard changes (cold re-anchor)
+    // or a boundary shift beyond the alignment tolerance (the demod's grid
+    // stays aligned otherwise, so a plain boundary refresh is silent).
+    // An invalid publish (reset) abandons the current stream.
+    struct SyncState {
+        bool valid{false};
+        std::uint64_t version{0};
+        std::uint64_t start_pos{0};
+        std::complex<float> phase{};
+        float score{};
+        TransmissionMode mode{TransmissionMode::k8};
+        GuardInterval guard{GuardInterval::gi_1_4};
+        std::size_t fft_size{};
+        std::size_t guard_size{};
+        std::uint32_t bandwidth{};
+        float resampled_rate{};
+    };
+
     struct FecItem {
-        enum class Kind { begin, symbol, end };
+        enum class Kind { begin, symbol, end, stats };
 
         Kind kind{Kind::symbol};
         std::uint64_t generation{};
         DecoderParameters parameters{};
         std::vector<std::uint8_t> mother_metrics;
         std::size_t symbol_index{};
-        ChunkSummary summary{};
     };
+
     mutable std::mutex mutex;
-    std::condition_variable ready;
-    std::condition_variable idle;
+    std::condition_variable input_ready;
     std::condition_variable input_not_full;
+    std::condition_variable ring_data;
+    std::condition_variable ring_space;
     std::condition_variable fec_ready;
     std::condition_variable fec_not_full;
+    std::condition_variable idle;
     std::deque<Block> queue;
     std::deque<FecItem> fec_queue;
     std::size_t queued_complex_samples{};
     std::size_t input_queue_capacity_samples{};
     std::size_t fec_queue_capacity{initial_symbol_queue_capacity};
-    std::vector<std::int16_t> accumulated;
+    // Circular buffer of resampled samples. Positions are absolute uint64
+    // stream offsets; the ring retains [ring_read_pos, ring_write_pos).
+    std::vector<std::complex<float>> ring;
+    std::uint64_t ring_write_pos{};
+    std::uint64_t ring_read_pos{};
+    bool ring_closed{};
+    SyncState sync;
     TransportCallback callback;
     EqualizedCallback equalized_callback;
     ReceiverParameters parameters;
@@ -600,30 +663,42 @@ struct StreamDecoder::Impl {
     bool stopping{};
     bool reset_requested{};
     bool flush_requested{};
-    bool worker_busy{};
+    // Set by the demod thread when its tracking has been lost for a long
+    // fade; the front-end responds with an immediate fresh acquisition whose
+    // publish forces a cold re-anchor (CP-phase CFO seed + wide carrier lock
+    // + TPS re-lock), mirroring the per-chunk re-acquisition of the old
+    // chunked pipeline.
+    bool reacquisition_requested{};
+    std::uint64_t reacquisition_generation{};
+    bool frontend_busy{};
+    bool demod_busy{};
     bool fec_worker_busy{};
-    bool overlap_active{};
     std::atomic<std::uint64_t> latest_generation{};
-    std::uint32_t accumulated_rate{};
-    std::uint32_t accumulated_bandwidth{};
-    std::unique_ptr<Cs16Resampler> resampler;
     std::unique_ptr<SymbolPostprocessorPool> symbol_postprocessor;
-    std::thread worker;
-    std::thread fec_worker;
+    std::thread frontend_thread;
+    std::thread demod_thread;
+    std::thread fec_thread;
 
-    Impl() : worker([this] { run(); }), fec_worker([this] { run_fec(); }) {}
+    Impl()
+        : ring(ring_capacity_samples),
+          frontend_thread([this] { run_frontend(); }),
+          demod_thread([this] { run_demod(); }),
+          fec_thread([this] { run_fec(); }) {}
     ~Impl() {
         cancel_requested = true;
         {
             const std::scoped_lock lock(mutex);
             stopping = true;
         }
-        ready.notify_one();
+        input_ready.notify_one();
         input_not_full.notify_all();
+        ring_data.notify_all();
+        ring_space.notify_all();
         fec_ready.notify_one();
         fec_not_full.notify_all();
-        worker.join();
-        fec_worker.join();
+        frontend_thread.join();
+        demod_thread.join();
+        fec_thread.join();
     }
 
     void reset_frontend_state() noexcept {
@@ -636,7 +711,10 @@ struct StreamDecoder::Impl {
         frontend.previous_continual.clear();
         frontend.previous_phase = -1;
         frontend.phase_discontinuities = 0;
-        frontend.consecutive_acquisition_failures = 0;
+        frontend.last_symbol_start = 0;
+        frontend.just_seeded = false;
+        frontend.tps_decoder.reset();
+        frontend.tps_snapshot = {};
     }
 
     [[nodiscard]] bool enqueue_fec(FecItem item) {
@@ -655,193 +733,548 @@ struct StreamDecoder::Impl {
         return true;
     }
 
-    void decode_chunk(const std::span<const std::int16_t> iq,
-                      const std::uint32_t rate, const std::uint32_t bandwidth,
-                      const std::size_t new_complex_samples) {
-        ReceiverParameters selected_parameters;
-        std::uint64_t generation = 0;
-        const auto started_at = std::chrono::steady_clock::now();
-        {
-            const std::scoped_lock guard(mutex);
-            selected_parameters = parameters;
-            generation = latest_generation;
-            if (!selected_parameters.mode.has_value() &&
-                stable_mode.has_value()) {
-                selected_parameters.mode = stable_mode;
+    // ------------------------------------------------------------------ //
+    // Front-end thread: cs16 -> resampled cfloat -> ring, plus the rolling
+    // acquisition window. Runs independently of the demod so symbol extraction
+    // is never blocked behind resampling (or vice versa); the 16-way partition
+    // of the old resampler is gone because resampling is memory-bandwidth-
+    // bound and a single streaming filter state is both simpler and correct.
+    // ------------------------------------------------------------------ //
+    void run_frontend() {
+        StreamingResampler resampler;
+        std::vector<std::complex<float>> convert_buffer;
+        std::vector<std::complex<float>> resample_buffer;
+        std::vector<std::complex<float>> acquisition_window;
+        bool need_acquisition = true;
+        auto last_monitor = std::chrono::steady_clock::now();
+        while (true) {
+            Block block;
+            bool close_ring = false;
+            {
+                std::unique_lock lock(mutex);
+                input_ready.wait(lock, [this] {
+                    return stopping || reset_requested || flush_requested ||
+                           !queue.empty();
+                });
+                if (stopping) {
+                    return;
+                }
+                if (reset_requested) {
+                    // Abandon the whole pipeline. The demod sees the invalid
+                    // sync and drops its per-stream state; the FEC worker
+                    // drops items whose generation is stale.
+                    reset_requested = false;
+                    cancel_requested = false;
+                    queue.clear();
+                    fec_queue.clear();
+                    queued_complex_samples = 0;
+                    ring_read_pos = 0;
+                    ring_write_pos = 0;
+                    ring_closed = false;
+                    sync.valid = false;
+                    ++sync.version;
+                    stable_mode.reset();
+                    stable_guard.reset();
+                    latest = {};
+                    ++latest_generation;
+                    acquisition_window.clear();
+                    need_acquisition = true;
+                    resampler = StreamingResampler{};
+                    input_not_full.notify_all();
+                    fec_not_full.notify_all();
+                    ring_data.notify_all();
+                    idle.notify_all();
+                    continue;
+                }
+                if (queue.empty()) {
+                    if (flush_requested) {
+                        flush_requested = false;
+                        ring_closed = true;
+                        close_ring = true;
+                    } else {
+                        idle.notify_all();
+                        continue;
+                    }
+                } else {
+                    block = std::move(queue.front());
+                    queue.pop_front();
+                    queued_complex_samples -= block.samples.size() / 2;
+                    input_not_full.notify_one();
+                    ++latest.input_blocks;
+                    frontend_busy = true;
+                }
             }
-            if (!selected_parameters.guard_interval.has_value() &&
-                stable_guard.has_value()) {
-                selected_parameters.guard_interval = stable_guard;
+            if (close_ring) {
+                ring_data.notify_all();
+                frontend_busy = false;
+                idle.notify_all();
+                continue;
             }
+            if (!block.samples.empty()) {
+                // A flush followed by new submits resumes the same stream:
+                // reopen the ring so the demod continues past the seam.
+                if (ring_closed) {
+                    {
+                        const std::scoped_lock lock(mutex);
+                        ring_closed = false;
+                    }
+                    ring_data.notify_all();
+                }
+                if (resampler.configured() &&
+                    (resampler.rate() != block.rate ||
+                     resampler.bandwidth() != block.bandwidth)) {
+                    // Retune: drop the filter state and re-acquire from
+                    // scratch (the demod will cold-start on the new sync).
+                    resampler = StreamingResampler{};
+                    acquisition_window.clear();
+                    need_acquisition = true;
+                }
+                if (!resampler.configured()) {
+                    resampler.configure(block.rate, block.bandwidth);
+                }
+                const std::size_t complex_count = block.samples.size() / 2;
+                convert_buffer.resize(complex_count);
+                volk_16i_s32f_convert_32f(
+                    reinterpret_cast<float *>(convert_buffer.data()),
+                    block.samples.data(), input_scale,
+                    static_cast<unsigned int>(complex_count * 2));
+                const auto resample_started_at =
+                    std::chrono::steady_clock::now();
+                resampler.process(convert_buffer, resample_buffer);
+                const std::uint64_t block_base = [&] {
+                    const std::scoped_lock lock(mutex);
+                    return ring_write_pos;
+                }();
+                // First acquisition: the head of this resampled block, the
+                // same window the old chunked pipeline acquired on. The demod
+                // needs the samples at this position, so the sync is published
+                // BEFORE the ring push; the ring push below is incremental
+                // (the ring is much smaller than a block) and paces itself
+                // against the demod's consumption.
+                if (need_acquisition &&
+                    resample_buffer.size() >= acquisition_samples) {
+                    acquire_and_publish(
+                        std::span(resample_buffer).first(acquisition_samples),
+                        block_base, block.bandwidth);
+                    need_acquisition = false;
+                    last_monitor = std::chrono::steady_clock::now();
+                }
+                // Rolling acquisition window (for monitor re-acquisitions):
+                // keep the most recent acquisition_samples of resampled data.
+                acquisition_window.insert(acquisition_window.end(),
+                                          resample_buffer.begin(),
+                                          resample_buffer.end());
+                if (acquisition_window.size() > acquisition_samples) {
+                    const std::size_t excess =
+                        acquisition_window.size() - acquisition_samples;
+                    acquisition_window.erase(
+                        acquisition_window.begin(),
+                        acquisition_window.begin() +
+                            static_cast<std::ptrdiff_t>(excess));
+                }
+                // Push to the ring incrementally: the ring (1 Mi samples) is
+                // smaller than a block (~4.8 Mi), so each iteration pushes
+                // only what fits and waits for the demod to free space.
+                std::size_t pushed = 0;
+                while (pushed < resample_buffer.size()) {
+                    std::unique_lock lock(mutex);
+                    ring_space.wait(lock, [this] {
+                        return stopping ||
+                               ring_write_pos - ring_read_pos < ring.size();
+                    });
+                    if (stopping) {
+                        return;
+                    }
+                    const std::size_t used = ring_write_pos - ring_read_pos;
+                    const std::size_t chunk = std::min(
+                        ring.size() - used, resample_buffer.size() - pushed);
+                    for (std::size_t i = 0; i < chunk; ++i) {
+                        ring[(ring_write_pos + i) % ring.size()] =
+                            resample_buffer[pushed + i];
+                    }
+                    ring_write_pos += chunk;
+                    pushed += chunk;
+                    ring_data.notify_all();
+                }
+                {
+                    const std::scoped_lock lock(mutex);
+                    latest.processed_input_samples += complex_count;
+                    latest.resample_time_ms = duration_ms(resample_started_at);
+                }
+                const auto now = std::chrono::steady_clock::now();
+                bool force_acquisition = false;
+                {
+                    const std::scoped_lock lock(mutex);
+                    if (reacquisition_requested) {
+                        force_acquisition = true;
+                        reacquisition_requested = false;
+                    }
+                }
+                if (force_acquisition ||
+                    (!need_acquisition &&
+                     now - last_monitor >=
+                         std::chrono::milliseconds(
+                             acquisition_monitor_interval_ms))) {
+                    last_monitor = now;
+                    const std::uint64_t window_base = [&] {
+                        const std::scoped_lock lock(mutex);
+                        return ring_write_pos - acquisition_window.size();
+                    }();
+                    acquire_and_publish(
+                        std::span(acquisition_window).last(acquisition_samples),
+                        window_base, block.bandwidth, force_acquisition);
+                }
+            }
+            {
+                const std::scoped_lock lock(mutex);
+                frontend_busy = false;
+            }
+            idle.notify_all();
         }
-        const std::size_t resample_workers =
-            selected_parameters.worker_threads == 0
-                ? default_viterbi_worker_count()
-                : selected_parameters.worker_threads;
-        if (!resampler || resampler->worker_count() != resample_workers) {
-            resampler = std::make_unique<Cs16Resampler>(resample_workers);
-        }
-        auto samples = resampler->process(iq, rate, bandwidth);
-        const auto resampled_at = std::chrono::steady_clock::now();
-        if (cancel_requested || samples.size() < acquisition_samples) {
+    }
+
+    void acquire_and_publish(const std::span<const std::complex<float>> window,
+                             const std::uint64_t base_pos,
+                             const std::uint32_t bandwidth,
+                             const bool forced = false) {
+        if (window.size() < acquisition_samples) {
             return;
         }
-        const OfdmAcquisition acquisition = acquire_ofdm(
-            std::span(samples).first(acquisition_samples), selected_parameters);
         const auto acquired_at = std::chrono::steady_clock::now();
-        if (cancel_requested || acquisition.score < 0.20F) {
-            return;
-        }
+        ReceiverParameters acquisition_parameters;
         {
-            const std::scoped_lock guard(mutex);
+            const std::scoped_lock lock(mutex);
+            acquisition_parameters = parameters;
+        }
+        const auto span = window.first(acquisition_samples);
+        const OfdmAcquisition acquisition =
+            acquire_ofdm(span, acquisition_parameters);
+        const float acquisition_ms = duration_ms(acquired_at);
+        if (acquisition.score < 0.20F) {
+            return; // keep the current sync; the demod keeps tracking
+        }
+        const std::uint64_t start_pos = base_pos + acquisition.start;
+        const float resampled_rate =
+            static_cast<float>(bandwidth) * (8.0F / 7.0F);
+        std::uint64_t new_version = 0;
+        {
+            const std::scoped_lock lock(mutex);
             stable_mode = acquisition.mode;
             stable_guard = acquisition.guard;
             latest.acquisition_score = acquisition.score;
+            latest.acquisition_time_ms = acquisition_ms;
             latest.fft_size = static_cast<std::uint32_t>(acquisition.fft_size);
             latest.guard_size =
                 static_cast<std::uint32_t>(acquisition.guard_size);
-        }
-        const bool carried = frontend.valid &&
-                             frontend.mode == acquisition.mode &&
-                             frontend.guard == acquisition.guard;
-        frontend.mode = acquisition.mode;
-        frontend.guard = acquisition.guard;
-        frontend.fft_size = acquisition.fft_size;
-        frontend.guard_size = acquisition.guard_size;
-        frontend.consecutive_acquisition_failures = 0;
-        frontend.valid = true;
-        if (!carried) {
-            // Cold start: seed the continuous tracking state from this
-            // chunk's acquisition estimate instead of resuming carried state.
-            frontend.tracked_cfo_phase =
-                std::arg(acquisition.phase) /
-                static_cast<float>(acquisition.fft_size);
-            frontend.residual_phase_ema = 0.0F;
-            frontend.carrier_offset = std::numeric_limits<int>::max();
-            frontend.previous_continual.clear();
-            frontend.previous_phase = -1;
-        }
-        const std::size_t maximum =
-            acquisition.mode == TransmissionMode::k8 ? 6816 : 1704;
-        const std::span<const int> continual = continual_2k;
-        const std::span<const int> tps = tps_2k;
-        std::optional<DecoderParameters> decoder_parameters;
-        if (selected_parameters.constellation.has_value() &&
-            selected_parameters.code_rate.has_value()) {
-            decoder_parameters = DecoderParameters{
-                acquisition.mode, *selected_parameters.constellation,
-                *selected_parameters.code_rate,
-                allocate_workers(selected_parameters.worker_threads).viterbi};
-        }
-        const std::size_t symbol_queue_capacity = buffered_symbol_count(
-            bandwidth, acquisition.fft_size + acquisition.guard_size);
-        {
-            const std::scoped_lock guard(mutex);
-            fec_queue_capacity = symbol_queue_capacity;
-        }
-        std::vector<std::complex<float>> fft_in(acquisition.fft_size);
-        std::vector<std::complex<float>> fft_out(acquisition.fft_size);
-        fftwf_plan plan =
-            fftwf_plan_dft_1d(static_cast<int>(acquisition.fft_size),
-                              reinterpret_cast<fftwf_complex *>(fft_in.data()),
-                              reinterpret_cast<fftwf_complex *>(fft_out.data()),
-                              FFTW_FORWARD, FFTW_ESTIMATE);
-        if (plan == nullptr) {
-            return;
-        }
-        float &tracked_cfo_phase = frontend.tracked_cfo_phase;
-        const std::size_t period =
-            acquisition.fft_size + acquisition.guard_size;
-        std::vector<std::size_t> continual_indices;
-        std::array<std::vector<std::size_t>, 4> pilot_indices;
-        std::array<std::vector<std::size_t>, 4> payload_indices;
-        continual_indices.reserve(continual_2k.size() *
-                                  (maximum == 6816 ? 4U : 1U));
-        for (std::size_t k = 0; k <= maximum; ++k) {
-            const std::size_t base = k % 1704;
-            const bool continual_carrier = listed(continual, base);
-            const bool tps_carrier = listed(tps, base);
-            if (continual_carrier) {
-                continual_indices.push_back(k);
-            }
-            for (std::size_t phase = 0; phase < 4; ++phase) {
-                const bool scattered = k % 12 == phase * 3;
-                if (scattered || continual_carrier) {
-                    pilot_indices[phase].push_back(k);
+            const bool same_parameters = sync.valid &&
+                                         sync.mode == acquisition.mode &&
+                                         sync.guard == acquisition.guard;
+            const std::uint64_t period =
+                acquisition.fft_size + acquisition.guard_size;
+            const std::uint64_t aligned_distance = [&] {
+                if (!sync.valid) {
+                    return std::uint64_t{0};
                 }
-                if (!scattered && !continual_carrier && !tps_carrier) {
-                    payload_indices[phase].push_back(k);
+                const std::uint64_t delta = sync.start_pos > start_pos
+                                                ? sync.start_pos - start_pos
+                                                : start_pos - sync.start_pos;
+                return std::min(delta % period, period - delta % period);
+            }();
+            sync.valid = true;
+            sync.start_pos = start_pos;
+            sync.phase = acquisition.phase;
+            sync.score = acquisition.score;
+            sync.mode = acquisition.mode;
+            sync.guard = acquisition.guard;
+            sync.fft_size = acquisition.fft_size;
+            sync.guard_size = acquisition.guard_size;
+            sync.bandwidth = bandwidth;
+            sync.resampled_rate = resampled_rate;
+            // The demod re-anchors only on parameter changes or boundary
+            // moves beyond a symbol's alignment tolerance; a silent refresh
+            // (drift + estimator noise) does not disturb continuous tracking.
+            // A forced re-acquisition always publishes so the demod can cold
+            // re-anchor from the fresh CP-phase CFO seed.
+            if (!same_parameters || aligned_distance >= 64 || forced) {
+                ++sync.version;
+                if (forced) {
+                    ++reacquisition_generation;
                 }
+                new_version = sync.version;
             }
         }
-        int &carrier_offset = frontend.carrier_offset;
-        int &previous_phase = frontend.previous_phase;
-        std::uint64_t &phase_discontinuities = frontend.phase_discontinuities;
-        double mer_sum = 0.0;
-        float demap_time_sum = 0.0F;
-        float deinterleave_time_sum = 0.0F;
-        float depuncture_time_sum = 0.0F;
-        const WorkerAllocation workers =
-            allocate_workers(selected_parameters.worker_threads);
-        SymbolPostprocessorPool *postprocessor = nullptr;
-        const auto start_decoder = [&]() {
-            if (!decoder_parameters || postprocessor) {
+        if (new_version != 0) {
+            ring_data.notify_all();
+        }
+    }
+
+    // ------------------------------------------------------------------ //
+    // Demod thread: contiguous symbol extraction, CFO/channel/TPS tracking,
+    // symbol postprocessing, and the windowed MER gate. One continuous symbol
+    // stream per sync; re-anchors and resets are handled at the loop heads.
+    // ------------------------------------------------------------------ //
+    void run_demod() {
+        try {
+            ReceiverParameters selected_parameters;
+            std::size_t maximum = 6816;
+            std::size_t fft_size = 8192;
+            std::size_t guard_size = 2048;
+            std::size_t period = 10240;
+            std::vector<std::complex<float>> fft_in;
+            std::vector<std::complex<float>> fft_out;
+            fftwf_plan plan = nullptr;
+            std::vector<std::size_t> continual_indices;
+            std::array<std::vector<std::size_t>, 4> pilot_indices;
+            std::array<std::vector<std::size_t>, 4> payload_indices;
+            std::optional<DecoderParameters> decoder_parameters;
+            WorkerAllocation workers{1, 1};
+            SymbolPostprocessorPool *postprocessor = nullptr;
+            struct PendingSymbol {
+                std::vector<std::complex<float>> payload;
+                std::vector<float> equalizer_power;
+                std::size_t fallback_index{};
+            };
+            std::deque<PendingSymbol> pending_symbols;
+            std::deque<PostprocessedSymbol> gate_buffer;
+            bool in_hopeless_region = false;
+            bool last_reanchor_carried = false;
+            std::uint64_t seen_sync_version = 0;
+            std::uint64_t seen_reacquisition_generation = 0;
+            bool have_grid = false;
+            std::uint64_t next_symbol_start = 0;
+            float nco_phase = 0.0F;
+            std::uint64_t symbol_count = 0;
+            std::uint64_t frozen_symbol_count = 0;
+            std::uint64_t fade_symbol_count = 0;
+            // Uncapped fade duration mod 4: the scattered-pilot phase rotates
+            // once per symbol, so a cold re-anchor must restore the phase
+            // advanced by the full fade length, not the capped counter.
+            std::uint64_t fade_phase_count = 0;
+            int lock_hold = 0;
+            std::uint64_t window_symbol_count = 0;
+            double mer_sum = 0.0;
+            float demap_time_sum = 0.0F;
+            float deinterleave_time_sum = 0.0F;
+            float depuncture_time_sum = 0.0F;
+            double timing_acc = 0.0;
+            std::uint64_t timing_count = 0;
+            auto window_started_at = std::chrono::steady_clock::now();
+
+            const auto cold_seed = [&]() {
+                // Seed the continuous tracking state from the sync's CP-phase
+                // estimate instead of resuming carried state.
+                frontend.tracked_cfo_phase =
+                    std::arg(sync.phase) / static_cast<float>(fft_size);
+                frontend.residual_phase_ema = 0.0F;
+                frontend.carrier_offset = std::numeric_limits<int>::max();
+                frontend.previous_continual.clear();
+                frontend.previous_phase = -1;
+                frontend.tps_decoder.reset();
+                frontend.tps_snapshot = {};
+                frontend.just_seeded = true;
+            };
+
+            const auto build_grid = [&]() {
+                maximum = frontend.fft_size == 8192 ? 6816 : 1704;
+                fft_size = frontend.fft_size;
+                guard_size = frontend.guard_size;
+                period = fft_size + guard_size;
+                continual_indices.clear();
+                pilot_indices = {};
+                payload_indices = {};
+                for (std::size_t k = 0; k <= maximum; ++k) {
+                    const std::size_t base = k % 1704;
+                    const bool continual_carrier = listed(continual_2k, base);
+                    const bool tps_carrier = listed(tps_2k, base);
+                    if (continual_carrier) {
+                        continual_indices.push_back(k);
+                    }
+                    for (std::size_t phase = 0; phase < 4; ++phase) {
+                        const bool scattered = k % 12 == phase * 3;
+                        if (scattered || continual_carrier) {
+                            pilot_indices[phase].push_back(k);
+                        }
+                        if (!scattered && !continual_carrier && !tps_carrier) {
+                            payload_indices[phase].push_back(k);
+                        }
+                    }
+                }
+                fft_in.resize(fft_size);
+                fft_out.resize(fft_size);
+                if (plan != nullptr) {
+                    fftwf_destroy_plan(plan);
+                    plan = nullptr;
+                }
+                plan = fftwf_plan_dft_1d(
+                    static_cast<int>(fft_size),
+                    reinterpret_cast<fftwf_complex *>(fft_in.data()),
+                    reinterpret_cast<fftwf_complex *>(fft_out.data()),
+                    FFTW_FORWARD, FFTW_ESTIMATE);
+            };
+
+            std::size_t symbol_queue_capacity = initial_symbol_queue_capacity;
+            // Handles a sync version change (first anchor, re-anchor, or
+            // reset). Returns true when the demod must act (grid (re)built or
+            // abandoned). Called with the mutex held.
+            const auto handle_sync_change = [&]() {
+                seen_sync_version = sync.version;
+                // A forced re-acquisition (long fade) always cold-reanchors
+                // even when the boundary looks aligned.
+                const bool forced =
+                    reacquisition_generation != seen_reacquisition_generation;
+                seen_reacquisition_generation = reacquisition_generation;
+                if (!sync.valid) {
+                    // Reset: abandon the stream. The FEC generation has already
+                    // advanced, so any stale queued items are dropped by the
+                    // worker.
+                    if (postprocessor != nullptr) {
+                        static_cast<void>(symbol_postprocessor->flush());
+                    }
+                    postprocessor = nullptr;
+                    pending_symbols.clear();
+                    gate_buffer.clear();
+                    in_hopeless_region = false;
+                    decoder_parameters.reset();
+                    have_grid = false;
+                    frontend.valid = false;
+                    frontend.just_seeded = false;
+                    return true;
+                }
+                const bool mode_changed =
+                    !frontend.valid || sync.fft_size != frontend.fft_size ||
+                    sync.guard_size != frontend.guard_size;
+                if (!have_grid || mode_changed) {
+                    frontend.mode = sync.mode;
+                    frontend.guard = sync.guard;
+                    frontend.fft_size = sync.fft_size;
+                    frontend.guard_size = sync.guard_size;
+                    frontend.valid = true;
+                    build_grid();
+                    cold_seed();
+                    // The mutex is already held by the caller.
+                    selected_parameters = parameters;
+                    if (!selected_parameters.mode.has_value() &&
+                        stable_mode.has_value()) {
+                        selected_parameters.mode = stable_mode;
+                    }
+                    if (!selected_parameters.guard_interval.has_value() &&
+                        stable_guard.has_value()) {
+                        selected_parameters.guard_interval = stable_guard;
+                    }
+                    workers =
+                        allocate_workers(selected_parameters.worker_threads);
+                    symbol_queue_capacity = buffered_symbol_count(
+                        sync.bandwidth, fft_size + guard_size);
+                    fec_queue_capacity = symbol_queue_capacity;
+                    if (selected_parameters.constellation.has_value() &&
+                        selected_parameters.code_rate.has_value()) {
+                        decoder_parameters = DecoderParameters{
+                            frontend.mode, *selected_parameters.constellation,
+                            *selected_parameters.code_rate, workers.viterbi};
+                    } else {
+                        decoder_parameters.reset();
+                    }
+                    if (postprocessor != nullptr) {
+                        static_cast<void>(symbol_postprocessor->flush());
+                        postprocessor = nullptr;
+                    }
+                    pending_symbols.clear();
+                    gate_buffer.clear();
+                    in_hopeless_region = false;
+                    next_symbol_start = sync.start_pos + sync.guard_size;
+                    nco_phase = frontend.tracked_cfo_phase *
+                                static_cast<float>(next_symbol_start);
+                    last_reanchor_carried = false;
+                    have_grid = true;
+                    demod_busy = true;
+                    return true;
+                }
+                // Same mode/guard: is the new boundary on the current grid?
+                const std::uint64_t new_start =
+                    sync.start_pos + sync.guard_size;
+                const std::uint64_t delta = next_symbol_start > new_start
+                                                ? next_symbol_start - new_start
+                                                : new_start - next_symbol_start;
+                const std::uint64_t aligned_distance =
+                    std::min(delta % period, period - delta % period);
+                if (aligned_distance < 64 && !forced) {
+                    return false; // aligned: keep the grid and the tracking
+                }
+                // Re-anchor: the boundary moved (signal drop/recovery or a
+                // first anchor estimate error). Tracking carries when the
+                // mode/guard are unchanged. Never read past the samples the
+                // ring has freed. When the tracking was lost for a long fade
+                // (the forced re-acquisition the front-end just published),
+                // cold-start instead: re-seed the CFO from the fresh CP-phase
+                // estimate, widen the carrier search, and re-lock the TPS
+                // superframe — the same recovery the old chunked pipeline got
+                // from its per-chunk re-acquisition.
+                const bool carried = frontend.valid;
+                const bool stale_tracking = forced;
+                std::uint64_t new_next = new_start;
+                while (new_next < ring_read_pos) {
+                    new_next += period;
+                }
+                if (stale_tracking) {
+                    cold_seed();
+                    // Restore the pre-fade carrier grid instead of trusting
+                    // the ambiguous wide pilot lock; the phase advances one
+                    // step per symbol across the fade (the uncapped counter
+                    // keeps the mod-4 phase information).
+                    if (frontend.stable_carrier_offset !=
+                        std::numeric_limits<int>::max()) {
+                        frontend.carrier_offset =
+                            frontend.stable_carrier_offset;
+                        frontend.previous_phase =
+                            (frontend.stable_phase +
+                             static_cast<int>(fade_phase_count)) %
+                            4;
+                        // Hold the restored grid for one symbol so the lock
+                        // cannot immediately flip the correct phase onto a
+                        // noise-latched one; the channel estimate and CFO
+                        // re-establish first.
+                        lock_hold = 1;
+                    }
+                }
+                nco_phase =
+                    stale_tracking
+                        ? frontend.tracked_cfo_phase *
+                              static_cast<float>(new_next)
+                        : std::remainder(
+                              nco_phase +
+                                  frontend.tracked_cfo_phase *
+                                      static_cast<float>(
+                                          static_cast<std::int64_t>(new_next) -
+                                          static_cast<std::int64_t>(
+                                              next_symbol_start)),
+                              2.0F * std::numbers::pi_v<float>);
+                next_symbol_start = new_next;
+                last_reanchor_carried = carried && !stale_tracking;
+                fade_symbol_count = 0;
                 return true;
-            }
-            if (!enqueue_fec({.kind = FecItem::Kind::begin,
-                              .generation = generation,
-                              .parameters = *decoder_parameters,
-                              .mother_metrics = {},
-                              .symbol_index = 0,
-                              .summary = {}})) {
-                return false;
-            }
-            if (!symbol_postprocessor ||
-                !symbol_postprocessor->compatible(
-                    workers.symbol, acquisition.mode,
-                    decoder_parameters->constellation,
-                    decoder_parameters->code_rate, symbol_queue_capacity)) {
-                symbol_postprocessor =
-                    std::make_unique<SymbolPostprocessorPool>(
-                        workers.symbol, acquisition.mode,
-                        decoder_parameters->constellation,
-                        decoder_parameters->code_rate, symbol_queue_capacity);
-            } else {
-                // A cancelled chunk can leave completed symbols that belong to
-                // its generation. Drain and discard them before reusing the
-                // pool so no stale result crosses a chunk boundary.
-                static_cast<void>(symbol_postprocessor->flush());
-            }
-            postprocessor = symbol_postprocessor.get();
-            return true;
-        };
-        if (decoder_parameters && !start_decoder()) {
-            return;
-        }
-        // MER gate: equalized symbols whose mean falls far below the
-        // constellation's decode floor cannot be FEC-decoded (deep multipath
-        // fades). Symbols are buffered until the whole chunk's MER is known,
-        // so a chunk whose head is faded but whose tail recovers is decoded
-        // normally, while a hopeless chunk discards its symbols and spares
-        // the Viterbi from grinding them. Front-end tracking is unaffected.
-        const auto fec_floor = [](const Constellation constellation) {
-            switch (constellation) {
-            case Constellation::qpsk:
-                return 5.0F;
-            case Constellation::qam16:
-                return 10.0F;
-            case Constellation::qam64:
+            };
+
+            // MER gate floor per constellation.
+            const auto fec_floor = [](const Constellation constellation) {
+                switch (constellation) {
+                case Constellation::qpsk:
+                    return 5.0F;
+                case Constellation::qam16:
+                    return 10.0F;
+                case Constellation::qam64:
+                    return 14.0F;
+                }
                 return 14.0F;
-            }
-            return 14.0F;
-        };
-        std::vector<PostprocessedSymbol> chunk_symbols;
-        chunk_symbols.reserve(1024);
-        const auto emit_postprocessed =
-            [this, &mer_sum, &demap_time_sum, &deinterleave_time_sum,
-             &depuncture_time_sum,
-             &chunk_symbols](std::vector<PostprocessedSymbol> symbols) {
-                for (auto &symbol : symbols) {
+            };
+
+            // Forwards a postprocessed batch through the equalized callback and
+            // the windowed MER gate into the FEC queue. Hopeless windows (deep
+            // fades) are dropped and bracket end/begin FEC resets at the region
+            // edges so the trellis never grinds through noise; tracking is
+            // unaffected.
+            const auto process_batch = [&](std::vector<PostprocessedSymbol>
+                                               batch) {
+                for (auto &symbol : batch) {
                     mer_sum += symbol.mer_db;
                     demap_time_sum += symbol.demap_time_ms;
                     deinterleave_time_sum += symbol.deinterleave_time_ms;
@@ -855,299 +1288,682 @@ struct StreamDecoder::Impl {
                         equalized_sink(symbol.carriers, symbol.reliabilities,
                                        symbol.symbol_index);
                     }
-                    chunk_symbols.push_back(std::move(symbol));
+                    gate_buffer.push_back(std::move(symbol));
                 }
+                if (!decoder_parameters) {
+                    return;
+                }
+                const float floor =
+                    fec_floor(decoder_parameters->constellation) + 4.0F;
+                while (gate_buffer.size() >= gate_window_symbols) {
+                    double window_mer = 0.0;
+                    for (std::size_t i = 0; i < gate_window_symbols; ++i) {
+                        window_mer += gate_buffer[i].mer_db;
+                    }
+                    window_mer /= static_cast<double>(gate_window_symbols);
+                    const bool hopeless =
+                        static_cast<float>(window_mer) < floor;
+                    if (hopeless && !in_hopeless_region) {
+                        in_hopeless_region = true;
+                        static_cast<void>(
+                            enqueue_fec({.kind = FecItem::Kind::end,
+                                         .generation = latest_generation,
+                                         .parameters = {},
+                                         .mother_metrics = {},
+                                         .symbol_index = 0}));
+                    } else if (!hopeless && in_hopeless_region) {
+                        in_hopeless_region = false;
+                        static_cast<void>(
+                            enqueue_fec({.kind = FecItem::Kind::begin,
+                                         .generation = latest_generation,
+                                         .parameters = *decoder_parameters,
+                                         .mother_metrics = {},
+                                         .symbol_index = 0}));
+                    }
+                    if (!hopeless) {
+                        for (std::size_t i = 0; i < gate_window_symbols; ++i) {
+                            static_cast<void>(enqueue_fec(
+                                {.kind = FecItem::Kind::symbol,
+                                 .generation = latest_generation,
+                                 .parameters = {},
+                                 .mother_metrics =
+                                     std::move(gate_buffer[i].mother_metrics),
+                                 .symbol_index = gate_buffer[i].symbol_index}));
+                        }
+                    }
+                    gate_buffer.erase(
+                        gate_buffer.begin(),
+                        gate_buffer.begin() +
+                            static_cast<std::ptrdiff_t>(gate_window_symbols));
+                }
+            };
+
+            const auto start_decoder = [&]() {
+                if (!decoder_parameters || postprocessor != nullptr) {
+                    return true;
+                }
+                if (!enqueue_fec({.kind = FecItem::Kind::begin,
+                                  .generation = latest_generation,
+                                  .parameters = *decoder_parameters,
+                                  .mother_metrics = {},
+                                  .symbol_index = 0})) {
+                    return false;
+                }
+                if (!symbol_postprocessor ||
+                    !symbol_postprocessor->compatible(
+                        workers.symbol, frontend.mode,
+                        decoder_parameters->constellation,
+                        decoder_parameters->code_rate, symbol_queue_capacity)) {
+                    symbol_postprocessor =
+                        std::make_unique<SymbolPostprocessorPool>(
+                            workers.symbol, frontend.mode,
+                            decoder_parameters->constellation,
+                            decoder_parameters->code_rate,
+                            symbol_queue_capacity);
+                } else {
+                    // A cancelled stream can leave completed symbols behind.
+                    // Drain and discard them before reuse so no stale result
+                    // crosses a stream or region boundary.
+                    static_cast<void>(symbol_postprocessor->flush());
+                }
+                postprocessor = symbol_postprocessor.get();
                 return true;
             };
-        // CP correlation locates the beginning of the guard interval.  The
-        // FFT window must start at the useful symbol, after that guard.  Using
-        // acquisition.start directly applies a large cyclic time shift and a
-        // carrier phase ramp that sparse-pilot interpolation cannot unwrap.
-        const std::size_t first_fft_start =
-            acquisition.start + acquisition.guard_size;
-        float nco_phase =
-            tracked_cfo_phase * static_cast<float>(first_fft_start);
-        std::vector<std::complex<float>> &previous_continual =
-            frontend.previous_continual;
-        // TPS state is per-chunk: the overlap re-decodes earlier symbols at
-        // every chunk boundary, which would corrupt a carried differential
-        // TPS decoder (see the FrontendState comment).
-        TpsDecoder tps_decoder;
-        TpsSnapshot tps_snapshot;
-        struct PendingSymbol {
-            std::vector<std::complex<float>> payload;
-            std::vector<float> equalizer_power;
-            std::size_t fallback_index{};
-        };
-        std::deque<PendingSymbol> pending_symbols;
-        float &residual_phase_ema = frontend.residual_phase_ema;
-        std::uint64_t symbol_count = 0;
-        const std::uint64_t phase_discontinuity_base =
-            frontend.phase_discontinuities;
-        std::size_t previous_symbol_start =
-            std::numeric_limits<std::size_t>::max();
-        for (std::size_t start = first_fft_start;
-             start + acquisition.fft_size <= samples.size() &&
-             !cancel_requested;
-             start += period) {
-            std::complex<float> nco = std::polar(1.0F, -nco_phase);
-            const std::complex<float> nco_step =
-                std::polar(1.0F, -tracked_cfo_phase);
-            for (std::size_t i = 0; i < acquisition.fft_size; ++i) {
-                fft_in[i] = samples[start + i] * nco;
-                nco *= nco_step;
-                if ((i & 511U) == 511U) {
-                    nco *= 1.0F / std::sqrt(std::norm(nco));
+
+            // Applies the pending statistics-window accumulators to `latest`.
+            const auto publish_stats_window = [&]() {
+                const float window_wall = duration_ms(window_started_at);
+                const std::uint64_t window_symbols = window_symbol_count;
+                const float input_seconds =
+                    sync.resampled_rate > 0.0F
+                        ? static_cast<float>(window_symbols) *
+                              static_cast<float>(period) / sync.resampled_rate
+                        : 0.0F;
+                const float timing_offset =
+                    timing_count == 0
+                        ? 0.0F
+                        : static_cast<float>(
+                              timing_acc / static_cast<double>(timing_count)) *
+                              static_cast<float>(fft_size) /
+                              (2.0F * std::numbers::pi_v<float>);
+                const std::scoped_lock lock(mutex);
+                latest.ofdm_locked = true;
+                latest.tps_locked = frontend.tps_snapshot.locked;
+                latest.tps_constellation =
+                    frontend.tps_snapshot.parameters.constellation;
+                latest.tps_code_rate =
+                    frontend.tps_snapshot.parameters.high_priority_code_rate;
+                latest.tps_guard_interval =
+                    frontend.tps_snapshot.parameters.guard_interval;
+                latest.tps_mode = frontend.tps_snapshot.parameters.mode;
+                latest.tps_hierarchy =
+                    frontend.tps_snapshot.parameters.hierarchy;
+                latest.carrier_bin_offset = frontend.carrier_offset;
+                latest.tracked_carrier_offset_hz =
+                    frontend.tracked_cfo_phase * sync.resampled_rate /
+                    (2.0F * std::numbers::pi_v<float>);
+                latest.acquisition_start =
+                    static_cast<std::size_t>(sync.start_pos % period);
+                latest.timing_offset_samples = timing_offset;
+                latest.mer_db =
+                    mer_sum == 0.0 && window_symbols == 0
+                        ? 0.0F
+                        : static_cast<float>(
+                              mer_sum /
+                              static_cast<double>(
+                                  std::max<std::uint64_t>(window_symbols, 1)));
+                latest.residual_carrier_offset_hz =
+                    frontend.residual_phase_ema * sync.resampled_rate /
+                    (2.0F * std::numbers::pi_v<float> *
+                     static_cast<float>(period));
+                latest.pilot_phase_discontinuities =
+                    frontend.phase_discontinuities;
+                latest.ofdm_symbols = symbol_count;
+                latest.processing_realtime_ratio =
+                    input_seconds > 0.0F
+                        ? (window_wall / 1000.0F) / input_seconds
+                        : 0.0F;
+                latest.equalization_time_ms = window_wall;
+                latest.demap_time_ms = demap_time_sum;
+                latest.deinterleave_time_ms = deinterleave_time_sum;
+                latest.depuncture_time_ms = depuncture_time_sum;
+                latest.symbol_workers = workers.symbol;
+                latest.resample_workers = 1;
+                latest.state_carried = last_reanchor_carried;
+                latest.fec_skipped = in_hopeless_region;
+                ++latest.processed_chunks;
+            };
+
+            while (true) {
+                // --- wait for a sync publish (first anchor / re-anchor / the
+                //     resume of a flushed stream) ---
+                {
+                    std::unique_lock lock(mutex);
+                    ring_data.wait(lock, [this, &seen_sync_version, &have_grid,
+                                          &next_symbol_start] {
+                        return stopping || sync.version != seen_sync_version ||
+                               (have_grid && !ring_closed &&
+                                ring_write_pos > next_symbol_start);
+                    });
+                    if (stopping) {
+                        return;
+                    }
                 }
-            }
-            fftwf_execute(plan);
-            const PilotLock lock =
-                lock_pilots(fft_out, maximum, carrier_offset);
-            if (previous_phase >= 0 && lock.phase != (previous_phase + 1) % 4) {
-                ++phase_discontinuities;
-            }
-            previous_phase = lock.phase;
-            carrier_offset = lock.offset;
-            std::vector<std::complex<float>> current_continual;
-            current_continual.reserve(continual_indices.size());
-            for (const std::size_t k : continual_indices) {
-                current_continual.push_back(
-                    carrier(fft_out, k, maximum, carrier_offset));
-            }
-            float residual_phase = 0.0F;
-            // Only update the CFO loop from a contiguous symbol pair. The
-            // first symbol of a chunk follows the previous chunk's last symbol
-            // by the overlap (~65 symbols earlier), so its temporal
-            // correlation would measure 65x the true residual and overshoot;
-            // the carried frequency is already converged, so skip the update.
-            if (previous_continual.size() == current_continual.size() &&
-                start == previous_symbol_start + period) {
-                std::complex<float> temporal_correlation{};
-                for (std::size_t i = 0; i < current_continual.size(); ++i) {
-                    temporal_correlation +=
-                        current_continual[i] * std::conj(previous_continual[i]);
+                {
+                    const std::scoped_lock lock(mutex);
+                    if (sync.version != seen_sync_version) {
+                        static_cast<void>(handle_sync_change());
+                    }
                 }
-                residual_phase = std::arg(temporal_correlation);
-                constexpr float loop_gain = 0.20F;
-                tracked_cfo_phase +=
-                    loop_gain * residual_phase / static_cast<float>(period);
-                residual_phase_ema =
-                    (0.1F * residual_phase) + (0.9F * residual_phase_ema);
-            }
-            previous_symbol_start = start;
-            previous_continual = std::move(current_continual);
-            std::vector<std::complex<float>> channel(maximum + 1);
-            const auto &pilots =
-                pilot_indices[static_cast<std::size_t>(lock.phase)];
-            for (const std::size_t k : pilots) {
-                const float sent = prbs[k] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
-                const auto received =
-                    carrier(fft_out, k, maximum, carrier_offset);
-                channel[k] = std::norm(received) > minimum_power
-                                 ? std::complex<float>{sent, 0.0F} / received
-                                 : std::complex<float>{};
-            }
-            for (std::size_t i = 1; i < pilots.size(); ++i) {
-                const std::size_t left = pilots[i - 1];
-                const std::size_t right = pilots[i];
-                for (std::size_t k = left; k <= right; ++k) {
-                    const float f = static_cast<float>(k - left) /
-                                    static_cast<float>(right - left);
-                    channel[k] =
-                        channel[left] + (channel[right] - channel[left]) * f;
+                if (!have_grid) {
+                    continue; // reset: wait for the next stream
                 }
-            }
-            std::fill(channel.begin(),
-                      channel.begin() +
-                          static_cast<std::ptrdiff_t>(pilots.front()),
-                      channel[pilots.front()]);
-            std::fill(channel.begin() +
-                          static_cast<std::ptrdiff_t>(pilots.back()),
-                      channel.end(), channel[pilots.back()]);
-            std::vector<std::complex<float>> tps_values;
-            tps_values.reserve(tps.size() * (maximum == 6816 ? 4U : 1U));
-            for (std::size_t k = 0; k <= maximum; ++k) {
-                if (listed(tps, k % 1704)) {
-                    tps_values.push_back(
-                        carrier(fft_out, k, maximum, carrier_offset) *
-                        channel[k]);
-                }
-            }
-            tps_snapshot = tps_decoder.process(tps_values);
-            const bool matching_tps =
-                tps_snapshot.locked &&
-                tps_snapshot.parameters.mode == acquisition.mode &&
-                tps_snapshot.parameters.guard_interval == acquisition.guard;
-            if (!decoder_parameters && matching_tps &&
-                tps_snapshot.parameters.hierarchy == 0U) {
-                decoder_parameters = DecoderParameters{
-                    acquisition.mode,
-                    selected_parameters.constellation.value_or(
-                        tps_snapshot.parameters.constellation),
-                    selected_parameters.code_rate.value_or(
-                        tps_snapshot.parameters.high_priority_code_rate),
-                    workers.viterbi};
-                if (!start_decoder()) {
-                    break;
-                }
-            }
-            std::vector<std::complex<float>> payload;
-            payload.reserve(payload_carrier_count(acquisition.mode));
-            std::vector<float> equalizer_power;
-            equalizer_power.reserve(payload_carrier_count(acquisition.mode));
-            for (const std::size_t k :
-                 payload_indices[static_cast<std::size_t>(lock.phase)]) {
-                payload.push_back(carrier(fft_out, k, maximum, carrier_offset) *
-                                  channel[k]);
-                equalizer_power.push_back(std::norm(channel[k]));
-            }
-            if (payload.size() != payload_carrier_count(acquisition.mode)) {
-                continue;
-            }
-            if (!postprocessor) {
-                pending_symbols.push_back(
-                    {.payload = std::move(payload),
-                     .equalizer_power = std::move(equalizer_power),
-                     .fallback_index = static_cast<std::size_t>(lock.phase)});
-                if (pending_symbols.size() > 136) {
-                    pending_symbols.pop_front();
-                }
-            } else {
-                if (!pending_symbols.empty()) {
-                    const std::size_t count = pending_symbols.size();
-                    for (std::size_t index = 0; index < count; ++index) {
-                        auto pending = std::move(pending_symbols.front());
-                        pending_symbols.pop_front();
-                        const std::size_t distance = count - index;
+                // --- contiguous symbol stream ---
+                while (true) {
+                    {
+                        const std::scoped_lock lock(mutex);
+                        if (sync.version != seen_sync_version) {
+                            static_cast<void>(handle_sync_change());
+                        }
+                    }
+                    if (!have_grid) {
+                        break; // reset mid-stream: drain nothing, wait for a
+                               // sync
+                    }
+                    const std::uint64_t needed =
+                        next_symbol_start +
+                        static_cast<std::uint64_t>(fft_size);
+                    {
+                        std::unique_lock lock(mutex);
+                        ring_data.wait(lock, [this, needed] {
+                            return stopping ||
+                                   (ring_closed && ring_write_pos < needed) ||
+                                   ring_write_pos >= needed;
+                        });
+                        if (stopping) {
+                            return;
+                        }
+                        if (ring_closed && ring_write_pos < needed) {
+                            break; // end of stream
+                        }
+                    }
+                    for (std::size_t i = 0; i < fft_size; ++i) {
+                        const std::uint64_t position = next_symbol_start + i;
+                        fft_in[i] = ring[position % ring.size()];
+                    }
+                    {
+                        const std::scoped_lock lock(mutex);
+                        ring_read_pos = needed;
+                        ring_space.notify_all();
+                    }
+                    const std::uint64_t start = next_symbol_start;
+                    std::complex<float> nco = std::polar(1.0F, -nco_phase);
+                    const std::complex<float> nco_step =
+                        std::polar(1.0F, -frontend.tracked_cfo_phase);
+                    for (std::size_t i = 0; i < fft_size; ++i) {
+                        fft_in[i] *= nco;
+                        nco *= nco_step;
+                        if ((i & 511U) == 511U) {
+                            nco *= 1.0F / std::sqrt(std::norm(nco));
+                        }
+                    }
+                    fftwf_execute(plan);
+                    std::vector<std::complex<float>> current_continual;
+                    current_continual.reserve(continual_indices.size());
+                    for (const std::size_t k : continual_indices) {
+                        current_continual.push_back(carrier(
+                            fft_out, k, maximum, frontend.carrier_offset));
+                    }
+                    float residual_phase = 0.0F;
+                    float fade_indicator = 1.0F;
+                    // Only update the CFO loop from a contiguous symbol pair.
+                    // The first symbol after a re-anchor follows the previous
+                    // symbol by a non-period step, so its temporal correlation
+                    // would measure a spurious residual and overshoot; the
+                    // carried frequency is already converged, so skip the
+                    // update.
+                    if (frontend.previous_continual.size() ==
+                            current_continual.size() &&
+                        start == frontend.last_symbol_start +
+                                     static_cast<std::uint64_t>(period)) {
+                        std::complex<float> temporal_correlation{};
+                        double carrier_power = 0.0;
+                        for (std::size_t i = 0; i < current_continual.size();
+                             ++i) {
+                            temporal_correlation +=
+                                current_continual[i] *
+                                std::conj(frontend.previous_continual[i]);
+                            carrier_power +=
+                                std::norm(current_continual[i]) +
+                                std::norm(frontend.previous_continual[i]);
+                        }
+                        residual_phase = std::arg(temporal_correlation);
+                        // Fade gate: the normalized temporal correlation of the
+                        // continual carriers collapses when the channel fades
+                        // (the carriers vanish into the noise). Updating the
+                        // loop on that uncorrelated garbage would drive the
+                        // converged tracked CFO away from the true offset, and
+                        // a deep fade long enough to integrate the error would
+                        // leave the demodulator rotated when the signal returns
+                        // (the old chunked pipeline was immune because a failed
+                        // chunk acquisition froze the tracking). Freeze the
+                        // loop until the correlation returns.
+                        const float normalized_correlation =
+                            carrier_power > 0.0
+                                ? static_cast<float>(
+                                      std::abs(temporal_correlation)) /
+                                      static_cast<float>(carrier_power)
+                                : 0.0F;
+                        fade_indicator = normalized_correlation;
+                        if (fade_indicator > 0.25F) {
+                            constexpr float loop_gain = 0.20F;
+                            frontend.tracked_cfo_phase +=
+                                loop_gain * residual_phase /
+                                static_cast<float>(period);
+                            frontend.residual_phase_ema =
+                                (0.1F * residual_phase) +
+                                (0.9F * frontend.residual_phase_ema);
+                        }
+                    }
+                    frontend.last_symbol_start = start;
+                    frontend.previous_continual = std::move(current_continual);
+                    if (frontend.just_seeded) {
+                        frontend.just_seeded = false;
+                    }
+                    // Pilot phase/carrier lock, refreshed only when the channel
+                    // is alive. During a fade the lock latches a noise-driven
+                    // phase/offset, and its narrow +/-2-bin search cannot
+                    // escape a bad latch when the signal returns, permanently
+                    // scrambling the channel estimate and payload (this was the
+                    // permanent lock loss the old chunked pipeline avoided by
+                    // skipping failed-acquisition chunks entirely). Freeze the
+                    // carried values instead; the pilot phase rotates mod 4 and
+                    // fades span whole 4-symbol cycles, so the carried phase
+                    // stays valid across the fade. A long freeze (a fade longer
+                    // than one TPS frame) periodically re-runs the WIDE lock so
+                    // the demodulator can re-grab the true grid the moment the
+                    // signal returns, instead of staying latched on stale or
+                    // noise-latched values.
+                    PilotLock lock;
+                    if (lock_hold > 0) {
+                        --lock_hold;
+                        lock =
+                            PilotLock{static_cast<int>(frontend.previous_phase),
+                                      frontend.carrier_offset};
+                    } else if (fade_indicator > 0.25F ||
+                               frontend.previous_phase < 0) {
+                        lock = lock_pilots(fft_out, maximum,
+                                           frontend.carrier_offset);
+                        if (frontend.previous_phase >= 0 &&
+                            lock.phase != (frontend.previous_phase + 1) % 4) {
+                            ++frontend.phase_discontinuities;
+                        }
+                        frontend.previous_phase = lock.phase;
+                        frontend.carrier_offset = lock.offset;
+                        frontend.stable_phase = lock.phase;
+                        frontend.stable_carrier_offset = lock.offset;
+                        frozen_symbol_count = 0;
+                        fade_symbol_count = 0;
+                        fade_phase_count = 0;
+                    } else {
+                        if (++frozen_symbol_count >= 68) {
+                            frozen_symbol_count = 0;
+                            // Wide re-lock: search the full pilot grid (the
+                            // narrow +/-2-bin lock cannot escape a noise
+                            // latch). Verify the candidate against the
+                            // phase-coherent scattered-pilot correlation: the
+                            // true grid shows a strong, phase-matched
+                            // correlation even through multipath, while
+                            // noise-latched grids do not. Accept only a
+                            // verified grid, otherwise keep the carried values
+                            // and retry next cycle.
+                            const PilotLock fresh =
+                                lock_pilots(fft_out, maximum,
+                                            std::numeric_limits<int>::max());
+                            std::complex<double> verify{};
+                            std::size_t verify_count = 0;
+                            for (std::size_t pilot =
+                                     static_cast<std::size_t>(fresh.phase * 3);
+                                 pilot <= maximum; pilot += 12) {
+                                const float value = prbs[pilot] == 0U
+                                                        ? 4.0F / 3.0F
+                                                        : -4.0F / 3.0F;
+                                verify +=
+                                    static_cast<std::complex<double>>(value) *
+                                    std::conj(static_cast<std::complex<double>>(
+                                        carrier(fft_out, pilot, maximum,
+                                                fresh.offset)));
+                                ++verify_count;
+                            }
+                            const float verified =
+                                std::abs(verify) /
+                                static_cast<float>(
+                                    std::max(verify_count, std::size_t{1}));
+                            if (verified >= 0.40F) {
+                                lock = fresh;
+                                frontend.previous_phase = lock.phase;
+                                frontend.carrier_offset = lock.offset;
+                                frontend.stable_phase = lock.phase;
+                                frontend.stable_carrier_offset = lock.offset;
+                                // The TPS superframe sync is stale after a
+                                // long fade; re-lock it (BCH frame sync +
+                                // symbol index) so the deinterleaver aligns
+                                // again. The following ~68 symbols decode on
+                                // the fallback index and are rejected by the
+                                // Viterbi/RS rather than silently scrambled.
+                                frontend.tps_decoder.reset();
+                                frontend.tps_snapshot = {};
+                            } else {
+                                lock = PilotLock{
+                                    static_cast<int>(frontend.previous_phase),
+                                    frontend.carrier_offset};
+                            }
+                        } else {
+                            lock = PilotLock{
+                                static_cast<int>(frontend.previous_phase),
+                                frontend.carrier_offset};
+                        }
+                        if (++fade_symbol_count >= 1400) {
+                            // ~2.1 s of continuous fade: request an immediate
+                            // fresh acquisition. Re-arms after each attempt so
+                            // a long fade keeps probing; a lower threshold
+                            // re-locks TPS too often and loses more payload
+                            // than the faster recovery gains.
+                            fade_symbol_count = 0;
+                            const std::scoped_lock guard(mutex);
+                            reacquisition_requested = true;
+                        }
+                        fade_phase_count = (fade_phase_count + 1) % 4;
+                    }
+                    std::vector<std::complex<float>> channel(maximum + 1);
+                    const auto &pilots =
+                        pilot_indices[static_cast<std::size_t>(lock.phase)];
+                    for (const std::size_t k : pilots) {
+                        const float sent =
+                            prbs[k] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+                        const auto received = carrier(fft_out, k, maximum,
+                                                      frontend.carrier_offset);
+                        channel[k] =
+                            std::norm(received) > minimum_power
+                                ? std::complex<float>{sent, 0.0F} / received
+                                : std::complex<float>{};
+                    }
+                    // Fractional timing estimate: an FFT-window shift of tau
+                    // samples ramps arg(channel) linearly across carriers
+                    // (2*pi*k*tau/N), so the mean phase difference between
+                    // adjacent pilots, normalized by their spacing, estimates
+                    // tau in samples. Multipath biases the absolute value but
+                    // its drift over the capture is the sample-clock offset.
+                    if (pilots.size() >= 2) {
+                        double pair_sum = 0.0;
+                        std::size_t pair_count = 0;
+                        for (std::size_t pair = 1; pair < pilots.size();
+                             ++pair) {
+                            const std::size_t left = pilots[pair - 1];
+                            const std::size_t right = pilots[pair];
+                            const std::size_t spacing = right - left;
+                            if (spacing == 0 || spacing > 64 ||
+                                std::norm(channel[left]) == 0.0F ||
+                                std::norm(channel[right]) == 0.0F) {
+                                continue;
+                            }
+                            pair_sum += std::arg(channel[right] *
+                                                 std::conj(channel[left])) /
+                                        static_cast<double>(spacing);
+                            ++pair_count;
+                        }
+                        if (pair_count != 0) {
+                            timing_acc +=
+                                pair_sum / static_cast<double>(pair_count);
+                            ++timing_count;
+                        }
+                    }
+                    for (std::size_t i = 1; i < pilots.size(); ++i) {
+                        const std::size_t left = pilots[i - 1];
+                        const std::size_t right = pilots[i];
+                        for (std::size_t k = left; k <= right; ++k) {
+                            const float f = static_cast<float>(k - left) /
+                                            static_cast<float>(right - left);
+                            channel[k] = channel[left] +
+                                         (channel[right] - channel[left]) * f;
+                        }
+                    }
+                    std::fill(channel.begin(),
+                              channel.begin() +
+                                  static_cast<std::ptrdiff_t>(pilots.front()),
+                              channel[pilots.front()]);
+                    std::fill(channel.begin() +
+                                  static_cast<std::ptrdiff_t>(pilots.back()),
+                              channel.end(), channel[pilots.back()]);
+                    std::vector<std::complex<float>> tps_values;
+                    tps_values.reserve(tps_2k.size() *
+                                       (maximum == 6816 ? 4U : 1U));
+                    for (std::size_t k = 0; k <= maximum; ++k) {
+                        if (listed(tps_2k, k % 1704)) {
+                            tps_values.push_back(
+                                carrier(fft_out, k, maximum,
+                                        frontend.carrier_offset) *
+                                channel[k]);
+                        }
+                    }
+                    // TPS state carries continuously across the whole stream
+                    // (contiguous symbols), so the differential decoder locks
+                    // once and stays locked through re-anchors.
+                    frontend.tps_snapshot =
+                        frontend.tps_decoder.process(tps_values);
+                    const bool matching_tps =
+                        frontend.tps_snapshot.locked &&
+                        frontend.tps_snapshot.parameters.mode ==
+                            frontend.mode &&
+                        frontend.tps_snapshot.parameters.guard_interval ==
+                            frontend.guard;
+                    if (!decoder_parameters && matching_tps &&
+                        frontend.tps_snapshot.parameters.hierarchy == 0U) {
+                        decoder_parameters = DecoderParameters{
+                            frontend.mode,
+                            selected_parameters.constellation.value_or(
+                                frontend.tps_snapshot.parameters.constellation),
+                            selected_parameters.code_rate.value_or(
+                                frontend.tps_snapshot.parameters
+                                    .high_priority_code_rate),
+                            workers.viterbi};
+                        if (!start_decoder()) {
+                            return;
+                        }
+                    }
+                    std::vector<std::complex<float>> payload;
+                    payload.reserve(payload_carrier_count(frontend.mode));
+                    std::vector<float> equalizer_power;
+                    equalizer_power.reserve(
+                        payload_carrier_count(frontend.mode));
+                    for (const std::size_t k :
+                         payload_indices[static_cast<std::size_t>(
+                             lock.phase)]) {
+                        payload.push_back(carrier(fft_out, k, maximum,
+                                                  frontend.carrier_offset) *
+                                          channel[k]);
+                        equalizer_power.push_back(std::norm(channel[k]));
+                    }
+                    if (payload.size() !=
+                        payload_carrier_count(frontend.mode)) {
+                        next_symbol_start += period;
+                        ++symbol_count;
+                        ++window_symbol_count;
+                        nco_phase = std::remainder(
+                            nco_phase + (frontend.tracked_cfo_phase *
+                                         static_cast<float>(period)),
+                            2.0F * std::numbers::pi_v<float>);
+                        if (window_symbol_count >= stats_window_symbols) {
+                            publish_stats_window();
+                            window_started_at =
+                                std::chrono::steady_clock::now();
+                            window_symbol_count = 0;
+                            mer_sum = 0.0;
+                            demap_time_sum = 0.0F;
+                            deinterleave_time_sum = 0.0F;
+                            depuncture_time_sum = 0.0F;
+                            timing_acc = 0.0;
+                            timing_count = 0;
+                        }
+                        continue;
+                    }
+                    if (postprocessor == nullptr) {
+                        pending_symbols.push_back(
+                            {.payload = std::move(payload),
+                             .equalizer_power = std::move(equalizer_power),
+                             .fallback_index =
+                                 static_cast<std::size_t>(lock.phase)});
+                        if (pending_symbols.size() > 136) {
+                            pending_symbols.pop_front();
+                        }
+                    } else {
+                        if (!pending_symbols.empty()) {
+                            const std::size_t count = pending_symbols.size();
+                            for (std::size_t index = 0; index < count;
+                                 ++index) {
+                                auto pending =
+                                    std::move(pending_symbols.front());
+                                pending_symbols.pop_front();
+                                const std::size_t distance = count - index;
+                                const std::size_t symbol_index =
+                                    matching_tps
+                                        ? (frontend.tps_snapshot.symbol_index +
+                                           68 - (distance % 68)) %
+                                              68
+                                        : pending.fallback_index;
+                                postprocessor->submit(
+                                    std::move(pending.payload),
+                                    std::move(pending.equalizer_power),
+                                    symbol_index);
+                            }
+                        }
                         const std::size_t symbol_index =
-                            matching_tps ? (tps_snapshot.symbol_index + 68 -
-                                            (distance % 68)) %
-                                               68
-                                         : pending.fallback_index;
-                        postprocessor->submit(
-                            std::move(pending.payload),
-                            std::move(pending.equalizer_power), symbol_index);
+                            matching_tps ? frontend.tps_snapshot.symbol_index
+                                         : static_cast<std::size_t>(lock.phase);
+                        postprocessor->submit(std::move(payload),
+                                              std::move(equalizer_power),
+                                              symbol_index);
+                        process_batch(postprocessor->take_ready());
+                    }
+                    ++symbol_count;
+                    ++window_symbol_count;
+                    nco_phase =
+                        std::remainder(nco_phase + (frontend.tracked_cfo_phase *
+                                                    static_cast<float>(period)),
+                                       2.0F * std::numbers::pi_v<float>);
+                    next_symbol_start += period;
+                    if (window_symbol_count >= stats_window_symbols) {
+                        publish_stats_window();
+                        static_cast<void>(
+                            enqueue_fec({.kind = FecItem::Kind::stats,
+                                         .generation = latest_generation,
+                                         .parameters = {},
+                                         .mother_metrics = {},
+                                         .symbol_index = 0}));
+                        window_started_at = std::chrono::steady_clock::now();
+                        window_symbol_count = 0;
+                        mer_sum = 0.0;
+                        demap_time_sum = 0.0F;
+                        deinterleave_time_sum = 0.0F;
+                        depuncture_time_sum = 0.0F;
+                        timing_acc = 0.0;
+                        timing_count = 0;
                     }
                 }
-                const std::size_t symbol_index =
-                    matching_tps ? tps_snapshot.symbol_index
-                                 : static_cast<std::size_t>(lock.phase);
-                postprocessor->submit(std::move(payload),
-                                      std::move(equalizer_power), symbol_index);
-                if (!emit_postprocessed(postprocessor->take_ready())) {
-                    break;
+                // --- end of stream: drain the postprocessor, the gate, and the
+                //     FEC decoder, then wait for the next stream ---
+                if (postprocessor != nullptr) {
+                    process_batch(postprocessor->flush());
                 }
-            }
-            ++symbol_count;
-            nco_phase = std::remainder(
-                nco_phase + (tracked_cfo_phase * static_cast<float>(period)),
-                2.0F * std::numbers::pi_v<float>);
-        }
-        if (!cancel_requested && postprocessor &&
-            !emit_postprocessed(postprocessor->flush())) {
-            return;
-        }
-        // Decide the MER gate from the chunk's symbol quality, then enqueue
-        // the buffered symbols (or discard them as hopeless). A faded-head /
-        // recovered-tail chunk must still decode, so the gate skips the FEC
-        // only when even the chunk's best symbols fall below the floor: a
-        // uniformly hopeless chunk is spared the Viterbi grind entirely.
-        bool fec_skipped = false;
-        if (!cancel_requested && !chunk_symbols.empty() && decoder_parameters) {
-            const float floor = fec_floor(decoder_parameters->constellation);
-            std::vector<float> mers;
-            mers.reserve(chunk_symbols.size());
-            for (const auto &symbol : chunk_symbols) {
-                mers.push_back(symbol.mer_db);
-            }
-            const std::size_t top = std::max<std::size_t>(1, mers.size() / 10);
-            std::ranges::nth_element(
-                mers,
-                mers.begin() + static_cast<std::ptrdiff_t>(mers.size() - top));
-            double best = 0.0;
-            for (std::size_t index = mers.size() - top; index < mers.size();
-                 ++index) {
-                best += mers[index];
-            }
-            best /= static_cast<double>(top);
-            fec_skipped = static_cast<float>(best) < floor + 4.0F;
-            if (!fec_skipped) {
-                for (auto &symbol : chunk_symbols) {
-                    if (!enqueue_fec(
-                            {.kind = FecItem::Kind::symbol,
-                             .generation = generation,
-                             .parameters = {},
-                             .mother_metrics = std::move(symbol.mother_metrics),
-                             .symbol_index = symbol.symbol_index,
-                             .summary = {}})) {
-                        break;
+                if (!gate_buffer.empty() && decoder_parameters) {
+                    double window_mer = 0.0;
+                    for (const auto &symbol : gate_buffer) {
+                        window_mer += symbol.mer_db;
+                    }
+                    window_mer /= static_cast<double>(gate_buffer.size());
+                    const float floor =
+                        fec_floor(decoder_parameters->constellation) + 4.0F;
+                    const bool hopeless =
+                        static_cast<float>(window_mer) < floor;
+                    if (hopeless && !in_hopeless_region) {
+                        in_hopeless_region = true;
+                    } else if (!hopeless && in_hopeless_region) {
+                        in_hopeless_region = false;
+                        static_cast<void>(
+                            enqueue_fec({.kind = FecItem::Kind::begin,
+                                         .generation = latest_generation,
+                                         .parameters = *decoder_parameters,
+                                         .mother_metrics = {},
+                                         .symbol_index = 0}));
+                    }
+                    if (!hopeless) {
+                        for (auto &symbol : gate_buffer) {
+                            static_cast<void>(enqueue_fec(
+                                {.kind = FecItem::Kind::symbol,
+                                 .generation = latest_generation,
+                                 .parameters = {},
+                                 .mother_metrics =
+                                     std::move(symbol.mother_metrics),
+                                 .symbol_index = symbol.symbol_index}));
+                        }
+                    }
+                    gate_buffer.clear();
+                }
+                if (postprocessor != nullptr) {
+                    static_cast<void>(
+                        enqueue_fec({.kind = FecItem::Kind::end,
+                                     .generation = latest_generation,
+                                     .parameters = {},
+                                     .mother_metrics = {},
+                                     .symbol_index = 0}));
+                    // A flushed stream that is then resumed starts a fresh
+                    // region so the replay's first symbols do not continue a
+                    // flushed trellis.
+                    if (decoder_parameters) {
+                        static_cast<void>(
+                            enqueue_fec({.kind = FecItem::Kind::begin,
+                                         .generation = latest_generation,
+                                         .parameters = *decoder_parameters,
+                                         .mother_metrics = {},
+                                         .symbol_index = 0}));
                     }
                 }
+                // Publish a final partial-window stats snapshot.
+                if (window_symbol_count != 0 || mer_sum != 0.0) {
+                    publish_stats_window();
+                    window_started_at = std::chrono::steady_clock::now();
+                    window_symbol_count = 0;
+                    mer_sum = 0.0;
+                    demap_time_sum = 0.0F;
+                    deinterleave_time_sum = 0.0F;
+                    depuncture_time_sum = 0.0F;
+                    timing_acc = 0.0;
+                    timing_count = 0;
+                }
+                {
+                    const std::scoped_lock lock(mutex);
+                    demod_busy = false;
+                }
+                idle.notify_all();
             }
-            chunk_symbols.clear();
-        }
-        fftwf_destroy_plan(plan);
-        const auto equalized_at = std::chrono::steady_clock::now();
-        if (cancel_requested) {
-            return;
-        }
-        const ChunkSummary summary{
-            .ofdm_locked = symbol_count != 0,
-            .state_carried = carried,
-            .fec_skipped = fec_skipped,
-            .tps_locked = tps_snapshot.locked,
-            .tps_parameters = tps_snapshot.parameters,
-            .carrier_bin_offset = carrier_offset,
-            .mer_db = symbol_count == 0
-                          ? 0.0F
-                          : static_cast<float>(
-                                mer_sum / static_cast<double>(symbol_count)),
-            .residual_carrier_offset_hz =
-                residual_phase_ema *
-                (static_cast<float>(bandwidth) * (8.0F / 7.0F)) /
-                (2.0F * std::numbers::pi_v<float> * static_cast<float>(period)),
-            .pilot_phase_discontinuities =
-                phase_discontinuities - phase_discontinuity_base,
-            .ofdm_symbols = symbol_count,
-            .input_seconds = static_cast<float>(new_complex_samples) /
-                             static_cast<float>(rate),
-            .overlap_input_seconds =
-                static_cast<float>((iq.size() / 2) - new_complex_samples) /
-                static_cast<float>(rate),
-            .input_samples = new_complex_samples,
-            .resample_time_ms = std::chrono::duration<float, std::milli>(
-                                    resampled_at - started_at)
-                                    .count(),
-            .acquisition_time_ms = std::chrono::duration<float, std::milli>(
-                                       acquired_at - resampled_at)
-                                       .count(),
-            .equalization_time_ms = std::chrono::duration<float, std::milli>(
-                                        equalized_at - acquired_at)
-                                        .count(),
-            .demap_time_ms = demap_time_sum,
-            .deinterleave_time_ms = deinterleave_time_sum,
-            .depuncture_time_ms = depuncture_time_sum,
-            .resample_workers = resample_workers,
-            .symbol_workers = workers.symbol,
-            .started_at = started_at,
-        };
-        if (postprocessor) {
-            static_cast<void>(enqueue_fec({.kind = FecItem::Kind::end,
-                                           .generation = generation,
-                                           .parameters = {},
-                                           .mother_metrics = {},
-                                           .symbol_index = 0,
-                                           .summary = summary}));
+        } catch (const std::exception &exception) {
+            throw;
+        } catch (...) {
+            throw;
         }
     }
 
+    // ------------------------------------------------------------------ //
+    // FEC worker: consumes the continuous symbol stream through the stateful
+    // TransportDecoder (Viterbi pool, RS, TS output). No per-chunk seams:
+    // symbols flow straight through, and end/begin items only bracket gated
+    // (hopeless) regions and stream boundaries.
+    // ------------------------------------------------------------------ //
     void run_fec() {
         std::unique_ptr<Decoder> decoder;
         std::uint64_t decoder_generation = 0;
-        std::uint64_t byte_count = 0;
         float fec_work_ms = 0.0F;
-        std::vector<std::uint8_t> chunk_transport;
-        std::vector<std::uint8_t> transport_history;
+        std::uint64_t window_transport_bytes = 0;
         while (true) {
             FecItem item;
             {
@@ -1165,8 +1981,6 @@ struct StreamDecoder::Impl {
 
             if (item.generation == latest_generation) {
                 if (item.kind == FecItem::Kind::begin) {
-                    const bool generation_changed =
-                        decoder_generation != item.generation;
                     if (!decoder || decoder_generation != item.generation ||
                         decoder->parameters() != item.parameters) {
                         decoder = std::make_unique<Decoder>(item.parameters);
@@ -1174,238 +1988,68 @@ struct StreamDecoder::Impl {
                         decoder->reset();
                     }
                     decoder_generation = item.generation;
-                    byte_count = 0;
-                    fec_work_ms = 0.0F;
-                    chunk_transport.clear();
-                    if (generation_changed) {
-                        transport_history.clear();
-                    }
                 } else if (item.kind == FecItem::Kind::symbol && decoder &&
                            decoder_generation == item.generation) {
                     const auto fec_started_at =
                         std::chrono::steady_clock::now();
                     const auto ts =
                         decoder->process_soft_metrics(item.mother_metrics);
-                    fec_work_ms +=
-                        std::chrono::duration<float, std::milli>(
-                            std::chrono::steady_clock::now() - fec_started_at)
-                            .count();
-                    if (!ts.empty() && item.generation == latest_generation) {
-                        chunk_transport.insert(chunk_transport.end(),
-                                               ts.begin(), ts.end());
+                    fec_work_ms += duration_ms(fec_started_at);
+                    if (!ts.empty()) {
+                        TransportCallback sink;
+                        {
+                            const std::scoped_lock guard(mutex);
+                            sink = callback;
+                            window_transport_bytes += ts.size();
+                        }
+                        if (sink) {
+                            sink(ts);
+                        }
                     }
                 } else if (item.kind == FecItem::Kind::end && decoder &&
                            decoder_generation == item.generation) {
                     const auto fec_started_at =
                         std::chrono::steady_clock::now();
                     const auto ts = decoder->flush();
-                    fec_work_ms +=
-                        std::chrono::duration<float, std::milli>(
-                            std::chrono::steady_clock::now() - fec_started_at)
-                            .count();
-                    if (!ts.empty() && item.generation == latest_generation) {
-                        chunk_transport.insert(chunk_transport.end(),
-                                               ts.begin(), ts.end());
-                    }
-                    const float chunk_seconds =
-                        item.summary.input_seconds +
-                        item.summary.overlap_input_seconds;
-                    const std::size_t expected_overlap_packets =
-                        chunk_seconds <= 0.0F
-                            ? 0
-                            : static_cast<std::size_t>(
-                                  static_cast<float>(chunk_transport.size() /
-                                                     ts_packet_size) *
-                                  item.summary.overlap_input_seconds /
-                                  chunk_seconds);
-                    const std::size_t overlap_packets =
-                        find_ts_overlap(transport_history, chunk_transport,
-                                        expected_overlap_packets);
-                    const bool join_failed =
-                        !transport_history.empty() && overlap_packets == 0;
-                    const auto emitted =
-                        std::span<const std::uint8_t>{chunk_transport}.subspan(
-                            overlap_packets * ts_packet_size);
-                    TransportCallback sink;
-                    {
-                        const std::scoped_lock guard(mutex);
-                        sink = callback;
-                    }
-                    if (sink && !emitted.empty()) {
-                        sink(emitted);
-                    }
-                    byte_count = emitted.size();
-                    if (chunk_transport.size() >=
-                        retained_ts_packets * ts_packet_size) {
-                        transport_history.assign(
-                            chunk_transport.end() -
-                                static_cast<std::ptrdiff_t>(
-                                    retained_ts_packets * ts_packet_size),
-                            chunk_transport.end());
-                    } else {
-                        transport_history.insert(transport_history.end(),
-                                                 emitted.begin(),
-                                                 emitted.end());
-                        if (transport_history.size() >
-                            retained_ts_packets * ts_packet_size) {
-                            transport_history.erase(
-                                transport_history.begin(),
-                                transport_history.end() -
-                                    static_cast<std::ptrdiff_t>(
-                                        retained_ts_packets * ts_packet_size));
+                    fec_work_ms += duration_ms(fec_started_at);
+                    if (!ts.empty()) {
+                        TransportCallback sink;
+                        {
+                            const std::scoped_lock guard(mutex);
+                            sink = callback;
+                            window_transport_bytes += ts.size();
+                        }
+                        if (sink) {
+                            sink(ts);
                         }
                     }
-                    const float wall_seconds =
-                        std::chrono::duration<float>(
-                            std::chrono::steady_clock::now() -
-                            item.summary.started_at)
-                            .count();
                     const std::scoped_lock guard(mutex);
                     if (item.generation == latest_generation) {
-                        latest.ofdm_locked = item.summary.ofdm_locked;
-                        latest.tps_locked = item.summary.tps_locked;
-                        latest.tps_constellation =
-                            item.summary.tps_parameters.constellation;
-                        latest.tps_code_rate =
-                            item.summary.tps_parameters.high_priority_code_rate;
-                        latest.tps_guard_interval =
-                            item.summary.tps_parameters.guard_interval;
-                        latest.tps_mode = item.summary.tps_parameters.mode;
-                        latest.tps_hierarchy =
-                            item.summary.tps_parameters.hierarchy;
-                        latest.carrier_bin_offset =
-                            item.summary.carrier_bin_offset;
-                        latest.mer_db = item.summary.mer_db;
-                        latest.residual_carrier_offset_hz =
-                            item.summary.residual_carrier_offset_hz;
-                        latest.pilot_phase_discontinuities +=
-                            item.summary.pilot_phase_discontinuities;
-                        ++latest.processed_chunks;
-                        latest.processed_input_samples +=
-                            item.summary.input_samples;
-                        latest.ofdm_symbols += item.summary.ofdm_symbols;
-                        latest.transport_bytes += byte_count;
-                        latest.ts_overlap_packets += overlap_packets;
-                        latest.ts_overlap_join_failures +=
-                            join_failed ? 1U : 0U;
-                        latest.transport = decoder->stats();
-                        latest.processing_realtime_ratio =
-                            wall_seconds / item.summary.input_seconds;
-                        latest.resample_time_ms = item.summary.resample_time_ms;
-                        latest.acquisition_time_ms =
-                            item.summary.acquisition_time_ms;
-                        latest.equalization_time_ms =
-                            item.summary.equalization_time_ms;
                         latest.fec_time_ms = fec_work_ms;
-                        latest.symbol_workers = item.summary.symbol_workers;
-                        latest.demap_time_ms = item.summary.demap_time_ms;
-                        latest.deinterleave_time_ms =
-                            item.summary.deinterleave_time_ms;
-                        latest.depuncture_time_ms =
-                            item.summary.depuncture_time_ms;
+                        latest.transport_bytes += window_transport_bytes;
+                        latest.transport = decoder->stats();
                         latest.transport_time_ms =
                             decoder->timing().transport_time_ms;
-                        latest.resample_workers = item.summary.resample_workers;
-                        latest.state_carried = item.summary.state_carried;
-                        latest.fec_skipped = item.summary.fec_skipped;
                     }
+                    fec_work_ms = 0.0F;
+                    window_transport_bytes = 0;
+                } else if (item.kind == FecItem::Kind::stats && decoder &&
+                           decoder_generation == item.generation) {
+                    const std::scoped_lock guard(mutex);
+                    if (item.generation == latest_generation) {
+                        latest.fec_time_ms = fec_work_ms;
+                        latest.transport_bytes += window_transport_bytes;
+                        latest.transport = decoder->stats();
+                        latest.transport_time_ms =
+                            decoder->timing().transport_time_ms;
+                    }
+                    fec_work_ms = 0.0F;
+                    window_transport_bytes = 0;
                 }
             }
             {
                 const std::scoped_lock guard(mutex);
                 fec_worker_busy = false;
-            }
-            idle.notify_all();
-        }
-    }
-
-    void run() {
-        while (true) {
-            Block block;
-            {
-                std::unique_lock lock(mutex);
-                ready.wait(lock, [this] {
-                    return stopping || reset_requested || flush_requested ||
-                           !queue.empty();
-                });
-                if (stopping) {
-                    return;
-                }
-                if (reset_requested) {
-                    queue.clear();
-                    fec_queue.clear();
-                    queued_complex_samples = 0;
-                    accumulated.clear();
-                    overlap_active = false;
-                    stable_mode.reset();
-                    stable_guard.reset();
-                    reset_frontend_state();
-                    latest = {};
-                    ++latest_generation;
-                    reset_requested = false;
-                    flush_requested = false;
-                    cancel_requested = false;
-                    input_not_full.notify_all();
-                    fec_not_full.notify_all();
-                }
-                if (queue.empty()) {
-                    if (flush_requested) {
-                        flush_requested = false;
-                        worker_busy = true;
-                    } else {
-                        idle.notify_all();
-                        continue;
-                    }
-                } else {
-                    block = std::move(queue.front());
-                    queue.pop_front();
-                    queued_complex_samples -= block.samples.size() / 2;
-                    input_not_full.notify_one();
-                    ++latest.input_blocks;
-                    worker_busy = true;
-                }
-            }
-            if (!block.samples.empty()) {
-                if (!accumulated.empty() &&
-                    (accumulated_rate != block.rate ||
-                     accumulated_bandwidth != block.bandwidth)) {
-                    accumulated.clear();
-                    overlap_active = false;
-                    reset_frontend_state();
-                }
-                accumulated_rate = block.rate;
-                accumulated_bandwidth = block.bandwidth;
-                accumulated.insert(accumulated.end(), block.samples.begin(),
-                                   block.samples.end());
-            }
-            const std::size_t scalar_chunk = processing_chunk_samples * 2;
-            const std::size_t overlap = chunk_overlap_samples(accumulated_rate);
-            const std::size_t scalar_step =
-                (processing_chunk_samples - overlap) * 2;
-            while (accumulated.size() >= scalar_chunk) {
-                decode_chunk(std::span(accumulated).first(scalar_chunk),
-                             accumulated_rate, accumulated_bandwidth,
-                             overlap_active ? processing_chunk_samples - overlap
-                                            : processing_chunk_samples);
-                overlap_active = true;
-                accumulated.erase(accumulated.begin(),
-                                  accumulated.begin() +
-                                      static_cast<std::ptrdiff_t>(scalar_step));
-            }
-            const std::size_t accumulated_complex = accumulated.size() / 2;
-            const std::size_t pending_complex =
-                overlap_active && accumulated_complex >= overlap
-                    ? accumulated_complex - overlap
-                    : accumulated_complex;
-            if (block.samples.empty() && pending_complex != 0) {
-                decode_chunk(accumulated, accumulated_rate,
-                             accumulated_bandwidth, pending_complex);
-                accumulated.clear();
-                overlap_active = false;
-            }
-            {
-                const std::scoped_lock guard(mutex);
-                worker_busy = false;
             }
             idle.notify_all();
         }
@@ -1437,7 +2081,7 @@ void StreamDecoder::submit(const std::span<const std::int16_t> interleaved_iq,
                                                       interleaved_iq.end()),
                             sample_rate_hz, channel_bandwidth_hz});
     impl_->queued_complex_samples += incoming_samples;
-    impl_->ready.notify_one();
+    impl_->input_ready.notify_one();
 }
 
 void StreamDecoder::submit_blocking(
@@ -1464,7 +2108,7 @@ void StreamDecoder::submit_blocking(
                                                       interleaved_iq.end()),
                             sample_rate_hz, channel_bandwidth_hz});
     impl_->queued_complex_samples += incoming_samples;
-    impl_->ready.notify_one();
+    impl_->input_ready.notify_one();
 }
 
 void StreamDecoder::flush() {
@@ -1472,16 +2116,17 @@ void StreamDecoder::flush() {
         const std::scoped_lock lock(impl_->mutex);
         impl_->flush_requested = true;
     }
-    impl_->ready.notify_one();
+    impl_->input_ready.notify_one();
     wait_until_idle();
 }
 
 void StreamDecoder::wait_until_idle() {
     std::unique_lock lock(impl_->mutex);
     impl_->idle.wait(lock, [this] {
-        return impl_->queue.empty() && !impl_->worker_busy &&
+        return impl_->queue.empty() && !impl_->frontend_busy &&
+               !impl_->demod_busy && !impl_->fec_worker_busy &&
                !impl_->flush_requested && !impl_->reset_requested &&
-               impl_->fec_queue.empty() && !impl_->fec_worker_busy;
+               impl_->fec_queue.empty();
     });
 }
 
@@ -1493,7 +2138,7 @@ void StreamDecoder::reset() {
         impl_->reset_requested = true;
     }
     impl_->fec_not_full.notify_all();
-    impl_->ready.notify_one();
+    impl_->input_ready.notify_one();
 }
 
 void StreamDecoder::set_parameters(const ReceiverParameters &parameters) {
@@ -1526,8 +2171,9 @@ StreamDecoderStats StreamDecoder::stats() const {
     statistics.queued_symbols = impl_->fec_queue.size();
     statistics.symbol_queue_capacity = impl_->fec_queue_capacity;
     statistics.fec_processing = impl_->fec_worker_busy;
-    statistics.processing = impl_->worker_busy || impl_->fec_worker_busy ||
-                            !impl_->queue.empty() || !impl_->fec_queue.empty();
+    statistics.processing = impl_->frontend_busy || impl_->demod_busy ||
+                            impl_->fec_worker_busy || !impl_->queue.empty() ||
+                            !impl_->fec_queue.empty();
     return statistics;
 }
 

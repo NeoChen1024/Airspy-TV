@@ -2349,8 +2349,6 @@ int decode_iq_cli(const std::filesystem::path &source,
     std::uint64_t reported_processed_chunks = 0;
     std::uint64_t reported_processed_samples = 0;
     std::uint64_t reported_transport_bytes = 0;
-    std::uint64_t reported_overlap_packets = 0;
-    std::uint64_t reported_join_failures = 0;
     std::uint64_t reported_phase_discontinuities = 0;
     const auto report_chunk = [&](const StreamDecoderStats &stats) {
         reported_processed_chunks = stats.processed_chunks;
@@ -2369,6 +2367,9 @@ int decode_iq_cli(const std::filesystem::path &source,
         }
         std::cerr << " carrier=" << stats.carrier_bin_offset
                   << " residual=" << stats.residual_carrier_offset_hz << " Hz"
+                  << " tracked=" << stats.tracked_carrier_offset_hz << " Hz"
+                  << " start=" << stats.acquisition_start
+                  << " timing=" << stats.timing_offset_samples << " smp"
                   << " carried=" << (stats.state_carried ? 1 : 0)
                   << " fec-skip=" << (stats.fec_skipped ? 1 : 0) << '\n';
         if (debug) {
@@ -2384,11 +2385,6 @@ int decode_iq_cli(const std::filesystem::path &source,
                       << " ms depuncture/quantize=" << stats.depuncture_time_ms
                       << " ms transport=" << stats.transport_time_ms << " ms\n";
             std::cerr << "  TPS: " << (stats.tps_locked ? "locked" : "unlocked")
-                      << '\n';
-            std::cerr << "  chunk join: overlap="
-                      << stats.ts_overlap_packets - reported_overlap_packets
-                      << " TS packets, failures="
-                      << stats.ts_overlap_join_failures - reported_join_failures
                       << '\n';
             if (stats.transport.pre_viterbi_compared_bits != 0) {
                 const double pre_viterbi_ber =
@@ -2412,8 +2408,6 @@ int decode_iq_cli(const std::filesystem::path &source,
                 std::cerr << '\n';
             }
         }
-        reported_overlap_packets = stats.ts_overlap_packets;
-        reported_join_failures = stats.ts_overlap_join_failures;
         const std::uint64_t phase_delta =
             stats.pilot_phase_discontinuities - reported_phase_discontinuities;
         reported_phase_discontinuities = stats.pilot_phase_discontinuities;
@@ -2463,10 +2457,7 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << ", RS=" << stats.transport.rs_packets << ", RS failures="
                   << stats.transport.rs_uncorrectable_packets
                   << ", TEI=" << stats.transport.tei_packets
-                  << ", packets=" << stats.transport.ts_packets
-                  << ", joined-overlap=" << stats.ts_overlap_packets
-                  << ", join-failures=" << stats.ts_overlap_join_failures
-                  << '\n';
+                  << ", packets=" << stats.transport.ts_packets << '\n';
     }
     if (output_failed.load(std::memory_order_relaxed) || !output) {
         std::cerr << "Failed while writing MPEG-TS output\n";
