@@ -1105,8 +1105,7 @@ struct StreamDecoder::Impl {
                     // dropped-block recovery: the content may have changed
                     // entirely, so playback must restart rather than
                     // concatenate.
-                    pending_discontinuity =
-                        TransportDiscontinuity::retune;
+                    pending_discontinuity = TransportDiscontinuity::retune;
                     if (postprocessor != nullptr) {
                         static_cast<void>(symbol_postprocessor->flush());
                     }
@@ -1432,6 +1431,8 @@ struct StreamDecoder::Impl {
                 }
                 const std::scoped_lock lock(mutex);
                 latest.ofdm_locked = true;
+                latest.fft_size = static_cast<std::uint32_t>(fft_size);
+                latest.guard_size = static_cast<std::uint32_t>(guard_size);
                 latest.tps_locked = frontend.tps_snapshot.currently_valid;
                 latest.tps_constellation =
                     frontend.tps_snapshot.parameters.constellation;
@@ -1500,8 +1501,11 @@ struct StreamDecoder::Impl {
                     ring_data.wait(lock, [this, &seen_sync_version,
                                           &have_grid] {
                         return stopping || sync.version != seen_sync_version ||
-                               (have_grid && !ring_closed &&
-                                ring_write_pos > ring_read_pos) ||
+                               // A finite stream may close while the first
+                               // acquisition is still running. Once the grid
+                               // is published, drain the already-written
+                               // samples even though the ring is closed.
+                               (have_grid && ring_write_pos > ring_read_pos) ||
                                (!have_grid && ring_closed) ||
                                (!have_grid && ring_write_pos - ring_read_pos >=
                                                   acquisition_samples);
@@ -1517,6 +1521,15 @@ struct StreamDecoder::Impl {
                     }
                 }
                 fire_pending_discontinuity();
+                // Explicit constellation/code-rate parameters are sufficient
+                // to start the FEC path; TPS is optional in that mode. This
+                // also makes a manually configured synthetic/test signal
+                // exercise the complete pipeline without manufacturing a
+                // valid TPS frame.
+                if (have_grid && decoder_parameters &&
+                    postprocessor == nullptr && !start_decoder()) {
+                    return;
+                }
                 if (!have_grid) {
                     // First anchor: event-driven acquisition (acquisition no
                     // longer runs on a fixed cadence; the only other events
@@ -1539,6 +1552,13 @@ struct StreamDecoder::Impl {
                         {
                             const std::scoped_lock lock(mutex);
                             demod_busy = false;
+                            // No acquisition means these samples cannot be
+                            // consumed by the symbol loop. Drop the closed
+                            // stream's dead data before parking for reset or a
+                            // new source, so wait_until_idle can observe a
+                            // genuinely drained decoder.
+                            ring_read_pos = ring_write_pos;
+                            idle.notify_all();
                         }
                         // The stream ended without a signal. Stay alive for
                         // the next stream: a reset bumps the sync version and
@@ -1589,6 +1609,10 @@ struct StreamDecoder::Impl {
                         }
                     }
                     fire_pending_discontinuity();
+                    if (have_grid && decoder_parameters &&
+                        postprocessor == nullptr && !start_decoder()) {
+                        return;
+                    }
                     if (!have_grid) {
                         break; // reset mid-stream: drain nothing, wait for a
                                // sync
@@ -2172,6 +2196,11 @@ struct StreamDecoder::Impl {
                 }
                 {
                     const std::scoped_lock lock(mutex);
+                    // A finite stream can end with a partial next symbol (the
+                    // guard prefix or a truncated FFT window). It is not
+                    // decodable input and must not keep wait_until_idle from
+                    // observing a drained stream after the valid tail flush.
+                    ring_read_pos = ring_write_pos;
                     demod_busy = false;
                     acquisition_pending = false;
                 }
@@ -2372,7 +2401,8 @@ void StreamDecoder::wait_until_idle() {
         return impl_->queue.empty() && !impl_->frontend_busy &&
                !impl_->demod_busy && !impl_->fec_worker_busy &&
                !impl_->flush_requested && !impl_->reset_requested &&
-               impl_->fec_queue.empty();
+               impl_->fec_queue.empty() &&
+               impl_->ring_read_pos == impl_->ring_write_pos;
     });
 }
 
@@ -2402,8 +2432,7 @@ void StreamDecoder::set_transport_callback(TransportCallback callback) {
     impl_->callback = std::move(callback);
 }
 
-void StreamDecoder::set_discontinuity_callback(
-    DiscontinuityCallback callback) {
+void StreamDecoder::set_discontinuity_callback(DiscontinuityCallback callback) {
     const std::scoped_lock lock(impl_->mutex);
     impl_->discontinuity_callback = std::move(callback);
 }

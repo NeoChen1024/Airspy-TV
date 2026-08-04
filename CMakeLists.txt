@@ -167,6 +167,20 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME dvbt-transport-decoder COMMAND dvbt-transport-decoder-test)
 
+    add_executable(dvbt-stream-decoder-test
+        tests/dvbt_stream_decoder_test.cpp
+    )
+    target_include_directories(dvbt-stream-decoder-test SYSTEM PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libcorrect/include")
+    target_link_libraries(dvbt-stream-decoder-test PRIVATE
+        airspy-tv-dvbt correct_static)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(dvbt-stream-decoder-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME dvbt-stream-decoder COMMAND dvbt-stream-decoder-test)
+    set_tests_properties(dvbt-stream-decoder PROPERTIES TIMEOUT 10)
+
     add_executable(epg-model-test
         tests/epg_model_test.cpp
         src/epg.cpp
