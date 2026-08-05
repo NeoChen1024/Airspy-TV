@@ -2708,8 +2708,14 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
               << " iq=" << static_cast<int>(std::clamp(iq_percent, 0.0F, 100.0F))
               << "% ring=" << static_cast<int>(std::clamp(ring_percent, 0.0F, 100.0F))
               << "% fecq=" << stats.queued_symbols
-              << " ofdm=" << stats.ofdm_locked << " tps=" << stats.tps_locked
+              << " ofdm=" << stats.ofdm_locked
+              << " tps=" << stats.tps_locked
+              << " tps-ever=" << stats.tps_ever_locked
+              << " car=" << stats.carrier_bin_offset
+              << " acq=" << stats.acquisition_score
+              << " fi=" << stats.fade_indicator
               << " mer=" << stats.mer_db << "dB"
+              << " fec-skip=" << stats.fec_skipped
               << " drop=" << stats.dropped_blocks
               << " cpu=" << static_cast<int>(stats.cpu_load * 100.0F) << "%";
     if (stats.processing_realtime_ratio > 0.0F) {

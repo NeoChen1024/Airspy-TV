@@ -34,6 +34,10 @@ enum class WorkerState : int {
 struct StreamDecoderStats {
     bool ofdm_locked{};
     bool tps_locked{};
+    // True once any TPS frame has ever validated (parameters are fix-once);
+    // tps_locked reflects only the most recent frame. Distinguishes "never
+    // locked on this stream" from "locked then lost and failed to re-lock".
+    bool tps_ever_locked{};
     Constellation tps_constellation{Constellation::qpsk};
     CodeRate tps_code_rate{CodeRate::rate_1_2};
     GuardInterval tps_guard_interval{GuardInterval::gi_1_32};
@@ -67,6 +71,11 @@ struct StreamDecoderStats {
     float tracked_carrier_offset_hz{};
     std::size_t acquisition_start{};
     float timing_offset_samples{};
+    // Continual-carrier fade indicator (normalized temporal correlation);
+    // ~1 healthy, <= 0.25 freezes the demod during a fade. Surfaced so a
+    // stall can be told apart: high fade_indicator with a collapsed MER and
+    // a drifted carrier offset points at a grid/phase latch, not a fade.
+    float fade_indicator{};
     std::uint64_t input_blocks{};
     std::uint64_t processed_chunks{};
     std::uint64_t processed_input_samples{};

@@ -139,6 +139,42 @@ lock_pilots(const std::span<const std::complex<float>> fft,
     return best;
 }
 
+// Phase-only re-lock at a fixed carrier offset, used while the fade
+// indicator is marginal (0.25 < fi <= 0.5): the grid is still up but the
+// channel is degraded enough that a full offset search is noise-driven and
+// can latch a multipath alias (545's 0 -> 3, 557's 0 -> -1). Re-verify only
+// the mod-4 scattered-pilot phase at the frozen offset; the offset itself is
+// re-searched only when fi > 0.5 (healthy) or after a fade.
+[[nodiscard]] int lock_phase_at_offset(
+    const std::span<const std::complex<float>> fft, const std::size_t maximum,
+    const int offset) {
+    int best_phase = 0;
+    float best_score = -1.0F;
+    for (int phase = 0; phase < 4; ++phase) {
+        std::complex<float> correlation{};
+        float score = 0.0F;
+        std::size_t chunk_count = 0;
+        for (std::size_t pilot = static_cast<std::size_t>(phase * 3);
+             pilot <= maximum; pilot += 12) {
+            const float value =
+                prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+            correlation +=
+                value * std::conj(carrier(fft, pilot, maximum, offset));
+            if (++chunk_count == 8) {
+                score += std::norm(correlation);
+                correlation = {};
+                chunk_count = 0;
+            }
+        }
+        score += std::norm(correlation);
+        if (score > best_score) {
+            best_score = score;
+            best_phase = phase;
+        }
+    }
+    return best_phase;
+}
+
 [[nodiscard]] bool listed(const std::span<const int> list,
                           const std::size_t value) {
     return std::ranges::binary_search(list, static_cast<int>(value));
@@ -1033,6 +1069,23 @@ struct StreamDecoder::Impl {
             std::uint64_t symbol_count = 0;
             std::uint64_t frozen_symbol_count = 0;
             std::uint64_t fade_symbol_count = 0;
+            // Confirmation state for the once-only stable-grid capture: the
+            // first healthy lock is not trusted until the same offset has
+            // held for a few consecutive symbols, so a marginal start cannot
+            // pin the pre-fade reference (which a re-anchor restores) onto a
+            // multipath alias.
+            int stable_pending_offset = std::numeric_limits<int>::max();
+            int stable_pending_count = 0;
+            // Confirmation state for per-symbol offset drift: a single
+            // lock_pilots result is not trusted — a degraded-but-not-yet-faded
+            // channel (MER collapses before the continual-carrier correlation
+            // does) makes the +/-2 offset search noise-driven and can latch a
+            // multipath alias (545's 0 -> 3, 557's 0 -> -1) in one symbol.
+            // The drift is accepted only after the same offset has held for
+            // several consecutive symbols; until then the grid stays put and
+            // only the phase is re-verified.
+            int drift_pending_offset = std::numeric_limits<int>::max();
+            int drift_pending_count = 0;
             // Unconditional periodic TPS re-seed (option B): a TPS frame sync
             // that locked while the carrier grid was briefly wrong stays
             // "locked" with a corrupted symbol index, silently scrambling the
@@ -1056,6 +1109,10 @@ struct StreamDecoder::Impl {
             float depuncture_time_sum = 0.0F;
             double timing_acc = 0.0;
             std::uint64_t timing_count = 0;
+            // Continual-carrier fade indicator for the current symbol
+            // (persisted here so publish_stats_window, defined before the
+            // symbol loop, can surface it).
+            float fade_indicator = 1.0F;
             // Wall-clock start of the current symbol's processing segment
             // (FFT through payload), for the CPU-load estimate.
             std::chrono::steady_clock::time_point symbol_busy_start{};
@@ -1288,6 +1345,8 @@ struct StreamDecoder::Impl {
                     std::lround(frontend.cir_offset));
                 last_reanchor_carried = carried;
                 fade_symbol_count = 0;
+                stable_pending_offset = std::numeric_limits<int>::max();
+                stable_pending_count = 0;
                 // The boundary moved: the timing loop restarts against the
                 // newly anchored grid.
                 fractional_timing = 0.0;
@@ -1420,10 +1479,32 @@ struct StreamDecoder::Impl {
                     gate_buffer.push_back(std::move(symbol));
                 }
                 if (!decoder_parameters) {
+                    // Bound the gate buffer while the FEC is not running:
+                    // symbols keep arriving when decoder_parameters is unset
+                    // (no TPS lock yet, or after a reset), and an unbounded
+                    // gate would grow ~100 KB per symbol until memory is
+                    // exhausted — the "TS stops and the machine wedges"
+                    // failure. With the FEC active the 68-symbol window loop
+                    // below already drains the gate, so no cap is needed.
+                    while (gate_buffer.size() > gate_window_symbols * 4) {
+                        gate_buffer.pop_front();
+                    }
                     return;
                 }
+                // Gate floor: the decision-directed MSE the MER is derived
+                // from saturates near the constellation's quantization noise
+                // (ideal 64-QAM reads ~21 dB, a healthy 64-QAM signal ~18
+                // dB), so a generous +4 dB margin sat on top of exactly the
+                // healthy operating point and gated healthy windows on MER
+                // ripple — a live 64-QAM mux at a steady ~18 dB drained the
+                // TS queue to zero over tens of seconds as half its windows
+                // were dropped. The floor sits well below the constellation's
+                // decode threshold instead (theory minus 6 dB: 64-QAM 12 dB,
+                // 16-QAM 8 dB, QPSK 3 dB), so only windows that are genuinely
+                // undecodable are gated and a healthy signal at its operating
+                // point can never be dropped at the boundary.
                 const float floor =
-                    fec_floor(decoder_parameters->constellation) + 4.0F;
+                    fec_floor(decoder_parameters->constellation) - 2.0F;
                 while (gate_buffer.size() >= gate_window_symbols) {
                     double window_mer = 0.0;
                     for (std::size_t i = 0; i < gate_window_symbols; ++i) {
@@ -1552,6 +1633,7 @@ struct StreamDecoder::Impl {
                 latest.fft_size = static_cast<std::uint32_t>(fft_size);
                 latest.guard_size = static_cast<std::uint32_t>(guard_size);
                 latest.tps_locked = frontend.tps_snapshot.currently_valid;
+                latest.tps_ever_locked = frontend.tps_snapshot.ever_locked;
                 latest.tps_constellation =
                     frontend.tps_snapshot.parameters.constellation;
                 latest.tps_code_rate =
@@ -1568,6 +1650,7 @@ struct StreamDecoder::Impl {
                 latest.acquisition_start =
                     static_cast<std::size_t>(sync.start_pos % period);
                 latest.timing_offset_samples = timing_offset;
+                latest.fade_indicator = fade_indicator;
                 latest.mer_db =
                     mer_sum == 0.0 && window_symbols == 0
                         ? 0.0F
@@ -1821,8 +1904,7 @@ struct StreamDecoder::Impl {
                             fft_out, k, maximum, frontend.carrier_offset));
                     }
                     float residual_phase = 0.0F;
-                    float fade_indicator = 1.0F;
-                    // Only update the CFO loop from a contiguous symbol pair.
+                    fade_indicator = 1.0F;                    // Only update the CFO loop from a contiguous symbol pair.
                     // The first symbol after a re-anchor follows the previous
                     // symbol by a non-period step, so its temporal correlation
                     // would measure a spurious residual and overshoot; the
@@ -1833,14 +1915,16 @@ struct StreamDecoder::Impl {
                         start == frontend.last_symbol_start +
                                      static_cast<std::uint64_t>(period)) {
                         std::complex<float> temporal_correlation{};
-                        double carrier_power = 0.0;
+                        double power_current = 0.0;
+                        double power_previous = 0.0;
                         for (std::size_t i = 0; i < current_continual.size();
                              ++i) {
                             temporal_correlation +=
                                 current_continual[i] *
                                 std::conj(frontend.previous_continual[i]);
-                            carrier_power +=
-                                std::norm(current_continual[i]) +
+                            power_current +=
+                                std::norm(current_continual[i]);
+                            power_previous +=
                                 std::norm(frontend.previous_continual[i]);
                         }
                         residual_phase = std::arg(temporal_correlation);
@@ -1853,12 +1937,20 @@ struct StreamDecoder::Impl {
                         // leave the demodulator rotated when the signal returns
                         // (the old chunked pipeline was immune because a failed
                         // chunk acquisition froze the tracking). Freeze the
-                        // loop until the correlation returns.
+                        // loop until the correlation returns. The denominator
+                        // is the geometric mean of the two powers
+                        // (sqrt(P_a * P_b)), not their sum: dividing by the
+                        // sum halves a perfect correlation to 0.5, which made
+                        // a healthy ~18 dB 64-QAM signal read as marginal
+                        // (fi ~= 0.5) and let the pilot lock drift onto a
+                        // multipath alias through the "healthy" path.
                         const float normalized_correlation =
-                            carrier_power > 0.0
+                            power_current > 0.0 && power_previous > 0.0
                                 ? static_cast<float>(
                                       std::abs(temporal_correlation)) /
-                                      static_cast<float>(carrier_power)
+                                      static_cast<float>(
+                                          std::sqrt(power_current *
+                                                    power_previous))
                                 : 0.0F;
                         fade_indicator = normalized_correlation;
                         if (fade_indicator > 0.25F) {
@@ -1898,8 +1990,66 @@ struct StreamDecoder::Impl {
                                       frontend.carrier_offset};
                     } else if (fade_indicator > 0.25F ||
                                frontend.previous_phase < 0) {
-                        lock = lock_pilots(fft_out, maximum,
-                                           frontend.carrier_offset);
+                        if (fade_indicator > 0.5F ||
+                            frontend.carrier_offset ==
+                                std::numeric_limits<int>::max()) {
+                            // Healthy: the continual-carrier correlation is
+                            // strong, so a full offset search is mostly
+                            // signal-driven — but a degraded channel can
+                            // still win one symbol before its correlation
+                            // collapses, so a drifting offset is accepted
+                            // only after consecutive confirmation.
+                            lock = lock_pilots(fft_out, maximum,
+                                               frontend.carrier_offset);
+                            if (lock.offset != frontend.carrier_offset &&
+                                frontend.carrier_offset !=
+                                    std::numeric_limits<int>::max()) {
+                                if (lock.offset == drift_pending_offset) {
+                                    if (++drift_pending_count >= 4) {
+                                        drift_pending_offset =
+                                            std::numeric_limits<int>::max();
+                                        drift_pending_count = 0;
+                                        // Confirmed: accept the new grid.
+                                    } else {
+                                        // Not yet confirmed: hold the grid
+                                        // and re-verify only the phase.
+                                        lock = PilotLock{
+                                            lock_phase_at_offset(
+                                                fft_out, maximum,
+                                                frontend.carrier_offset),
+                                            frontend.carrier_offset};
+                                    }
+                                } else {
+                                    drift_pending_offset = lock.offset;
+                                    drift_pending_count = 1;
+                                    lock = PilotLock{
+                                        lock_phase_at_offset(
+                                            fft_out, maximum,
+                                            frontend.carrier_offset),
+                                        frontend.carrier_offset};
+                                }
+                            } else {
+                                drift_pending_offset =
+                                    std::numeric_limits<int>::max();
+                                drift_pending_count = 0;
+                            }
+                        } else {
+                            // Marginal (0.25 < fi <= 0.5): the grid is still
+                            // up but the channel is degraded enough that an
+                            // offset search is noise-driven and can latch a
+                            // multipath alias (545's 0 -> 3, 557's 0 -> -1),
+                            // which the fade freeze then cannot escape.
+                            // Re-verify only the rotating phase at the frozen
+                            // offset; the offset is re-searched once the
+                            // signal is healthy again.
+                            lock = PilotLock{
+                                lock_phase_at_offset(fft_out, maximum,
+                                                     frontend.carrier_offset),
+                                frontend.carrier_offset};
+                            drift_pending_offset =
+                                std::numeric_limits<int>::max();
+                            drift_pending_count = 0;
+                        }
                         if (frontend.previous_phase >= 0 &&
                             lock.phase != (frontend.previous_phase + 1) % 4) {
                             ++frontend.phase_discontinuities;
@@ -1909,12 +2059,28 @@ struct StreamDecoder::Impl {
                         // Capture the stable grid only once: the carrier grid
                         // is fixed for the life of the stream (the LO never
                         // moves), so the pre-fade reference the fade re-anchor
-                        // restores must be the first healthy lock, never a
-                        // later multipath-influenced one.
+                        // restores must be a healthy lock, never a
+                        // multipath-influenced one. A single first lock is not
+                        // enough — the stream can start through a marginal
+                        // channel, and a noise-latched alias captured here
+                        // would be restored by every later re-anchor (the
+                        // 545 capture's car 0->3: the stable reference was
+                        // pinned to the alias, so each fade re-anchor snapped
+                        // the grid to 3 and decoding never recovered). Require
+                        // the same offset for a few consecutive healthy
+                        // symbols before trusting it.
                         if (frontend.stable_carrier_offset ==
                             std::numeric_limits<int>::max()) {
-                            frontend.stable_phase = lock.phase;
-                            frontend.stable_carrier_offset = lock.offset;
+                            if (lock.offset == stable_pending_offset) {
+                                if (++stable_pending_count >= 4) {
+                                    frontend.stable_phase = lock.phase;
+                                    frontend.stable_carrier_offset =
+                                        lock.offset;
+                                }
+                            } else {
+                                stable_pending_offset = lock.offset;
+                                stable_pending_count = 1;
+                            }
                         }
                         frozen_symbol_count = 0;
                         fade_symbol_count = 0;
@@ -2431,7 +2597,7 @@ struct StreamDecoder::Impl {
                     }
                     window_mer /= static_cast<double>(gate_buffer.size());
                     const float floor =
-                        fec_floor(decoder_parameters->constellation) + 4.0F;
+                        fec_floor(decoder_parameters->constellation) - 2.0F;
                     const bool hopeless =
                         static_cast<float>(window_mer) < floor;
                     if (hopeless && !in_hopeless_region) {
@@ -2512,9 +2678,10 @@ struct StreamDecoder::Impl {
             // crash so a mid-stream stall/exit is diagnosable.
             std::fprintf(stderr,
                          "[decoder] demod thread exception: %s "
-                         "(sync=%d locked=%d ring=%llu/%llu iq=%zu/%zu "
+                         "(sync=%llu locked=%d ring=%llu/%llu iq=%zu/%zu "
                          "fec=%zu/%zu)\n",
-                         exception.what(), sync.version,
+                         exception.what(),
+                         static_cast<unsigned long long>(sync.version),
                          static_cast<int>(sync.valid),
                          static_cast<unsigned long long>(ring_write_pos -
                                                          ring_read_pos),
