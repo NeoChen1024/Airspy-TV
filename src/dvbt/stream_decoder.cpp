@@ -1781,42 +1781,46 @@ struct StreamDecoder::Impl {
                         ++tau_history_count;
                     }
                     if (tau_history_count >= tau_history_min) {
-                        double sum_x = 0.0;
-                        double sum_y = 0.0;
-                        double sum_xy = 0.0;
-                        double sum_xx = 0.0;
-                        for (std::size_t i = 0; i < tau_history_count; ++i) {
-                            const double x = static_cast<double>(i);
-                            // Ring read in insertion order; the subtraction is
-                            // done in unsigned arithmetic, so fold the wrap
-                            // explicitly instead of letting head - count
-                            // underflow to a huge index (which read garbage
-                            // and made the slope estimate ~0, stalling the
-                            // compensation while tau kept ramping).
-                            const std::size_t idx =
+                        // Robust drift estimate: the least-squares slope is
+                        // wrecked by a single outlier window. A multipath
+                        // group-delay jump can flip the per-pair pilot phase
+                        // difference past +/-pi and shift the measured tau by
+                        // a hundred samples in one window (observed on 545:
+                        // tau=171.11 -> -163.89 in one stats window, after
+                        // which the slope estimate dropped to ~0 and the loop
+                        // walked the window off grid). Take the median of the
+                        // consecutive first differences instead: the true
+                        // sample-clock drift is slow (0.36 samples/window on
+                        // 545) and the per-window noise is symmetric, so a
+                        // handful of outlier windows cannot move the median
+                        // while the median still tracks the drift.
+                        const std::size_t diffs_count = tau_history_count - 1;
+                        std::array<double, tau_history_n - 1> diffs{};
+                        for (std::size_t i = 0; i < diffs_count; ++i) {
+                            const std::size_t idx0 =
                                 (tau_history_head + tau_history_n -
                                  tau_history_count + i) %
                                 tau_history_n;
-                            const double y = tau_history[idx];
-                            sum_x += x;
-                            sum_y += y;
-                            sum_xy += x * y;
-                            sum_xx += x * x;
+                            const std::size_t idx1 = (idx0 + 1) % tau_history_n;
+                            diffs[i] = tau_history[idx1] - tau_history[idx0];
                         }
-                        const double denom =
-                            static_cast<double>(tau_history_count) * sum_xx -
-                            sum_x * sum_x;
-                        if (std::abs(denom) > 1e-9) {
-                            const double slope =
-                                (static_cast<double>(tau_history_count) *
-                                     sum_xy -
-                                 sum_x * sum_y) /
-                                denom;
-                            smoothed_timing_drift =
-                                0.1 * slope +
-                                0.9 * smoothed_timing_drift;
-                        }
+                        std::nth_element(
+                            diffs.begin(),
+                            diffs.begin() +
+                                static_cast<std::ptrdiff_t>(diffs_count / 2),
+                            diffs.begin() +
+                                static_cast<std::ptrdiff_t>(diffs_count));
+                        const double drift_estimate =
+                            diffs_count % 2 != 0
+                                ? diffs[diffs_count / 2]
+                                : 0.5 * (diffs[diffs_count / 2 - 1] +
+                                         diffs[diffs_count / 2]);
+                        smoothed_timing_drift =
+                            0.1 * drift_estimate +
+                            0.9 * smoothed_timing_drift;
                     }
+                    smoothed_timing_drift =
+                        std::clamp(smoothed_timing_drift, -4.0, 4.0);
                     fractional_timing += smoothed_timing_drift;
                     fractional_timing =
                         std::clamp(fractional_timing, -4.0, 4.0);
