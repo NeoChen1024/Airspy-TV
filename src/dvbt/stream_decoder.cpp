@@ -43,6 +43,16 @@ constexpr std::size_t acquisition_samples = 350'000;
 constexpr std::size_t buffer_duration_denominator = 5;
 constexpr std::size_t initial_symbol_queue_capacity = 256;
 constexpr std::size_t ts_packet_size = 188;
+
+// Event-driven debug dump: when AIRSPYTV_EVENT_DEBUG is set, key pipeline
+// transitions (fade enter/exit, TPS lock/unlock, carrier drift, re-anchor,
+// acquisition) print their internal state to stderr immediately so a 10 s
+// polling diag does not miss the instant a transient event damages the grid.
+[[nodiscard]] inline bool event_debug_enabled() {
+    static const bool enabled =
+        std::getenv("AIRSPYTV_EVENT_DEBUG") != nullptr;
+    return enabled;
+}
 // Resampled-sample ring shared by the front-end thread (producer) and the
 // demod thread (consumer). The ring is sized at run time from the input rate
 // to retain ~0.2 s of baseband (the baseband rate is always <= the input
@@ -151,15 +161,62 @@ lock_pilots(const std::span<const std::complex<float>> fft,
     int best_phase = 0;
     float best_score = -1.0F;
     for (int phase = 0; phase < 4; ++phase) {
+        // Window-offset phase ramp: an FFT-window shift of tau samples
+        // rotates each carrier by exp(j 2 pi k tau / N), so a naive
+        // correlation against the nominal pilot phases collapses after only
+        // a few samples of window offset — the 545 phase-jump storms
+        // (hundreds of jumps per second while fi reads 1.0, near every
+        // ~38000-symbol badlock). Estimate the per-carrier phase ramp from
+        // the adjacent-pilot phase differences (de-rotating the pilot sign
+        // sequence), then verify with the ramp removed. The ramp estimate is
+        // unambiguous for tau < N/24 (~341 samples at 8K); the measured tau
+        // stays far below that.
         std::complex<float> correlation{};
         float score = 0.0F;
         std::size_t chunk_count = 0;
+        double ramp_sum = 0.0;
+        std::size_t ramp_count = 0;
+        std::size_t previous_pilot = std::numeric_limits<std::size_t>::max();
+        for (std::size_t pilot = static_cast<std::size_t>(phase * 3);
+             pilot <= maximum; pilot += 12) {
+            if (previous_pilot != std::numeric_limits<std::size_t>::max()) {
+                const auto left =
+                    carrier(fft, previous_pilot, maximum, offset);
+                const auto right = carrier(fft, pilot, maximum, offset);
+                const float left_value = prbs[previous_pilot] == 0U
+                                             ? 4.0F / 3.0F
+                                             : -4.0F / 3.0F;
+                const float right_value = prbs[pilot] == 0U ? 4.0F / 3.0F
+                                                            : -4.0F / 3.0F;
+                if (std::norm(left) > 0.0F && std::norm(right) > 0.0F) {
+                    // right * conj(left) has phase 2 pi * 12 * tau / N plus
+                    // a +-pi flip from the pilot sign difference; multiplying
+                    // by the known sign product removes the flip.
+                    const double difference = std::arg(
+                        right * std::conj(left) *
+                        std::complex<float>(right_value * left_value, 0.0F));
+                    if (std::isfinite(difference)) {
+                        ramp_sum += difference;
+                        ++ramp_count;
+                    }
+                }
+            }
+            previous_pilot = pilot;
+        }
+        // Per-carrier phase ramp (2 pi tau / N) and the de-rotation for each
+        // pilot carrier.
+        const double ramp =
+            ramp_count != 0 ? ramp_sum / static_cast<double>(ramp_count) / 12.0
+                            : 0.0;
         for (std::size_t pilot = static_cast<std::size_t>(phase * 3);
              pilot <= maximum; pilot += 12) {
             const float value =
                 prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+            const float dephase = static_cast<float>(-ramp *
+                                                     static_cast<double>(pilot));
             correlation +=
-                value * std::conj(carrier(fft, pilot, maximum, offset));
+                value * std::conj(std::polar(1.0F, dephase) *
+                                  carrier(fft, pilot, maximum, offset));
             if (++chunk_count == 8) {
                 score += std::norm(correlation);
                 correlation = {};
@@ -1068,7 +1125,15 @@ struct StreamDecoder::Impl {
             float nco_phase = 0.0F;
             std::uint64_t symbol_count = 0;
             std::uint64_t frozen_symbol_count = 0;
-            std::uint64_t fade_symbol_count = 0;
+            // Windows whose MER is below the decode floor, back to back.
+            // Unlike fade_indicator (the continual-carrier temporal
+            // correlation, which stays high while the signal is present
+            // even if the carrier grid has drifted off), the MER floor
+            // detects a genuinely undecodable stream, so sustained
+            // hopelessness forces a re-acquisition even when fi reads
+            // healthy (the 581 tail: MER stuck at ~7.8 dB, fi=0.9996,
+            // never entering the fade branch).
+            std::uint64_t hopeless_window_count = 0;
             // Confirmation state for the once-only stable-grid capture: the
             // first healthy lock is not trusted until the same offset has
             // held for a few consecutive symbols, so a marginal start cannot
@@ -1081,11 +1146,6 @@ struct StreamDecoder::Impl {
             // channel (MER collapses before the continual-carrier correlation
             // does) makes the +/-2 offset search noise-driven and can latch a
             // multipath alias (545's 0 -> 3, 557's 0 -> -1) in one symbol.
-            // The drift is accepted only after the same offset has held for
-            // several consecutive symbols; until then the grid stays put and
-            // only the phase is re-verified.
-            int drift_pending_offset = std::numeric_limits<int>::max();
-            int drift_pending_count = 0;
             // Unconditional periodic TPS re-seed (option B): a TPS frame sync
             // that locked while the carrier grid was briefly wrong stays
             // "locked" with a corrupted symbol index, silently scrambling the
@@ -1097,10 +1157,6 @@ struct StreamDecoder::Impl {
             // mismatch (a station switch without a fade) re-runs the
             // acquisition so the grid rebuilds for the new mode.
             std::uint64_t tps_mismatch_symbols = 0;
-            // Uncapped fade duration mod 4: the scattered-pilot phase rotates
-            // once per symbol, so a cold re-anchor must restore the phase
-            // advanced by the full fade length, not the capped counter.
-            std::uint64_t fade_phase_count = 0;
             int lock_hold = 0;
             std::uint64_t window_symbol_count = 0;
             double mer_sum = 0.0;
@@ -1127,6 +1183,21 @@ struct StreamDecoder::Impl {
             double last_windowed_timing = 0.0;
             double smoothed_timing_drift = 0.0;
             double fractional_timing = 0.0;
+            // Tau history for the linear-regression drift estimate (immune to
+            // the loop's own period steps — see publish_stats_window).
+            static constexpr std::size_t tau_history_n = 24;
+            static constexpr std::size_t tau_history_min = 16;
+            std::array<double, tau_history_n> tau_history{};
+            std::size_t tau_history_head = 0;
+            std::size_t tau_history_count = 0;
+            // Cumulative FFT-window displacement applied by the period steps
+            // (each +/-1-sample step on next_symbol_start), retained for
+            // diagnostics. NOTE: not used to rebase the tau measurement — the
+            // pilot phase-slope tau responds to a window step by only a
+            // fraction of a sample (multipath attenuates the sensitivity, ~
+            // 0.38 measured on 545), so subtracting the full step
+            // over-compensates, inverts the drift sign and stalls the loop.
+            double accumulated_window_shift = 0.0;
             // Window-averaged CIR offset of the previous stats window: the
             // drift estimate is computed in window-position-invariant
             // coordinates so the adaptive FFT-window slides do not read as
@@ -1249,6 +1320,7 @@ struct StreamDecoder::Impl {
                     frontend.just_seeded = false;
                     fractional_timing = 0.0;
                     smoothed_timing_drift = 0.0;
+                    accumulated_window_shift = 0.0;
                     frontend.cir_offset = 0.0F;
                     frontend.cir_symbol_count = 0;
                     applied_cir_offset = 0;
@@ -1308,6 +1380,7 @@ struct StreamDecoder::Impl {
                     // new boundary.
                     fractional_timing = 0.0;
                     smoothed_timing_drift = 0.0;
+                    accumulated_window_shift = 0.0;
                     last_windowed_cir_avg = 0.0;
                     cir_off_window_begin = applied_cir_offset;
                     have_grid = true;
@@ -1344,13 +1417,13 @@ struct StreamDecoder::Impl {
                 applied_cir_offset = static_cast<int>(
                     std::lround(frontend.cir_offset));
                 last_reanchor_carried = carried;
-                fade_symbol_count = 0;
                 stable_pending_offset = std::numeric_limits<int>::max();
                 stable_pending_count = 0;
                 // The boundary moved: the timing loop restarts against the
                 // newly anchored grid.
                 fractional_timing = 0.0;
                 smoothed_timing_drift = 0.0;
+                accumulated_window_shift = 0.0;
                 last_windowed_cir_avg = 0.0;
                 cir_off_window_begin = applied_cir_offset;
                 return true;
@@ -1364,7 +1437,49 @@ struct StreamDecoder::Impl {
             // the shared sync so handle_sync_change can act (first anchor:
             // grid build + cold seed; re-anchor: carried tracking + boundary
             // move; mode change: full rebuild).
-            const auto run_event_acquisition = [&]() -> float {
+            const auto run_event_acquisition = [&](bool wait_for_data = false)
+                -> float {
+                if (wait_for_data) {
+                    // Re-anchor in a live stream: the ring is drained as fast
+                    // as the frontend fills it (realtime decode keeps no
+                    // backlog), so a snapshot sees little or nothing. Block
+                    // (bounded) until a full acquisition window accumulates —
+                    // that was the 545 failure: 309 re-anchor attempts, all
+                    // score=0.000. A partial window (< 10 symbol periods) is
+                    // just as useless: acquire_ofdm's periodic phase scan
+                    // requires count >= 10 (10+ symbol periods) before it
+                    // reports any non-zero score, so a 2-symbol snapshot
+                    // still scores 0.000. While recovering there is no valid
+                    // TS to lose, so the wait is free.
+                    const auto wait_started =
+                        std::chrono::steady_clock::now();
+                    for (;;) {
+                        bool cancel = false;
+                        std::uint64_t now_available = 0;
+                        {
+                            const std::scoped_lock lock(mutex);
+                            cancel = stopping || reset_requested ||
+                                     cancel_requested;
+                            now_available =
+                                ring_write_pos - ring_read_pos;
+                        }
+                        if (cancel || duration_ms(wait_started) > 1000.0F) {
+                            if (event_debug_enabled() && !cancel) {
+                                std::fprintf(
+                                    stderr,
+                                    "[evt] acq wait-timeout avail=%llu\n",
+                                    static_cast<unsigned long long>(
+                                        now_available));
+                            }
+                            return 0.0F;
+                        }
+                        if (now_available >= acquisition_samples) {
+                            break;
+                        }
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(4));
+                    }
+                }
                 std::vector<std::complex<float>> window;
                 ReceiverParameters acquisition_parameters;
                 std::uint64_t base = 0;
@@ -1436,6 +1551,15 @@ struct StreamDecoder::Impl {
                     sync.bandwidth = bandwidth;
                     sync.resampled_rate = resampled_rate;
                     latest.acquisition_score = acquisition.score;
+                    if (event_debug_enabled()) {
+                        std::fprintf(
+                            stderr,
+                            "[evt] acq ok score=%.3f start=%llu mode=%d g=%d\n",
+                            acquisition.score,
+                            static_cast<unsigned long long>(acquisition.start),
+                            static_cast<int>(acquisition.mode),
+                            static_cast<int>(acquisition.guard));
+                    }
                     ++sync.version;
                     static_cast<void>(handle_sync_change());
                 }
@@ -1513,6 +1637,22 @@ struct StreamDecoder::Impl {
                     window_mer /= static_cast<double>(gate_window_symbols);
                     const bool hopeless =
                         static_cast<float>(window_mer) < floor;
+                    // Back-to-back hopeless windows, counted at the window
+                    // cadence (one per 68 symbols). A single bad window is
+                    // ripple; sustained hopelessness is what forces the
+                    // re-acquisition path even when fi reads healthy.
+                    hopeless_window_count =
+                        hopeless ? hopeless_window_count + 1 : 0;
+                    if (event_debug_enabled() && hopeless) {
+                        std::fprintf(stderr,
+                                     "[evt] hopeless mer=%.2f floor=%.2f "
+                                     "count=%llu sym=%llu\n",
+                                     static_cast<float>(window_mer), floor,
+                                     static_cast<unsigned long long>(
+                                         hopeless_window_count),
+                                     static_cast<unsigned long long>(
+                                         symbol_count));
+                    }
                     if (hopeless && !in_hopeless_region) {
                         in_hopeless_region = true;
                         static_cast<void>(
@@ -1622,11 +1762,74 @@ struct StreamDecoder::Impl {
                         (last_windowed_timing + last_windowed_cir_avg);
                     last_windowed_timing = static_cast<double>(timing_offset);
                     last_windowed_cir_avg = window_cir_avg;
-                    smoothed_timing_drift =
-                        0.02 * drift + 0.98 * smoothed_timing_drift;
-                    fractional_timing += 0.25 * smoothed_timing_drift;
+                    // The naive EMA of the per-window drift is corrupted by
+                    // the loop's own period steps: a step moves the measured
+                    // tau by only ~0.38 samples (multipath attenuates the
+                    // phase-slope sensitivity, measured on 545), so the step
+                    // shows up as a negative drift spike that drags the
+                    // smoothed estimate down and stalls the compensation —
+                    // the tau sawtooth (ramping 0 -> 62 samples until the
+                    // pilot verify collapses, one badlock per ~38000
+                    // symbols). Fit a linear regression to the tau history
+                    // instead: a single step is one outlier among N points
+                    // and barely moves the slope, so the estimate tracks the
+                    // true sample-clock drift.
+                    tau_history[tau_history_head] =
+                        static_cast<double>(timing_offset) + window_cir_avg;
+                    tau_history_head = (tau_history_head + 1) % tau_history_n;
+                    if (tau_history_count < tau_history_n) {
+                        ++tau_history_count;
+                    }
+                    if (tau_history_count >= tau_history_min) {
+                        double sum_x = 0.0;
+                        double sum_y = 0.0;
+                        double sum_xy = 0.0;
+                        double sum_xx = 0.0;
+                        for (std::size_t i = 0; i < tau_history_count; ++i) {
+                            const double x = static_cast<double>(i);
+                            // Ring read in insertion order; the subtraction is
+                            // done in unsigned arithmetic, so fold the wrap
+                            // explicitly instead of letting head - count
+                            // underflow to a huge index (which read garbage
+                            // and made the slope estimate ~0, stalling the
+                            // compensation while tau kept ramping).
+                            const std::size_t idx =
+                                (tau_history_head + tau_history_n -
+                                 tau_history_count + i) %
+                                tau_history_n;
+                            const double y = tau_history[idx];
+                            sum_x += x;
+                            sum_y += y;
+                            sum_xy += x * y;
+                            sum_xx += x * x;
+                        }
+                        const double denom =
+                            static_cast<double>(tau_history_count) * sum_xx -
+                            sum_x * sum_x;
+                        if (std::abs(denom) > 1e-9) {
+                            const double slope =
+                                (static_cast<double>(tau_history_count) *
+                                     sum_xy -
+                                 sum_x * sum_y) /
+                                denom;
+                            smoothed_timing_drift =
+                                0.1 * slope +
+                                0.9 * smoothed_timing_drift;
+                        }
+                    }
+                    fractional_timing += smoothed_timing_drift;
                     fractional_timing =
                         std::clamp(fractional_timing, -4.0, 4.0);
+                    if (event_debug_enabled() && timing_count != 0 &&
+                        window_symbols >= stats_window_symbols) {
+                        std::fprintf(stderr,
+                                     "[evt] tloop tau=%.2f shift=%.1f "
+                                     "drift=%.3f smooth=%.3f frac=%.2f\n",
+                                     static_cast<double>(timing_offset),
+                                     accumulated_window_shift, drift,
+                                     smoothed_timing_drift,
+                                     fractional_timing);
+                    }
                 }
                 const std::scoped_lock lock(mutex);
                 latest.ofdm_locked = true;
@@ -1982,77 +2185,177 @@ struct StreamDecoder::Impl {
                     // the demodulator can re-grab the true grid the moment the
                     // signal returns, instead of staying latched on stale or
                     // noise-latched values.
+                    // Shared re-acquisition used by both the fade branch and
+                    // the decode-stuck branch below: run the wideband CP
+                    // acquisition and, on success, restore the stable carrier
+                    // grid and the mod-4 phase at the absolute frame position
+                    // (deterministic and immune to the rotation a stale
+                    // channel estimate carries, which the MER cannot see),
+                    // then re-lock the TPS on the healthy grid. Returns true
+                    // when the caller must discard the in-flight symbol and
+                    // restart from the newly published boundary.
+                    const auto maybe_reacquire = [&]() -> bool {
+                        if (event_debug_enabled()) {
+                            std::fprintf(stderr,
+                                         "[evt] re-anchor triggered fi=%.3f "
+                                         "off=%d sym=%llu\n",
+                                         fade_indicator,
+                                         frontend.carrier_offset,
+                                         static_cast<unsigned long long>(
+                                             symbol_count));
+                        }
+                        const float reanchor_score =
+                            run_event_acquisition(true);
+                        if (event_debug_enabled()) {
+                            std::fprintf(stderr,
+                                         "[evt] re-anchor score=%.3f "
+                                         "stable_off=%d\n",
+                                         reanchor_score,
+                                         frontend.stable_carrier_offset);
+                        }
+                        if (reanchor_score < 0.20F) {
+                            return false;
+                        }
+                        if (frontend.stable_carrier_offset !=
+                            std::numeric_limits<int>::max()) {
+                            // Restore the carrier grid from the stable
+                            // reference: the LO never moves, so the true
+                            // offset is the pre-fade one, while the narrow
+                            // lock can latch a multipath alias (the observed
+                            // off=2 at the 581 fade) whose pilot pattern
+                            // passes the scatter verify. Restore the offset
+                            // and the scattered-pilot phase from the absolute
+                            // frame position, then hold the restored grid for
+                            // one symbol so the lock cannot immediately flip
+                            // the correct phase onto a noise-latched one.
+                            frontend.carrier_offset =
+                                frontend.stable_carrier_offset;
+                            frontend.previous_phase = static_cast<int>(
+                                (frontend.stable_phase + symbol_count) % 4);
+                            lock_hold = 1;
+                        }
+                        // The acquisition republished the grid: the in-flight
+                        // symbol's FFT window was read from the pre-anchor
+                        // boundary, so combining it with the newly anchored
+                        // grid would corrupt its channel estimate and payload.
+                        // Discard it and restart from the published
+                        // next_symbol_start at the loop head.
+                        hopeless_window_count = 0;
+                        return true;
+                    };
                     PilotLock lock;
                     if (lock_hold > 0) {
                         --lock_hold;
                         lock =
                             PilotLock{static_cast<int>(frontend.previous_phase),
                                       frontend.carrier_offset};
-                    } else if (fade_indicator > 0.25F ||
-                               frontend.previous_phase < 0) {
-                        if (fade_indicator > 0.5F ||
-                            frontend.carrier_offset ==
-                                std::numeric_limits<int>::max()) {
-                            // Healthy: the continual-carrier correlation is
-                            // strong, so a full offset search is mostly
-                            // signal-driven — but a degraded channel can
-                            // still win one symbol before its correlation
-                            // collapses, so a drifting offset is accepted
-                            // only after consecutive confirmation.
+                    } else if ((fade_indicator <= 0.25F &&
+                                frontend.previous_phase >= 0) ||
+                               hopeless_window_count >= 4) {
+                        if (event_debug_enabled() && frozen_symbol_count == 0) {
+                            // Distinguish a real fade (fi collapsed) from a
+                            // decode-stuck state (fi healthy but MER below the
+                            // decode floor — the carrier grid drifted off,
+                            // which the continual-carrier correlation cannot
+                            // see).
+                            if (fade_indicator > 0.25F) {
+                                std::fprintf(
+                                    stderr,
+                                    "[evt] badlock enter fi=%.3f off=%d "
+                                    "sym=%llu discont=%llu timing=%.2f "
+                                    "hopeless=%llu\n",
+                                    fade_indicator, frontend.carrier_offset,
+                                    static_cast<unsigned long long>(
+                                        symbol_count),
+                                    static_cast<unsigned long long>(
+                                        frontend.phase_discontinuities),
+                                    timing_count == 0
+                                        ? 0.0
+                                        : (timing_acc /
+                                           static_cast<double>(timing_count)) *
+                                              static_cast<double>(fft_size) /
+                                              (2.0 *
+                                               std::numbers::pi_v<double>),
+                                    static_cast<unsigned long long>(
+                                        hopeless_window_count));
+                            } else {
+                                std::fprintf(
+                                    stderr,
+                                    "[evt] fade enter fi=%.3f off=%d sym=%llu\n",
+                                    fade_indicator, frontend.carrier_offset,
+                                    static_cast<unsigned long long>(
+                                        symbol_count));
+                            }
+                        }
+                        // Fade / decode-stuck: hold the frozen phase/offset
+                        // and re-acquire directly. A fade (or a grid drift)
+                        // can shift the true carrier offset (observed off=2 at
+                        // the 581 fade) and disturb the mod-4 scattered-pilot
+                        // phase, so a narrow re-lock on the frozen grid can
+                        // only latch a multipath alias or stay stuck on a
+                        // stale phase — the permanent lock loss seen on the
+                        // 581 tail (MER stuck at ~7.8 dB with
+                        // phase-discontinuities climbing). The wideband CP
+                        // correlation, unlike the continual-carrier
+                        // correlation, survives the multipath that keeps
+                        // fade_indicator collapsed, so re-acquisition
+                        // confirms the signal's return and rebuilds the whole
+                        // grid (offset, phase, boundary, guard) at once.
+                        // Retry every 68 symbols (~100 ms) until the signal
+                        // returns; while faded there is no valid TS to lose,
+                        // and a re-anchor that lands while the signal is
+                        // still gone just scores low and retries.
+                        lock = PilotLock{
+                            static_cast<int>(frontend.previous_phase),
+                            frontend.carrier_offset};
+                        if (++frozen_symbol_count >= 68 &&
+                            frozen_symbol_count % 68 == 0 &&
+                            maybe_reacquire()) {
+                            continue;
+                        }
+                    } else {
+                        if (frontend.carrier_offset ==
+                            std::numeric_limits<int>::max()) {
+                            // First healthy lock after (re-)acquisition: the
+                            // grid is unknown, so run the full offset search
+                            // once to establish it.
                             lock = lock_pilots(fft_out, maximum,
                                                frontend.carrier_offset);
-                            if (lock.offset != frontend.carrier_offset &&
-                                frontend.carrier_offset !=
-                                    std::numeric_limits<int>::max()) {
-                                if (lock.offset == drift_pending_offset) {
-                                    if (++drift_pending_count >= 4) {
-                                        drift_pending_offset =
-                                            std::numeric_limits<int>::max();
-                                        drift_pending_count = 0;
-                                        // Confirmed: accept the new grid.
-                                    } else {
-                                        // Not yet confirmed: hold the grid
-                                        // and re-verify only the phase.
-                                        lock = PilotLock{
-                                            lock_phase_at_offset(
-                                                fft_out, maximum,
-                                                frontend.carrier_offset),
-                                            frontend.carrier_offset};
-                                    }
-                                } else {
-                                    drift_pending_offset = lock.offset;
-                                    drift_pending_count = 1;
-                                    lock = PilotLock{
-                                        lock_phase_at_offset(
-                                            fft_out, maximum,
-                                            frontend.carrier_offset),
-                                        frontend.carrier_offset};
-                                }
-                            } else {
-                                drift_pending_offset =
-                                    std::numeric_limits<int>::max();
-                                drift_pending_count = 0;
-                            }
                         } else {
-                            // Marginal (0.25 < fi <= 0.5): the grid is still
-                            // up but the channel is degraded enough that an
-                            // offset search is noise-driven and can latch a
-                            // multipath alias (545's 0 -> 3, 557's 0 -> -1),
-                            // which the fade freeze then cannot escape.
-                            // Re-verify only the rotating phase at the frozen
-                            // offset; the offset is re-searched once the
-                            // signal is healthy again.
+                            // Grid already established: freeze the carrier
+                            // offset and re-verify only the rotating phase.
+                            // The offset is a fixed physical property (the LO
+                            // never moves; residual drift is sub-bin and owned
+                            // by the CFO loop), so re-searching it every
+                            // symbol only chases multipath-induced offset
+                            // ambiguity — the 545 capture shows lock_pilots
+                            // returning 0/±1/±2 at random from symbol to
+                            // symbol even at fi=0.9996, and a 4-symbol
+                            // confirmation window is short enough to accept
+                            // one of those spurious offsets, permanently
+                            // snapping the grid off the true carrier (the
+                            // observed car 0->3 collapse). The grid is only
+                            // re-established by a re-anchor after a real
+                            // fade, which restores the pre-fade stable
+                            // offset.
                             lock = PilotLock{
                                 lock_phase_at_offset(fft_out, maximum,
                                                      frontend.carrier_offset),
                                 frontend.carrier_offset};
-                            drift_pending_offset =
-                                std::numeric_limits<int>::max();
-                            drift_pending_count = 0;
                         }
                         if (frontend.previous_phase >= 0 &&
                             lock.phase != (frontend.previous_phase + 1) % 4) {
                             ++frontend.phase_discontinuities;
+                            if (event_debug_enabled()) {
+                                std::fprintf(stderr,
+                                             "[evt] phase-jump %d->%d sym=%llu "
+                                             "fi=%.3f off=%d\n",
+                                             frontend.previous_phase, lock.phase,
+                                             static_cast<unsigned long long>(
+                                                 symbol_count),
+                                             fade_indicator,
+                                             frontend.carrier_offset);
+                            }
                         }
                         frontend.previous_phase = lock.phase;
                         frontend.carrier_offset = lock.offset;
@@ -2082,133 +2385,17 @@ struct StreamDecoder::Impl {
                                 stable_pending_count = 1;
                             }
                         }
+                        const auto was_frozen = frozen_symbol_count;
                         frozen_symbol_count = 0;
-                        fade_symbol_count = 0;
-                        fade_phase_count = 0;
-                    } else {
-                        if (++frozen_symbol_count >= 68) {
-                            frozen_symbol_count = 0;
-                            // Phase-only re-lock at the frozen carrier offset.
-                            // The carrier grid is fixed for the life of the
-                            // stream (the LO never moves), so the only thing a
-                            // fade can disturb is the mod-4 scattered-pilot
-                            // phase. Searching the offset dimension is
-                            // actively harmful: through multipath the pilot
-                            // pattern aliases (offset+3n is the same grid as
-                            // phase+n), and an accepted alias pins the channel
-                            // estimate to data bins, silently scrambling the
-                            // payload even while the signal is back — the
-                            // corruption seen on the 581 tail. Verify each
-                            // phase at the frozen offset; the true phase
-                            // correlates with the scattered pilots, the other
-                            // three land on data carriers and do not. This is
-                            // the core fade-recovery mechanism: the moment the
-                            // signal returns, the payload decodes again
-                            // (no acquisition needed).
-                            const int frozen_offset = frontend.carrier_offset;
-                            int best_phase = -1;
-                            float best_verified = 0.0F;
-                            for (int candidate = 0; candidate < 4;
-                                 ++candidate) {
-                                std::complex<double> verify{};
-                                std::size_t verify_count = 0;
-                                for (std::size_t pilot =
-                                         static_cast<std::size_t>(candidate *
-                                                                  3);
-                                     pilot <= maximum; pilot += 12) {
-                                    const float value = prbs[pilot] == 0U
-                                                            ? 4.0F / 3.0F
-                                                            : -4.0F / 3.0F;
-                                    verify +=
-                                        static_cast<std::complex<double>>(
-                                            value) *
-                                        std::conj(
-                                            static_cast<std::complex<double>>(
-                                                carrier(fft_out, pilot, maximum,
-                                                        frozen_offset)));
-                                    ++verify_count;
-                                }
-                                const float verified =
-                                    static_cast<float>(std::abs(verify)) /
-                                    static_cast<float>(
-                                        std::max(verify_count, std::size_t{1}));
-                                if (verified > best_verified) {
-                                    best_verified = verified;
-                                    best_phase = candidate;
-                                }
-                            }
-                            if (best_verified >= 0.40F &&
-                                best_phase != frontend.previous_phase) {
-                                lock = PilotLock{best_phase, frozen_offset};
-                                frontend.previous_phase = best_phase;
-                            } else {
-                                lock = PilotLock{
-                                    static_cast<int>(frontend.previous_phase),
-                                    frozen_offset};
-                            }
-                        } else {
-                            lock = PilotLock{
-                                static_cast<int>(frontend.previous_phase),
-                                frontend.carrier_offset};
+                        if (event_debug_enabled() && was_frozen > 0) {
+                            std::fprintf(stderr,
+                                         "[evt] fade exit fi=%.3f off=%d "
+                                         "sym=%llu\n",
+                                         fade_indicator,
+                                         frontend.carrier_offset,
+                                         static_cast<unsigned long long>(
+                                             symbol_count));
                         }
-                        if (++fade_symbol_count >= 1400) {
-                            // ~2.1 s of continuous fade: event-driven
-                            // re-acquisition (acquisition no longer runs on a
-                            // fixed cadence). The wideband CP correlation —
-                            // unlike the continual-carrier correlation —
-                            // survives the multipath that keeps fade_indicator
-                            // collapsed, so it confirms the signal's return
-                            // and refreshes the absolute boundary, correcting
-                            // any counter-grid drift. The re-anchor keeps the
-                            // continuous tracking (the frozen offset/CFO are
-                            // already the pre-fade values). On a confirmed
-                            // return, also restore the mod-4 scattered-pilot
-                            // phase: the carried phase is the pre-fade value,
-                            // and the payload would decode rotated through a
-                            // stale channel estimate (the MER cannot see the
-                            // rotation, so the RS silently fails and the
-                            // outer sync can false-lock). Re-arms after each
-                            // attempt.
-                            fade_symbol_count = 0;
-                            if (run_event_acquisition() >= 0.20F) {
-                                if (frontend.stable_carrier_offset !=
-                                    std::numeric_limits<int>::max()) {
-                                    // Restore the carrier grid from the stable
-                                    // reference: the LO never moves, so the
-                                    // true offset is the pre-fade one, while
-                                    // the narrow lock can latch a multipath
-                                    // alias (the observed off=2 at the 581
-                                    // fade) whose pilot pattern passes the
-                                    // scatter verify. Restore the offset and
-                                    // the scattered-pilot phase from the
-                                    // absolute frame position
-                                    // ((first_lock_phase + symbol_count) mod
-                                    // 4, deterministic and immune to the
-                                    // rotation a stale channel estimate
-                                    // carries, which the MER cannot see),
-                                    // then re-lock the TPS on the healthy
-                                    // grid.
-                                    frontend.carrier_offset =
-                                        frontend.stable_carrier_offset;
-                                    frontend.previous_phase = static_cast<int>(
-                                        (frontend.stable_phase + symbol_count) %
-                                        4);
-                                    // Hold the restored grid for one symbol
-                                    // so the lock cannot immediately flip the
-                                    // correct phase onto a noise-latched one.
-                                    lock_hold = 1;
-                                }
-                                // The acquisition republished the grid: the
-                                // in-flight symbol's FFT window was read from
-                                // the pre-anchor boundary, so combining it
-                                // with the newly anchored grid would corrupt
-                                // its channel estimate and payload. Discard
-                                // it and restart from the published
-                                // next_symbol_start at the loop head.
-                                continue;
-                            }
-                        }
-                        fade_phase_count = (fade_phase_count + 1) % 4;
                     }
                     std::vector<std::complex<float>> channel(maximum + 1);
                     const auto &pilots =
@@ -2442,7 +2629,7 @@ struct StreamDecoder::Impl {
                     if (frontend.tps_snapshot.ever_locked && !matching_tps) {
                         if (++tps_mismatch_symbols >= 1400) {
                             tps_mismatch_symbols = 0;
-                            if (run_event_acquisition() >= 0.20F) {
+                            if (run_event_acquisition(true) >= 0.20F) {
                                 // The grid was republished (the TPS decoded a
                                 // mode/guard that disagrees with the current
                                 // grid): the in-flight symbol predates the new
@@ -2456,6 +2643,21 @@ struct StreamDecoder::Impl {
                     }
                     if (!decoder_parameters && matching_tps &&
                         frontend.tps_snapshot.parameters.hierarchy == 0U) {
+                        if (event_debug_enabled()) {
+                            std::fprintf(stderr,
+                                         "[evt] TPS lock mode=%d g=%d const=%d "
+                                         "rate=%d sym=%llu\n",
+                                         static_cast<int>(frontend.mode),
+                                         static_cast<int>(frontend.guard),
+                                         static_cast<int>(
+                                             frontend.tps_snapshot.parameters
+                                                 .constellation),
+                                         static_cast<int>(
+                                             frontend.tps_snapshot.parameters
+                                                 .high_priority_code_rate),
+                                         static_cast<unsigned long long>(
+                                             symbol_count));
+                        }
                         decoder_parameters = DecoderParameters{
                             frontend.mode,
                             selected_parameters.constellation.value_or(
@@ -2490,9 +2692,11 @@ struct StreamDecoder::Impl {
                         next_symbol_start += period;
                         if (fractional_timing >= 0.5) {
                             ++next_symbol_start;
+                            accumulated_window_shift += 1.0;
                             fractional_timing -= 1.0;
                         } else if (fractional_timing <= -0.5) {
                             --next_symbol_start;
+                            accumulated_window_shift -= 1.0;
                             fractional_timing += 1.0;
                         }
                         nco_phase = std::remainder(

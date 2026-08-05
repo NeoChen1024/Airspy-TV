@@ -1831,6 +1831,23 @@ void draw_sidebar(AppState &state) {
         draw_bipolar_metric("Carrier offset", carrier_offset.c_str(),
                             carrier_offset_position,
                             ImVec4(0.52F, 0.82F, 1.0F, 1.0F));
+        // Continual-carrier fade indicator: the GUI diag dump already logs
+        // it every 10 s, but a real-time bar helps correlate a drift/stall
+        // with a marginal channel before consulting logs.
+        {
+            const float fi = state.decoder.fade_indicator;
+            const std::string fi_text = std::format("{:.3f}", fi);
+            draw_metric("Fade ind", fi_text.c_str(),
+                        std::clamp(fi, 0.0F, 1.0F),
+                        ImVec4(0.62F, 0.92F, 0.45F, 1.0F));
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip(
+                    "Continual-carrier normalized correlation; ~1 = healthy, "
+                    "<= 0.25 freeze, 0.25-0.5 marginal grid.\n"
+                    "If it stays high while the grid drifts, the alias was "
+                    "latched before the correlation collapsed.");
+            }
+        }
         const std::string mer =
             state.signal_analysis.locked
                 ? std::format("{:.1f} dB", state.signal_analysis.mer_db)
