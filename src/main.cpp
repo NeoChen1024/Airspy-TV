@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -29,6 +30,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <getopt.h>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -2335,7 +2337,8 @@ int enumerate_cli() {
     return 0;
 }
 
-int record_first_cli(const std::filesystem::path &path, const int duration_ms) {
+int record_first_cli(const std::filesystem::path &path, const int duration_ms,
+                     const SourceSettings &settings) {
     EnumerationResult result = SdrDevice::enumerate(false);
     if (result.devices.empty()) {
         std::cerr << "No SDR devices found\n";
@@ -2355,24 +2358,24 @@ int record_first_cli(const std::filesystem::path &path, const int duration_ms) {
         return 1;
     }
 
-    SourceSettings settings;
+    SourceSettings effective = settings;
     if (!receiver.sample_rates().empty()) {
-        settings.sample_rate_hz = *std::ranges::min_element(
+        effective.sample_rate_hz = *std::ranges::min_element(
             receiver.sample_rates(), {},
-            [target = settings.sample_rate_hz](const std::uint32_t rate) {
+            [target = effective.sample_rate_hz](const std::uint32_t rate) {
                 return std::llabs(static_cast<long long>(rate) - target);
             });
     }
-    if (!receiver.start_recording(path, settings, error)) {
+    if (!receiver.start_recording(path, effective, error)) {
         std::cerr << error << '\n';
         return 1;
     }
-    ++settings.airspy_gain;
-    if (!receiver.set_gain(settings, error) ||
+    ++effective.airspy_gain;
+    if (!receiver.set_gain(effective, error) ||
         !receiver.set_bias_tee(false, error) ||
-        !receiver.set_center_frequency(settings.center_frequency_hz + 1'000,
+        !receiver.set_center_frequency(effective.center_frequency_hz + 1'000,
                                        error) ||
-        !receiver.set_center_frequency(settings.center_frequency_hz, error)) {
+        !receiver.set_center_frequency(effective.center_frequency_hz, error)) {
         receiver.stop_recording();
         std::cerr << error << '\n';
         return 1;
@@ -2484,7 +2487,7 @@ int inspect_iq_cli(const std::filesystem::path &path,
 int decode_iq_cli(const std::filesystem::path &source,
                   const std::filesystem::path &destination,
                   const std::uint32_t raw_sample_rate_hz,
-                  const std::size_t decoder_threads, const bool debug) {
+                  const ReceiverParameters &parameters, const bool debug) {
     IqFileInfo info;
     std::string error;
     if (!airspy_tv::resolve_iq_file(source, raw_sample_rate_hz, 0, info,
@@ -2518,15 +2521,74 @@ int decode_iq_cli(const std::filesystem::path &source,
     }
 
     StreamDecoder decoder;
-    ReceiverParameters decoder_parameters;
-    decoder_parameters.worker_threads = decoder_threads;
+    ReceiverParameters decoder_parameters = parameters;
     decoder.set_parameters(decoder_parameters);
     if (debug) {
         std::cerr << "Decoder worker budget="
-                  << (decoder_threads == 0
+                  << (decoder_parameters.worker_threads == 0
                           ? airspy_tv::dvbt::default_viterbi_worker_count()
-                          : decoder_threads)
-                  << (decoder_threads == 0 ? " (auto)\n" : "\n");
+                          : decoder_parameters.worker_threads)
+                  << (decoder_parameters.worker_threads == 0 ? " (auto)\n"
+                                                             : "\n");
+        std::cerr << "DVB-T parameters: bandwidth="
+                  << decoder_parameters.channel_bandwidth_hz;
+        if (decoder_parameters.mode.has_value()) {
+            std::cerr << " mode="
+                      << (*decoder_parameters.mode ==
+                                  airspy_tv::dvbt::TransmissionMode::k2
+                              ? "2k"
+                              : "8k");
+        } else {
+            std::cerr << " mode=auto";
+        }
+        if (decoder_parameters.guard_interval.has_value()) {
+            using airspy_tv::dvbt::GuardInterval;
+            std::cerr << " guard="
+                      << (*decoder_parameters.guard_interval ==
+                                  GuardInterval::gi_1_32
+                              ? "1/32"
+                              : *decoder_parameters.guard_interval ==
+                                      GuardInterval::gi_1_16
+                                    ? "1/16"
+                                    : *decoder_parameters.guard_interval ==
+                                            GuardInterval::gi_1_8
+                                          ? "1/8"
+                                          : "1/4");
+        } else {
+            std::cerr << " guard=auto";
+        }
+        if (decoder_parameters.constellation.has_value()) {
+            using airspy_tv::dvbt::Constellation;
+            std::cerr << " modulation="
+                      << (*decoder_parameters.constellation ==
+                                  Constellation::qpsk
+                              ? "qpsk"
+                              : *decoder_parameters.constellation ==
+                                      Constellation::qam16
+                                    ? "qam16"
+                                    : "qam64");
+        } else {
+            std::cerr << " modulation=auto";
+        }
+        if (decoder_parameters.code_rate.has_value()) {
+            using airspy_tv::dvbt::CodeRate;
+            const char *rate =
+                *decoder_parameters.code_rate == CodeRate::rate_1_2
+                    ? "1/2"
+                    : *decoder_parameters.code_rate == CodeRate::rate_2_3
+                          ? "2/3"
+                          : *decoder_parameters.code_rate ==
+                                    CodeRate::rate_3_4
+                                ? "3/4"
+                                : *decoder_parameters.code_rate ==
+                                          CodeRate::rate_5_6
+                                      ? "5/6"
+                                      : "7/8";
+            std::cerr << " code-rate=" << rate;
+        } else {
+            std::cerr << " code-rate=auto";
+        }
+        std::cerr << '\n';
     }
     std::atomic_bool output_failed{};
     decoder.set_transport_callback(
@@ -2777,107 +2839,401 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
 
 } // namespace
 
+namespace {
+
+// Flat getopt_long CLI surface: every option has a globally unique name, so
+// the decoder/recorder/inspect sub-commands do not need their own dispatch
+// (and future standards extend the table without nesting). `--decode-iq` takes
+// the I/Q source path as its argument; the MPEG-TS sink is a separate
+// `--ts-output` option rather than a positional argument, which matches the
+// getopt paradigm where every operand is named.
+enum CliOption : int {
+    opt_enumerate = 1000,
+    opt_inspect_iq,
+    opt_decode_iq,
+    opt_ts_output,
+    opt_sample_rate,
+    opt_mode,
+    opt_dvbt_mode,
+    opt_dvbt_bandwidth,
+    opt_dvbt_guard,
+    opt_dvbt_modulation,
+    opt_dvbt_code_rate,
+    opt_decoder_threads,
+    opt_record_first,
+    opt_duration,
+    opt_frequency,
+    opt_ppm,
+    opt_gain,
+    opt_gain_mode,
+    opt_bias_tee,
+};
+
+constexpr option cli_options[] = {
+    {"help", no_argument, nullptr, 'h'},
+    {"enumerate", no_argument, nullptr, opt_enumerate},
+    {"inspect-iq", required_argument, nullptr, opt_inspect_iq},
+    {"decode-iq", required_argument, nullptr, opt_decode_iq},
+    {"ts-output", required_argument, nullptr, opt_ts_output},
+    {"sample-rate", required_argument, nullptr, opt_sample_rate},
+    // Broadcast standard selection: DVB-T is the only implemented value
+    // today; DVB-C / DVB-T2 / DTMB / ATSC are reserved for the roadmap.
+    {"mode", required_argument, nullptr, opt_mode},
+    // DVB-T transmission parameters. Every optional one defaults to
+    // auto-detection from the TPS; supplying it forces the decoder to use
+    // that value instead of the signalled one.
+    {"dvbt-mode", required_argument, nullptr, opt_dvbt_mode},
+    {"dvbt-channel-bandwidth", required_argument, nullptr, opt_dvbt_bandwidth},
+    {"dvbt-guard", required_argument, nullptr, opt_dvbt_guard},
+    {"dvbt-modulation", required_argument, nullptr, opt_dvbt_modulation},
+    {"dvbt-code-rate", required_argument, nullptr, opt_dvbt_code_rate},
+    {"decoder-threads", required_argument, nullptr, opt_decoder_threads},
+    {"record-first", required_argument, nullptr, opt_record_first},
+    {"duration", required_argument, nullptr, opt_duration},
+    {"frequency", required_argument, nullptr, opt_frequency},
+    {"ppm", required_argument, nullptr, opt_ppm},
+    {"gain", required_argument, nullptr, opt_gain},
+    {"gain-mode", required_argument, nullptr, opt_gain_mode},
+    {"bias-tee", no_argument, nullptr, opt_bias_tee},
+    {"debug", no_argument, nullptr, 'd'},
+    {nullptr, 0, nullptr, 0},
+};
+
+[[noreturn]] void cli_usage_error(const std::string_view message) {
+    std::cerr << "airspy-tv: " << message << "\n"
+              << "Try 'airspy-tv --help' for usage.\n";
+    std::exit(2);
+}
+
+void print_cli_usage() {
+    std::cout
+        << "Usage: airspy-tv [options]\n"
+        << "\n"
+        << "General:\n"
+        << "  -h, --help                     Show this help\n"
+        << "  -d, --debug                    Verbose decoder diagnostics\n"
+        << "\n"
+        << "Device information:\n"
+        << "      --enumerate                List SDR devices and exit\n"
+        << "      --inspect-iq PATH          Inspect a raw I/Q capture "
+           "(needs --sample-rate)\n"
+        << "\n"
+        << "I/Q to MPEG-TS decoding (offline):\n"
+        << "      --decode-iq PATH          Raw I/Q input file (.cs16 / "
+           "raw INT16_IQ; a .json\n"
+        << "                                 sidecar is honoured when "
+           "present)\n"
+        << "      --ts-output PATH          MPEG-TS output file (required "
+           "with --decode-iq)\n"
+        << "      --sample-rate HZ          Raw I/Q sample rate (default "
+           "10000000)\n"
+        << "      --decoder-threads N       Worker budget 0..256 "
+           "(default 0 = auto)\n"
+        << "\n"
+        << "Broadcast standard (default dvbt):\n"
+        << "      --mode STANDARD           dvbt (DVB-C/DVB-T2/DTMB/ATSC "
+           "reserved)\n"
+        << "\n"
+        << "DVB-T transmission parameters (default: auto from TPS):\n"
+        << "      --dvbt-mode 2k|8k                Force transmission mode\n"
+        << "      --dvbt-channel-bandwidth 5M|6M|7M|8M\n"
+        << "      --dvbt-guard 1/32|1/16|1/8|1/4   Force guard interval\n"
+        << "      --dvbt-modulation qpsk|qam16|qam64\n"
+        << "      --dvbt-code-rate 1/2|2/3|3/4|5/6|7/8\n"
+        << "\n"
+        << "I/Q recording (needs an SDR device):\n"
+        << "      --record-first PATH       Record I/Q to PATH and exit\n"
+        << "      --duration MS             Recording duration (default "
+           "1000)\n"
+        << "      --frequency HZ            Center frequency (default "
+           "545000000)\n"
+        << "      --sample-rate HZ          Sample rate (default 10000000)\n"
+        << "      --ppm DOUBLE              Frequency-correction ppm\n"
+        << "      --gain N                  Airspy profile gain (default "
+           "10)\n"
+        << "      --gain-mode sensitivity|linearity\n"
+        << "      --bias-tee                Enable the Bias-T supply\n";
+}
+
+// Numeric parse helpers: full-string parse via std::from_chars, rejecting any
+// trailing garbage (a bare argv string never has whitespace, so from_chars
+// range checks are sufficient).
+
+[[nodiscard]] std::uint64_t parse_u64(const std::string_view text,
+                                      const std::string_view what) {
+    std::uint64_t value = 0;
+    const auto parsed = std::from_chars(text.begin(), text.end(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.end()) {
+        cli_usage_error(std::format("invalid {}: '{}'", what, text));
+    }
+    return value;
+}
+
+[[nodiscard]] double parse_double(const std::string_view text,
+                                  const std::string_view what) {
+    double value = 0.0;
+    const auto parsed = std::from_chars(text.begin(), text.end(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.end() ||
+        !std::isfinite(value)) {
+        cli_usage_error(std::format("invalid {}: '{}'", what, text));
+    }
+    return value;
+}
+
+// "6M" / "6m" / "8000000" -> Hz; only the DVB-T bandwidths are accepted.
+[[nodiscard]] std::uint32_t parse_bandwidth(const std::string_view text) {
+    constexpr std::array<std::pair<std::string_view, std::uint32_t>, 4>
+        named{{{ "5M", 5'000'000U},
+               { "6M", 6'000'000U},
+               { "7M", 7'000'000U},
+               { "8M", 8'000'000U}}};
+    for (const auto &[name, value] : named) {
+        if (text.size() == name.size() &&
+            std::ranges::equal(text, name, [](const char a, const char b) {
+                return std::tolower(static_cast<unsigned char>(a)) ==
+                       std::tolower(static_cast<unsigned char>(b));
+            })) {
+            return value;
+        }
+    }
+    const std::uint64_t hz = parse_u64(text, "channel bandwidth");
+    if (hz != 5'000'000U && hz != 6'000'000U && hz != 7'000'000U &&
+        hz != 8'000'000U) {
+        cli_usage_error(
+            std::format("invalid channel bandwidth: '{}' (expected 5M/6M/7M/"
+                        "8M or an explicit Hz value)",
+                        text));
+    }
+    return static_cast<std::uint32_t>(hz);
+}
+
+[[nodiscard]] airspy_tv::dvbt::TransmissionMode
+parse_dvbt_mode(const std::string_view text) {
+    if (text == "2k" || text == "2K") {
+        return airspy_tv::dvbt::TransmissionMode::k2;
+    }
+    if (text == "8k" || text == "8K") {
+        return airspy_tv::dvbt::TransmissionMode::k8;
+    }
+    cli_usage_error(std::format("invalid --dvbt-mode: '{}' (expected 2k|8k)",
+                                text));
+}
+
+[[nodiscard]] airspy_tv::dvbt::GuardInterval
+parse_guard_interval(const std::string_view text) {
+    using airspy_tv::dvbt::GuardInterval;
+    if (text == "1/32") {
+        return GuardInterval::gi_1_32;
+    }
+    if (text == "1/16") {
+        return GuardInterval::gi_1_16;
+    }
+    if (text == "1/8") {
+        return GuardInterval::gi_1_8;
+    }
+    if (text == "1/4") {
+        return GuardInterval::gi_1_4;
+    }
+    cli_usage_error(std::format(
+        "invalid --dvbt-guard: '{}' (expected 1/32|1/16|1/8|1/4)", text));
+}
+
+[[nodiscard]] airspy_tv::dvbt::Constellation
+parse_modulation(const std::string_view text) {
+    using airspy_tv::dvbt::Constellation;
+    if (text == "qpsk") {
+        return Constellation::qpsk;
+    }
+    if (text == "qam16") {
+        return Constellation::qam16;
+    }
+    if (text == "qam64") {
+        return Constellation::qam64;
+    }
+    cli_usage_error(std::format(
+        "invalid --dvbt-modulation: '{}' (expected qpsk|qam16|qam64)", text));
+}
+
+[[nodiscard]] airspy_tv::dvbt::CodeRate
+parse_code_rate(const std::string_view text) {
+    using airspy_tv::dvbt::CodeRate;
+    if (text == "1/2") {
+        return CodeRate::rate_1_2;
+    }
+    if (text == "2/3") {
+        return CodeRate::rate_2_3;
+    }
+    if (text == "3/4") {
+        return CodeRate::rate_3_4;
+    }
+    if (text == "5/6") {
+        return CodeRate::rate_5_6;
+    }
+    if (text == "7/8") {
+        return CodeRate::rate_7_8;
+    }
+    cli_usage_error(std::format(
+        "invalid --dvbt-code-rate: '{}' (expected 1/2|2/3|3/4|5/6|7/8)",
+        text));
+}
+
+[[nodiscard]] airspy_tv::ReceiveStandard
+parse_standard(const std::string_view text) {
+    if (text == "dvbt") {
+        return airspy_tv::ReceiveStandard::DvbT;
+    }
+    cli_usage_error(std::format(
+        "invalid --mode: '{}' (only dvbt is implemented today)", text));
+}
+
+[[nodiscard]] airspy_tv::AirspyGainMode
+parse_gain_mode(const std::string_view text) {
+    using airspy_tv::AirspyGainMode;
+    if (text == "sensitivity") {
+        return AirspyGainMode::Sensitivity;
+    }
+    if (text == "linearity") {
+        return AirspyGainMode::Linearity;
+    }
+    cli_usage_error(std::format("invalid --gain-mode: '{}' (expected "
+                                "sensitivity|linearity)",
+                                text));
+}
+
+} // namespace
+
 int main(const int argc, char **argv) {
-    if (argc > 1 && std::string_view(argv[1]) == "--enumerate") {
-        return enumerate_cli();
+    bool debug = false;
+    std::optional<std::filesystem::path> inspect_iq_path;
+    std::optional<std::filesystem::path> decode_iq_path;
+    std::optional<std::filesystem::path> ts_output_path;
+    std::optional<std::filesystem::path> record_path;
+    std::uint32_t sample_rate_hz = 10'000'000;
+    std::uint64_t center_frequency_hz = 545'000'000;
+    double frequency_correction_ppm = 0.0;
+    int duration_ms = 1000;
+    int airspy_gain = 10;
+    AirspyGainMode airspy_gain_mode = AirspyGainMode::Sensitivity;
+    bool bias_tee = false;
+    ReceiverParameters dvbt_parameters;
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "hd", cli_options, nullptr)) != -1) {
+        switch (opt) {
+        case 'h':
+            print_cli_usage();
+            return 0;
+        case 'd':
+            debug = true;
+            break;
+        case opt_enumerate:
+            return enumerate_cli();
+        case opt_inspect_iq:
+            inspect_iq_path = optarg;
+            break;
+        case opt_decode_iq:
+            decode_iq_path = optarg;
+            break;
+        case opt_ts_output:
+            ts_output_path = optarg;
+            break;
+        case opt_sample_rate:
+            sample_rate_hz = static_cast<std::uint32_t>(
+                parse_u64(optarg, "sample rate"));
+            if (sample_rate_hz == 0) {
+                cli_usage_error("sample rate must be non-zero");
+            }
+            break;
+        case opt_mode:
+            // Validated here; DVB-T is the only implemented standard today,
+            // so the parsed value is otherwise unused (a future standard
+            // switch would select the demodulator type).
+            static_cast<void>(parse_standard(optarg));
+            break;
+        case opt_dvbt_mode:
+            dvbt_parameters.mode = parse_dvbt_mode(optarg);
+            break;
+        case opt_dvbt_bandwidth:
+            dvbt_parameters.channel_bandwidth_hz = parse_bandwidth(optarg);
+            break;
+        case opt_dvbt_guard:
+            dvbt_parameters.guard_interval = parse_guard_interval(optarg);
+            break;
+        case opt_dvbt_modulation:
+            dvbt_parameters.constellation = parse_modulation(optarg);
+            break;
+        case opt_dvbt_code_rate:
+            dvbt_parameters.code_rate = parse_code_rate(optarg);
+            break;
+        case opt_decoder_threads:
+            dvbt_parameters.worker_threads = static_cast<std::size_t>(
+                parse_u64(optarg, "decoder thread count"));
+            if (dvbt_parameters.worker_threads > 256) {
+                cli_usage_error("decoder thread count must be 0..256");
+            }
+            break;
+        case opt_record_first:
+            record_path = optarg;
+            break;
+        case opt_duration:
+            duration_ms = static_cast<int>(
+                parse_u64(optarg, "recording duration"));
+            if (duration_ms <= 0) {
+                cli_usage_error("recording duration must be positive");
+            }
+            break;
+        case opt_frequency:
+            center_frequency_hz = parse_u64(optarg, "center frequency");
+            break;
+        case opt_ppm:
+            frequency_correction_ppm = parse_double(optarg, "frequency correction");
+            break;
+        case opt_gain:
+            airspy_gain = static_cast<int>(parse_u64(optarg, "gain"));
+            break;
+        case opt_gain_mode:
+            airspy_gain_mode = parse_gain_mode(optarg);
+            break;
+        case opt_bias_tee:
+            bias_tee = true;
+            break;
+        default:
+            cli_usage_error("unrecognized option");
+        }
     }
-    if (argc > 1 && std::string_view(argv[1]) == "--help") {
-        std::cout << "Usage: airspy-tv [--enumerate|--record-first PATH "
-                     "[MILLISECONDS]|--inspect-iq PATH [SAMPLE_RATE_HZ] "
-                     "[CENTER_FREQUENCY_HZ]|--decode-iq INPUT OUTPUT.ts "
-                     "[SAMPLE_RATE_HZ] [--decoder-threads N] [-d|--debug]|"
-                     "--help]\n";
-        return 0;
+    if (optind != argc) {
+        cli_usage_error(std::format("unexpected positional argument: '{}'",
+                                    argv[optind]));
     }
-    if (argc > 2 && std::string_view(argv[1]) == "--record-first") {
-        int duration_ms = 1000;
-        if (argc > 3) {
-            const std::string_view duration_text = argv[3];
-            const auto parsed = std::from_chars(
-                duration_text.begin(), duration_text.end(), duration_ms);
-            if (parsed.ec != std::errc{} || parsed.ptr != duration_text.end() ||
-                duration_ms <= 0) {
-                std::cerr << "Invalid recording duration: " << duration_text
-                          << '\n';
-                return 2;
-            }
-        }
-        return record_first_cli(argv[2], duration_ms);
+
+    const int command_count = (decode_iq_path.has_value() ? 1 : 0) +
+                              (record_path.has_value() ? 1 : 0) +
+                              (inspect_iq_path.has_value() ? 1 : 0);
+    if (command_count > 1) {
+        cli_usage_error("--decode-iq, --record-first and --inspect-iq are "
+                        "mutually exclusive");
     }
-    if (argc > 2 && std::string_view(argv[1]) == "--inspect-iq") {
-        std::uint32_t sample_rate_hz = 10'000'000;
-        std::uint64_t center_frequency_hz = 545'000'000;
-        if (argc > 3) {
-            const std::string_view text = argv[3];
-            const auto parsed =
-                std::from_chars(text.begin(), text.end(), sample_rate_hz);
-            if (parsed.ec != std::errc{} || parsed.ptr != text.end() ||
-                sample_rate_hz == 0) {
-                std::cerr << "Invalid raw I/Q sample rate: " << text << '\n';
-                return 2;
-            }
-        }
-        if (argc > 4) {
-            const std::string_view text = argv[4];
-            const auto parsed =
-                std::from_chars(text.begin(), text.end(), center_frequency_hz);
-            if (parsed.ec != std::errc{} || parsed.ptr != text.end()) {
-                std::cerr << "Invalid raw I/Q center frequency: " << text
-                          << '\n';
-                return 2;
-            }
-        }
-        return inspect_iq_cli(argv[2], sample_rate_hz, center_frequency_hz);
+
+    if (inspect_iq_path.has_value()) {
+        return inspect_iq_cli(*inspect_iq_path, sample_rate_hz,
+                              center_frequency_hz);
     }
-    if (argc > 1 && std::string_view(argv[1]) == "--decode-iq") {
-        std::uint32_t sample_rate_hz = 10'000'000;
-        std::size_t decoder_threads = 0;
-        bool debug = false;
-        bool sample_rate_supplied = false;
-        if (argc < 4) {
-            std::cerr << "Usage: airspy-tv --decode-iq INPUT OUTPUT.ts "
-                         "[SAMPLE_RATE_HZ] [--decoder-threads N] "
-                         "[-d|--debug]\n";
-            return 2;
+    if (decode_iq_path.has_value()) {
+        if (!ts_output_path.has_value()) {
+            cli_usage_error("--decode-iq requires --ts-output");
         }
-        for (int index = 4; index < argc; ++index) {
-            const std::string_view text = argv[index];
-            if (text == "-d" || text == "--debug") {
-                debug = true;
-                continue;
-            }
-            if (text == "--decoder-threads" || text == "--viterbi-threads") {
-                if (++index >= argc) {
-                    std::cerr << "Missing decoder thread count\n";
-                    return 2;
-                }
-                const std::string_view count_text = argv[index];
-                const auto parsed = std::from_chars(
-                    count_text.begin(), count_text.end(), decoder_threads);
-                if (parsed.ec != std::errc{} ||
-                    parsed.ptr != count_text.end() || decoder_threads > 256) {
-                    std::cerr << "Invalid decoder worker budget: " << count_text
-                              << " (expected 0..256)\n";
-                    return 2;
-                }
-                continue;
-            }
-            if (sample_rate_supplied) {
-                std::cerr << "Unexpected --decode-iq argument: " << text
-                          << '\n';
-                return 2;
-            }
-            const auto parsed =
-                std::from_chars(text.begin(), text.end(), sample_rate_hz);
-            if (parsed.ec != std::errc{} || parsed.ptr != text.end() ||
-                sample_rate_hz == 0) {
-                std::cerr << "Invalid raw I/Q sample rate: " << text << '\n';
-                return 2;
-            }
-            sample_rate_supplied = true;
-        }
-        return decode_iq_cli(argv[2], argv[3], sample_rate_hz, decoder_threads,
-                             debug);
+        return decode_iq_cli(*decode_iq_path, *ts_output_path, sample_rate_hz,
+                             dvbt_parameters, debug);
+    }
+    if (record_path.has_value()) {
+        SourceSettings settings;
+        settings.center_frequency_hz = center_frequency_hz;
+        settings.frequency_correction_ppm = frequency_correction_ppm;
+        settings.sample_rate_hz = sample_rate_hz;
+        settings.airspy_gain_mode = airspy_gain_mode;
+        settings.airspy_gain = airspy_gain;
+        settings.bias_tee = bias_tee;
+        return record_first_cli(*record_path, duration_ms, settings);
     }
 
     SDL_SetAppMetadata("Airspy TV", "0.1.0", "io.github.airspy-tv");

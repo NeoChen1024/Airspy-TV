@@ -152,35 +152,42 @@ Run a short source/recorder diagnostic using the first native Airspy, falling
 back to the first SoapySDR device:
 
 ```sh
-./build/airspy-tv --record-first /tmp/airspy-tv-smoke.cs16 250
+./build/airspy-tv --record-first /tmp/airspy-tv-smoke.cs16 --duration 250
 ```
 
 Inspect a sidecar or bare I/Q file without starting the GUI:
 
 ```sh
 ./build/airspy-tv --inspect-iq capture.cs16.json
-./build/airspy-tv --inspect-iq airspy-rx-output.iq 10000000 545000000
+./build/airspy-tv --inspect-iq airspy-rx-output.iq \
+  --sample-rate 10000000 --frequency 545000000
 ```
 
 Decode finite I/Q input to MPEG-TS as quickly as the CPU permits:
 
 ```sh
-./build/airspy-tv --decode-iq capture.cs16.json output.ts
-./build/airspy-tv --decode-iq airspy-rx-output.iq output.ts 10000000
-./build/airspy-tv --decode-iq capture.cs16.json output.ts \
-  --decoder-threads 8
-./build/airspy-tv --decode-iq capture.cs16.json output.ts --debug
+./build/airspy-tv --decode-iq capture.cs16.json --ts-output output.ts
+./build/airspy-tv --decode-iq airspy-rx-output.iq \
+  --ts-output output.ts --sample-rate 10000000
+./build/airspy-tv --decode-iq capture.cs16.json \
+  --ts-output output.ts --decoder-threads 8
+./build/airspy-tv --decode-iq capture.cs16.json \
+  --ts-output output.ts --debug
 ```
 
 JSON input uses the same sidecar resolver as the GUI. A sample rate is only
-needed for bare INT16_IQ files. Offline decoding uses blocking submission and
-does not drop input when the decoder is slower than the file reader.
+needed for bare INT16_IQ files; pass it with `--sample-rate HZ`. Offline
+decoding uses blocking submission and does not drop input when the decoder is
+slower than the file reader.
 
 The decoder worker budget defaults to `std::thread::hardware_concurrency()`.
 `--decoder-threads N` overrides it; the same option appears in the GUI and is
-fixed while a source is open. `0` selects the automatic default. The legacy
-`--viterbi-threads` spelling remains an alias. Pass `-d` or `--debug` to include
-worker allocation, per-stage timings, and detailed FEC statistics.
+fixed while a source is open. `0` selects the automatic default. The DVB-T
+transmission parameters (`--dvbt-mode`, `--dvbt-channel-bandwidth`,
+`--dvbt-guard`, `--dvbt-modulation`, `--dvbt-code-rate`) default to
+auto-detection from the TPS and can be forced when the signal is marginal or
+the capture metadata is incomplete. Pass `-d` or `--debug` to include worker
+allocation, per-stage timings, and detailed FEC statistics.
 
 ## Decoder architecture
 
@@ -219,7 +226,7 @@ XDG_CACHE_HOME=/tmp/airspy-tv-gnuradio-cache \
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release --target airspy-tv
 ./build-release/airspy-tv --decode-iq \
-  /tmp/airspy-tv-ideal.cs16.json /tmp/airspy-tv-ideal-native.ts
+  /tmp/airspy-tv-ideal.cs16.json --ts-output /tmp/airspy-tv-ideal-native.ts
 ```
 
 The generator writes an application-compatible JSON sidecar and the
