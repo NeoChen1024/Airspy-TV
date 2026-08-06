@@ -5,7 +5,7 @@ I/Q samples into watchable television. It includes a native DVB-T decoder,
 real-time RF diagnostics, service selection, a now/next EPG guide, embedded
 libmpv playback, and raw I/Q/MPEG-TS recording in one application.
 
-![Airspy TV receiving and playing a Taiwanese DVB-T service](images/Screenshot_20260803_142304.jpg)
+![Airspy TV receiving and playing a Taiwanese DVB-T service](images/ptv.jpg)
 
 The current receiver can lock and play clean 6 MHz Taiwanese DVB-T captures
 from an Airspy R2, including automatic TPS parameter discovery and
@@ -60,13 +60,14 @@ Airspy / SoapySDR / CS16 file
         -> libmpv video and audio
 ```
 
-Clean 557 MHz and 581 MHz Airspy recordings recover valid transport streams and
-play in the GUI. EIT present/following data from the same streams drives the
-EPG panel, which shows the selected service's current and next programs with
-correct names, times, and durations for both Taiwanese broadcasters (581 MHz
-TTV and 557 MHz FTV). Weak signals and difficult multipath environments remain
-experimental while carrier, sample-clock, and channel tracking are improved.
-DVB-T2 is not currently implemented.
+Clean and multipath 557/581 MHz Airspy recordings recover valid transport
+streams and play in the GUI. The 151.6-minute 545 MHz replay is the current
+long-run timing baseline: sample-clock tracking remains bounded and TS output
+continues past the point where the earlier timing loop failed. EIT
+present/following data drives the selected service's now/next guide.
+
+Hierarchical DVB-T and captured long-delay/SFN validation remain unfinished.
+DVB-T2 and the other roadmap standards are not implemented.
 
 ## Build
 
@@ -78,8 +79,8 @@ Required system libraries:
 - FFTW3f and VOLK
 - a C++20 compiler and CMake 3.25 or newer
 
-Dear ImGui, nlohmann/json, tinycolormap, liquid-dsp, and libcorrect are pinned
-under `contrib/` as Git submodules.
+Dear ImGui, nlohmann/json, tinycolormap, liquid-dsp, libcorrect, and
+ViterbiDecoderCpp are pinned under `contrib/` as Git submodules.
 
 ```sh
 git submodule update --init --recursive
@@ -89,13 +90,16 @@ cmake --build build
 ```
 
 Debug builds default to `-O3 -g -DNDEBUG`, retaining debugger symbols while the
-DSP and libcorrect SIMD paths run at Release-like speed. Configure with
+optimized DSP and Viterbi paths run at Release-like speed. Configure with
 `-DAIRSPY_TV_OPTIMIZED_DEBUG=OFF` for an assertion-enabled, unoptimized Debug
 build.
 
 Builds also default to `-march=native`. Use
 `-DAIRSPY_TV_NATIVE_ARCH=OFF` when producing a portable binary for a different
-CPU.
+CPU. The default soft-Viterbi backend is ViterbiDecoderCpp's AVX2-u16
+implementation when the compiler target supports AVX2. A build without that
+path falls back to libcorrect; configure explicitly with
+`-DAIRSPY_TV_USE_AVX2_VITERBI=OFF` to exercise the fallback.
 
 ## Using the receiver
 
@@ -136,9 +140,13 @@ center frequency manually.
 | Airspy TV `.json` sidecar | Sample rate, center frequency, data filename | Real time |
 | Bare `.cs16` / `.iq` | Enter sample rate and center frequency manually | Real time |
 
-The raw I/Q recorder has a five-second queue. DSP queues retain approximately
-200 ms of their respective streams to tolerate ordinary scheduler jitter; RF
-input remains non-blocking because live hardware cannot accept backpressure.
+The raw I/Q recorder has a five-second queue and the full-MPTS recorder has an
+independent 24 MiB write queue. DSP queues retain approximately 200 ms of their
+respective streams to tolerate ordinary scheduler jitter; RF input remains
+non-blocking because live hardware cannot accept backpressure. The separate
+mpv queue has an 8 MiB capacity, enters buffering below 1 MiB, and resumes at
+2 MiB so a short decoder dropout does not immediately become playback
+stutter.
 
 ## Command-line tools
 
@@ -194,22 +202,27 @@ allocation, per-stage timings, and detailed FEC statistics.
 <details>
 <summary>Native DVB-T processing pipeline</summary>
 
-The shared GUI/CLI decoder is a bounded ordered pipeline. Its front end performs
-partitioned rational resampling, OFDM acquisition, FFT, pilot tracking, channel
-interpolation, decision-directed gain correction, MER estimation, carrier
-reliability calculation, Max-Log demapping, symbol/bit deinterleaving, and
-depuncturing.
+The shared GUI/CLI decoder is a continuous bounded pipeline. A frontend thread
+converts and resamples CS16 input into an absolute-position sample ring. The
+serial demod thread owns acquisition, FFT-window position, carrier and timing
+loops, channel state, TPS, and symbol order.
 
-Independent OFDM symbols are processed by a worker pool and rejoined in input
-order. The FEC worker dispatches overlapping Viterbi windows to independent
-libcorrect contexts, performs an ordered join, then runs convolutional
-deinterleaving, Reed-Solomon decoding, energy descrambling, and TS recovery.
+Independent symbol postprocessing is dispatched to a worker pool and rejoined
+by sequence. A separate FEC thread sends overlapping mother-code windows to
+the Viterbi pool, performs another ordered join, then serializes convolutional
+byte deinterleaving, RS(204,188), energy descrambling, and MPEG-TS output. The
+optimized backend uses AVX2 ViterbiDecoderCpp; libcorrect remains the portable
+Viterbi fallback and provides the Reed-Solomon implementation.
 
-Raw-I/Q chunks use a 100 ms overlap-save boundary. Packet-aligned overlap
-matching emits the shared transport region only once and preserves continuity
-across processing chunks. Backpressure is applied to offline decoding instead
-of dropping symbols, because a missing symbol invalidates the stateful
-convolutional and outer-interleaver stream.
+There are no per-chunk decoder seams or packet-overlap joins. Generation-tagged
+reset and retune handling suppress stale worker results before they can reach
+stateful FEC or output sinks. Live sources drop and report an input block on
+overload; offline decoding applies backpressure instead.
+
+See [docs/worker-pools-and-dataflow.md](docs/worker-pools-and-dataflow.md) for
+thread, queue, ordering, and reset details. Clock-tracking experiments and
+remaining validation are maintained in
+[docs/clock-tracking.md](docs/clock-tracking.md).
 
 </details>
 
