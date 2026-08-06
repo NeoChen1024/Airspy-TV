@@ -22,10 +22,10 @@ struct TpsParameters {
 };
 
 struct TpsSnapshot {
-    // Parameters are fixed after the first valid TPS frame and survive later
-    // decode failures (the demod's fix-once design); `currently_valid`
-    // reflects only whether the most recent frame passed its BCH/sync check,
-    // so a failed later check is never reported as a healthy lock.
+    // Parameters come from the most recent valid TPS frame and survive later
+    // decode failures. `currently_valid` is held between expected frame
+    // boundaries and reflects whether the latest complete frame passed its
+    // BCH/sync check.
     bool ever_locked{};
     bool currently_valid{};
     std::size_t symbol_index{};

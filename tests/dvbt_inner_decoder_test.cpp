@@ -340,15 +340,18 @@ void test_tps_decoder() {
     TpsDecoder decoder;
     std::vector<std::complex<float>> carriers(17, {1.0F, 0.0F});
     static_cast<void>(decoder.process(carriers));
-    for (const std::uint8_t bit : bits) {
+    const auto process_bit = [&decoder, &carriers](const std::uint8_t bit) {
         if (bit != 0U) {
             for (auto &carrier : carriers) {
                 carrier = -carrier;
             }
         }
-        static_cast<void>(decoder.process(carriers));
+        return decoder.process(carriers);
+    };
+    for (const std::uint8_t bit : bits) {
+        static_cast<void>(process_bit(bit));
     }
-    const auto snapshot = decoder.snapshot();
+    auto snapshot = decoder.snapshot();
     require(snapshot.ever_locked && snapshot.currently_valid,
             "TPS BCH and synchronization lock");
     require(snapshot.symbol_index == 67, "TPS frame-end symbol index");
@@ -363,6 +366,34 @@ void test_tps_decoder() {
     require(snapshot.parameters.guard_interval ==
                 airspy_tv::dvbt::GuardInterval::gi_1_4,
             "TPS guard interval");
+
+    for (std::size_t index = 0; index + 1 < bits.size(); ++index) {
+        snapshot = process_bit(bits[index]);
+        require(snapshot.currently_valid,
+                "TPS lock must hold between frame boundaries");
+        require(snapshot.symbol_index == index,
+                "TPS synchronized symbol index");
+    }
+    snapshot = process_bit(bits.back());
+    require(snapshot.currently_valid && snapshot.symbol_index == 67,
+            "next valid TPS frame boundary");
+
+    auto corrupt_bits = bits;
+    corrupt_bits[25] ^= 1U;
+    for (std::size_t index = 0; index + 1 < corrupt_bits.size(); ++index) {
+        snapshot = process_bit(corrupt_bits[index]);
+        require(snapshot.currently_valid,
+                "partial bad TPS frame must not invalidate prior frame");
+    }
+    snapshot = process_bit(corrupt_bits.back());
+    require(snapshot.ever_locked && !snapshot.currently_valid,
+            "bad TPS frame must invalidate at its boundary");
+
+    for (const std::uint8_t bit : bits) {
+        snapshot = process_bit(bit);
+    }
+    require(snapshot.currently_valid && snapshot.symbol_index == 67,
+            "TPS sliding reacquisition after a bad frame");
 }
 
 } // namespace

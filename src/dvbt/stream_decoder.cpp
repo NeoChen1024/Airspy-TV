@@ -1267,6 +1267,8 @@ struct StreamDecoder::Impl {
             std::vector<std::complex<float>> fft_out;
             fftwf_plan plan = nullptr;
             std::vector<std::size_t> continual_indices;
+            std::vector<std::size_t> tps_indices;
+            std::vector<std::complex<float>> tps_values;
             std::array<std::vector<std::size_t>, 4> pilot_indices;
             std::array<std::vector<std::size_t>, 4> payload_indices;
             std::optional<DecoderParameters> decoder_parameters;
@@ -1307,13 +1309,6 @@ struct StreamDecoder::Impl {
             // channel (MER collapses before the continual-carrier correlation
             // does) makes the +/-2 offset search noise-driven and can latch a
             // multipath alias (545's 0 -> 3, 557's 0 -> -1) in one symbol.
-            // Unconditional periodic TPS re-seed (option B): a TPS frame sync
-            // that locked while the carrier grid was briefly wrong stays
-            // "locked" with a corrupted symbol index, silently scrambling the
-            // deinterleave even after the demod recovers. Re-seeding on a
-            // fixed cadence forces a fresh deterministic sync-word search on
-            // the current (healthy) grid; the re-lock gap is absorbed
-            // losslessly by the pending buffer.
             // Event-driven mode-change detection: a persistent TPS-locked
             // mismatch (a station switch without a fade) re-runs the
             // acquisition so the grid rebuilds for the new mode.
@@ -1414,6 +1409,7 @@ struct StreamDecoder::Impl {
                 guard_size = frontend.guard_size;
                 period = fft_size + guard_size;
                 continual_indices.clear();
+                tps_indices.clear();
                 pilot_indices = {};
                 payload_indices = {};
                 for (std::size_t k = 0; k <= maximum; ++k) {
@@ -1422,6 +1418,9 @@ struct StreamDecoder::Impl {
                     const bool tps_carrier = listed(tps_2k, base);
                     if (continual_carrier) {
                         continual_indices.push_back(k);
+                    }
+                    if (tps_carrier) {
+                        tps_indices.push_back(k);
                     }
                     for (std::size_t phase = 0; phase < 4; ++phase) {
                         const bool scattered = k % 12 == phase * 3;
@@ -1433,6 +1432,7 @@ struct StreamDecoder::Impl {
                         }
                     }
                 }
+                tps_values.resize(tps_indices.size());
                 fft_in.resize(fft_size);
                 fft_out.resize(fft_size);
                 if (plan != nullptr) {
@@ -2956,31 +2956,21 @@ struct StreamDecoder::Impl {
                     std::fill(channel.begin() +
                                   static_cast<std::ptrdiff_t>(pilots.back()),
                               channel.end(), channel[pilots.back()]);
-                    std::vector<std::complex<float>> tps_values;
-                    tps_values.reserve(tps_2k.size() *
-                                       (maximum == 6816 ? 4U : 1U));
-                    for (std::size_t k = 0; k <= maximum; ++k) {
-                        if (listed(tps_2k, k % 1704)) {
-                            tps_values.push_back(
-                                carrier(fft_out, k, maximum,
-                                        frontend.carrier_offset) *
-                                channel[k]);
-                        }
+                    for (std::size_t i = 0; i < tps_indices.size(); ++i) {
+                        const std::size_t k = tps_indices[i];
+                        tps_values[i] =
+                            carrier(fft_out, k, maximum,
+                                    frontend.carrier_offset) *
+                            channel[k];
                     }
-                    // The TPS decodes once (the first matching lock) and its
-                    // parameters are fixed for the life of the stream — no
-                    // periodic re-seed: the differential decode stays locked
-                    // through healthy periods, re-locks naturally after a
-                    // fade breaks it, and a mid-stream unlock is invisible to
-                    // the decode (the deinterleave needs only the parity,
-                    // which comes from the measured pilot phase below, not
-                    // from the TPS frame index). Forced resets created the
-                    // very unlock windows and re-lock risk they were meant to
-                    // cure, and a corrupted re-lock could flip the deinterleave
-                    // parity.
-                    // TPS state carries continuously across the whole stream
-                    // (contiguous symbols), so the differential decoder locks
-                    // once and stays locked through re-anchors.
+                    // TPS differential bits carry continuously across the
+                    // stream. Before synchronization the decoder checks each
+                    // sliding 68-bit window; afterward it validates only the
+                    // expected frame boundary and returns to the sliding search
+                    // after a bad frame. The FEC configuration remains fixed
+                    // after its first matching TPS frame; deinterleave parity
+                    // comes from the measured pilot phase below, not the TPS
+                    // frame index.
                     frontend.tps_snapshot =
                         frontend.tps_decoder.process(tps_values);
                     const bool matching_tps =

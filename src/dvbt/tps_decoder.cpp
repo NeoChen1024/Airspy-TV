@@ -102,7 +102,7 @@ struct TpsDecoder::Impl {
     std::vector<std::complex<float>> previous;
     std::deque<std::uint8_t> bits;
     TpsSnapshot latest;
-    bool previously_valid{};
+    bool frame_synchronized{};
 };
 
 TpsDecoder::TpsDecoder() : impl_(std::make_unique<Impl>()) {}
@@ -126,16 +126,25 @@ TpsDecoder::process(const std::span<const std::complex<float>> carriers) {
         if (impl_->bits.size() > 68) {
             impl_->bits.pop_front();
         }
-        if (const auto parameters = decode(impl_->bits); parameters) {
-            impl_->latest = {.ever_locked = true,
-                             .currently_valid = true,
-                             .symbol_index = 67,
-                             .parameters = *parameters};
-        } else if (impl_->latest.ever_locked) {
-            // A later frame failed its BCH/sync check: the parameters stay
-            // fixed (fix-once), but the lock is no longer currently healthy.
-            impl_->latest.currently_valid = false;
+        if (impl_->frame_synchronized) {
             impl_->latest.symbol_index = (impl_->latest.symbol_index + 1) % 68;
+        }
+        const bool should_validate =
+            !impl_->frame_synchronized || impl_->latest.symbol_index == 67;
+        if (should_validate) {
+            if (const auto parameters = decode(impl_->bits); parameters) {
+                impl_->latest = {.ever_locked = true,
+                                 .currently_valid = true,
+                                 .symbol_index = 67,
+                                 .parameters = *parameters};
+                impl_->frame_synchronized = true;
+            } else if (impl_->frame_synchronized) {
+                // Only an expected frame boundary can invalidate a healthy
+                // lock. Resume the sliding search so a phase slip or the next
+                // valid frame can re-establish synchronization.
+                impl_->latest.currently_valid = false;
+                impl_->frame_synchronized = false;
+            }
         }
     }
     impl_->previous.assign(carriers.begin(), carriers.end());
