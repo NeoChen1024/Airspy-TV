@@ -9,6 +9,8 @@ extern "C" {
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <span>
@@ -24,6 +26,17 @@ constexpr std::size_t ts_packet_size = 188;
 constexpr std::size_t packets_per_energy_frame = 8;
 constexpr std::size_t outer_interleaver_branches = 12;
 constexpr std::size_t outer_interleaver_step = 17;
+constexpr std::size_t minimum_alignment_rs_evidence = 4;
+// A marginal but correctly aligned stream can produce a short burst of
+// uncorrectable RS blocks. Keep the known phase long enough for
+// EnergyDescrambler::process_corrupt() to preserve TS cadence; only a much
+// longer run is treated as evidence of a false outer-phase lock.
+constexpr std::size_t uncorrectable_reset_threshold = 512;
+
+[[nodiscard]] bool fec_debug_enabled() noexcept {
+    static const bool enabled = std::getenv("AIRSPYTV_FEC_DEBUG") != nullptr;
+    return enabled;
+}
 
 class ByteDeinterleaver {
   public:
@@ -111,6 +124,14 @@ class EnergyDescrambler {
     }
 
     [[nodiscard]] bool synchronized() const noexcept { return synchronized_; }
+
+    void start_at_energy_phase(const std::size_t phase) {
+        reset();
+        synchronized_ = true;
+        for (std::size_t packet = 0; packet < phase; ++packet) {
+            skip_packet();
+        }
+    }
 
     void skip_packet() {
         if (!synchronized_) {
@@ -207,6 +228,7 @@ struct AlignmentEvidence {
     std::size_t start{std::numeric_limits<std::size_t>::max()};
     unsigned int sync_distance{std::numeric_limits<unsigned int>::max()};
     std::size_t rs_successes{};
+    std::size_t energy_phase{};
 };
 
 [[nodiscard]] AlignmentEvidence
@@ -233,7 +255,7 @@ find_rs_alignment(const std::span<const std::uint8_t> bytes,
                         bytes[start + (packet * rs_packet_size)] ^ expected)));
             }
             if (best.rs_successes == 0 && distance < best.sync_distance) {
-                best = {start, distance, 0};
+                best = {start, distance, 0, energy_phase};
             }
             if (distance > 24) {
                 continue;
@@ -255,7 +277,7 @@ find_rs_alignment(const std::span<const std::uint8_t> bytes,
             if (rs_successes > best.rs_successes ||
                 (rs_successes == best.rs_successes &&
                  distance < best.sync_distance)) {
-                best = {start, distance, rs_successes};
+                best = {start, distance, rs_successes, energy_phase};
             }
         }
     }
@@ -277,14 +299,24 @@ struct OuterFec::Impl {
         energy_descrambler.reset();
         statistics = {};
         uncorrectable_since_sync = 0;
+        alignment_search_bytes = 0;
+        alignment_search_count = 0;
+        alignment_search_done = false;
+        pending_alignment_phase = outer_interleaver_branches;
     }
 
     [[nodiscard]] std::vector<std::uint8_t>
     process(const std::span<const std::uint8_t> decoded) {
         constexpr std::size_t maximum_search = 32 * rs_packet_size;
         if (selected_outer_phase == outer_interleaver_branches) {
-            std::array<AlignmentEvidence, outer_interleaver_branches>
-                evidence{};
+            // Searching all 12 deinterleaver branches is deliberately kept
+            // out of the per-symbol hot path.  A marginal channel can lose
+            // an already selected RS phase for a short burst; repeatedly
+            // scanning the same 6.5 KiB window in that state makes the FEC
+            // worker spend seconds in Reed-Solomon checks and back-pressure
+            // the demod queue.  The window itself is retained, so a real
+            // alignment remains available for the next search.
+            alignment_search_bytes += decoded.size();
             for (std::size_t phase = 0; phase < outer_interleavers.size();
                  ++phase) {
                 auto deinterleaved = outer_interleavers[phase].process(decoded);
@@ -297,7 +329,54 @@ struct OuterFec::Impl {
                         candidate.end() -
                             static_cast<std::ptrdiff_t>(maximum_search));
                 }
-                evidence[phase] = find_rs_alignment(candidate, reed_solomon);
+            }
+            const bool candidates_full = std::ranges::all_of(
+                outer_candidates, [](const auto &candidate) {
+                    return candidate.size() >= maximum_search;
+                });
+            // Once a candidate is pending confirmation, do the second check
+            // on the next decoded chunk. Keep the longer cadence only while
+            // no phase has presented usable RS evidence; waiting a full
+            // window here would slide the candidate past the first packets
+            // of a short finite stream before the lock is confirmed.
+            const std::size_t next_search_interval =
+                pending_alignment_phase != outer_interleaver_branches
+                    ? 1U
+                    : alignment_search_interval;
+            const bool search_requested =
+                candidates_full &&
+                (!alignment_search_done ||
+                 alignment_search_bytes >= next_search_interval);
+            if (!search_requested) {
+                return {};
+            }
+            alignment_search_done = true;
+            alignment_search_bytes = 0;
+            ++alignment_search_count;
+            std::array<AlignmentEvidence, outer_interleaver_branches>
+                evidence{};
+            for (std::size_t phase = 0; phase < outer_candidates.size();
+                 ++phase) {
+                evidence[phase] =
+                    find_rs_alignment(outer_candidates[phase], reed_solomon);
+            }
+            if (fec_debug_enabled()) {
+                std::fprintf(stderr, "[fec] align-search #%llu",
+                             static_cast<unsigned long long>(
+                                 alignment_search_count));
+                for (std::size_t phase = 0;
+                     phase < outer_candidates.size(); ++phase) {
+                    const auto &candidate_evidence = evidence[phase];
+                    std::fprintf(
+                        stderr, " p%zu=%u/%zu@%zu", phase,
+                        candidate_evidence.sync_distance,
+                        candidate_evidence.rs_successes,
+                        candidate_evidence.start ==
+                                std::numeric_limits<std::size_t>::max()
+                            ? 0
+                            : candidate_evidence.start);
+                }
+                std::fputc('\n', stderr);
             }
             std::size_t selected_phase = outer_interleaver_branches;
             AlignmentEvidence selected_evidence;
@@ -310,7 +389,8 @@ struct OuterFec::Impl {
                     global_sync_distance, candidate_evidence.sync_distance);
                 global_rs_evidence = std::max(global_rs_evidence,
                                               candidate_evidence.rs_successes);
-                if (candidate_evidence.rs_successes < 4) {
+                if (candidate_evidence.rs_successes <
+                    minimum_alignment_rs_evidence) {
                     continue;
                 }
                 if (selected_phase == outer_interleaver_branches ||
@@ -330,33 +410,20 @@ struct OuterFec::Impl {
                     : global_sync_distance;
             statistics.outer_rs_evidence =
                 static_cast<std::uint32_t>(global_rs_evidence);
-            const bool candidates_full = std::ranges::all_of(
-                outer_candidates, [](const auto &candidate) {
-                    return candidate.size() >= maximum_search;
-                });
-            if (selected_phase == outer_interleaver_branches &&
-                candidates_full) {
-                for (std::size_t phase = 0; phase < evidence.size(); ++phase) {
-                    const auto &candidate_evidence = evidence[phase];
-                    // The sync-distance-only heuristic must still show at
-                    // least one successful RS codeword. Locking onto a
-                    // zero-evidence phase (a random 0x47 alignment through
-                    // fade garbage) silently scrambles every subsequent
-                    // packet; keep searching until the sliding window picks
-                    // up a genuinely decodable run.
-                    if (candidate_evidence.rs_successes == 0 ||
-                        candidate_evidence.sync_distance > 20) {
-                        continue;
-                    }
-                    if (selected_phase == outer_interleaver_branches ||
-                        candidate_evidence.sync_distance <
-                            selected_evidence.sync_distance) {
-                        selected_phase = phase;
-                        selected_evidence = candidate_evidence;
-                    }
-                }
-            }
             if (selected_phase != outer_interleaver_branches) {
+                if (pending_alignment_phase != selected_phase) {
+                    pending_alignment_phase = selected_phase;
+                    statistics.rs_synchronized = false;
+                    if (fec_debug_enabled()) {
+                        std::fprintf(
+                            stderr,
+                            "[fec] align-pending phase=%zu sync=%u rs=%zu\n",
+                            selected_phase, selected_evidence.sync_distance,
+                            selected_evidence.rs_successes);
+                    }
+                    return {};
+                }
+                pending_alignment_phase = outer_interleaver_branches;
                 selected_outer_phase = selected_phase;
                 statistics.outer_deinterleaver_phase =
                     static_cast<int>(selected_phase);
@@ -365,7 +432,28 @@ struct OuterFec::Impl {
                     candidate.begin() +
                         static_cast<std::ptrdiff_t>(selected_evidence.start),
                     candidate.end());
+                energy_descrambler.start_at_energy_phase(
+                    selected_evidence.energy_phase);
                 statistics.rs_synchronized = true;
+                if (fec_debug_enabled()) {
+                    std::fprintf(
+                        stderr,
+                        "[fec] align-lock phase=%zu start=%zu sync=%u "
+                        "rs=%zu energy=%zu candidate=%zu confirmed=2\n",
+                        selected_phase, selected_evidence.start,
+                        selected_evidence.sync_distance,
+                        selected_evidence.rs_successes,
+                        selected_evidence.energy_phase,
+                        outer_candidates[selected_phase].size());
+                }
+            } else {
+                pending_alignment_phase = outer_interleaver_branches;
+                if (fec_debug_enabled()) {
+                    std::fprintf(stderr,
+                                 "[fec] align-miss searches=%llu\n",
+                                 static_cast<unsigned long long>(
+                                     alignment_search_count));
+                }
             }
             if (!statistics.rs_synchronized) {
                 return {};
@@ -389,15 +477,56 @@ struct OuterFec::Impl {
                 randomized, &corrected_payload_bits);
             rs_bytes.erase(rs_bytes.begin(), rs_bytes.begin() + rs_packet_size);
             ++statistics.rs_packets;
+            if (fec_debug_enabled() && statistics.rs_packets <= 4) {
+                std::fprintf(stderr,
+                             "[fec] rs-attempt #%llu valid=%d sync=0x%02x "
+                             "rsbuf=%zu energy=%d\n",
+                             static_cast<unsigned long long>(
+                                 statistics.rs_packets),
+                             valid ? 1 : 0, received_randomized.front(),
+                             rs_bytes.size(),
+                             energy_descrambler.synchronized() ? 1 : 0);
+            }
+            // Count every codeword once it has been selected by a valid outer
+            // phase. The old accounting only advanced after a successful RS
+            // decode *and* energy descramble, which made the GUI Outer BER
+            // freeze exactly when a false lock began producing only bad
+            // codewords. An uncorrectable shortened RS block has no reliable
+            // payload estimate; charging all 188 payload bytes is a
+            // deliberate conservative indicator of outer-lock failure.
+            statistics.compared_payload_bits += ts_packet_size * 8;
             if (!valid) {
                 ++statistics.rs_uncorrectable_packets;
-                if (++uncorrectable_since_sync >= 100) {
-                    // ~7 symbols of consecutive RS failures: the selected
-                    // outer phase is almost certainly wrong (a false lock
-                    // from a fade-corrupted search window). Drop it and let
-                    // the sliding-window search re-select from the data that
-                    // has accumulated since; the healthy phase re-locks with
-                    // real RS evidence once the garbage has slid out.
+                statistics.corrected_payload_bits += ts_packet_size * 8;
+                ++uncorrectable_since_sync;
+                if (fec_debug_enabled() &&
+                    (uncorrectable_since_sync == 1 ||
+                     uncorrectable_since_sync == 8 ||
+                     uncorrectable_since_sync == 32 ||
+                     uncorrectable_since_sync == 128 ||
+                     uncorrectable_since_sync == 256 ||
+                     uncorrectable_since_sync ==
+                         uncorrectable_reset_threshold)) {
+                    std::fprintf(
+                        stderr,
+                        "[fec] rs-fail streak=%zu total=%llu packets=%llu "
+                        "phase=%zu rsbuf=%zu energy=%d\n",
+                        uncorrectable_since_sync,
+                        static_cast<unsigned long long>(
+                            statistics.rs_uncorrectable_packets),
+                        static_cast<unsigned long long>(statistics.rs_packets),
+                        selected_outer_phase, rs_bytes.size(),
+                        energy_descrambler.synchronized() ? 1 : 0);
+                }
+                if (uncorrectable_since_sync >=
+                    uncorrectable_reset_threshold) {
+                    // A long run of consecutive RS failures means the
+                    // selected outer phase is almost certainly wrong (a
+                    // false lock from a fade-corrupted search window). Drop
+                    // it and let the sliding-window search re-select from the
+                    // data that has accumulated since; the healthy phase
+                    // re-locks with real RS evidence once the garbage has
+                    // slid out.
                     uncorrectable_since_sync = 0;
                     selected_outer_phase = outer_interleaver_branches;
                     rs_bytes.clear();
@@ -405,7 +534,24 @@ struct OuterFec::Impl {
                          ++phase) {
                         outer_candidates[phase].clear();
                     }
+                    energy_descrambler.reset();
+                    alignment_search_bytes = 0;
+                    alignment_search_done = false;
+                    pending_alignment_phase = outer_interleaver_branches;
                     statistics.rs_synchronized = false;
+                    statistics.energy_synchronized = false;
+                    statistics.outer_deinterleaver_phase = -1;
+                    statistics.outer_sync_distance = 0;
+                    statistics.outer_rs_evidence = 0;
+                    if (fec_debug_enabled()) {
+                        std::fprintf(
+                            stderr,
+                            "[fec] outer-reset reason=rs-failure-streak "
+                            "threshold=%zu total=%llu\n",
+                            uncorrectable_reset_threshold,
+                            static_cast<unsigned long long>(
+                                statistics.rs_uncorrectable_packets));
+                    }
                     break;
                 }
                 std::array<std::uint8_t, ts_packet_size> packet{};
@@ -418,11 +564,19 @@ struct OuterFec::Impl {
                 }
                 continue;
             }
+            if (fec_debug_enabled() && uncorrectable_since_sync >= 8) {
+                std::fprintf(stderr,
+                             "[fec] rs-recover previous-streak=%zu total=%llu "
+                             "phase=%zu\n",
+                             uncorrectable_since_sync,
+                             static_cast<unsigned long long>(
+                                 statistics.rs_uncorrectable_packets),
+                             selected_outer_phase);
+            }
             uncorrectable_since_sync = 0;
             std::array<std::uint8_t, ts_packet_size> packet{};
             if (energy_descrambler.process(randomized, packet)) {
                 statistics.corrected_payload_bits += corrected_payload_bits;
-                statistics.compared_payload_bits += ts_packet_size * 8;
                 transport_stream.insert(transport_stream.end(), packet.begin(),
                                         packet.end());
                 ++statistics.ts_packets;
@@ -447,6 +601,17 @@ struct OuterFec::Impl {
     // selection is dropped and the sliding-window search resumes on the
     // current (healthier) data.
     std::size_t uncorrectable_since_sync{};
+    // Search cadence while the selected RS phase is unavailable.  The first
+    // search is made as soon as the sliding candidates are full; subsequent
+    // searches are throttled so a noisy interval cannot monopolize the FEC
+    // worker.  This is many times longer than one RS alignment window, while
+    // the candidate buffers continue to retain the newest window.
+    static constexpr std::size_t alignment_search_interval =
+        32 * 32 * 204;
+    std::size_t alignment_search_bytes{};
+    std::uint64_t alignment_search_count{};
+    std::size_t pending_alignment_phase{outer_interleaver_branches};
+    bool alignment_search_done{};
 };
 
 OuterFec::OuterFec() : impl_(std::make_unique<Impl>()) {}

@@ -13,8 +13,10 @@ struct OuterFecStats {
     std::uint64_t rs_uncorrectable_packets{};
     std::uint64_t tei_packets{};
     std::uint64_t ts_packets{};
-    // RS-corrected payload bits compared against the received codewords; the
-    // DVB-T path reports these as its post-Viterbi error/compared counters.
+    // RS-derived payload error estimate and attempted payload bits. Corrected
+    // bits are counted for valid codewords; an uncorrectable codeword is
+    // conservatively charged as a fully invalid 188-byte payload so the
+    // post-Viterbi BER remains live during an outer-lock failure.
     std::uint64_t corrected_payload_bits{};
     std::uint64_t compared_payload_bits{};
     int outer_deinterleaver_phase{-1};

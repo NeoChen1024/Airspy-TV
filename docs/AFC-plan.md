@@ -1,139 +1,282 @@
-# Sample-Clock Timing Loop：问题分析与 AFC 改造计划
+# Sample-Clock Timing Loop and AFC Plan
 
-> 状态：**问题未完全解决**。本文记录 545 长时间解码中反复出现的周期性解调崩溃的完整调查过程、根因分析、已尝试修复及其局限，以及下一步 AFC（Automatic Frequency Control）式闭环的设计方向。
+## Status
 
-## 1. 背景与现象
+The long-running DVB-T timing failure has been reproduced, diagnosed, and
+fixed in the current native decoder. The remaining items in this document are
+incremental improvements and research directions; they are not required to
+recover the current 545 MHz capture.
 
-### 1.1 测试素材
+The main validation capture is:
 
-- `545M-DVB-T-公視-3.cs16`：363.9 GB，10 Msps CS16，`airspy_rx` 录制，约 2.5 小时真实 DVB-T 信号（含真实时钟漂移、动态多径、fading）。
-- `--decode-iq` 直接回放，`--decoder-threads 16`。
-- 事件调试：`AIRSPYTV_EVENT_DEBUG=1`，stderr 输出 `[evt]` 行。
+- `545M-DVB-T-公視-3.cs16`: 363.9 GB, 10 MS/s CS16, approximately 151.6
+  minutes of real DVB-T signal recorded by `airspy_rx`.
+- The capture contains real sample-clock and LO-clock drift, dynamic
+  multipath, and short signal-quality degradations.
+- Offline replay uses `--decode-iq`, the same native `StreamDecoder` used by
+  the GUI, and normally `--decoder-threads 16`.
+- `AIRSPYTV_EVENT_DEBUG=1` enables timing and FEC event diagnostics.
 
-### 1.2 用户观察
+## 1. Observed failure
 
-- DVB-T 成功解码后，过几分钟 TS 串流突然没掉，CPU 使用率掉得很低（解码线程停摆）。
-- TS buffer（mpv 播放 queue）水位开始下降，最后 run-out，mpv 无反应。
-- **`tau`（timing 测值）爬到 ~171 左右时就炸掉**——只是把崩溃推迟了，没有根治。
-- Viterbi / RS FEC 在崩溃时都还正常，BER 在合理范围。
+The original failure looked like a transport/FEC problem:
 
-### 1.3 日志证据（fi2.log，5 次 badlock）
+1. The signal was usually around 19--20 dB MER and had stable power.
+2. The MPEG-TS stream decoded normally for a long period.
+3. `tau` slowly accumulated to roughly 170 samples.
+4. RS failures then increased rapidly, the outer FEC lock was lost, and the TS
+   output stopped.
 
-```
-[evt] badlock enter fi=0.830 off=0 sym=187887 discont=138 timing=28.85 hopeless=4
-[evt] badlock enter fi=0.903 off=0 sym=189995 discont=436 timing=79.65 hopeless=4
-[evt] badlock enter fi=0.819 off=0 sym=190742 discont=439 timing=15.77 hopeless=4
-[evt] badlock enter fi=0.706 off=0 sym=312259 discont=615 timing=115.75 hopeless=4
-[evt] badlock enter fi=0.796 off=0 sym=314503 discont=840 timing=-13.92 hopeless=4
-```
+The important point is that MER did not need to remain low for the FEC to
+fail. MER measures constellation decision quality after equalization; it does
+not by itself prove that the FFT window, scattered-pilot phase branch, symbol
+parity, and FEC alignment are still consistent. A timing/phase branch error
+can therefore precede the visible MER collapse.
 
-timing 环路失控的关键序列（tloop，文件尾部）：
+Representative pre-fix timing output was:
 
-```
+```text
 [evt] tloop tau=170.66 shift=46.0 drift=0.804 smooth=0.358 frac=0.46
 [evt] tloop tau=171.11 shift=46.0 drift=0.449 smooth=0.359 frac=0.82
 [evt] tloop tau=170.41 shift=47.0 drift=-0.700 smooth=0.360 frac=0.18
-[evt] tloop tau=-163.89 shift=47.0 drift=-334.307 smooth=0.026 frac=0.20   ← 测值翻转！
-[evt] tloop tau=-29.16  shift=47.0 drift=134.738 smooth=-0.447 frac=-0.24   ← 环路失控
-[evt] tloop tau=10.90   shift=47.0 drift=40.052 smooth=-0.985 frac=-1.23
-...
-[evt] tloop tau=35.94   shift=-29.0 drift=4.494 smooth=-5.255 frac=-4.00   ← clamp 撞底，窗口乱移
+[evt] tloop tau=-163.89 shift=47.0 drift=-334.307 smooth=0.026 frac=0.20
+[evt] tloop tau=-29.16 shift=47.0 drift=134.738 smooth=-0.447 frac=-0.24
 ```
 
-## 2. 三层问题
+After this transition, the decoder produced repeated `align-miss` events and
+eventually reported `outer=-1` while the TS byte counter stopped advancing.
 
-调查发现"545 周期崩溃"实际是**三个独立问题**叠加，前两个与环路有关，第三个是信道现象：
+## 2. Root cause
 
-### 2.1 时钟漂移本体（✅ 已解决）
+The failure was caused by the interaction of three timing-loop problems, not
+by a permanently bad MPEG-TS queue or by RS decoding alone.
 
-- 545 的录制时钟漂移约 **0.36 样本/窗口**（1 窗口 = 68 符号 ≈ 0.1 s）。
-- pilot phase-slope（相邻 scattered pilot 的相位差）每符号测一次 tau，窗口平均。
-- 只跟踪**窗口间差分**（慢漂移），不追绝对值——绝对值被多径 group delay 主导（545 上约 +128 样本恒偏），追绝对值等于追信道。
-- 补偿：`fractional_timing` 累积，跨 ±0.5 时对符号周期 ±1 样本（`advance_symbol`），clamp ±4。
-- **现状**：差分测量 + 补偿基本闭合（tloop 显示 `tau − shift ≈ 常数` 时窗口追上了漂移）。
+### 2.1 Pilot-slope ambiguity
 
-### 2.2 环路回归被离群点击垮（🔧 已修复，但只验证了 300 s）
-
-- **现象**：`tau=171.11 → -163.89` 单窗口翻转，`smooth` 从 0.36 崩到 0.026，随后 `frac` 撞 clamp、窗口在约 1 秒内移动上百样本。
-- **根因**：这不是 arg 的 π 包装（1.57 rad 离 π 还远），而是 **545 动态多径的 group-delay 突变**——某个窗口内多径相位变化把相邻 pilot 相位差推过了 ±π，测值瞬间跳 ~335 样本。**最小二乘回归对 24 点历史里的单个离群点毫无抵抗力**：一个离群点把斜率拉偏 ~100/24 ≈ 4，`smooth` 被拖成负值，环路失去补偿方向。
-- **修复**：把最小二乘回归换成**中位数连续差**（对每窗口的相邻 tau 差取中位数，1-2 个离群窗口无法移动中位数），并对 `smoothed_timing_drift` 加 ±4 clamp 双保险。
-- **验证**：545 跑 300 s（约 5 分钟，覆盖 1+ 个崩溃周期）零 badlock / 零 hopeless / phase-jump 1 次，tau 平滑爬过 175 不翻。
-- **局限**：300 s 只覆盖约 1 个崩溃周期，**不足以证明长期稳定**。用户更长实测仍观察到"差不多的问题"。
-
-### 2.3 verify 瞬时 ramp 估计的 π 边界（❌ 未解决）
-
-- `lock_phase_at_offset` 的去旋转 ramp 是**每符号用相邻 pilot 相位差瞬时估计**的。
-- 该估计的模是 **N/24 = 341 样本**（12 载波间距对应 π）：`tau` 爬过 341 后 arg 必然包装，估计失效 → verify 选错 phase → MER 崩。
-- tau 绝对值无界爬升（每 ~8 分钟约 341 样本），所以**最终必然撞上这个边界**——中位数回归只是让环路在撞边界前不失控，撞上后仍要靠 hopeless → re-anchor 兜底（丢 ~0.4 s）。
-- 更糟：**多径 group-delay 突变也会让瞬时估计翻 π**（见 2.2），这是 badlock 段 phase-jump 风暴（841 次，集中在崩溃段）的直接来源之一。
-
-### 2.4 badlock = 真实信道退化（fading / 动态多径）（⚠️ 期望行为，非 bug）
-
-- badlock 时 `fi=0.83/0.90/0.82/0.71/0.80`——**continual-carrier 相关本身下降**，说明信号真的在退化（fading / ISI），不是环路假象。
-- hopeless 机制（窗口 MER < floor 连续 4 窗口 → 强制 re-acquisition）按设计工作：re-anchor score 0.99，恢复后 MER 回 20 dB。
-- 这是**深衰落时的正确行为**（丢 ~0.4 s 恢复），不应消除，只能缩短恢复时间。
-
-## 3. 为什么短时验证无效
-
-崩溃周期 ~4.6 分钟（badlock 段 sym≈187K 与 312K，间隔约 186 K 符号 ≈ 4.6 分钟）。300 s 测试恰好在崩溃周期边缘，**即使过了也不代表长期稳定**。验证必须满足：
-
-- 覆盖**至少 3 个完整崩溃周期**（≥ 15 分钟墙钟 / 或直接跑全文件 2.5 小时）。
-- 关键观测点：**tau 爬过 341**（arg π 边界）时 verify 是否崩；**GD 突变窗口**出现时环路是否受扰。
-- 区分两类事件：**环路自身崩溃**（应归零）vs **信道退化恢复**（fading 时的 re-anchor，允许存在，但恢复应 < 1 s）。
-
-## 4. 当前架构（as of 1cb5a50 之后）
+For an 8K DVB-T symbol, adjacent scattered pilots are 12 carriers apart. The
+phase-slope estimate is therefore periodic in:
 
 ```text
-pilot phase-slope（每符号）
-        │ timing_acc（窗口平均）
-        ▼
-   tau 测值（含 group-delay 偏置 ~+128）
-        │ rebase CIR slide
-        ▼
-   drift = tau − tau_prev          ← 差分，只留慢漂移
-        │ tau_history[24]
-        ▼
-   中位数连续差 → smoothed_drift   ← 当前修复点（抗离群）
-        │ clamp ±4
-        ▼
-   fractional_timing（±0.5 阈值）
-        ▼
-   advance_symbol：next_symbol_start ± 1（bang-bang 步进）
+N / 12 = 8192 / 12 samples per full 2-pi slope cycle
+N / 24 = 341.3 samples per pi branch ambiguity
 ```
 
-执行器是**积分器 + 阈值步进**（bang-bang），不是连续比例反馈。tau 绝对值无界爬升（窗口只追漂移、不归零），这是 2.3 的根。
+The old implementation estimated the phase ramp independently at multiple
+points in the pipeline. A wrapped or multipath-contaminated estimate could
+change the phase branch used by pilot verification even while the carrier
+quality indicator and MER still looked healthy.
 
-## 5. 设计方向（AFC 式闭环）
+### 2.2 Dynamic multipath outliers
 
-目标是把"只追踪、不修正"改成真正的闭环：误差检测 → 环路滤波 → 反馈到执行器 → 误差归零。
+The capture contains moving group-delay structure. A short-lived channel
+change can make the phase difference of a pilot pair cross the `arg()` wrap
+boundary. This produces a large apparent timing jump even though a
+sample-clock cannot move the FFT boundary by hundreds of samples in one short
+window.
 
-| 层次 | 现状 | AFC 式目标 |
-|---|---|---|
-| 漂移闭环 | 差分测量 + 中位数回归（已修） | 保持差分（group delay bias 免疫），执行器改比例反馈 |
-| 位置归零 | 故意不追绝对值（bias 风险） | 不归零到 0，而是把窗口移到 **CIR 能量重心**（多径质心） |
-| 亚样本 | 整数步进（±1 sample） | 可选：polyphase 小数延迟，窗口连续移动 |
+The previous least-squares history fit was too sensitive to one such outlier:
+one bad point in a 24-window history could reverse the estimated drift, drive
+the fractional accumulator into its clamp, and make the window move in the
+wrong direction.
 
-具体候选改造（按优先级）：
+### 2.3 Feedback contamination
 
-1. **verify 共享环路 tau（模 N 去旋转）**——消除 2.3 的 π 边界。verify 不再每符号瞬时估计 ramp，改用环路平滑后的 `tau mod N`（`N = fft_size`）做去旋转。环路 tau 平滑、无瞬时噪声，且模 N 后无包装问题。**注意**：verify 的 phase 区分对 tau 误差敏感（dephase = 2π·k·τ/N，k 最大 6816，τ 误差 1 样本就错 5.2 rad），所以环路 tau 必须足够平滑，且 GD 突变时也不能引入大误差——可能需要**多符号中位数**的 ramp 估计。
-2. **tau unwrap**——维护无界累积的展开值，避免测值在 ±341 处翻转；回归/差分全部在展开域做。GD 突变跳变仍需 2 的方案（中位数/限幅）过滤。
-3. **执行器比例化**——`next_symbol_start` 直接按 `W += K·drift` 连续调整（K≈2.6 抵消 0.38 的步进衰减，见历史测量），替代"累积到 ±0.5 才跳"的 bang-bang。锯齿消失、无 clamp。
-4. **CIR 重心定位**——窗口放在 guard 内多径能量质心（ROADMAP 已有 adaptive window 条目），解决 group-delay 偏置 + 深衰落时窗口位置不佳的问题。注意与 timing 环路解耦（CIR slide 需要 rebase 测量基准，历史教训：rebase 系数 1.0 过补偿、实测 0.38）。
-5. **群延迟偏置估计**——把恒定 GD（~+128）从 tau 测值中分离（长时间平均），让测值反映纯窗口偏移，绝对值才有意义。
+`shift` is the cumulative number of integer sample corrections applied by the
+timing loop. If those corrections are not removed from the measured timing
+history, the loop interprets its own action as physical clock drift. This
+creates a sawtooth or runaway feedback path.
 
-## 6. 已验证的事实（供设计参考）
+The sample-clock loop and the LO/CFO loop are separate control paths:
 
-- 漂移率：0.36 样本/窗口（545）；0.5 ppm TCXO @ 48/7 MSPS ≈ 3.4 样本/秒 ≈ 0.005 样本/符号。
-- 步进响应：`next_symbol_start` 移动 1 样本，tau 测值只降 **0.38**（多径衰减了 phase-slope 灵敏度）——所以 rebase 系数不能用 1.0。
-- 窗口滑动 d 样本，timing 测值移动 **−d**（需 rebase 到窗口平均位置）。
-- arg 包装：相邻 pilot（间距 12）相位差 = 2π·12·τ/N，包装在 τ = N/24 = 341 样本（8K 模式）。
-- group delay 偏置：545 上约 +128 样本恒偏（tau 测值 = 窗口偏移 + GD）。
-- verify 在 tau 172（150 s 测试）下工作正常；phase-jump 只在信道退化段（fi < 0.9）密集出现。
+- the timing loop changes the FFT symbol-window position;
+- the CFO loop changes the complex NCO phase/frequency.
 
-## 7. 验收标准
+A shared reference clock may correlate their physical drift, but the decoder
+must still estimate and control the two observables separately.
 
-- 545 全文件（2.5 小时）离线解码：**环路相关崩溃归零**（无 `tau 翻转`、无 smooth 失控、无 clamp 撞击）。
-- tau 爬过 341 时不触发 verify 崩溃（2.3 修复后）。
-- fading 段 re-anchor 恢复 < 1 s，恢复后 MER 回正常值。
-- 581 / 557 回归不劣化（byte 级或 sync 率 100%）。
-- ctest 全绿。
+## 3. Current implementation
+
+The following changes are implemented in
+`src/dvbt/stream_decoder.cpp`.
+
+### 3.1 One robust scattered-pilot timing estimate
+
+Timing is estimated only from the fixed-spacing scattered-pilot grid. The
+channel estimate is formed as sent-pilot divided by received-pilot, so the
+known pilot polarity is not applied a second time. The fixed spacing makes the
+branch period explicit and consistent for every observation.
+
+### 3.2 Shared timing-slope tracker
+
+`TimingSlopeTracker` now:
+
+- unwraps each measurement to the branch nearest the previous filtered value;
+- rejects implausible jumps larger than 24 samples;
+- maintains a short robust median history;
+- applies a slow low-pass filter to the accepted value;
+- supplies the same filtered timing value to both the timing loop and pilot
+  phase verification.
+
+This prevents one multipath click from simultaneously corrupting the timing
+feedback and the phase decision.
+
+### 3.3 Corrected feedback accounting
+
+The statistics-window update explicitly removes the timing loop's own integer
+window corrections from the drift history. The current shared timing
+coordinate uses a one-sample window-step response, and the loop's cumulative
+step count is added back when reconstructing the physical timing coordinate.
+
+The drift estimator is the median of recent consecutive differences rather
+than an unprotected least-squares slope. The smoothed drift remains clamped to
+`+/-4`, and the existing fractional accumulator converts it into occasional
+`+/-1` sample symbol-window steps.
+
+The control variables have different meanings:
+
+- `tau`: the filtered residual pilot-slope timing coordinate, in processed
+  complex samples;
+- `shift`: the cumulative integer timing correction, also in processed
+  complex samples;
+- `fractional_timing`: the bounded sub-sample accumulator that decides when
+  the next integer step is due.
+
+`shift` is expected to grow during a long stream when a persistent sample-clock
+offset exists. It resets when a stream is re-anchored, retuned, or reset. A
+bounded residual `tau`, stable MER, and continuous FEC are the meaningful
+health indicators; `shift` itself is not expected to remain near zero.
+
+## 4. Validation results
+
+The full 545 MHz capture was replayed through the current native decoder.
+During the replay:
+
+- all 90,973,175,808 complex samples were processed;
+- the TS byte counter advanced continuously to approximately 16.98 GB;
+- `tau` stayed within approximately 0--20 samples rather than climbing toward
+  170 or 341 samples;
+- MER remained near 20 dB for the normal signal regions;
+- no `outer-reset`, `align-miss`, `badlock`, or `timing-branch` event occurred;
+- the only `phase-jump` event was the normal initial acquisition transition.
+
+The TS sink for this validation was `/dev/null`; the decoder and FEC pipeline
+still ran normally and the transport byte counter was monitored. A shorter
+debug-enabled replay produced 1.60 GB of TS with 624 isolated RS failures and
+no permanent FEC loss. The previous implementation produced 179,532 RS
+failures and stopped TS output over the same 32 GiB replay segment.
+
+The repository test suite remains green:
+
+```text
+100% tests passed out of 4
+```
+
+## 5. Improvement opportunities
+
+The current loop is stable enough for the validation capture. The following
+improvements should be evaluated one at a time against this baseline.
+
+### 5.1 Fractional-delay or polyphase timing correction
+
+The current actuator is an integer-step window correction driven by a
+fractional accumulator. This is robust and cheap, but it quantizes the timing
+correction and can leave a small residual sawtooth.
+
+A fractional-delay filter or a polyphase resampler could move the effective
+FFT window continuously. Expected benefits are:
+
+- lower residual `tau` jitter;
+- less periodic phase modulation from integer steps;
+- less growth pressure on the cumulative `shift` counter.
+
+This should not be introduced merely to force `tau` to zero. A non-zero stable
+value can represent channel group delay or an intentional FFT-window margin.
+The acceptance criterion is improved timing/FEC stability, not a numerically
+small `tau` alone.
+
+### 5.2 CIR-aware initial and adaptive window placement
+
+The FFT window should remain inside the guard interval with balanced pre- and
+post-ISI margins. The CIR estimate can provide a useful target such as the
+energy centroid or a robust central percentile of the impulse response.
+
+The CIR placement path must remain separate from the sample-clock drift path:
+a deliberate CIR-window slide changes the measured pilot slope and must be
+rebased with its calibrated response. The target is a safe window location, not
+an assumption that the channel delay should be zero.
+
+### 5.3 A genuine second-order timing loop
+
+The present implementation filters timing differences and integrates them into
+integer window corrections. It handles approximately constant clock offset
+well, but it does not explicitly model changes in the drift rate.
+
+A future second-order loop can maintain:
+
+1. timing phase: the residual window-position error;
+2. timing frequency: the sample-clock offset or `shift` rate;
+3. optionally, a very slow drift-rate estimate for thermal changes.
+
+The update gains must be much slower than the OFDM symbol loop and must be
+gated by pilot confidence. The CFO/NCO loop should remain a separate loop,
+with shared-reference correlation used only as a diagnostic or as a carefully
+validated feed-forward aid.
+
+### 5.4 Confidence-weighted timing updates
+
+The current branch rejection is deliberately conservative. It can be improved
+by weighting timing updates using:
+
+- scattered-pilot power and coverage;
+- channel-estimate consistency;
+- CIR stability;
+- continual-carrier quality or fade indicator;
+- recent MER and post-Viterbi error indicators.
+
+During a fade or a rapidly changing multipath condition, the timing loop should
+slow down or hold its last trusted state instead of following a low-confidence
+group-delay estimate. Re-acquisition remains the correct recovery mechanism
+when the signal is genuinely unavailable.
+
+### 5.5 Better timing diagnostics
+
+Future diagnostics should publish these values independently:
+
+- raw pilot-slope estimate;
+- unwrapped and filtered `tau`;
+- physical drift estimate after removing loop feedback;
+- cumulative `shift` and its rate;
+- fractional-timing accumulator;
+- pilot/CIR confidence;
+- CFO estimate and residual CFO;
+- FEC and TS continuity.
+
+This makes it possible to distinguish a real RF fade, sample-clock drift, LO
+drift, a pilot branch ambiguity, and a downstream FEC alignment problem.
+
+## 6. Recommended implementation order
+
+1. Keep the current robust tracker and full-capture replay as the regression
+   baseline.
+2. Add timing residual, shift-rate, and confidence telemetry without changing
+   control behavior.
+3. Evaluate fractional-delay correction on the 545 MHz capture and synthetic
+   timing-offset fixtures.
+4. Evaluate CIR-aware window placement, including guard-interval margin checks.
+5. Prototype a second-order timing loop behind an opt-in configuration.
+6. Validate every change against the 545 MHz capture and the 557/581 MHz
+   multipath captures.
+
+## 7. Acceptance criteria
+
+Any future timing-loop change should satisfy all of the following:
+
+- no timing-loop `tau` branch flip or runaway drift on the full 545 MHz
+  capture;
+- no timing-induced `align-miss` or permanent outer-FEC loss;
+- continuous TS output through normal 19--20 dB MER regions;
+- stable recovery after genuine fading, without treating a fade as a timing
+  failure;
+- no regression on the 557/581 MHz captures;
+- no regression in the native decoder test suite;
+- no unexplained increase in CPU load, queue depth, or dropped input blocks.

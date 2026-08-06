@@ -350,6 +350,10 @@ void test_uncorrectable_packet_is_emitted_with_tei() {
     const auto stats = decoder.stats();
     require(stats.rs_uncorrectable_packets == 1,
             "one deliberately uncorrectable RS packet");
+    require(stats.post_viterbi_compared_bits != 0,
+            "outer BER denominator advances on an uncorrectable packet");
+    require(stats.post_viterbi_error_bits >= ts_packet_size * 8,
+            "outer BER records the uncorrectable payload penalty");
     require(stats.tei_packets == 1,
             "uncorrectable synchronized packet is emitted with TEI");
     require(stats.ts_packets == recovered.size() / ts_packet_size,

@@ -21,6 +21,9 @@ struct PlaybackTelemetry {
     std::int64_t vo_dropped_frames{};
     std::size_t queued_bytes{};
     std::size_t queue_capacity{};
+    // True while the player's own queue is below its recovery watermark.
+    // Playback starts/resumes at 4 MiB and re-enters buffering at 2 MiB.
+    bool buffering{};
     // Stream-level seams received from the decoder (fec_region_reset,
     // stream_end, retune) — distinct from per-packet TEI corruption.
     std::uint64_t discontinuities{};

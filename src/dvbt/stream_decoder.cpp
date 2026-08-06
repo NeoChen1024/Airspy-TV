@@ -112,6 +112,148 @@ struct PilotLock {
     int offset{};
 };
 
+constexpr std::size_t timing_pilot_spacing = 12;
+constexpr std::size_t timing_filter_history_size = 7;
+constexpr double timing_outlier_limit_samples = 24.0;
+// A one-sample FFT-window correction produces essentially a one-sample change
+// in the unwrapped pilot-slope coordinate. Keep this explicit because the
+// response is used both to de-bias the drift history and to convert the drift
+// estimate back into the integer window-step accumulator.
+constexpr double timing_window_shift_response = 1.0;
+
+[[nodiscard]] std::optional<double>
+estimate_scattered_timing_tau(
+    const std::span<const std::complex<float>> channel,
+    const std::size_t phase, const std::size_t maximum,
+    const std::size_t fft_size) {
+    // Use only the scattered pilots here.  `pilot_indices` also contains
+    // continual carriers, whose non-uniform spacing gives each phase pair a
+    // different unwrap period.  The scattered-pilot grid has one fixed
+    // spacing, so all observations share the same N/12-sample ambiguity.
+    std::array<double, 1024> estimates{};
+    std::size_t estimate_count = 0;
+    const std::size_t first = phase * 3;
+    for (std::size_t left = first;
+         left + timing_pilot_spacing <= maximum;
+         left += timing_pilot_spacing) {
+        const std::size_t right = left + timing_pilot_spacing;
+        if (std::norm(channel[left]) <= minimum_power ||
+            std::norm(channel[right]) <= minimum_power ||
+            estimate_count == estimates.size()) {
+            continue;
+        }
+        // `channel` is already normalized as sent / received below, so the
+        // known +/- scattered-pilot polarity has already been removed.  Do
+        // not multiply by the pilot signs again: doing so reintroduces a pi
+        // jump for every polarity transition and turns it into a false
+        // timing branch, which then poisons the phase verifier.
+        const double slope = std::arg(channel[right] *
+                                      std::conj(channel[left])) /
+                             static_cast<double>(timing_pilot_spacing);
+        if (std::isfinite(slope)) {
+            estimates[estimate_count++] =
+                slope * static_cast<double>(fft_size) /
+                (2.0 * std::numbers::pi_v<double>);
+        }
+    }
+    if (estimate_count == 0) {
+        return std::nullopt;
+    }
+    std::ranges::sort(estimates.begin(),
+                      estimates.begin() +
+                          static_cast<std::ptrdiff_t>(estimate_count));
+    const std::size_t middle = estimate_count / 2;
+    if (estimate_count % 2 != 0) {
+        return estimates[middle];
+    }
+    return 0.5 * (estimates[middle - 1] + estimates[middle]);
+}
+
+// The pilot phase slope is periodic in N/12 samples.  Keep its absolute
+// branch continuous and reject isolated group-delay clicks before they reach
+// either the long-term sample-clock loop or pilot phase verification.  The
+// latter is particularly sensitive: one sample of ramp error is already
+// several radians at the edge of the 8K carrier grid.
+struct TimingSlopeTracker {
+    void reset(const std::size_t fft_size = 0) noexcept {
+        ambiguity_period = fft_size == 0
+                                ? 0.0
+                                : static_cast<double>(fft_size) /
+                                      static_cast<double>(timing_pilot_spacing);
+        history.fill(0.0);
+        history_head = 0;
+        accepted_count = 0;
+        filtered_tau = 0.0;
+        initialized = false;
+    }
+
+    [[nodiscard]] std::optional<double> observe(
+        const double measured_tau) noexcept {
+        if (!std::isfinite(measured_tau) || ambiguity_period <= 0.0) {
+            return std::nullopt;
+        }
+        if (!initialized) {
+            // Seed the whole short history with the first valid observation so
+            // median_history() never has to sort a partially initialized
+            // buffer.
+            history.fill(measured_tau);
+            history_head = 1 % history.size();
+            filtered_tau = measured_tau;
+            initialized = true;
+            accepted_count = 1;
+            return filtered_tau;
+        }
+        double candidate = measured_tau;
+        candidate +=
+            ambiguity_period *
+            std::round((filtered_tau - candidate) / ambiguity_period);
+        const double center = median_history();
+        if (std::abs(candidate - center) > timing_outlier_limit_samples) {
+            // A sample-clock drift cannot move the FFT boundary by dozens of
+            // samples in a handful of OFDM symbols. A persistent jump here
+            // is therefore a phase-slope ambiguity or a multipath outlier,
+            // not a new timing branch to adopt. Keeping the last valid slope
+            // is safe because the closed loop below prevents the true offset
+            // from approaching this ambiguity in the first place. Adopting
+            // the old branch after a few confirmations was what turned the
+            // capture's 282 -> 405 -> 680 sequence into a phase storm.
+            return std::nullopt;
+        }
+        history[history_head] = candidate;
+        history_head = (history_head + 1) % history.size();
+        const double robust_tau = median_history();
+        filtered_tau = 0.25 * robust_tau + 0.75 * filtered_tau;
+        ++accepted_count;
+        return filtered_tau;
+    }
+
+    [[nodiscard]] std::optional<double> filtered() const noexcept {
+        // A few accepted symbols make the shared verify ramp independent of
+        // the first noisy pilot observation after acquisition.
+        return accepted_count >= 4 && initialized
+                   ? std::optional<double>{filtered_tau}
+                   : std::nullopt;
+    }
+
+  private:
+    [[nodiscard]] double median_history() const noexcept {
+        std::array<double, timing_filter_history_size> sorted = history;
+        std::ranges::sort(sorted);
+        const std::size_t middle = sorted.size() / 2;
+        if (sorted.size() % 2 != 0) {
+            return sorted[middle];
+        }
+        return 0.5 * (sorted[middle - 1] + sorted[middle]);
+    }
+
+    double ambiguity_period{};
+    std::array<double, timing_filter_history_size> history{};
+    std::size_t history_head{};
+    std::size_t accepted_count{};
+    double filtered_tau{};
+    bool initialized{};
+};
+
 [[nodiscard]] PilotLock
 lock_pilots(const std::span<const std::complex<float>> fft,
             const std::size_t maximum, const int previous_offset) {
@@ -157,7 +299,7 @@ lock_pilots(const std::span<const std::complex<float>> fft,
 // re-searched only when fi > 0.5 (healthy) or after a fade.
 [[nodiscard]] int lock_phase_at_offset(
     const std::span<const std::complex<float>> fft, const std::size_t maximum,
-    const int offset) {
+    const int offset, const std::optional<double> timing_tau) {
     int best_phase = 0;
     float best_score = -1.0F;
     for (int phase = 0; phase < 4; ++phase) {
@@ -168,51 +310,70 @@ lock_pilots(const std::span<const std::complex<float>> fft,
         // (hundreds of jumps per second while fi reads 1.0, near every
         // ~38000-symbol badlock). Estimate the per-carrier phase ramp from
         // the adjacent-pilot phase differences (de-rotating the pilot sign
-        // sequence), then verify with the ramp removed. The ramp estimate is
-        // unambiguous for tau < N/24 (~341 samples at 8K); the measured tau
-        // stays far below that.
+        // sequence), then verify with the ramp removed. Once the shared
+        // timing tracker has four good observations, use its unwrapped and
+        // robustly filtered channel slope instead of measuring the ramp again
+        // in this phase decision. That prevents one multipath click from
+        // changing both the timing loop and the phase lock at once.
         std::complex<float> correlation{};
         float score = 0.0F;
         std::size_t chunk_count = 0;
-        double ramp_sum = 0.0;
-        std::size_t ramp_count = 0;
-        std::size_t previous_pilot = std::numeric_limits<std::size_t>::max();
-        for (std::size_t pilot = static_cast<std::size_t>(phase * 3);
-             pilot <= maximum; pilot += 12) {
-            if (previous_pilot != std::numeric_limits<std::size_t>::max()) {
-                const auto left =
-                    carrier(fft, previous_pilot, maximum, offset);
-                const auto right = carrier(fft, pilot, maximum, offset);
-                const float left_value = prbs[previous_pilot] == 0U
-                                             ? 4.0F / 3.0F
-                                             : -4.0F / 3.0F;
-                const float right_value = prbs[pilot] == 0U ? 4.0F / 3.0F
-                                                            : -4.0F / 3.0F;
-                if (std::norm(left) > 0.0F && std::norm(right) > 0.0F) {
-                    // right * conj(left) has phase 2 pi * 12 * tau / N plus
-                    // a +-pi flip from the pilot sign difference; multiplying
-                    // by the known sign product removes the flip.
-                    const double difference = std::arg(
-                        right * std::conj(left) *
-                        std::complex<float>(right_value * left_value, 0.0F));
-                    if (std::isfinite(difference)) {
-                        ramp_sum += difference;
-                        ++ramp_count;
+        // `timing_tau` is measured from sent / received channel estimates, so
+        // it has the opposite sign of the raw FFT carrier ramp.  The positive
+        // sign below therefore de-rotates the received pilots.  Before the
+        // shared tracker is ready, retain the old local estimate as a cold
+        // start fallback.
+        double dephase_slope = 0.0;
+        if (timing_tau.has_value()) {
+            dephase_slope =
+                2.0 * std::numbers::pi_v<double> * *timing_tau /
+                static_cast<double>(fft.size());
+        } else {
+            double ramp_sum = 0.0;
+            std::size_t ramp_count = 0;
+            std::size_t previous_pilot =
+                std::numeric_limits<std::size_t>::max();
+            for (std::size_t pilot = static_cast<std::size_t>(phase * 3);
+                 pilot <= maximum; pilot += 12) {
+                if (previous_pilot != std::numeric_limits<std::size_t>::max()) {
+                    const auto left =
+                        carrier(fft, previous_pilot, maximum, offset);
+                    const auto right = carrier(fft, pilot, maximum, offset);
+                    const float left_value = prbs[previous_pilot] == 0U
+                                                 ? 4.0F / 3.0F
+                                                 : -4.0F / 3.0F;
+                    const float right_value = prbs[pilot] == 0U
+                                                  ? 4.0F / 3.0F
+                                                  : -4.0F / 3.0F;
+                    if (std::norm(left) > 0.0F &&
+                        std::norm(right) > 0.0F) {
+                        const double difference = std::arg(
+                            right * std::conj(left) *
+                            std::complex<float>(right_value * left_value,
+                                                0.0F));
+                        if (std::isfinite(difference)) {
+                            ramp_sum += difference;
+                            ++ramp_count;
+                        }
                     }
                 }
+                previous_pilot = pilot;
             }
-            previous_pilot = pilot;
+            // The local estimate comes from the received FFT values, while
+            // the shared timing estimate comes from sent / received channel
+            // values and therefore has the opposite sign.
+            dephase_slope =
+                ramp_count != 0
+                    ? -ramp_sum /
+                          static_cast<double>(ramp_count *
+                                              timing_pilot_spacing)
+                    : 0.0;
         }
-        // Per-carrier phase ramp (2 pi tau / N) and the de-rotation for each
-        // pilot carrier.
-        const double ramp =
-            ramp_count != 0 ? ramp_sum / static_cast<double>(ramp_count) / 12.0
-                            : 0.0;
         for (std::size_t pilot = static_cast<std::size_t>(phase * 3);
              pilot <= maximum; pilot += 12) {
             const float value =
                 prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
-            const float dephase = static_cast<float>(-ramp *
+            const float dephase = static_cast<float>(dephase_slope *
                                                      static_cast<double>(pilot));
             correlation +=
                 value * std::conj(std::polar(1.0F, dephase) *
@@ -1165,6 +1326,7 @@ struct StreamDecoder::Impl {
             float depuncture_time_sum = 0.0F;
             double timing_acc = 0.0;
             std::uint64_t timing_count = 0;
+            TimingSlopeTracker timing_tracker;
             // Continual-carrier fade indicator for the current symbol
             // (persisted here so publish_stats_window, defined before the
             // symbol loop, can surface it).
@@ -1192,17 +1354,17 @@ struct StreamDecoder::Impl {
             std::size_t tau_history_count = 0;
             // Cumulative FFT-window displacement applied by the period steps
             // (each +/-1-sample step on next_symbol_start), retained for
-            // diagnostics. NOTE: not used to rebase the tau measurement — the
-            // pilot phase-slope tau responds to a window step by only a
-            // fraction of a sample (multipath attenuates the sensitivity, ~
-            // 0.38 measured on 545), so subtracting the full step
-            // over-compensates, inverts the drift sign and stalls the loop.
+            // diagnostics. The publish loop adds the calibrated response
+            // back when estimating the physical drift.
             double accumulated_window_shift = 0.0;
             // Window-averaged CIR offset of the previous stats window: the
             // drift estimate is computed in window-position-invariant
             // coordinates so the adaptive FFT-window slides do not read as
             // sample-clock steps.
             double last_windowed_cir_avg = 0.0;
+            // Baseline used to remove the timing loop's own integer steps
+            // from the measured sample-clock drift.
+            double last_timing_window_shift = 0.0;
             int cir_off_window_begin = 0;
             // Integer CIR window offset currently applied to
             // `next_symbol_start`; the per-frame estimate only nudges the
@@ -1325,6 +1487,8 @@ struct StreamDecoder::Impl {
                     frontend.cir_symbol_count = 0;
                     applied_cir_offset = 0;
                     last_windowed_cir_avg = 0.0;
+                    last_timing_window_shift = 0.0;
+                    timing_tracker.reset();
                     cir_off_window_begin = 0;
                     return true;
                 }
@@ -1382,6 +1546,8 @@ struct StreamDecoder::Impl {
                     smoothed_timing_drift = 0.0;
                     accumulated_window_shift = 0.0;
                     last_windowed_cir_avg = 0.0;
+                    last_timing_window_shift = 0.0;
+                    timing_tracker.reset(fft_size);
                     cir_off_window_begin = applied_cir_offset;
                     have_grid = true;
                     demod_busy = true;
@@ -1425,6 +1591,8 @@ struct StreamDecoder::Impl {
                 smoothed_timing_drift = 0.0;
                 accumulated_window_shift = 0.0;
                 last_windowed_cir_avg = 0.0;
+                last_timing_window_shift = 0.0;
+                timing_tracker.reset(fft_size);
                 cir_off_window_begin = applied_cir_offset;
                 return true;
             };
@@ -1756,26 +1924,42 @@ struct StreamDecoder::Impl {
                     const double window_cir_avg =
                         0.5 * (static_cast<double>(cir_off_window_begin) +
                                static_cast<double>(applied_cir_offset));
-                    const double drift =
+                    const double observed_drift =
                         (static_cast<double>(timing_offset) +
                          window_cir_avg) -
                         (last_windowed_timing + last_windowed_cir_avg);
                     last_windowed_timing = static_cast<double>(timing_offset);
                     last_windowed_cir_avg = window_cir_avg;
-                    // The naive EMA of the per-window drift is corrupted by
-                    // the loop's own period steps: a step moves the measured
-                    // tau by only ~0.38 samples (multipath attenuates the
-                    // phase-slope sensitivity, measured on 545), so the step
-                    // shows up as a negative drift spike that drags the
-                    // smoothed estimate down and stalls the compensation —
+                    const double window_shift =
+                        accumulated_window_shift -
+                        last_timing_window_shift;
+                    last_timing_window_shift = accumulated_window_shift;
+                    // A positive window step makes the measured pilot slope
+                    // move negative by only the channel-dependent response
+                    // fraction. Add that known response back so the loop
+                    // estimates physical sample-clock drift instead of
+                    // cancelling its own correction in the measurement.
+                    const double drift =
+                        observed_drift +
+                        timing_window_shift_response * window_shift;
+                    // The per-window drift is corrected for the loop's own
+                    // period steps above: a step moves the measured tau by
+                    // approximately one sample, so treating that step as
+                    // physical drift would bias the compensation —
                     // the tau sawtooth (ramping 0 -> 62 samples until the
                     // pilot verify collapses, one badlock per ~38000
                     // symbols). Fit a linear regression to the tau history
                     // instead: a single step is one outlier among N points
                     // and barely moves the slope, so the estimate tracks the
                     // true sample-clock drift.
+                    // Store the timing coordinate after undoing the known
+                    // response of all integer window corrections. The median
+                    // first-difference estimator below must see physical
+                    // sample-clock drift, not the loop's sawtooth response.
                     tau_history[tau_history_head] =
-                        static_cast<double>(timing_offset) + window_cir_avg;
+                        static_cast<double>(timing_offset) + window_cir_avg +
+                        timing_window_shift_response *
+                            accumulated_window_shift;
                     tau_history_head = (tau_history_head + 1) % tau_history_n;
                     if (tau_history_count < tau_history_n) {
                         ++tau_history_count;
@@ -1821,7 +2005,8 @@ struct StreamDecoder::Impl {
                     }
                     smoothed_timing_drift =
                         std::clamp(smoothed_timing_drift, -4.0, 4.0);
-                    fractional_timing += smoothed_timing_drift;
+                    fractional_timing +=
+                        smoothed_timing_drift / timing_window_shift_response;
                     fractional_timing =
                         std::clamp(fractional_timing, -4.0, 4.0);
                     if (event_debug_enabled() && timing_count != 0 &&
@@ -2343,8 +2528,9 @@ struct StreamDecoder::Impl {
                             // fade, which restores the pre-fade stable
                             // offset.
                             lock = PilotLock{
-                                lock_phase_at_offset(fft_out, maximum,
-                                                     frontend.carrier_offset),
+                                lock_phase_at_offset(
+                                    fft_out, maximum, frontend.carrier_offset,
+                                    timing_tracker.filtered()),
                                 frontend.carrier_offset};
                         }
                         if (frontend.previous_phase >= 0 &&
@@ -2416,32 +2602,49 @@ struct StreamDecoder::Impl {
                     }
                     // Fractional timing estimate: an FFT-window shift of tau
                     // samples ramps arg(channel) linearly across carriers
-                    // (2*pi*k*tau/N), so the mean phase difference between
-                    // adjacent pilots, normalized by their spacing, estimates
-                    // tau in samples. Multipath biases the absolute value but
-                    // its drift over the capture is the sample-clock offset.
-                    if (pilots.size() >= 2) {
-                        double pair_sum = 0.0;
-                        std::size_t pair_count = 0;
-                        for (std::size_t pair = 1; pair < pilots.size();
-                             ++pair) {
-                            const std::size_t left = pilots[pair - 1];
-                            const std::size_t right = pilots[pair];
-                            const std::size_t spacing = right - left;
-                            if (spacing == 0 || spacing > 64 ||
-                                std::norm(channel[left]) == 0.0F ||
-                                std::norm(channel[right]) == 0.0F) {
-                                continue;
+                    // (2*pi*k*tau/N). Estimate it from the fixed-spacing
+                    // scattered-pilot grid, unwrap it against the previous
+                    // filtered value, and reject isolated group-delay clicks
+                    // before feeding either the long-term timing loop or the
+                    // phase verifier.
+                    if (const auto measured_tau =
+                            estimate_scattered_timing_tau(
+                                channel, static_cast<std::size_t>(lock.phase),
+                                maximum, fft_size);
+                        measured_tau.has_value()) {
+                        const auto previous_filtered_tau =
+                            timing_tracker.filtered();
+                        const auto accepted_tau =
+                            timing_tracker.observe(*measured_tau);
+                        if (accepted_tau.has_value()) {
+                            if (event_debug_enabled() &&
+                                previous_filtered_tau.has_value() &&
+                                std::abs(*accepted_tau -
+                                         *previous_filtered_tau) >
+                                    timing_outlier_limit_samples) {
+                                std::fprintf(
+                                    stderr,
+                                    "[evt] timing-branch old=%.2f new=%.2f "
+                                    "raw=%.2f sym=%llu\n",
+                                    *previous_filtered_tau, *accepted_tau,
+                                    *measured_tau,
+                                    static_cast<unsigned long long>(
+                                        symbol_count));
                             }
-                            pair_sum += std::arg(channel[right] *
-                                                 std::conj(channel[left])) /
-                                        static_cast<double>(spacing);
-                            ++pair_count;
-                        }
-                        if (pair_count != 0) {
                             timing_acc +=
-                                pair_sum / static_cast<double>(pair_count);
+                                *accepted_tau *
+                                (2.0 * std::numbers::pi_v<double>) /
+                                static_cast<double>(fft_size);
                             ++timing_count;
+                        } else if (event_debug_enabled()) {
+                            const auto filtered_tau = timing_tracker.filtered();
+                            std::fprintf(
+                                stderr,
+                                "[evt] timing-reject raw=%.2f filtered=%.2f "
+                                "sym=%llu\n",
+                                *measured_tau,
+                                filtered_tau.value_or(*measured_tau),
+                                static_cast<unsigned long long>(symbol_count));
                         }
                     }
                     // CIR / delay-spread estimate (scattered pilots -> IFFT ->

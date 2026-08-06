@@ -1900,10 +1900,11 @@ void draw_sidebar(AppState &state) {
                     ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
             ImGui::SetTooltip(
-                "Residual bit errors after the outer FEC: payload-bit "
-                "corrections made by successful RS(204,188) codewords; "
-                "uncorrectable packets are reported separately.\n%llu "
-                "corrected bits / %llu checked bits; %llu RS failures",
+                "RS-derived outer error estimate: corrected payload bits "
+                "from valid codewords plus a full 188-byte penalty for each "
+                "uncorrectable codeword. This keeps the metric live during "
+                "outer-lock loss.\n%llu error bits / %llu attempted bits; "
+                "%llu RS failures",
                 static_cast<unsigned long long>(
                     transport.post_viterbi_error_bits),
                 static_cast<unsigned long long>(
@@ -2050,12 +2051,20 @@ void draw_playback_panel(AppState &state) {
         return;
     }
     const auto telemetry = state.player.telemetry();
-    const bool playing = state.player.ready() && !telemetry.paused;
+    const bool playing = state.player.ready() && !telemetry.paused &&
+                         !telemetry.buffering;
+    const char *playback_status =
+        telemetry.buffering
+            ? "BUFFERING"
+            : (state.player.ready()
+                   ? (telemetry.paused ? "PAUSED" : "PLAYING")
+                   : "PLAYER IDLE");
     draw_status_indicator(
-        playing ? "PLAYING" : (state.player.ready() ? "PAUSED" : "PLAYER IDLE"),
+        playback_status,
         playing ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
-                : (state.player.ready() ? ImVec4(0.95F, 0.72F, 0.30F, 1.0F)
-                                        : ImVec4(0.55F, 0.62F, 0.70F, 1.0F)));
+                : (telemetry.buffering || state.player.ready()
+                       ? ImVec4(0.95F, 0.72F, 0.30F, 1.0F)
+                       : ImVec4(0.55F, 0.62F, 0.70F, 1.0F)));
     std::string position = "--:--:--";
     if (telemetry.playback_time_s > 0.0) {
         const auto total = static_cast<std::int64_t>(telemetry.playback_time_s);
@@ -2101,7 +2110,8 @@ void draw_playback_panel(AppState &state) {
         ImGui::SetTooltip(
             "Decoded TS bytes queued for libmpv vs the queue capacity; growth "
             "here means playback is not keeping up (stalled audio device or a "
-            "paused player).");
+            "paused player). Playback buffers to 4 MiB at startup/recovery, "
+            "and re-enters buffering below 2 MiB.");
     }
     ImGui::Text("Dropped frames  %lld   (VO %lld)",
                 static_cast<long long>(telemetry.dropped_frames),
@@ -2800,6 +2810,17 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
     if (stats.processing_realtime_ratio > 0.0F) {
         std::cerr << " rt=" << (1.0F / stats.processing_realtime_ratio) << "x";
     }
+    const auto &transport = stats.transport;
+    std::cerr << " TS=" << stats.transport_bytes
+              << " RS=" << transport.rs_packets
+              << " rsbad=" << transport.rs_uncorrectable_packets
+              << " TEI=" << transport.tei_packets
+              << " tsp=" << transport.ts_packets
+              << " rslock=" << (transport.rs_synchronized ? 1 : 0)
+              << " energysync=" << (transport.energy_synchronized ? 1 : 0)
+              << " outer=" << transport.outer_deinterleaver_phase
+              << " dist=" << transport.outer_sync_distance
+              << " evidence=" << transport.outer_rs_evidence;
     std::cerr << '\n';
 
     // Stall fingerprints: a worker parked on a wait whose predicate can never

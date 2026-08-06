@@ -32,7 +32,9 @@ namespace airspy_tv {
 namespace {
 
 constexpr std::size_t transport_packet_size = 188;
-constexpr std::size_t playback_queue_capacity = 24U << 20U;
+constexpr std::size_t playback_queue_capacity = 8U << 20U;
+constexpr std::size_t playback_queue_low_watermark = 2U << 20U;
+constexpr std::size_t playback_queue_resume_watermark = 4U << 20U;
 
 [[nodiscard]] std::string mpv_error(const std::string_view operation,
                                     const int code) {
@@ -65,6 +67,10 @@ struct MpvPlayer::Impl {
     std::deque<std::vector<std::uint8_t>> queue;
     std::size_t front_offset{};
     std::size_t queued_bytes{};
+    // Do not let libmpv consume a short tail immediately after startup or a
+    // dropout.  The hysteresis avoids repeatedly entering/leaving buffering
+    // at the same threshold while preserving a bounded live latency.
+    bool buffering{true};
     std::uint64_t generation{};
     bool source_active{};
     std::optional<TransportService> selected_service;
@@ -110,7 +116,8 @@ struct MpvPlayer::Impl {
         std::unique_lock lock(self.mutex);
         self.data_ready.wait(lock, [&] {
             return cookie->canceled.load() || !self.source_active ||
-                   cookie->generation != self.generation || !self.queue.empty();
+                   cookie->generation != self.generation ||
+                   (!self.buffering && !self.queue.empty());
         });
         if (cookie->canceled.load() || !self.source_active ||
             cookie->generation != self.generation) {
@@ -135,6 +142,9 @@ struct MpvPlayer::Impl {
                 self.front_offset = 0;
             }
         }
+        if (self.queued_bytes <= playback_queue_low_watermark) {
+            self.buffering = true;
+        }
         return static_cast<std::int64_t>(copied);
     }
 
@@ -153,6 +163,7 @@ struct MpvPlayer::Impl {
         queue.clear();
         front_offset = 0;
         queued_bytes = 0;
+        buffering = true;
     }
 
     void restart_playback() {
@@ -384,8 +395,12 @@ void MpvPlayer::submit(const std::span<const std::uint8_t> transport_stream) {
         }
         impl_->queued_bytes += filtered.size();
         impl_->queue.push_back(std::move(filtered));
+        if (impl_->buffering &&
+            impl_->queued_bytes >= playback_queue_resume_watermark) {
+            impl_->buffering = false;
+        }
     }
-    impl_->data_ready.notify_one();
+    impl_->data_ready.notify_all();
 }
 
 void MpvPlayer::on_discontinuity(
@@ -507,6 +522,7 @@ PlaybackTelemetry MpvPlayer::telemetry() const {
         const std::scoped_lock lock(impl_->mutex);
         result.queued_bytes = impl_->queued_bytes;
         result.queue_capacity = playback_queue_capacity;
+        result.buffering = impl_->source_active && impl_->buffering;
         result.discontinuities = impl_->discontinuity_count;
     }
     if (impl_->handle == nullptr) {
