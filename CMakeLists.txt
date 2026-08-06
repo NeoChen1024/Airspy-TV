@@ -145,6 +145,7 @@ if(AIRSPY_TV_USE_AVX2_VITERBI)
 endif()
 
 add_library(airspy-tv-dvbt STATIC
+    src/dvbt/analysis_publisher.cpp
     src/dvbt/decoder.cpp
     src/dvbt/inner_decoder.cpp
     src/dvbt/ofdm_acquisition.cpp
@@ -167,6 +168,7 @@ add_executable(airspy-tv
     src/sdr.cpp
     src/si_common.cpp
     src/spectrum.cpp
+    src/transport_router.cpp
     src/transport_stream.cpp
 )
 target_include_directories(airspy-tv PRIVATE include)
@@ -228,8 +230,13 @@ if(BUILD_TESTING)
         target_compile_options(dvbt-stream-decoder-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
-    add_test(NAME dvbt-stream-decoder COMMAND dvbt-stream-decoder-test)
-    set_tests_properties(dvbt-stream-decoder PROPERTIES TIMEOUT 10)
+    foreach(STREAM_CASE clean reset-new reset-live reset-wait no-acq)
+        add_test(NAME dvbt-stream-decoder-${STREAM_CASE}
+                 COMMAND dvbt-stream-decoder-test)
+        set_tests_properties(dvbt-stream-decoder-${STREAM_CASE} PROPERTIES
+            ENVIRONMENT "AIRSPYTV_STREAM_TEST=${STREAM_CASE}"
+            TIMEOUT 90)
+    endforeach()
 
     add_executable(epg-model-test
         tests/epg_model_test.cpp

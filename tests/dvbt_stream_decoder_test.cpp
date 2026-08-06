@@ -15,6 +15,7 @@ extern "C" {
 #include <complex>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <span>
@@ -31,6 +32,8 @@ using airspy_tv::dvbt::CodeRate;
 using airspy_tv::dvbt::Constellation;
 using airspy_tv::dvbt::GuardInterval;
 using airspy_tv::dvbt::MaxLogDemapper;
+using airspy_tv::dvbt::SignalAnalysisSnapshot;
+using airspy_tv::dvbt::SignalAnalysisSource;
 using airspy_tv::dvbt::StreamDecoder;
 using airspy_tv::dvbt::SymbolDeinterleaver;
 using airspy_tv::dvbt::TransmissionMode;
@@ -393,6 +396,7 @@ struct DecodeResult {
     std::vector<std::uint8_t> transport;
     std::vector<TransportDiscontinuity> discontinuities;
     airspy_tv::dvbt::StreamDecoderStats stats;
+    SignalAnalysisSnapshot analysis;
 };
 
 void submit_in_blocks(StreamDecoder &decoder,
@@ -455,6 +459,7 @@ decode_in_blocks(const std::span<const std::int16_t> iq,
     {
         const std::scoped_lock lock(callback_mutex);
         result.stats = decoder.stats();
+        result.analysis = decoder.analysis_snapshot();
     }
     return result;
 }
@@ -487,6 +492,14 @@ void test_8k_clean_signal() {
     require(result.stats.timing_confidence > 0.0F &&
                 result.stats.timing_confidence <= 1.0F,
             "timing confidence is outside its normalized range");
+    require(result.analysis.locked &&
+                result.analysis.source == SignalAnalysisSource::demodulator,
+            "GUI analysis did not switch to production demod telemetry");
+    require(std::isfinite(result.analysis.cp_snr_db) &&
+                std::isfinite(result.analysis.deepest_notch_db),
+            "production signal analysis contains a non-finite value");
+    require(result.analysis.cp_snr_db > 10.0F,
+            "production CP SNR was not populated from the ideal signal");
     require(std::isfinite(result.stats.raw_timing_offset_samples) &&
                 std::isfinite(result.stats.timing_offset_samples) &&
                 std::isfinite(result.stats.physical_timing_offset_samples) &&
@@ -679,11 +692,25 @@ void test_8k_reset_while_demod_waiting() {
 
 int main() {
     try {
-        test_8k_clean_signal();
-        test_8k_reset_then_new_stream();
-        test_8k_reset_live_resume();
-        test_8k_reset_while_demod_waiting();
-        test_8k_non_acquirable_stream_drains();
+        const std::string_view selected = [] {
+            const char *value = std::getenv("AIRSPYTV_STREAM_TEST");
+            return value == nullptr ? std::string_view{}
+                                    : std::string_view{value};
+        }();
+        bool ran = false;
+        const auto run = [selected, &ran](const std::string_view name,
+                                          const auto &test) {
+            if (selected.empty() || selected == name) {
+                ran = true;
+                test();
+            }
+        };
+        run("clean", test_8k_clean_signal);
+        run("reset-new", test_8k_reset_then_new_stream);
+        run("reset-live", test_8k_reset_live_resume);
+        run("reset-wait", test_8k_reset_while_demod_waiting);
+        run("no-acq", test_8k_non_acquirable_stream_drains);
+        require(ran, "unknown AIRSPYTV_STREAM_TEST selection");
     } catch (const std::exception &error) {
         std::cerr << "DVB-T StreamDecoder integration test failed: "
                   << error.what() << '\n';

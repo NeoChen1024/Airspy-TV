@@ -1,11 +1,15 @@
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 
+#include "airspy_tv/dvbt/analysis_publisher.hpp"
 #include "airspy_tv/dvbt/decoder.hpp"
 #include "airspy_tv/dvbt/inner_decoder.hpp"
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
 #include "airspy_tv/dvbt/tps_decoder.hpp"
+#include "airspy_tv/fftw_plan.hpp"
 #include "airspy_tv/thread_name.hpp"
+
+#include "absolute_sample_ring.hpp"
 
 #include <fftw3.h>
 #include <liquid/liquid.h>
@@ -26,9 +30,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <numbers>
 #include <numeric>
-#include <new>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -53,8 +57,7 @@ constexpr std::size_t ts_packet_size = 188;
 // acquisition) print their internal state to stderr immediately so a 10 s
 // polling diag does not miss the instant a transient event damages the grid.
 [[nodiscard]] inline bool event_debug_enabled() {
-    static const bool enabled =
-        std::getenv("AIRSPYTV_EVENT_DEBUG") != nullptr;
+    static const bool enabled = std::getenv("AIRSPYTV_EVENT_DEBUG") != nullptr;
     return enabled;
 }
 // Resampled-sample ring shared by the front-end thread (producer) and the
@@ -76,6 +79,7 @@ ring_capacity_for(const std::uint32_t sample_rate_hz) noexcept {
 // report cadence for the CLI (the demod no longer reports once per submitted
 // input chunk).
 constexpr std::size_t stats_window_symbols = 400;
+constexpr std::size_t analysis_interval_symbols = 32;
 // MER gate window: one TPS superframe (68 symbols). Windows whose mean MER
 // falls below the constellation's decode floor are dropped and bracket a
 // fresh FEC trellis at the region edges.
@@ -125,11 +129,9 @@ constexpr double timing_outlier_limit_samples = 24.0;
 // estimate back into the integer window-step accumulator.
 constexpr double timing_window_shift_response = 1.0;
 
-[[nodiscard]] std::optional<double>
-estimate_scattered_timing_tau(
-    const std::span<const std::complex<float>> channel,
-    const std::size_t phase, const std::size_t maximum,
-    const std::size_t fft_size) {
+[[nodiscard]] std::optional<double> estimate_scattered_timing_tau(
+    const std::span<const std::complex<float>> channel, const std::size_t phase,
+    const std::size_t maximum, const std::size_t fft_size) {
     // Use only the scattered pilots here.  `pilot_indices` also contains
     // continual carriers, whose non-uniform spacing gives each phase pair a
     // different unwrap period.  The scattered-pilot grid has one fixed
@@ -137,8 +139,7 @@ estimate_scattered_timing_tau(
     std::array<double, 1024> estimates{};
     std::size_t estimate_count = 0;
     const std::size_t first = phase * 3;
-    for (std::size_t left = first;
-         left + timing_pilot_spacing <= maximum;
+    for (std::size_t left = first; left + timing_pilot_spacing <= maximum;
          left += timing_pilot_spacing) {
         const std::size_t right = left + timing_pilot_spacing;
         if (std::norm(channel[left]) <= minimum_power ||
@@ -151,13 +152,13 @@ estimate_scattered_timing_tau(
         // not multiply by the pilot signs again: doing so reintroduces a pi
         // jump for every polarity transition and turns it into a false
         // timing branch, which then poisons the phase verifier.
-        const double slope = std::arg(channel[right] *
-                                      std::conj(channel[left])) /
-                             static_cast<double>(timing_pilot_spacing);
+        const double slope =
+            std::arg(channel[right] * std::conj(channel[left])) /
+            static_cast<double>(timing_pilot_spacing);
         if (std::isfinite(slope)) {
-            estimates[estimate_count++] =
-                slope * static_cast<double>(fft_size) /
-                (2.0 * std::numbers::pi_v<double>);
+            estimates[estimate_count++] = slope *
+                                          static_cast<double>(fft_size) /
+                                          (2.0 * std::numbers::pi_v<double>);
         }
     }
     if (estimate_count == 0) {
@@ -173,90 +174,42 @@ estimate_scattered_timing_tau(
     return 0.5 * (estimates[middle - 1] + estimates[middle]);
 }
 
+[[nodiscard]] float estimate_channel_notch_db(
+    const std::span<const std::complex<float>> inverse_channel,
+    const std::size_t phase, const std::size_t maximum) {
+    std::vector<float> channel_db;
+    channel_db.reserve((maximum / timing_pilot_spacing) + 1);
+    const std::size_t edge_guard = maximum / 32;
+    for (std::size_t carrier_index = phase * 3; carrier_index <= maximum;
+         carrier_index += timing_pilot_spacing) {
+        const float inverse_power = std::norm(inverse_channel[carrier_index]);
+        if (carrier_index >= edge_guard &&
+            carrier_index + edge_guard <= maximum &&
+            inverse_power > minimum_power) {
+            channel_db.push_back(-10.0F * std::log10(inverse_power));
+        }
+    }
+    if (channel_db.empty()) {
+        return 0.0F;
+    }
+    auto baseline = channel_db;
+    auto median =
+        baseline.begin() + static_cast<std::ptrdiff_t>(baseline.size() / 2);
+    std::ranges::nth_element(baseline, median);
+    const std::size_t lower_index =
+        std::min(channel_db.size() - 1,
+                 std::max<std::size_t>(1, channel_db.size() / 100));
+    auto lower = channel_db.begin() + static_cast<std::ptrdiff_t>(lower_index);
+    std::ranges::nth_element(channel_db, lower);
+    return *lower - *median;
+}
+
 // The pilot phase slope is periodic in N/12 samples.  Keep its absolute
 // branch continuous and reject isolated group-delay clicks before they reach
 // either the long-term sample-clock loop or pilot phase verification.  The
 // latter is particularly sensitive: one sample of ramp error is already
 // several radians at the edge of the 8K carrier grid.
-struct TimingSlopeTracker {
-    void reset(const std::size_t fft_size = 0) noexcept {
-        ambiguity_period = fft_size == 0
-                                ? 0.0
-                                : static_cast<double>(fft_size) /
-                                      static_cast<double>(timing_pilot_spacing);
-        history.fill(0.0);
-        history_head = 0;
-        accepted_count = 0;
-        filtered_tau = 0.0;
-        initialized = false;
-    }
-
-    [[nodiscard]] std::optional<double> observe(
-        const double measured_tau) noexcept {
-        if (!std::isfinite(measured_tau) || ambiguity_period <= 0.0) {
-            return std::nullopt;
-        }
-        if (!initialized) {
-            // Seed the whole short history with the first valid observation so
-            // median_history() never has to sort a partially initialized
-            // buffer.
-            history.fill(measured_tau);
-            history_head = 1 % history.size();
-            filtered_tau = measured_tau;
-            initialized = true;
-            accepted_count = 1;
-            return filtered_tau;
-        }
-        double candidate = measured_tau;
-        candidate +=
-            ambiguity_period *
-            std::round((filtered_tau - candidate) / ambiguity_period);
-        const double center = median_history();
-        if (std::abs(candidate - center) > timing_outlier_limit_samples) {
-            // A sample-clock drift cannot move the FFT boundary by dozens of
-            // samples in a handful of OFDM symbols. A persistent jump here
-            // is therefore a phase-slope ambiguity or a multipath outlier,
-            // not a new timing branch to adopt. Keeping the last valid slope
-            // is safe because the closed loop below prevents the true offset
-            // from approaching this ambiguity in the first place. Adopting
-            // the old branch after a few confirmations was what turned the
-            // capture's 282 -> 405 -> 680 sequence into a phase storm.
-            return std::nullopt;
-        }
-        history[history_head] = candidate;
-        history_head = (history_head + 1) % history.size();
-        const double robust_tau = median_history();
-        filtered_tau = 0.25 * robust_tau + 0.75 * filtered_tau;
-        ++accepted_count;
-        return filtered_tau;
-    }
-
-    [[nodiscard]] std::optional<double> filtered() const noexcept {
-        // A few accepted symbols make the shared verify ramp independent of
-        // the first noisy pilot observation after acquisition.
-        return accepted_count >= 4 && initialized
-                   ? std::optional<double>{filtered_tau}
-                   : std::nullopt;
-    }
-
-  private:
-    [[nodiscard]] double median_history() const noexcept {
-        std::array<double, timing_filter_history_size> sorted = history;
-        std::ranges::sort(sorted);
-        const std::size_t middle = sorted.size() / 2;
-        if (sorted.size() % 2 != 0) {
-            return sorted[middle];
-        }
-        return 0.5 * (sorted[middle - 1] + sorted[middle]);
-    }
-
-    double ambiguity_period{};
-    std::array<double, timing_filter_history_size> history{};
-    std::size_t history_head{};
-    std::size_t accepted_count{};
-    double filtered_tau{};
-    bool initialized{};
-};
+#include "timing_slope_tracker.hpp"
 
 [[nodiscard]] PilotLock
 lock_pilots(const std::span<const std::complex<float>> fft,
@@ -301,9 +254,10 @@ lock_pilots(const std::span<const std::complex<float>> fft,
 // can latch a multipath alias (545's 0 -> 3, 557's 0 -> -1). Re-verify only
 // the mod-4 scattered-pilot phase at the frozen offset; the offset itself is
 // re-searched only when fi > 0.5 (healthy) or after a fade.
-[[nodiscard]] int lock_phase_at_offset(
-    const std::span<const std::complex<float>> fft, const std::size_t maximum,
-    const int offset, const std::optional<double> timing_tau) {
+[[nodiscard]] int
+lock_phase_at_offset(const std::span<const std::complex<float>> fft,
+                     const std::size_t maximum, const int offset,
+                     const std::optional<double> timing_tau) {
     int best_phase = 0;
     float best_score = -1.0F;
     for (int phase = 0; phase < 4; ++phase) {
@@ -329,9 +283,8 @@ lock_pilots(const std::span<const std::complex<float>> fft,
         // start fallback.
         double dephase_slope = 0.0;
         if (timing_tau.has_value()) {
-            dephase_slope =
-                2.0 * std::numbers::pi_v<double> * *timing_tau /
-                static_cast<double>(fft.size());
+            dephase_slope = 2.0 * std::numbers::pi_v<double> * *timing_tau /
+                            static_cast<double>(fft.size());
         } else {
             double ramp_sum = 0.0;
             std::size_t ramp_count = 0;
@@ -343,18 +296,15 @@ lock_pilots(const std::span<const std::complex<float>> fft,
                     const auto left =
                         carrier(fft, previous_pilot, maximum, offset);
                     const auto right = carrier(fft, pilot, maximum, offset);
-                    const float left_value = prbs[previous_pilot] == 0U
-                                                 ? 4.0F / 3.0F
-                                                 : -4.0F / 3.0F;
-                    const float right_value = prbs[pilot] == 0U
-                                                  ? 4.0F / 3.0F
-                                                  : -4.0F / 3.0F;
-                    if (std::norm(left) > 0.0F &&
-                        std::norm(right) > 0.0F) {
-                        const double difference = std::arg(
-                            right * std::conj(left) *
-                            std::complex<float>(right_value * left_value,
-                                                0.0F));
+                    const float left_value =
+                        prbs[previous_pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+                    const float right_value =
+                        prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+                    if (std::norm(left) > 0.0F && std::norm(right) > 0.0F) {
+                        const double difference =
+                            std::arg(right * std::conj(left) *
+                                     std::complex<float>(
+                                         right_value * left_value, 0.0F));
                         if (std::isfinite(difference)) {
                             ramp_sum += difference;
                             ++ramp_count;
@@ -369,16 +319,14 @@ lock_pilots(const std::span<const std::complex<float>> fft,
             dephase_slope =
                 ramp_count != 0
                     ? -ramp_sum /
-                          static_cast<double>(ramp_count *
-                                              timing_pilot_spacing)
+                          static_cast<double>(ramp_count * timing_pilot_spacing)
                     : 0.0;
         }
         for (std::size_t pilot = static_cast<std::size_t>(phase * 3);
              pilot <= maximum; pilot += 12) {
-            const float value =
-                prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
-            const float dephase = static_cast<float>(dephase_slope *
-                                                     static_cast<double>(pilot));
+            const float value = prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+            const float dephase =
+                static_cast<float>(dephase_slope * static_cast<double>(pilot));
             correlation +=
                 value * std::conj(std::polar(1.0F, dephase) *
                                   carrier(fft, pilot, maximum, offset));
@@ -402,781 +350,18 @@ lock_pilots(const std::span<const std::complex<float>> fft,
     return std::ranges::binary_search(list, static_cast<int>(value));
 }
 
-struct PostprocessedSymbol {
-    std::vector<std::complex<float>> carriers;
-    std::vector<float> reliabilities;
-    std::vector<std::uint8_t> mother_metrics;
-    std::size_t symbol_index{};
-    float mer_db{};
-    float preprocess_time_ms{};
-    float demap_time_ms{};
-    float deinterleave_time_ms{};
-    float depuncture_time_ms{};
-};
-
-struct WorkerAllocation {
-    std::size_t resample{};
-    std::size_t symbol{};
-    std::size_t viterbi{};
-};
-
-[[nodiscard]] WorkerAllocation
-allocate_workers(const std::size_t requested_threads) noexcept {
-    const std::size_t total = requested_threads == 0
-                                  ? default_viterbi_worker_count()
-                                  : requested_threads;
-    if (total <= 2) {
-        return {1, 1, 1};
-    }
-    const std::size_t resample = std::max<std::size_t>(1, total / 4);
-    const std::size_t remaining = total - resample;
-    const std::size_t symbol = std::max<std::size_t>(1, remaining / 2);
-    return {resample, symbol, std::max<std::size_t>(1, remaining - symbol)};
-}
-
-[[nodiscard]] std::size_t
-buffered_symbol_count(const std::uint32_t bandwidth,
-                      const std::size_t symbol_samples) noexcept {
-    // Nominal DVB-T sample rate is bandwidth * 8 / 7; retain one fifth of a
-    // second at the current OFDM symbol duration.
-    const std::uint64_t numerator = static_cast<std::uint64_t>(bandwidth) * 8U;
-    const std::uint64_t denominator =
-        7U * buffer_duration_denominator * symbol_samples;
-    return std::max<std::size_t>(
-        1,
-        static_cast<std::size_t>((numerator + denominator - 1) / denominator));
-}
-
-[[nodiscard]] std::size_t
-buffered_input_samples(const std::uint32_t sample_rate) noexcept {
-    return std::max<std::size_t>(1, (static_cast<std::size_t>(sample_rate) +
-                                     buffer_duration_denominator - 1) /
-                                        buffer_duration_denominator);
-}
-
-[[nodiscard]] float
-duration_ms(const std::chrono::steady_clock::time_point started_at) {
-    return std::chrono::duration<float, std::milli>(
-               std::chrono::steady_clock::now() - started_at)
-        .count();
-}
-
-class SymbolPostprocessorPool {
-  public:
-    SymbolPostprocessorPool(const std::size_t requested_workers,
-                            const TransmissionMode mode,
-                            const Constellation constellation,
-                            const CodeRate code_rate,
-                            const std::size_t queue_capacity)
-        : worker_count_(requested_workers == 0 ? default_viterbi_worker_count()
-                                               : requested_workers),
-          mode_(mode), constellation_(constellation), reference_(constellation),
-          symbol_deinterleaver_(mode),
-          bits_per_carrier_(bits_per_symbol(constellation)),
-          code_rate_(code_rate), maximum_queued_(std::max<std::size_t>(
-                                     queue_capacity, worker_count_ * 2)) {
-        workers_.reserve(worker_count_);
-        try {
-            for (std::size_t index = 0; index < worker_count_; ++index) {
-                workers_.emplace_back([this, index] {
-                    set_current_thread_name("dvbt-sym-" +
-                                            std::to_string(index));
-                    run_worker();
-                });
-            }
-        } catch (...) {
-            stop_and_join();
-            throw;
-        }
-    }
-
-    ~SymbolPostprocessorPool() { stop_and_join(); }
-    SymbolPostprocessorPool(const SymbolPostprocessorPool &) = delete;
-    SymbolPostprocessorPool &
-    operator=(const SymbolPostprocessorPool &) = delete;
-
-    [[nodiscard]] bool
-    compatible(const std::size_t worker_count, const TransmissionMode mode,
-               const Constellation constellation, const CodeRate code_rate,
-               const std::size_t queue_capacity) const noexcept {
-        return worker_count_ == worker_count && mode_ == mode &&
-               constellation_ == constellation && code_rate_ == code_rate &&
-               maximum_queued_ ==
-                   std::max<std::size_t>(queue_capacity, worker_count * 2);
-    }
-
-    void submit(std::vector<std::complex<float>> carriers,
-                std::vector<float> equalizer_power,
-                const std::size_t symbol_index) {
-        Task task{.carriers = std::move(carriers),
-                  .equalizer_power = std::move(equalizer_power),
-                  .symbol_index = symbol_index};
-        {
-            std::unique_lock lock(mutex_);
-            space_available_.wait(lock, [this] {
-                return stopping_ || worker_error_ ||
-                       tasks_.size() < maximum_queued_;
-            });
-            rethrow_worker_error();
-            if (stopping_) {
-                return;
-            }
-            task.sequence = next_sequence_++;
-            ++outstanding_;
-            tasks_.push_back(std::move(task));
-        }
-        task_ready_.notify_one();
-    }
-
-    [[nodiscard]] std::vector<PostprocessedSymbol> take_ready() {
-        std::scoped_lock lock(mutex_);
-        rethrow_worker_error();
-        return take_ready_locked();
-    }
-
-    [[nodiscard]] std::vector<PostprocessedSymbol> flush() {
-        std::unique_lock lock(mutex_);
-        finished_.wait(lock,
-                       [this] { return outstanding_ == 0 || worker_error_; });
-        rethrow_worker_error();
-        return take_ready_locked();
-    }
-
-  private:
-    struct Task {
-        std::uint64_t sequence{};
-        std::vector<std::complex<float>> carriers;
-        std::vector<float> equalizer_power;
-        std::size_t symbol_index{};
-    };
-
-    [[nodiscard]] PostprocessedSymbol process(Task task) const {
-        const auto preprocess_started_at = std::chrono::steady_clock::now();
-        std::vector<std::complex<float>> nearest(task.carriers.size());
-        for (int iteration = 0; iteration < 2; ++iteration) {
-            reference_.slice_nearest(task.carriers, nearest);
-            std::complex<double> numerator{};
-            double denominator = 0.0;
-            for (std::size_t index = 0; index < task.carriers.size(); ++index) {
-                const auto value = task.carriers[index];
-                const auto reference = nearest[index];
-                numerator +=
-                    std::conj(static_cast<std::complex<double>>(reference)) *
-                    static_cast<std::complex<double>>(value);
-                denominator += std::norm(reference);
-            }
-            const auto gain =
-                static_cast<std::complex<float>>(numerator / denominator);
-            if (std::abs(gain) > 1.0e-6F) {
-                const std::complex<float> inverse_gain = 1.0F / gain;
-                for (auto &value : task.carriers) {
-                    value *= inverse_gain;
-                }
-            }
-        }
-
-        std::vector<float> errors;
-        errors.reserve(task.carriers.size());
-        reference_.slice_nearest(task.carriers, nearest);
-        for (std::size_t index = 0; index < task.carriers.size(); ++index) {
-            errors.push_back(std::norm(task.carriers[index] - nearest[index]));
-        }
-        const double mean_error =
-            std::accumulate(errors.begin(), errors.end(), 0.0) /
-            static_cast<double>(errors.size());
-        auto middle =
-            errors.begin() + static_cast<std::ptrdiff_t>(errors.size() / 2);
-        std::ranges::nth_element(errors, middle);
-        const float reliability =
-            1.0F / std::max(*middle / std::log(2.0F), 1.0e-4F);
-
-        auto equalizer_power_order = task.equalizer_power;
-        auto equalizer_middle =
-            equalizer_power_order.begin() +
-            static_cast<std::ptrdiff_t>(equalizer_power_order.size() / 2);
-        std::ranges::nth_element(equalizer_power_order, equalizer_middle);
-        const float median_equalizer_power =
-            std::max(*equalizer_middle, minimum_power);
-        std::vector<float> reliabilities(task.carriers.size());
-        for (std::size_t index = 0; index < reliabilities.size(); ++index) {
-            const float relative_channel_power =
-                median_equalizer_power /
-                std::max(task.equalizer_power[index], minimum_power);
-            reliabilities[index] =
-                reliability * std::clamp(relative_channel_power, 0.01F, 16.0F);
-        }
-
-        const std::size_t metric_count =
-            task.carriers.size() * bits_per_carrier_;
-        std::vector<float> demapped(metric_count);
-        std::vector<float> symbol_metrics(metric_count);
-        std::vector<float> bit_metrics(metric_count);
-        const auto demap_started_at = std::chrono::steady_clock::now();
-        reference_.demap(task.carriers, reliabilities, demapped);
-        const auto deinterleave_started_at = std::chrono::steady_clock::now();
-        symbol_deinterleaver_.process(demapped, bits_per_carrier_,
-                                      task.symbol_index, symbol_metrics);
-        bit_deinterleave(symbol_metrics, bits_per_carrier_, bit_metrics);
-        const auto depuncture_started_at = std::chrono::steady_clock::now();
-        std::vector<float> depunctured(
-            depunctured_size(bit_metrics.size(), code_rate_));
-        depuncture(bit_metrics, code_rate_, depunctured);
-        std::vector<std::uint8_t> mother_metrics(depunctured.size());
-        for (std::size_t index = 0; index < depunctured.size(); ++index) {
-            const float soft =
-                std::clamp(127.5F + (depunctured[index] * 8.0F), 0.0F, 255.0F);
-            mother_metrics[index] = static_cast<std::uint8_t>(soft + 0.5F);
-        }
-        const auto finished_at = std::chrono::steady_clock::now();
-        return {.carriers = std::move(task.carriers),
-                .reliabilities = std::move(reliabilities),
-                .mother_metrics = std::move(mother_metrics),
-                .symbol_index = task.symbol_index,
-                .mer_db = static_cast<float>(
-                    -10.0 * std::log10(std::max(mean_error, 1.0e-12))),
-                .preprocess_time_ms =
-                    std::chrono::duration<float, std::milli>(
-                        demap_started_at - preprocess_started_at)
-                        .count(),
-                .demap_time_ms = std::chrono::duration<float, std::milli>(
-                                     deinterleave_started_at - demap_started_at)
-                                     .count(),
-                .deinterleave_time_ms =
-                    std::chrono::duration<float, std::milli>(
-                        depuncture_started_at - deinterleave_started_at)
-                        .count(),
-                .depuncture_time_ms = std::chrono::duration<float, std::milli>(
-                                          finished_at - depuncture_started_at)
-                                          .count()};
-    }
-
-    void run_worker() {
-        while (true) {
-            Task task;
-            {
-                std::unique_lock lock(mutex_);
-                task_ready_.wait(
-                    lock, [this] { return stopping_ || !tasks_.empty(); });
-                if (stopping_ && tasks_.empty()) {
-                    return;
-                }
-                task = std::move(tasks_.front());
-                tasks_.pop_front();
-            }
-            space_available_.notify_one();
-            try {
-                const std::uint64_t sequence = task.sequence;
-                auto result = process(std::move(task));
-                const std::scoped_lock lock(mutex_);
-                completed_.emplace(sequence, std::move(result));
-                --outstanding_;
-            } catch (...) {
-                const std::scoped_lock lock(mutex_);
-                if (!worker_error_) {
-                    worker_error_ = std::current_exception();
-                }
-                --outstanding_;
-            }
-            finished_.notify_all();
-            space_available_.notify_all();
-        }
-    }
-
-    [[nodiscard]] std::vector<PostprocessedSymbol> take_ready_locked() {
-        std::vector<PostprocessedSymbol> output;
-        auto found = completed_.find(next_result_);
-        while (found != completed_.end()) {
-            output.push_back(std::move(found->second));
-            completed_.erase(found);
-            ++next_result_;
-            found = completed_.find(next_result_);
-        }
-        return output;
-    }
-
-    void stop_and_join() {
-        {
-            const std::scoped_lock lock(mutex_);
-            stopping_ = true;
-        }
-        task_ready_.notify_all();
-        space_available_.notify_all();
-        for (auto &worker : workers_) {
-            if (worker.joinable()) {
-                worker.join();
-            }
-        }
-    }
-
-    void rethrow_worker_error() const {
-        if (worker_error_) {
-            std::rethrow_exception(worker_error_);
-        }
-    }
-
-    const std::size_t worker_count_;
-    const TransmissionMode mode_;
-    const Constellation constellation_;
-    const MaxLogDemapper reference_;
-    const SymbolDeinterleaver symbol_deinterleaver_;
-    const std::size_t bits_per_carrier_;
-    const CodeRate code_rate_;
-    const std::size_t maximum_queued_;
-    std::vector<std::thread> workers_;
-    std::mutex mutex_;
-    std::condition_variable task_ready_;
-    std::condition_variable space_available_;
-    std::condition_variable finished_;
-    std::deque<Task> tasks_;
-    std::map<std::uint64_t, PostprocessedSymbol> completed_;
-    std::uint64_t next_sequence_{};
-    std::uint64_t next_result_{};
-    std::size_t outstanding_{};
-    std::exception_ptr worker_error_;
-    bool stopping_{};
-};
-
-class OverwriteComplexBuffer {
-  public:
-    ~OverwriteComplexBuffer() {
-        if (data_ != nullptr) {
-            volk_free(data_);
-        }
-    }
-    OverwriteComplexBuffer() = default;
-    OverwriteComplexBuffer(const OverwriteComplexBuffer &) = delete;
-    OverwriteComplexBuffer &operator=(const OverwriteComplexBuffer &) = delete;
-    OverwriteComplexBuffer(OverwriteComplexBuffer &&other) noexcept {
-        *this = std::move(other);
-    }
-    OverwriteComplexBuffer &operator=(OverwriteComplexBuffer &&other) noexcept {
-        if (this != &other) {
-            if (data_ != nullptr) {
-                volk_free(data_);
-            }
-            data_ = std::exchange(other.data_, nullptr);
-            size_ = std::exchange(other.size_, 0);
-            capacity_ = std::exchange(other.capacity_, 0);
-        }
-        return *this;
-    }
-
-    void resize_for_overwrite(const std::size_t size) {
-        static_assert(std::is_trivially_copyable_v<std::complex<float>> &&
-                      std::is_trivially_destructible_v<std::complex<float>>);
-        if (size > capacity_) {
-            auto *next = static_cast<std::complex<float> *>(volk_malloc(
-                sizeof(std::complex<float>) * size, volk_get_alignment()));
-            if (next == nullptr) {
-                throw std::bad_alloc{};
-            }
-            if (data_ != nullptr) {
-                volk_free(data_);
-            }
-            data_ = next;
-            capacity_ = size;
-        }
-        size_ = size;
-    }
-
-    [[nodiscard]] std::complex<float> *data() noexcept { return data_; }
-    [[nodiscard]] std::span<const std::complex<float>> view() const noexcept {
-        return {data_, size_};
-    }
-
-  private:
-    std::complex<float> *data_{};
-    std::size_t size_{};
-    std::size_t capacity_{};
-};
-
-// Parallel rational resampler with one persistent primary filter. Partition 0
-// carries the exact stream state across calls; the other filters are reset and
-// primed from the preceding m*Q input samples before processing their disjoint
-// ranges. This preserves the continuous serial result while allowing the FIR
-// work in a large input block to scale across cores.
-class StreamingResampler {
-  public:
-    explicit StreamingResampler(const std::size_t worker_count)
-        : worker_count_(std::max<std::size_t>(worker_count, 1)),
-          filters_(worker_count_, nullptr) {
-        workers_.reserve(worker_count_);
-        try {
-            for (std::size_t index = 0; index < worker_count_; ++index) {
-                workers_.emplace_back([this, index] {
-                    set_current_thread_name("dvbt-resamp-" +
-                                            std::to_string(index));
-                    run_worker(index);
-                });
-            }
-        } catch (...) {
-            stop_and_join();
-            throw;
-        }
-    }
-    ~StreamingResampler() {
-        stop_and_join();
-        destroy_filters();
-    }
-    StreamingResampler(const StreamingResampler &) = delete;
-    StreamingResampler &operator=(const StreamingResampler &) = delete;
-    StreamingResampler(StreamingResampler &&) = delete;
-    StreamingResampler &operator=(StreamingResampler &&) = delete;
-
-    [[nodiscard]] std::size_t worker_count() const noexcept {
-        return worker_count_;
-    }
-
-    void reset() {
-        destroy_filters();
-        rate_ = 0;
-        bandwidth_ = 0;
-        interpolation_ = 0;
-        decimation_ = 0;
-        residual_.clear();
-        history_.clear();
-        output_.resize_for_overwrite(0);
-    }
-
-    void configure(const std::uint32_t rate, const std::uint32_t bandwidth) {
-        if (configured() && rate == rate_ && bandwidth == bandwidth_) {
-            return;
-        }
-        reset();
-        // Nominal DVB-T output rate is bandwidth * 8 / 7 samples/second.
-        const std::uint64_t interpolation =
-            static_cast<std::uint64_t>(bandwidth) * 8U;
-        const std::uint64_t decimation = static_cast<std::uint64_t>(rate) * 7U;
-        const std::uint64_t divisor = std::gcd(interpolation, decimation);
-        const unsigned int p =
-            static_cast<unsigned int>(interpolation / divisor);
-        const unsigned int q = static_cast<unsigned int>(decimation / divisor);
-        for (auto &filter : filters_) {
-            filter = rresamp_crcf_create_kaiser(p, q, resampler_semi_length,
-                                                -1.0F, 60.0F);
-            if (filter == nullptr) {
-                destroy_filters();
-                throw std::runtime_error(
-                    "failed to create streaming resampler");
-            }
-        }
-        rate_ = rate;
-        bandwidth_ = bandwidth;
-        interpolation_ = p;
-        decimation_ = q;
-        residual_.clear();
-        residual_.reserve(decimation_);
-        history_.clear();
-        history_.reserve(resampler_semi_length * decimation_);
-    }
-
-    // Full decimation blocks are processed directly from the caller's input;
-    // only the short tail crossing a call boundary is copied into residual_.
-    // output_ is raw overwrite storage because liquid fills every output
-    // sample, avoiding std::vector's redundant value initialization.
-    [[nodiscard]] std::span<const std::complex<float>>
-    process(std::span<const std::complex<float>> input) {
-        if (!configured()) {
-            output_.resize_for_overwrite(0);
-            return {};
-        }
-        const std::size_t blocks =
-            (residual_.size() + input.size()) / decimation_;
-        if (blocks == 0) {
-            residual_.insert(residual_.end(), input.begin(), input.end());
-            output_.resize_for_overwrite(0);
-            return {};
-        }
-        if (blocks > std::numeric_limits<unsigned int>::max()) {
-            throw std::length_error("resampler block count exceeds liquid API");
-        }
-        output_.resize_for_overwrite(blocks * interpolation_);
-        std::size_t output_offset = 0;
-
-        if (!residual_.empty()) {
-            const std::size_t needed = decimation_ - residual_.size();
-            residual_.insert(residual_.end(), input.begin(),
-                             input.begin() +
-                                 static_cast<std::ptrdiff_t>(needed));
-            if (rresamp_crcf_execute_block(filters_.front(), residual_.data(),
-                                           1, output_.data()) != LIQUID_OK) {
-                throw std::runtime_error("streaming resampler boundary failed");
-            }
-            output_offset += interpolation_;
-            input = input.subspan(needed);
-            append_history(residual_);
-            residual_.clear();
-        }
-
-        const std::size_t direct_blocks = input.size() / decimation_;
-        if (direct_blocks != 0) {
-            process_direct(input.first(direct_blocks * decimation_),
-                           direct_blocks, output_.data() + output_offset);
-            output_offset += direct_blocks * interpolation_;
-            append_history(input.first(direct_blocks * decimation_));
-            input = input.subspan(direct_blocks * decimation_);
-        }
-        residual_.assign(input.begin(), input.end());
-        if (output_offset != blocks * interpolation_) {
-            throw std::logic_error("resampler output size mismatch");
-        }
-        return output_.view();
-    }
-
-    [[nodiscard]] bool configured() const noexcept {
-        return !filters_.empty() && filters_.front() != nullptr;
-    }
-    [[nodiscard]] std::uint32_t rate() const noexcept { return rate_; }
-    [[nodiscard]] std::uint32_t bandwidth() const noexcept {
-        return bandwidth_;
-    }
-
-  private:
-    static constexpr std::size_t minimum_partition_blocks = 1024;
-
-    void destroy_filters() noexcept {
-        for (auto &filter : filters_) {
-            if (filter != nullptr) {
-                rresamp_crcf_destroy(filter);
-                filter = nullptr;
-            }
-        }
-    }
-
-    void append_history(const std::span<const std::complex<float>> samples) {
-        const std::size_t capacity = resampler_semi_length * decimation_;
-        if (samples.size() >= capacity) {
-            history_.assign(samples.end() -
-                                static_cast<std::ptrdiff_t>(capacity),
-                            samples.end());
-            return;
-        }
-        if (history_.size() + samples.size() > capacity) {
-            const std::size_t discard =
-                history_.size() + samples.size() - capacity;
-            history_.erase(history_.begin(),
-                           history_.begin() +
-                               static_cast<std::ptrdiff_t>(discard));
-        }
-        history_.insert(history_.end(), samples.begin(), samples.end());
-    }
-
-    void process_direct(const std::span<const std::complex<float>> input,
-                        const std::size_t blocks,
-                        std::complex<float> *const output) {
-        const std::size_t active_workers = std::min(
-            worker_count_,
-            std::max<std::size_t>(1, blocks / minimum_partition_blocks));
-        if (active_workers == 1) {
-            if (rresamp_crcf_execute_block(
-                    filters_.front(),
-                    const_cast<std::complex<float> *>(input.data()),
-                    static_cast<unsigned int>(blocks), output) != LIQUID_OK) {
-                throw std::runtime_error("streaming resampler failed");
-            }
-            return;
-        }
-
-        {
-            const std::scoped_lock lock(worker_mutex_);
-            task_input_ = input.data();
-            task_output_ = output;
-            task_blocks_ = blocks;
-            task_active_workers_ = active_workers;
-            task_history_blocks_ = history_.size() / decimation_;
-            task_error_ = nullptr;
-            task_remaining_ = active_workers;
-            ++task_generation_;
-        }
-        task_ready_.notify_all();
-        std::unique_lock lock(worker_mutex_);
-        task_done_.wait(lock, [this] { return task_remaining_ == 0; });
-        if (task_error_ != nullptr) {
-            std::rethrow_exception(task_error_);
-        }
-        // The final partition owns the filter state at the end of this input
-        // range. Promote it to primary so the next process() call continues
-        // from exactly the same state as a serial resampler.
-        std::swap(filters_.front(), filters_[active_workers - 1]);
-    }
-
-    void run_worker(const std::size_t index) {
-        std::uint64_t seen_generation = 0;
-        while (true) {
-            const std::complex<float> *input = nullptr;
-            std::complex<float> *output = nullptr;
-            std::size_t blocks = 0;
-            std::size_t active_workers = 0;
-            std::size_t history_blocks = 0;
-            {
-                std::unique_lock lock(worker_mutex_);
-                task_ready_.wait(lock, [this, seen_generation] {
-                    return stopping_ || task_generation_ != seen_generation;
-                });
-                if (stopping_) {
-                    return;
-                }
-                seen_generation = task_generation_;
-                if (index >= task_active_workers_) {
-                    continue;
-                }
-                input = task_input_;
-                output = task_output_;
-                blocks = task_blocks_;
-                active_workers = task_active_workers_;
-                history_blocks = task_history_blocks_;
-            }
-
-            try {
-                const std::size_t begin = blocks * index / active_workers;
-                const std::size_t end = blocks * (index + 1) / active_workers;
-                auto filter = filters_[index];
-                if (index != 0) {
-                    if (rresamp_crcf_reset(filter) != LIQUID_OK) {
-                        throw std::runtime_error(
-                            "resampler partition reset failed");
-                    }
-                    const std::size_t current_history =
-                        std::min<std::size_t>(begin, resampler_semi_length);
-                    const std::size_t prior_history =
-                        std::min(history_blocks,
-                                 resampler_semi_length - current_history);
-                    for (std::size_t block = history_blocks - prior_history;
-                         block < history_blocks; ++block) {
-                        if (rresamp_crcf_write(
-                                filter, history_.data() +
-                                            block * decimation_) != LIQUID_OK) {
-                            throw std::runtime_error(
-                                "resampler history priming failed");
-                        }
-                    }
-                    for (std::size_t block = begin - current_history;
-                         block < begin; ++block) {
-                        if (rresamp_crcf_write(
-                                filter, const_cast<std::complex<float> *>(
-                                            input + block * decimation_)) !=
-                            LIQUID_OK) {
-                            throw std::runtime_error(
-                                "resampler partition priming failed");
-                        }
-                    }
-                }
-                if (rresamp_crcf_execute_block(
-                        filter,
-                        const_cast<std::complex<float> *>(input +
-                                                          begin * decimation_),
-                        static_cast<unsigned int>(end - begin),
-                        output + begin * interpolation_) != LIQUID_OK) {
-                    throw std::runtime_error("resampler partition failed");
-                }
-            } catch (...) {
-                const std::scoped_lock lock(worker_mutex_);
-                if (task_error_ == nullptr) {
-                    task_error_ = std::current_exception();
-                }
-            }
-
-            {
-                const std::scoped_lock lock(worker_mutex_);
-                --task_remaining_;
-                if (task_remaining_ == 0) {
-                    task_done_.notify_one();
-                }
-            }
-        }
-    }
-
-    void stop_and_join() noexcept {
-        {
-            const std::scoped_lock lock(worker_mutex_);
-            stopping_ = true;
-        }
-        task_ready_.notify_all();
-        for (auto &worker : workers_) {
-            if (worker.joinable()) {
-                worker.join();
-            }
-        }
-    }
-
-    const std::size_t worker_count_;
-    std::vector<rresamp_crcf> filters_;
-    std::vector<std::thread> workers_;
-    std::mutex worker_mutex_;
-    std::condition_variable task_ready_;
-    std::condition_variable task_done_;
-    const std::complex<float> *task_input_{};
-    std::complex<float> *task_output_{};
-    std::size_t task_blocks_{};
-    std::size_t task_active_workers_{};
-    std::size_t task_history_blocks_{};
-    std::size_t task_remaining_{};
-    std::uint64_t task_generation_{};
-    std::exception_ptr task_error_;
-    bool stopping_{};
-    std::uint32_t rate_{};
-    std::uint32_t bandwidth_{};
-    std::size_t interpolation_{};
-    std::size_t decimation_{};
-    std::vector<std::complex<float>> residual_;
-    std::vector<std::complex<float>> history_;
-    OverwriteComplexBuffer output_;
-};
-
+#include "stream_decoder_components.hpp"
 } // namespace
+
+#include "fec_stage_item.hpp"
+#include "ofdm_tracking_state.hpp"
 
 struct StreamDecoder::Impl {
     struct Block {
         std::vector<std::int16_t> samples;
         std::uint32_t rate{};
         std::uint32_t bandwidth{};
-    };
-
-    // Continuous front-end tracking state owned by the demod thread and
-    // carried for the life of a stream. The resampled symbol stream is
-    // contiguous (no overlap rewind), so the CFO loop, carrier search,
-    // continual-carrier reference, AND TPS superframe decoder all carry
-    // continuously; they are re-seeded only on cold starts (mode/guard
-    // changes or resets). The TPS carry is the key weak-signal win: with the
-    // old chunked pipeline every chunk re-locked TPS from scratch (~68
-    // symbols) and the per-chunk CFO boundary overshoot perturbed tracking.
-    struct FrontendState {
-        bool valid{false};
-        TransmissionMode mode{TransmissionMode::k8};
-        GuardInterval guard{GuardInterval::gi_1_4};
-        std::size_t fft_size{};
-        std::size_t guard_size{};
-        float tracked_cfo_phase{0.0F};
-        float residual_phase_ema{0.0F};
-        int carrier_offset{std::numeric_limits<int>::max()};
-        // Values captured while the tracking was last healthy; a fade never
-        // moves the carrier grid (the LO is stable), so a cold re-anchor
-        // restores these instead of re-running the ambiguous wide pilot lock.
-        int stable_carrier_offset{std::numeric_limits<int>::max()};
-        int stable_phase{-1};
-        std::vector<std::complex<float>> previous_continual;
-        int previous_phase{-1};
-        std::uint64_t phase_discontinuities{0};
-        // Absolute stream position of the most recent processed symbol; the
-        // CFO loop only updates from contiguous symbol pairs (start ==
-        // last_symbol_start + period), so the first symbol after a re-anchor
-        // is skipped exactly like the first symbol of the old chunks.
-        std::uint64_t last_symbol_start{0};
-        bool just_seeded{false};
-        TpsDecoder tps_decoder;
-        TpsSnapshot tps_snapshot;
-        // CIR / delay-spread estimation for adaptive FFT-window placement.
-        // Updated once per TPS frame (68 symbols) from the scattered pilots,
-        // so the added work is negligible; `cir_offset` is the smoothed FFT
-        // window offset (samples, <= 0) relative to the effective symbol
-        // start (start_pos + guard_size), sliding the window toward the
-        // latest strong tap when the delay spread leaves guard margin.
-        std::vector<std::complex<float>> cir_grid;
-        std::vector<std::complex<float>> cir_response;
-        fftwf_plan cir_plan{nullptr};
-        std::size_t cir_n{0};
-        float cir_offset{0.0F};
-        int cir_symbol_count{0};
+        std::uint64_t generation{};
     };
 
     // Acquisition result published by the front-end thread. `version` is
@@ -1198,16 +383,6 @@ struct StreamDecoder::Impl {
         float resampled_rate{};
     };
 
-    struct FecItem {
-        enum class Kind { begin, symbol, end, stats };
-
-        Kind kind{Kind::symbol};
-        std::uint64_t generation{};
-        DecoderParameters parameters{};
-        std::vector<std::uint8_t> mother_metrics;
-        std::size_t symbol_index{};
-    };
-
     mutable std::mutex mutex;
     std::condition_variable input_ready;
     std::condition_variable input_not_full;
@@ -1216,6 +391,7 @@ struct StreamDecoder::Impl {
     std::condition_variable fec_ready;
     std::condition_variable fec_not_full;
     std::condition_variable idle;
+    std::condition_variable reset_acknowledged;
     std::deque<Block> queue;
     std::deque<FecItem> fec_queue;
     std::size_t queued_complex_samples{};
@@ -1223,10 +399,10 @@ struct StreamDecoder::Impl {
     std::size_t fec_queue_capacity{initial_symbol_queue_capacity};
     // Circular buffer of resampled samples. Positions are absolute uint64
     // stream offsets; the ring retains [ring_read_pos, ring_write_pos).
-    std::vector<std::complex<float>> ring;
-    std::uint64_t ring_write_pos{};
-    std::uint64_t ring_read_pos{};
-    bool ring_closed{};
+    AbsoluteSampleRing ring;
+    std::uint64_t &ring_write_pos{ring.write_position};
+    std::uint64_t &ring_read_pos{ring.read_position};
+    bool &ring_closed{ring.closed};
     SyncState sync;
     // The most recent block's bandwidth, published by the front-end; the demod
     // reads it when it runs its event-driven acquisitions (the resampled rate
@@ -1241,9 +417,10 @@ struct StreamDecoder::Impl {
     EqualizedCallback equalized_callback;
     ReceiverParameters parameters;
     dvbt::SignalAnalyzer analyzer;
+    AnalysisPublisher analysis_publisher;
     std::optional<TransmissionMode> stable_mode;
     std::optional<GuardInterval> stable_guard;
-    FrontendState frontend;
+    OfdmTrackingState frontend;
     StreamDecoderStats latest;
     std::atomic<bool> cancel_requested{};
     // Where each pipeline thread is parked, for diagnostics (see
@@ -1257,6 +434,9 @@ struct StreamDecoder::Impl {
     double demod_busy_time_sum_ms{};
     bool stopping{};
     bool reset_requested{};
+    std::uint64_t reset_request_generation{};
+    std::uint64_t demod_reset_generation{};
+    std::uint64_t completed_reset_generation{};
     bool flush_requested{};
     bool frontend_busy{};
     bool demod_busy{};
@@ -1271,24 +451,25 @@ struct StreamDecoder::Impl {
     bool acquisition_pending{};
     bool fec_worker_busy{};
     std::atomic<std::uint64_t> latest_generation{};
+    std::exception_ptr terminal_exception;
+    std::string terminal_error;
     std::unique_ptr<SymbolPostprocessorPool> symbol_postprocessor;
     std::thread frontend_thread;
     std::thread demod_thread;
     std::thread fec_thread;
 
     Impl()
-        : ring(ring_minimum_samples),
-          frontend_thread([this] {
+        : ring(ring_minimum_samples), frontend_thread([this] {
               set_current_thread_name("dvbt-frontend");
-              run_frontend();
+              run_guarded("frontend", [this] { run_frontend(); });
           }),
           demod_thread([this] {
               set_current_thread_name("dvbt-demod");
-              run_demod();
+              run_guarded("demod", [this] { run_demod(); });
           }),
           fec_thread([this] {
               set_current_thread_name("dvbt-fec");
-              run_fec();
+              run_guarded("fec", [this] { run_fec(); });
           }) {}
     ~Impl() {
         cancel_requested = true;
@@ -1302,9 +483,49 @@ struct StreamDecoder::Impl {
         ring_space.notify_all();
         fec_ready.notify_one();
         fec_not_full.notify_all();
+        reset_acknowledged.notify_all();
         frontend_thread.join();
         demod_thread.join();
         fec_thread.join();
+    }
+
+    void notify_all_waiters() noexcept {
+        input_ready.notify_all();
+        input_not_full.notify_all();
+        ring_data.notify_all();
+        ring_space.notify_all();
+        fec_ready.notify_all();
+        fec_not_full.notify_all();
+        reset_acknowledged.notify_all();
+        idle.notify_all();
+    }
+
+    template <typename Function>
+    void run_guarded(const char *stage, Function &&function) noexcept {
+        try {
+            std::forward<Function>(function)();
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            std::string message = std::string(stage) + " worker failed";
+            try {
+                std::rethrow_exception(error);
+            } catch (const std::exception &exception) {
+                message += ": ";
+                message += exception.what();
+            } catch (...) {
+                message += ": unknown exception";
+            }
+            {
+                const std::scoped_lock lock(mutex);
+                if (!terminal_exception) {
+                    terminal_exception = error;
+                    terminal_error = std::move(message);
+                }
+                stopping = true;
+                cancel_requested = true;
+            }
+            notify_all_waiters();
+        }
     }
 
     void reset_frontend_state() noexcept {
@@ -1392,31 +613,27 @@ struct StreamDecoder::Impl {
                     return;
                 }
                 if (reset_requested) {
-                    // Abandon the whole pipeline. The demod sees the invalid
-                    // sync and drops its per-stream state; the FEC worker
-                    // drops items whose generation is stale.
-                    reset_requested = false;
-                    cancel_requested = false;
                     frontend_state.store(
                         static_cast<int>(WorkerState::processing));
-                    queue.clear();
-                    fec_queue.clear();
-                    queued_complex_samples = 0;
-                    ring_read_pos = 0;
-                    ring_write_pos = 0;
-                    ring_closed = false;
-                    sync.valid = false;
-                    ++sync.version;
-                    stable_mode.reset();
-                    stable_guard.reset();
-                    latest = {};
-                    ++latest_generation;
-                    current_bandwidth = 0;
-                    demod_busy_time_sum_ms = 0.0;
+                    // Tracking and the ring are still owned by the demod until
+                    // it abandons this generation at a symbol boundary.
+                    reset_acknowledged.wait(lock, [this] {
+                        return stopping || demod_reset_generation >=
+                                               reset_request_generation;
+                    });
+                    if (stopping) {
+                        frontend_state.store(
+                            static_cast<int>(WorkerState::exited));
+                        return;
+                    }
+                    const std::uint64_t generation = reset_request_generation;
+                    ring.reset();
                     if (resampler != nullptr) {
                         resampler->reset();
                     }
-                    reset_frontend_state();
+                    reset_requested = false;
+                    cancel_requested = false;
+                    completed_reset_generation = generation;
                     input_not_full.notify_all();
                     fec_not_full.notify_all();
                     ring_data.notify_all();
@@ -1437,7 +654,9 @@ struct StreamDecoder::Impl {
                     queue.pop_front();
                     queued_complex_samples -= block.samples.size() / 2;
                     input_not_full.notify_one();
-                    ++latest.input_blocks;
+                    if (block.generation == latest_generation) {
+                        ++latest.input_blocks;
+                    }
                     frontend_busy = true;
                     block_resample_workers =
                         allocate_workers(parameters.worker_threads).resample;
@@ -1447,7 +666,10 @@ struct StreamDecoder::Impl {
             }
             if (close_ring) {
                 ring_data.notify_all();
-                frontend_busy = false;
+                {
+                    const std::scoped_lock lock(mutex);
+                    frontend_busy = false;
+                }
                 idle.notify_all();
                 continue;
             }
@@ -1461,12 +683,17 @@ struct StreamDecoder::Impl {
                 }
                 // A flush followed by new submits resumes the same stream:
                 // reopen the ring so the demod continues past the seam.
-                if (ring_closed) {
-                    {
-                        const std::scoped_lock lock(mutex);
-                        ring_closed = false;
+                {
+                    const std::scoped_lock lock(mutex);
+                    if (block.generation != latest_generation) {
+                        frontend_busy = false;
+                        idle.notify_all();
+                        continue;
                     }
-                    ring_data.notify_all();
+                    if (ring_closed) {
+                        ring_closed = false;
+                        ring_data.notify_all();
+                    }
                 }
                 {
                     const std::scoped_lock lock(mutex);
@@ -1490,14 +717,8 @@ struct StreamDecoder::Impl {
                         current_bandwidth = block.bandwidth;
                         sync.valid = false;
                         ++sync.version;
-                        // A retune is a receiver reset: the TPS-fixed
-                        // parameters and the fade-recovery grid captured from
-                        // the previous frequency must not carry over.
-                        stable_mode.reset();
-                        stable_guard.reset();
-                        frontend.stable_carrier_offset =
-                            std::numeric_limits<int>::max();
-                        frontend.stable_phase = -1;
+                        // The demod owns all tracking state and clears it when
+                        // it observes this invalid sync publication.
                     }
                     ring_data.notify_all();
                 }
@@ -1555,17 +776,19 @@ struct StreamDecoder::Impl {
                     // the push so no submitted data is dropped at the end of
                     // a stream.
                     if (reset_requested ||
+                        block.generation != latest_generation ||
                         (flush_requested && !demod_busy &&
                          !acquisition_pending &&
                          ring_write_pos - ring_read_pos >= ring.size())) {
                         break;
                     }
                     const std::size_t used = ring_write_pos - ring_read_pos;
-                    const std::size_t chunk = std::min(
-                        ring.size() - used, resampled.size() - pushed);
+                    const std::size_t chunk =
+                        std::min(ring.size() - used, resampled.size() - pushed);
                     const auto ring_copy_started_at =
                         std::chrono::steady_clock::now();
-                    const std::size_t write_index = ring_write_pos % ring.size();
+                    const std::size_t write_index =
+                        ring_write_pos % ring.size();
                     const std::size_t first =
                         std::min(chunk, ring.size() - write_index);
                     std::copy_n(resampled.data() + pushed, first,
@@ -1581,14 +804,19 @@ struct StreamDecoder::Impl {
                 }
                 {
                     const std::scoped_lock lock(mutex);
-                    latest.processed_input_samples += complex_count;
-                    latest.last_frontend_block_wall_time_ms =
-                        duration_ms(frontend_block_started_at);
-                    latest.last_frontend_convert_time_ms = convert_time_ms;
-                    latest.last_frontend_resample_time_ms = resample_time_ms;
-                    latest.last_frontend_ring_copy_time_ms = ring_copy_time_ms;
-                    latest.last_frontend_ring_wait_time_ms = ring_wait_time_ms;
-                    current_bandwidth = block.bandwidth;
+                    if (block.generation == latest_generation) {
+                        latest.processed_input_samples += complex_count;
+                        latest.last_frontend_block_wall_time_ms =
+                            duration_ms(frontend_block_started_at);
+                        latest.last_frontend_convert_time_ms = convert_time_ms;
+                        latest.last_frontend_resample_time_ms =
+                            resample_time_ms;
+                        latest.last_frontend_ring_copy_time_ms =
+                            ring_copy_time_ms;
+                        latest.last_frontend_ring_wait_time_ms =
+                            ring_wait_time_ms;
+                        current_bandwidth = block.bandwidth;
+                    }
                 }
             }
             {
@@ -1613,7 +841,7 @@ struct StreamDecoder::Impl {
             std::size_t period = 10240;
             std::vector<std::complex<float>> fft_in;
             std::vector<std::complex<float>> fft_out;
-            fftwf_plan plan = nullptr;
+            FftwfPlan plan;
             std::vector<std::size_t> continual_indices;
             std::vector<std::size_t> tps_indices;
             std::vector<std::complex<float>> tps_values;
@@ -1629,12 +857,16 @@ struct StreamDecoder::Impl {
             std::deque<PendingSymbol> pending_symbols;
             std::deque<PostprocessedSymbol> gate_buffer;
             bool in_hopeless_region = false;
+            std::uint64_t demod_generation = latest_generation.load();
             bool last_reanchor_carried = false;
             std::uint64_t seen_sync_version = 0;
             bool have_grid = false;
             std::uint64_t next_symbol_start = 0;
             float nco_phase = 0.0F;
             std::uint64_t symbol_count = 0;
+            std::uint64_t analysis_symbol_count = 0;
+            float latest_cp_snr_db = 0.0F;
+            float latest_deepest_notch_db = 0.0F;
             std::uint64_t frozen_symbol_count = 0;
             // Windows whose MER is below the decode floor, back to back.
             // Unlike fade_indicator (the continual-carrier temporal
@@ -1784,11 +1016,7 @@ struct StreamDecoder::Impl {
                 tps_values.resize(tps_indices.size());
                 fft_in.resize(fft_size);
                 fft_out.resize(fft_size);
-                if (plan != nullptr) {
-                    fftwf_destroy_plan(plan);
-                    plan = nullptr;
-                }
-                plan = fftwf_plan_dft_1d(
+                plan = FftwfPlan::dft_1d(
                     static_cast<int>(fft_size),
                     reinterpret_cast<fftwf_complex *>(fft_in.data()),
                     reinterpret_cast<fftwf_complex *>(fft_out.data()),
@@ -1797,18 +1025,12 @@ struct StreamDecoder::Impl {
                 // sub-carriers), so the impulse response spans Tu/12 and tap i
                 // is delayed i * fft_size / (12 * N) samples after the window.
                 frontend.cir_n = fft_size == 8192 ? 1024 : 256;
-                frontend.cir_grid.assign(frontend.cir_n,
-                                         std::complex<float>{});
+                frontend.cir_grid.assign(frontend.cir_n, std::complex<float>{});
                 frontend.cir_response.assign(frontend.cir_n,
                                              std::complex<float>{});
-                if (frontend.cir_plan != nullptr) {
-                    fftwf_destroy_plan(frontend.cir_plan);
-                    frontend.cir_plan = nullptr;
-                }
-                frontend.cir_plan = fftwf_plan_dft_1d(
+                frontend.cir_plan = FftwfPlan::dft_1d(
                     static_cast<int>(frontend.cir_n),
-                    reinterpret_cast<fftwf_complex *>(
-                        frontend.cir_grid.data()),
+                    reinterpret_cast<fftwf_complex *>(frontend.cir_grid.data()),
                     reinterpret_cast<fftwf_complex *>(
                         frontend.cir_response.data()),
                     FFTW_BACKWARD, FFTW_ESTIMATE);
@@ -1820,6 +1042,8 @@ struct StreamDecoder::Impl {
                     const bool reset_window_cir) {
                     fractional_timing = 0.0;
                     smoothed_sample_clock_ppm = 0.0;
+                    latest_cp_snr_db = 0.0F;
+                    latest_deepest_notch_db = 0.0F;
                     accumulated_window_shift = 0.0;
                     last_windowed_timing = 0.0;
                     last_windowed_cir_avg = 0.0;
@@ -1847,6 +1071,7 @@ struct StreamDecoder::Impl {
             // abandoned). Called with the mutex held.
             const auto handle_sync_change = [&]() {
                 seen_sync_version = sync.version;
+                demod_generation = latest_generation.load();
                 // Effective symbol start (acquisition boundary + guard) plus
                 // the adaptive CIR window offset (<= 0 samples, sliding the
                 // FFT window toward the latest strong tap).
@@ -1880,6 +1105,13 @@ struct StreamDecoder::Impl {
                     frontend.cir_symbol_count = 0;
                     applied_cir_offset = 0;
                     reset_timing_state(0, true);
+                    reset_frontend_state();
+                    stable_mode.reset();
+                    stable_guard.reset();
+                    if (reset_requested) {
+                        demod_reset_generation = demod_generation;
+                        reset_acknowledged.notify_all();
+                    }
                     return true;
                 }
                 const bool mode_changed =
@@ -1927,8 +1159,8 @@ struct StreamDecoder::Impl {
                     nco_phase = frontend.tracked_cfo_phase *
                                 static_cast<float>(next_symbol_start);
                     last_reanchor_carried = false;
-                    applied_cir_offset = static_cast<int>(
-                        std::lround(frontend.cir_offset));
+                    applied_cir_offset =
+                        static_cast<int>(std::lround(frontend.cir_offset));
                     // The timing loop's reference grid changed: its residual
                     // fraction and drift state have no meaning against the
                     // new boundary.
@@ -1964,8 +1196,8 @@ struct StreamDecoder::Impl {
                                 static_cast<std::int64_t>(next_symbol_start)),
                     2.0F * std::numbers::pi_v<float>);
                 next_symbol_start = new_next;
-                applied_cir_offset = static_cast<int>(
-                    std::lround(frontend.cir_offset));
+                applied_cir_offset =
+                    static_cast<int>(std::lround(frontend.cir_offset));
                 last_reanchor_carried = carried;
                 stable_pending_offset = std::numeric_limits<int>::max();
                 stable_pending_count = 0;
@@ -1983,8 +1215,8 @@ struct StreamDecoder::Impl {
             // the shared sync so handle_sync_change can act (first anchor:
             // grid build + cold seed; re-anchor: carried tracking + boundary
             // move; mode change: full rebuild).
-            const auto run_event_acquisition = [&](bool wait_for_data = false)
-                -> float {
+            const auto run_event_acquisition = [&](bool wait_for_data =
+                                                       false) -> float {
                 if (wait_for_data) {
                     // Re-anchor in a live stream: the ring is drained as fast
                     // as the frontend fills it (realtime decode keeps no
@@ -1997,17 +1229,15 @@ struct StreamDecoder::Impl {
                     // reports any non-zero score, so a 2-symbol snapshot
                     // still scores 0.000. While recovering there is no valid
                     // TS to lose, so the wait is free.
-                    const auto wait_started =
-                        std::chrono::steady_clock::now();
+                    const auto wait_started = std::chrono::steady_clock::now();
                     for (;;) {
                         bool cancel = false;
                         std::uint64_t now_available = 0;
                         {
                             const std::scoped_lock lock(mutex);
-                            cancel = stopping || reset_requested ||
-                                     cancel_requested;
-                            now_available =
-                                ring_write_pos - ring_read_pos;
+                            cancel =
+                                stopping || reset_requested || cancel_requested;
+                            now_available = ring_write_pos - ring_read_pos;
                         }
                         if (cancel || duration_ms(wait_started) > 1000.0F) {
                             if (event_debug_enabled() && !cancel) {
@@ -2147,6 +1377,21 @@ struct StreamDecoder::Impl {
                         equalized_sink(symbol.carriers, symbol.reliabilities,
                                        symbol.symbol_index);
                     }
+                    if (decoder_parameters &&
+                        (analysis_symbol_count++ % analysis_interval_symbols) ==
+                            0U) {
+                        const float carrier_offset_hz =
+                            frontend.tracked_cfo_phase * sync.resampled_rate /
+                            (2.0F * std::numbers::pi_v<float>)+static_cast<
+                                float>(frontend.carrier_offset) *
+                            sync.resampled_rate /
+                            static_cast<float>(frontend.fft_size);
+                        analysis_publisher.publish(
+                            symbol.carriers, symbol.mer_db, latest_cp_snr_db,
+                            latest_deepest_notch_db, carrier_offset_hz,
+                            frontend.mode, frontend.guard,
+                            decoder_parameters->constellation);
+                    }
                     gate_buffer.push_back(std::move(symbol));
                 }
                 if (!decoder_parameters) {
@@ -2191,20 +1436,20 @@ struct StreamDecoder::Impl {
                     hopeless_window_count =
                         hopeless ? hopeless_window_count + 1 : 0;
                     if (event_debug_enabled() && hopeless) {
-                        std::fprintf(stderr,
-                                     "[evt] hopeless mer=%.2f floor=%.2f "
-                                     "count=%llu sym=%llu\n",
-                                     static_cast<float>(window_mer), floor,
-                                     static_cast<unsigned long long>(
-                                         hopeless_window_count),
-                                     static_cast<unsigned long long>(
-                                         symbol_count));
+                        std::fprintf(
+                            stderr,
+                            "[evt] hopeless mer=%.2f floor=%.2f "
+                            "count=%llu sym=%llu\n",
+                            static_cast<float>(window_mer), floor,
+                            static_cast<unsigned long long>(
+                                hopeless_window_count),
+                            static_cast<unsigned long long>(symbol_count));
                     }
                     if (hopeless && !in_hopeless_region) {
                         in_hopeless_region = true;
                         static_cast<void>(
                             enqueue_fec({.kind = FecItem::Kind::end,
-                                         .generation = latest_generation,
+                                         .generation = demod_generation,
                                          .parameters = {},
                                          .mother_metrics = {},
                                          .symbol_index = 0}));
@@ -2212,7 +1457,7 @@ struct StreamDecoder::Impl {
                         in_hopeless_region = false;
                         static_cast<void>(
                             enqueue_fec({.kind = FecItem::Kind::begin,
-                                         .generation = latest_generation,
+                                         .generation = demod_generation,
                                          .parameters = *decoder_parameters,
                                          .mother_metrics = {},
                                          .symbol_index = 0}));
@@ -2221,7 +1466,7 @@ struct StreamDecoder::Impl {
                         for (std::size_t i = 0; i < gate_window_symbols; ++i) {
                             static_cast<void>(enqueue_fec(
                                 {.kind = FecItem::Kind::symbol,
-                                 .generation = latest_generation,
+                                 .generation = demod_generation,
                                  .parameters = {},
                                  .mother_metrics =
                                      std::move(gate_buffer[i].mother_metrics),
@@ -2240,7 +1485,7 @@ struct StreamDecoder::Impl {
                     return true;
                 }
                 if (!enqueue_fec({.kind = FecItem::Kind::begin,
-                                  .generation = latest_generation,
+                                  .generation = demod_generation,
                                   .parameters = *decoder_parameters,
                                   .mother_metrics = {},
                                   .symbol_index = 0})) {
@@ -2315,8 +1560,7 @@ struct StreamDecoder::Impl {
                     (shift_rate_history_head + 1) % shift_rate_history_n;
                 const double rolling_shift_rate_ppm =
                     rolling_shift_samples > 0.0
-                        ? rolling_shift_steps * 1.0e6 /
-                              rolling_shift_samples
+                        ? rolling_shift_steps * 1.0e6 / rolling_shift_samples
                         : 0.0;
                 const double timing_sample_position =
                     timing_elapsed_samples + 0.5 * window_sample_count;
@@ -2341,14 +1585,12 @@ struct StreamDecoder::Impl {
                     // is rebased onto the window's average position by
                     // adding the slide back.)
                     observed_drift =
-                        (static_cast<double>(timing_offset) +
-                         window_cir_avg) -
+                        (static_cast<double>(timing_offset) + window_cir_avg) -
                         (last_windowed_timing + last_windowed_cir_avg);
                     last_windowed_timing = static_cast<double>(timing_offset);
                     last_windowed_cir_avg = window_cir_avg;
                     window_shift =
-                        accumulated_window_shift -
-                        last_timing_window_shift;
+                        accumulated_window_shift - last_timing_window_shift;
                     last_timing_window_shift = accumulated_window_shift;
                     // A positive window step makes the measured pilot slope
                     // move negative by only the channel-dependent response
@@ -2373,8 +1615,7 @@ struct StreamDecoder::Impl {
                     // sample-clock drift, not the loop's sawtooth response.
                     tau_history[tau_history_head] =
                         static_cast<double>(timing_offset) + window_cir_avg +
-                        timing_window_shift_response *
-                            accumulated_window_shift;
+                        timing_window_shift_response * accumulated_window_shift;
                     tau_sample_history[tau_history_head] =
                         timing_sample_position;
                     tau_history_head = (tau_history_head + 1) % tau_history_n;
@@ -2412,10 +1653,9 @@ struct StreamDecoder::Impl {
                                           1.0e6 / sample_span
                                     : 0.0;
                         }
-                        std::sort(
-                            diffs.begin(),
-                            diffs.begin() +
-                                static_cast<std::ptrdiff_t>(diffs_count));
+                        std::sort(diffs.begin(),
+                                  diffs.begin() +
+                                      static_cast<std::ptrdiff_t>(diffs_count));
                         const double drift_estimate_ppm =
                             diffs_count % 2 != 0
                                 ? diffs[diffs_count / 2]
@@ -2429,12 +1669,11 @@ struct StreamDecoder::Impl {
                         4.0 * 1.0e6 /
                         (static_cast<double>(stats_window_symbols) *
                          static_cast<double>(period));
-                    smoothed_sample_clock_ppm = std::clamp(
-                        smoothed_sample_clock_ppm, -drift_limit_ppm,
-                        drift_limit_ppm);
+                    smoothed_sample_clock_ppm =
+                        std::clamp(smoothed_sample_clock_ppm, -drift_limit_ppm,
+                                   drift_limit_ppm);
                     smoothed_timing_drift =
-                        smoothed_sample_clock_ppm * window_sample_count /
-                        1.0e6;
+                        smoothed_sample_clock_ppm * window_sample_count / 1.0e6;
                     fractional_timing +=
                         smoothed_timing_drift / timing_window_shift_response;
                     fractional_timing =
@@ -2453,8 +1692,7 @@ struct StreamDecoder::Impl {
                                          window_cir_avg +
                                          timing_window_shift_response *
                                              accumulated_window_shift,
-                                     accumulated_window_shift,
-                                     corrected_drift,
+                                     accumulated_window_shift, corrected_drift,
                                      smoothed_timing_drift,
                                      smoothed_sample_clock_ppm,
                                      fractional_timing,
@@ -2494,13 +1732,12 @@ struct StreamDecoder::Impl {
                     static_cast<float>(latest_raw_timing);
                 latest.timing_offset_samples = timing_offset;
                 latest.physical_timing_offset_samples =
-                    timing_count == 0
-                        ? 0.0F
-                        : static_cast<float>(
-                              static_cast<double>(timing_offset) +
-                              window_cir_avg +
-                              timing_window_shift_response *
-                                  accumulated_window_shift);
+                    timing_count == 0 ? 0.0F
+                                      : static_cast<float>(
+                                            static_cast<double>(timing_offset) +
+                                            window_cir_avg +
+                                            timing_window_shift_response *
+                                                accumulated_window_shift);
                 latest.observed_timing_drift_samples =
                     static_cast<float>(observed_drift);
                 latest.corrected_timing_drift_samples =
@@ -2524,10 +1761,9 @@ struct StreamDecoder::Impl {
                 latest.timing_confidence =
                     window_symbols == 0
                         ? 0.0F
-                        : std::clamp(
-                              static_cast<float>(timing_count) /
-                                  static_cast<float>(window_symbols),
-                              0.0F, 1.0F);
+                        : std::clamp(static_cast<float>(timing_count) /
+                                         static_cast<float>(window_symbols),
+                                     0.0F, 1.0F);
                 latest.cir_confidence = static_cast<float>(cir_confidence);
                 latest.timing_measurements = timing_raw_count;
                 latest.timing_accepted_measurements = timing_count;
@@ -2555,9 +1791,8 @@ struct StreamDecoder::Impl {
                         : 0.0F;
                 latest.demod_busy_fraction =
                     window_wall > 0.0F
-                        ? static_cast<float>(
-                              demod_busy_time_sum_ms /
-                              static_cast<double>(window_wall))
+                        ? static_cast<float>(demod_busy_time_sum_ms /
+                                             static_cast<double>(window_wall))
                         : 0.0F;
                 latest.demod_window_wall_time_ms = window_wall;
                 latest.demod_busy_time_ms =
@@ -2615,13 +1850,18 @@ struct StreamDecoder::Impl {
                         return;
                     }
                 }
+                bool stream_abandoned = false;
                 {
                     const std::scoped_lock lock(mutex);
                     if (sync.version != seen_sync_version) {
                         static_cast<void>(handle_sync_change());
+                        stream_abandoned = !have_grid;
                     }
                 }
                 fire_pending_discontinuity();
+                if (stream_abandoned) {
+                    continue;
+                }
                 // Explicit constellation/code-rate parameters are sufficient
                 // to start the FEC path; TPS is optional in that mode. This
                 // also makes a manually configured synthetic/test signal
@@ -2647,9 +1887,12 @@ struct StreamDecoder::Impl {
                         static_cast<int>(WorkerState::processing));
                     const float score = run_event_acquisition();
                     if (!have_grid) {
-                        const std::scoped_lock lock(mutex);
-                        demod_busy = false;
-                        acquisition_pending = false;
+                        {
+                            const std::scoped_lock lock(mutex);
+                            demod_busy = false;
+                            acquisition_pending = false;
+                        }
+                        idle.notify_all();
                     }
                     if (!have_grid && ring_closed) {
                         {
@@ -2695,14 +1938,14 @@ struct StreamDecoder::Impl {
                         // and close the ring so the stream ends cleanly
                         // instead of deadlocking.
                         std::unique_lock lock(mutex);
-                        demod_state.store(static_cast<int>(
-                            WorkerState::waiting_acquisition));
-                        ring_data.wait_for(
-                            lock, std::chrono::milliseconds(100),
-                            [this, &seen_sync_version] {
-                                return stopping ||
-                                       sync.version != seen_sync_version;
-                            });
+                        demod_state.store(
+                            static_cast<int>(WorkerState::waiting_acquisition));
+                        ring_data.wait_for(lock, std::chrono::milliseconds(100),
+                                           [this, &seen_sync_version] {
+                                               return stopping ||
+                                                      sync.version !=
+                                                          seen_sync_version;
+                                           });
                         if (stopping) {
                             demod_state.store(
                                 static_cast<int>(WorkerState::exited));
@@ -2733,9 +1976,10 @@ struct StreamDecoder::Impl {
                         static_cast<std::uint64_t>(fft_size);
                     {
                         std::unique_lock lock(mutex);
-                        demod_state.store(static_cast<int>(
-                            WorkerState::waiting_ring_data));
-                        ring_data.wait(lock, [this, needed, &seen_sync_version] {
+                        demod_state.store(
+                            static_cast<int>(WorkerState::waiting_ring_data));
+                        ring_data.wait(lock, [this, needed,
+                                              &seen_sync_version] {
                             return stopping ||
                                    sync.version != seen_sync_version ||
                                    (ring_closed && ring_write_pos < needed) ||
@@ -2757,9 +2001,48 @@ struct StreamDecoder::Impl {
                             break; // end of stream
                         }
                     }
-                    for (std::size_t i = 0; i < fft_size; ++i) {
-                        const std::uint64_t position = next_symbol_start + i;
-                        fft_in[i] = ring[position % ring.size()];
+                    {
+                        const std::scoped_lock lock(mutex);
+                        if (sync.version != seen_sync_version) {
+                            continue;
+                        }
+                        for (std::size_t i = 0; i < fft_size; ++i) {
+                            const std::uint64_t position =
+                                next_symbol_start + i;
+                            fft_in[i] = ring[position % ring.size()];
+                        }
+                        if ((symbol_count % analysis_interval_symbols) == 0U &&
+                            next_symbol_start >= guard_size) {
+                            const std::uint64_t prefix_start =
+                                next_symbol_start - guard_size;
+                            if (prefix_start >= ring_read_pos) {
+                                std::complex<float> correlation{};
+                                double prefix_power = 0.0;
+                                double suffix_power = 0.0;
+                                for (std::size_t i = 0; i < guard_size; ++i) {
+                                    const auto prefix =
+                                        ring[(prefix_start + i) % ring.size()];
+                                    const auto suffix =
+                                        ring[(prefix_start + fft_size + i) %
+                                             ring.size()];
+                                    correlation += std::conj(prefix) * suffix;
+                                    prefix_power += std::norm(prefix);
+                                    suffix_power += std::norm(suffix);
+                                }
+                                const float rho =
+                                    prefix_power > 0.0 && suffix_power > 0.0
+                                        ? static_cast<float>(
+                                              std::abs(correlation) /
+                                              std::sqrt(prefix_power *
+                                                        suffix_power))
+                                        : 0.0F;
+                                latest_cp_snr_db =
+                                    10.0F *
+                                    std::log10(std::max(
+                                        rho / std::max(1.0F - rho, 1.0e-4F),
+                                        minimum_power));
+                            }
+                        }
                     }
                     demod_state.store(
                         static_cast<int>(WorkerState::processing));
@@ -2780,7 +2063,7 @@ struct StreamDecoder::Impl {
                             nco *= 1.0F / std::sqrt(std::norm(nco));
                         }
                     }
-                    fftwf_execute(plan);
+                    plan.execute();
                     std::vector<std::complex<float>> current_continual;
                     current_continual.reserve(continual_indices.size());
                     for (const std::size_t k : continual_indices) {
@@ -2788,7 +2071,8 @@ struct StreamDecoder::Impl {
                             fft_out, k, maximum, frontend.carrier_offset));
                     }
                     float residual_phase = 0.0F;
-                    fade_indicator = 1.0F;                    // Only update the CFO loop from a contiguous symbol pair.
+                    fade_indicator = 1.0F; // Only update the CFO loop from a
+                                           // contiguous symbol pair.
                     // The first symbol after a re-anchor follows the previous
                     // symbol by a non-period step, so its temporal correlation
                     // would measure a spurious residual and overshoot; the
@@ -2806,8 +2090,7 @@ struct StreamDecoder::Impl {
                             temporal_correlation +=
                                 current_continual[i] *
                                 std::conj(frontend.previous_continual[i]);
-                            power_current +=
-                                std::norm(current_continual[i]);
+                            power_current += std::norm(current_continual[i]);
                             power_previous +=
                                 std::norm(frontend.previous_continual[i]);
                         }
@@ -2832,9 +2115,8 @@ struct StreamDecoder::Impl {
                             power_current > 0.0 && power_previous > 0.0
                                 ? static_cast<float>(
                                       std::abs(temporal_correlation)) /
-                                      static_cast<float>(
-                                          std::sqrt(power_current *
-                                                    power_previous))
+                                      static_cast<float>(std::sqrt(
+                                          power_current * power_previous))
                                 : 0.0F;
                         fade_indicator = normalized_correlation;
                         if (fade_indicator > 0.25F) {
@@ -2877,13 +2159,12 @@ struct StreamDecoder::Impl {
                     // restart from the newly published boundary.
                     const auto maybe_reacquire = [&]() -> bool {
                         if (event_debug_enabled()) {
-                            std::fprintf(stderr,
-                                         "[evt] re-anchor triggered fi=%.3f "
-                                         "off=%d sym=%llu\n",
-                                         fade_indicator,
-                                         frontend.carrier_offset,
-                                         static_cast<unsigned long long>(
-                                             symbol_count));
+                            std::fprintf(
+                                stderr,
+                                "[evt] re-anchor triggered fi=%.3f "
+                                "off=%d sym=%llu\n",
+                                fade_indicator, frontend.carrier_offset,
+                                static_cast<unsigned long long>(symbol_count));
                         }
                         const float reanchor_score =
                             run_event_acquisition(true);
@@ -2960,12 +2241,13 @@ struct StreamDecoder::Impl {
                                     static_cast<unsigned long long>(
                                         hopeless_window_count));
                             } else {
-                                std::fprintf(
-                                    stderr,
-                                    "[evt] fade enter fi=%.3f off=%d sym=%llu\n",
-                                    fade_indicator, frontend.carrier_offset,
-                                    static_cast<unsigned long long>(
-                                        symbol_count));
+                                std::fprintf(stderr,
+                                             "[evt] fade enter fi=%.3f off=%d "
+                                             "sym=%llu\n",
+                                             fade_indicator,
+                                             frontend.carrier_offset,
+                                             static_cast<unsigned long long>(
+                                                 symbol_count));
                             }
                         }
                         // Fade / decode-stuck: hold the frozen phase/offset
@@ -2986,9 +2268,9 @@ struct StreamDecoder::Impl {
                         // returns; while faded there is no valid TS to lose,
                         // and a re-anchor that lands while the signal is
                         // still gone just scores low and retries.
-                        lock = PilotLock{
-                            static_cast<int>(frontend.previous_phase),
-                            frontend.carrier_offset};
+                        lock =
+                            PilotLock{static_cast<int>(frontend.previous_phase),
+                                      frontend.carrier_offset};
                         if (++frozen_symbol_count >= 68 &&
                             frozen_symbol_count % 68 == 0 &&
                             maybe_reacquire()) {
@@ -3020,23 +2302,23 @@ struct StreamDecoder::Impl {
                             // fade, which restores the pre-fade stable
                             // offset.
                             lock = PilotLock{
-                                lock_phase_at_offset(
-                                    fft_out, maximum, frontend.carrier_offset,
-                                    timing_tracker.filtered()),
+                                lock_phase_at_offset(fft_out, maximum,
+                                                     frontend.carrier_offset,
+                                                     timing_tracker.filtered()),
                                 frontend.carrier_offset};
                         }
                         if (frontend.previous_phase >= 0 &&
                             lock.phase != (frontend.previous_phase + 1) % 4) {
                             ++frontend.phase_discontinuities;
                             if (event_debug_enabled()) {
-                                std::fprintf(stderr,
-                                             "[evt] phase-jump %d->%d sym=%llu "
-                                             "fi=%.3f off=%d\n",
-                                             frontend.previous_phase, lock.phase,
-                                             static_cast<unsigned long long>(
-                                                 symbol_count),
-                                             fade_indicator,
-                                             frontend.carrier_offset);
+                                std::fprintf(
+                                    stderr,
+                                    "[evt] phase-jump %d->%d sym=%llu "
+                                    "fi=%.3f off=%d\n",
+                                    frontend.previous_phase, lock.phase,
+                                    static_cast<unsigned long long>(
+                                        symbol_count),
+                                    fade_indicator, frontend.carrier_offset);
                             }
                         }
                         frontend.previous_phase = lock.phase;
@@ -3070,13 +2352,12 @@ struct StreamDecoder::Impl {
                         const auto was_frozen = frozen_symbol_count;
                         frozen_symbol_count = 0;
                         if (event_debug_enabled() && was_frozen > 0) {
-                            std::fprintf(stderr,
-                                         "[evt] fade exit fi=%.3f off=%d "
-                                         "sym=%llu\n",
-                                         fade_indicator,
-                                         frontend.carrier_offset,
-                                         static_cast<unsigned long long>(
-                                             symbol_count));
+                            std::fprintf(
+                                stderr,
+                                "[evt] fade exit fi=%.3f off=%d "
+                                "sym=%llu\n",
+                                fade_indicator, frontend.carrier_offset,
+                                static_cast<unsigned long long>(symbol_count));
                         }
                     }
                     std::vector<std::complex<float>> channel(maximum + 1);
@@ -3092,6 +2373,11 @@ struct StreamDecoder::Impl {
                                 ? std::complex<float>{sent, 0.0F} / received
                                 : std::complex<float>{};
                     }
+                    if ((symbol_count % analysis_interval_symbols) == 0U) {
+                        latest_deepest_notch_db = estimate_channel_notch_db(
+                            channel, static_cast<std::size_t>(lock.phase),
+                            maximum);
+                    }
                     // Fractional timing estimate: an FFT-window shift of tau
                     // samples ramps arg(channel) linearly across carriers
                     // (2*pi*k*tau/N). Estimate it from the fixed-spacing
@@ -3099,10 +2385,9 @@ struct StreamDecoder::Impl {
                     // filtered value, and reject isolated group-delay clicks
                     // before feeding either the long-term timing loop or the
                     // phase verifier.
-                    if (const auto measured_tau =
-                            estimate_scattered_timing_tau(
-                                channel, static_cast<std::size_t>(lock.phase),
-                                maximum, fft_size);
+                    if (const auto measured_tau = estimate_scattered_timing_tau(
+                            channel, static_cast<std::size_t>(lock.phase),
+                            maximum, fft_size);
                         measured_tau.has_value()) {
                         latest_raw_timing = *measured_tau;
                         ++timing_raw_count;
@@ -3125,10 +2410,9 @@ struct StreamDecoder::Impl {
                                     static_cast<unsigned long long>(
                                         symbol_count));
                             }
-                            timing_acc +=
-                                *accepted_tau *
-                                (2.0 * std::numbers::pi_v<double>) /
-                                static_cast<double>(fft_size);
+                            timing_acc += *accepted_tau *
+                                          (2.0 * std::numbers::pi_v<double>) /
+                                          static_cast<double>(fft_size);
                             ++timing_count;
                         } else if (event_debug_enabled()) {
                             ++timing_rejected_count;
@@ -3159,8 +2443,7 @@ struct StreamDecoder::Impl {
                     // the timing loop is never perturbed by a jump.
                     if (++frontend.cir_symbol_count >= 68) {
                         frontend.cir_symbol_count = 0;
-                        if (fade_indicator > 0.25F &&
-                            frontend.cir_plan != nullptr) {
+                        if (fade_indicator > 0.25F && frontend.cir_plan) {
                             std::fill(frontend.cir_grid.begin(),
                                       frontend.cir_grid.end(),
                                       std::complex<float>{});
@@ -3175,16 +2458,15 @@ struct StreamDecoder::Impl {
                                 frontend.cir_grid[slot] = channel[k];
                                 ++slot;
                             }
-                            fftwf_execute(frontend.cir_plan);
-                            const std::size_t n =
-                                frontend.cir_response.size();
+                            frontend.cir_plan.execute();
+                            const std::size_t n = frontend.cir_response.size();
                             std::vector<double> energy(n, 0.0);
                             double total = 0.0;
                             std::size_t peak = 0;
                             double peak_energy = -1.0;
                             for (std::size_t i = 0; i < n; ++i) {
-                                energy[i] = static_cast<double>(std::norm(
-                                    frontend.cir_response[i]));
+                                energy[i] = static_cast<double>(
+                                    std::norm(frontend.cir_response[i]));
                                 total += energy[i];
                                 if (energy[i] > peak_energy) {
                                     peak_energy = energy[i];
@@ -3196,8 +2478,7 @@ struct StreamDecoder::Impl {
                             // Only trust a structured response: the peak tap
                             // must hold a meaningful share of the energy, so
                             // a noise-driven CIR cannot drag the window.
-                            if (total > 0.0 &&
-                                peak_energy / total > 0.05) {
+                            if (total > 0.0 && peak_energy / total > 0.05) {
                                 // Contiguous main lobe: taps above 1% of the
                                 // peak, wrapping the IFFT window (taps that
                                 // arrive before the FFT window fold to its
@@ -3213,8 +2494,7 @@ struct StreamDecoder::Impl {
                                        (lo + n - 1) % n != hi) {
                                     lo = (lo + n - 1) % n;
                                 }
-                                while (energy[(hi + 1) % n] >=
-                                           lobe_threshold &&
+                                while (energy[(hi + 1) % n] >= lobe_threshold &&
                                        (hi + 1) % n != lo) {
                                     hi = (hi + 1) % n;
                                 }
@@ -3244,8 +2524,7 @@ struct StreamDecoder::Impl {
                                                static_cast<double>(
                                                    guard_size)) /
                                                   2.0,
-                                              -static_cast<double>(
-                                                  guard_size),
+                                              -static_cast<double>(guard_size),
                                               0.0)
                                         : 0.0;
                                 frontend.cir_offset = static_cast<float>(
@@ -3308,10 +2587,9 @@ struct StreamDecoder::Impl {
                               channel.end(), channel[pilots.back()]);
                     for (std::size_t i = 0; i < tps_indices.size(); ++i) {
                         const std::size_t k = tps_indices[i];
-                        tps_values[i] =
-                            carrier(fft_out, k, maximum,
-                                    frontend.carrier_offset) *
-                            channel[k];
+                        tps_values[i] = carrier(fft_out, k, maximum,
+                                                frontend.carrier_offset) *
+                                        channel[k];
                     }
                     // TPS differential bits carry continuously across the
                     // stream. Before synchronization the decoder checks each
@@ -3347,19 +2625,18 @@ struct StreamDecoder::Impl {
                     if (!decoder_parameters && matching_tps &&
                         frontend.tps_snapshot.parameters.hierarchy == 0U) {
                         if (event_debug_enabled()) {
-                            std::fprintf(stderr,
-                                         "[evt] TPS lock mode=%d g=%d const=%d "
-                                         "rate=%d sym=%llu\n",
-                                         static_cast<int>(frontend.mode),
-                                         static_cast<int>(frontend.guard),
-                                         static_cast<int>(
-                                             frontend.tps_snapshot.parameters
-                                                 .constellation),
-                                         static_cast<int>(
-                                             frontend.tps_snapshot.parameters
-                                                 .high_priority_code_rate),
-                                         static_cast<unsigned long long>(
-                                             symbol_count));
+                            std::fprintf(
+                                stderr,
+                                "[evt] TPS lock mode=%d g=%d const=%d "
+                                "rate=%d sym=%llu\n",
+                                static_cast<int>(frontend.mode),
+                                static_cast<int>(frontend.guard),
+                                static_cast<int>(frontend.tps_snapshot
+                                                     .parameters.constellation),
+                                static_cast<int>(
+                                    frontend.tps_snapshot.parameters
+                                        .high_priority_code_rate),
+                                static_cast<unsigned long long>(symbol_count));
                         }
                         decoder_parameters = DecoderParameters{
                             frontend.mode,
@@ -3483,7 +2760,7 @@ struct StreamDecoder::Impl {
                         publish_stats_window();
                         static_cast<void>(
                             enqueue_fec({.kind = FecItem::Kind::stats,
-                                         .generation = latest_generation,
+                                         .generation = demod_generation,
                                          .parameters = {},
                                          .mother_metrics = {},
                                          .symbol_index = 0}));
@@ -3523,7 +2800,7 @@ struct StreamDecoder::Impl {
                         in_hopeless_region = false;
                         static_cast<void>(
                             enqueue_fec({.kind = FecItem::Kind::begin,
-                                         .generation = latest_generation,
+                                         .generation = demod_generation,
                                          .parameters = *decoder_parameters,
                                          .mother_metrics = {},
                                          .symbol_index = 0}));
@@ -3532,7 +2809,7 @@ struct StreamDecoder::Impl {
                         for (auto &symbol : gate_buffer) {
                             static_cast<void>(enqueue_fec(
                                 {.kind = FecItem::Kind::symbol,
-                                 .generation = latest_generation,
+                                 .generation = demod_generation,
                                  .parameters = {},
                                  .mother_metrics =
                                      std::move(symbol.mother_metrics),
@@ -3543,22 +2820,18 @@ struct StreamDecoder::Impl {
                 }
                 if (postprocessor != nullptr) {
                     static_cast<void>(
-                        enqueue_fec({.kind = FecItem::Kind::end,
-                                     .generation = latest_generation,
+                        enqueue_fec({.kind = FecItem::Kind::stream_end,
+                                     .generation = demod_generation,
                                      .parameters = {},
                                      .mother_metrics = {},
                                      .symbol_index = 0}));
-                    // The input ended: the FEC flush emits the trellis tail
-                    // and the stream is over. Playback must not wait for more
-                    // data — it plays out the queued tail and hits EOF.
-                    fire_discontinuity(TransportDiscontinuity::stream_end);
                     // A flushed stream that is then resumed starts a fresh
                     // region so the replay's first symbols do not continue a
                     // flushed trellis.
                     if (decoder_parameters) {
                         static_cast<void>(
                             enqueue_fec({.kind = FecItem::Kind::begin,
-                                         .generation = latest_generation,
+                                         .generation = demod_generation,
                                          .parameters = *decoder_parameters,
                                          .mother_metrics = {},
                                          .symbol_index = 0}));
@@ -3597,18 +2870,8 @@ struct StreamDecoder::Impl {
             // An unexpected exception here would terminate the process (the
             // thread is joined in ~Impl). Dump the pipeline state before the
             // crash so a mid-stream stall/exit is diagnosable.
-            std::fprintf(stderr,
-                         "[decoder] demod thread exception: %s "
-                         "(sync=%llu locked=%d ring=%llu/%llu iq=%zu/%zu "
-                         "fec=%zu/%zu)\n",
-                         exception.what(),
-                         static_cast<unsigned long long>(sync.version),
-                         static_cast<int>(sync.valid),
-                         static_cast<unsigned long long>(ring_write_pos -
-                                                         ring_read_pos),
-                         static_cast<unsigned long long>(ring.size()),
-                         queue.size(), input_queue_capacity_samples,
-                         fec_queue.size(), fec_queue_capacity);
+            std::fprintf(stderr, "[decoder] demod thread exception: %s\n",
+                         exception.what());
             throw;
         } catch (...) {
             std::fprintf(stderr, "[decoder] demod thread exception: unknown\n");
@@ -3632,7 +2895,8 @@ struct StreamDecoder::Impl {
             FecItem item;
             {
                 std::unique_lock lock(mutex);
-                fec_state.store(static_cast<int>(WorkerState::waiting_fec_item));
+                fec_state.store(
+                    static_cast<int>(WorkerState::waiting_fec_item));
                 fec_ready.wait(
                     lock, [this] { return stopping || !fec_queue.empty(); });
                 if (stopping) {
@@ -3688,15 +2952,18 @@ struct StreamDecoder::Impl {
                         TransportCallback sink;
                         {
                             const std::scoped_lock guard(mutex);
-                            sink = callback;
-                            window_transport_bytes += ts.size();
+                            if (item.generation == latest_generation) {
+                                sink = callback;
+                                window_transport_bytes += ts.size();
+                            }
                         }
                         if (sink) {
                             sink(ts);
                         }
                     }
-                } else if (item.kind == FecItem::Kind::end && decoder &&
-                           decoder_generation == item.generation) {
+                } else if ((item.kind == FecItem::Kind::end ||
+                            item.kind == FecItem::Kind::stream_end) &&
+                           decoder && decoder_generation == item.generation) {
                     const auto fec_started_at =
                         std::chrono::steady_clock::now();
                     const auto ts = decoder->flush();
@@ -3705,8 +2972,10 @@ struct StreamDecoder::Impl {
                         TransportCallback sink;
                         {
                             const std::scoped_lock guard(mutex);
-                            sink = callback;
-                            window_transport_bytes += ts.size();
+                            if (item.generation == latest_generation) {
+                                sink = callback;
+                                window_transport_bytes += ts.size();
+                            }
                         }
                         if (sink) {
                             sink(ts);
@@ -3718,15 +2987,26 @@ struct StreamDecoder::Impl {
                         std::max(0.0F, total_transport_time_ms -
                                            decoder_transport_time_ms);
                     decoder_transport_time_ms = total_transport_time_ms;
-                    const std::scoped_lock guard(mutex);
-                    if (item.generation == latest_generation) {
-                        latest.fec_work_time_ms = fec_work_ms;
-                        latest.transport_bytes += window_transport_bytes;
-                        latest.transport = decoder->stats();
-                        latest.transport_work_time_ms = window_transport_time_ms;
+                    bool fire_stream_end = false;
+                    {
+                        const std::scoped_lock guard(mutex);
+                        if (item.generation == latest_generation) {
+                            latest.fec_work_time_ms = fec_work_ms;
+                            latest.transport_bytes += window_transport_bytes;
+                            latest.transport = decoder->stats();
+                            latest.transport_work_time_ms =
+                                window_transport_time_ms;
+                            fire_stream_end =
+                                item.kind == FecItem::Kind::stream_end;
+                        }
                     }
                     fec_work_ms = 0.0F;
                     window_transport_bytes = 0;
+                    if (fire_stream_end) {
+                        // This event is part of the serialized FEC output
+                        // stream: all final TS bytes have been delivered.
+                        fire_discontinuity(TransportDiscontinuity::stream_end);
+                    }
                 } else if (item.kind == FecItem::Kind::stats && decoder &&
                            decoder_generation == item.generation) {
                     const float total_transport_time_ms =
@@ -3740,7 +3020,8 @@ struct StreamDecoder::Impl {
                         latest.fec_work_time_ms = fec_work_ms;
                         latest.transport_bytes += window_transport_bytes;
                         latest.transport = decoder->stats();
-                        latest.transport_work_time_ms = window_transport_time_ms;
+                        latest.transport_work_time_ms =
+                            window_transport_time_ms;
                     }
                     fec_work_ms = 0.0F;
                     window_transport_bytes = 0;
@@ -3765,8 +3046,10 @@ void StreamDecoder::submit(const std::span<const std::int16_t> interleaved_iq,
         (interleaved_iq.size() % 2) != 0) {
         return;
     }
-    impl_->analyzer.submit(interleaved_iq, sample_rate_hz,
-                           channel_bandwidth_hz);
+    if (!impl_->analysis_publisher.locked()) {
+        impl_->analyzer.submit(interleaved_iq, sample_rate_hz,
+                               channel_bandwidth_hz);
+    }
     const std::scoped_lock lock(impl_->mutex);
     const std::size_t incoming_samples = interleaved_iq.size() / 2;
     impl_->input_queue_capacity_samples =
@@ -3778,7 +3061,8 @@ void StreamDecoder::submit(const std::span<const std::int16_t> interleaved_iq,
     }
     impl_->queue.push_back({std::vector<std::int16_t>(interleaved_iq.begin(),
                                                       interleaved_iq.end()),
-                            sample_rate_hz, channel_bandwidth_hz});
+                            sample_rate_hz, channel_bandwidth_hz,
+                            impl_->latest_generation.load()});
     impl_->queued_complex_samples += incoming_samples;
     impl_->input_ready.notify_one();
 }
@@ -3805,7 +3089,8 @@ void StreamDecoder::submit_blocking(
     }
     impl_->queue.push_back({std::vector<std::int16_t>(interleaved_iq.begin(),
                                                       interleaved_iq.end()),
-                            sample_rate_hz, channel_bandwidth_hz});
+                            sample_rate_hz, channel_bandwidth_hz,
+                            impl_->latest_generation.load()});
     impl_->queued_complex_samples += incoming_samples;
     impl_->input_ready.notify_one();
 }
@@ -3824,26 +3109,43 @@ void StreamDecoder::flush() {
 void StreamDecoder::wait_until_idle() {
     std::unique_lock lock(impl_->mutex);
     impl_->idle.wait(lock, [this] {
-        return impl_->queue.empty() && !impl_->frontend_busy &&
-               !impl_->demod_busy && !impl_->fec_worker_busy &&
-               !impl_->flush_requested && !impl_->reset_requested &&
-               impl_->fec_queue.empty() &&
-               (!impl_->ring_closed ||
-                impl_->ring_read_pos == impl_->ring_write_pos);
+        return impl_->stopping ||
+               (impl_->queue.empty() && !impl_->frontend_busy &&
+                !impl_->demod_busy && !impl_->fec_worker_busy &&
+                !impl_->flush_requested && !impl_->reset_requested &&
+                impl_->fec_queue.empty() &&
+                (!impl_->ring_closed ||
+                 impl_->ring_read_pos == impl_->ring_write_pos));
     });
 }
 
-void StreamDecoder::reset() {
+void StreamDecoder::request_reset() {
     impl_->analyzer.reset();
-    impl_->cancel_requested = true;
+    impl_->analysis_publisher.reset();
     {
         const std::scoped_lock lock(impl_->mutex);
+        impl_->cancel_requested = true;
+        const std::uint64_t generation =
+            impl_->latest_generation.fetch_add(1) + 1;
+        impl_->reset_request_generation = generation;
         impl_->reset_requested = true;
+        impl_->queue.clear();
+        impl_->fec_queue.clear();
+        impl_->queued_complex_samples = 0;
+        impl_->sync.valid = false;
+        ++impl_->sync.version;
+        impl_->latest = {};
+        impl_->current_bandwidth = 0;
+        impl_->demod_busy_time_sum_ms = 0.0;
     }
     impl_->fec_not_full.notify_all();
     impl_->input_ready.notify_one();
     impl_->ring_space.notify_all();
     impl_->ring_data.notify_all();
+}
+
+void StreamDecoder::reset() {
+    request_reset();
     // Wait for the front-end to consume the reset. reset() is called when a
     // source is closed or re-opened, and the caller may start submitting the
     // next stream immediately after it returns: an asynchronous clear would
@@ -3852,8 +3154,11 @@ void StreamDecoder::reset() {
     // blocks). Blocking here also lets live sources drop nothing: by the time
     // the caller re-opens, the pipeline is already drained and parked.
     std::unique_lock lock(impl_->mutex);
-    impl_->idle.wait(lock,
-                     [this] { return impl_->stopping || !impl_->reset_requested; });
+    const std::uint64_t generation = impl_->reset_request_generation;
+    impl_->idle.wait(lock, [this, generation] {
+        return impl_->stopping ||
+               impl_->completed_reset_generation >= generation;
+    });
 }
 
 void StreamDecoder::set_parameters(const ReceiverParameters &parameters) {
@@ -3894,6 +3199,8 @@ void StreamDecoder::set_equalized_callback(EqualizedCallback callback) {
 StreamDecoderStats StreamDecoder::stats() const {
     const std::scoped_lock lock(impl_->mutex);
     auto statistics = impl_->latest;
+    statistics.failed = impl_->terminal_exception != nullptr;
+    statistics.error = impl_->terminal_error;
     statistics.queued_blocks = impl_->queue.size();
     statistics.queued_input_samples = impl_->queued_complex_samples;
     statistics.input_queue_capacity_samples =
@@ -3933,11 +3240,19 @@ DemodulatorStats StreamDecoder::demodulator_stats() const {
 }
 
 SignalAnalysisSnapshot StreamDecoder::analysis_snapshot() const {
-    return impl_->analyzer.snapshot();
+    auto snapshot = impl_->analysis_publisher.snapshot();
+    if (snapshot.locked) {
+        return snapshot;
+    }
+    snapshot = impl_->analyzer.snapshot();
+    snapshot.source = snapshot.locked ? SignalAnalysisSource::prelock_monitor
+                                      : SignalAnalysisSource::none;
+    return snapshot;
 }
 
 void StreamDecoder::set_snr_smoothing(const bool enabled, const int speed) {
     impl_->analyzer.set_snr_smoothing(enabled, speed);
+    impl_->analysis_publisher.set_smoothing(enabled, speed);
 }
 
 } // namespace airspy_tv::dvbt

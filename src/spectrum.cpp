@@ -1,4 +1,5 @@
 #include "airspy_tv/spectrum.hpp"
+#include "airspy_tv/fftw_plan.hpp"
 
 #include <fftw3.h>
 #include <volk/volk.h>
@@ -175,7 +176,7 @@ struct SpectrumAnalyzer::Impl {
     float smoothed_rf_snr_db{};
     float smoothed_notch_db{};
     bool average_initialized{};
-    fftwf_plan plan{};
+    FftwfPlan plan;
     std::thread worker;
 
     Impl()
@@ -198,14 +199,11 @@ struct SpectrumAnalyzer::Impl {
         }
 
         static_assert(sizeof(lv_32fc_t) == sizeof(fftwf_complex));
-        plan = fftwf_plan_dft_1d(
+        plan = FftwfPlan::dft_1d(
             static_cast<int>(spectrum_fft_size),
             reinterpret_cast<fftwf_complex *>(windowed.get()),
             reinterpret_cast<fftwf_complex *>(fft_output.get()), FFTW_FORWARD,
             FFTW_ESTIMATE);
-        if (plan == nullptr) {
-            throw std::bad_alloc();
-        }
         worker = std::thread([this] { run(); });
     }
 
@@ -217,9 +215,6 @@ struct SpectrumAnalyzer::Impl {
         pending_ready.notify_one();
         if (worker.joinable()) {
             worker.join();
-        }
-        if (plan != nullptr) {
-            fftwf_destroy_plan(plan);
         }
     }
 
@@ -270,7 +265,7 @@ struct SpectrumAnalyzer::Impl {
         volk_32fc_32f_multiply_32fc(
             windowed.get(), input.get(), window.get(),
             static_cast<unsigned int>(spectrum_fft_size));
-        fftwf_execute(plan);
+        plan.execute();
         volk_32fc_magnitude_squared_32f(
             power.get(), fft_output.get(),
             static_cast<unsigned int>(spectrum_fft_size));
@@ -360,11 +355,8 @@ void SpectrumAnalyzer::submit(
     }
 
     const auto now = std::chrono::steady_clock::now();
-    if (now < impl_->next_capture) {
-        return;
-    }
     std::unique_lock lock(impl_->pending_mutex, std::try_to_lock);
-    if (!lock.owns_lock()) {
+    if (!lock.owns_lock() || now < impl_->next_capture) {
         return;
     }
 

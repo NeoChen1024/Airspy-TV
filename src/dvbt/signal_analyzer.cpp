@@ -1,4 +1,5 @@
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
+#include "airspy_tv/fftw_plan.hpp"
 #include "airspy_tv/thread_name.hpp"
 
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <numbers>
 #include <ranges>
 #include <span>
@@ -68,16 +70,16 @@ transform_symbol(const std::span<const std::complex<float>> samples,
                                  static_cast<float>(data_start + index));
     }
     static_assert(sizeof(std::complex<float>) == sizeof(fftwf_complex));
-    fftwf_plan plan =
-        fftwf_plan_dft_1d(static_cast<int>(acquisition.fft_size),
-                          reinterpret_cast<fftwf_complex *>(input.data()),
-                          reinterpret_cast<fftwf_complex *>(output.data()),
-                          FFTW_FORWARD, FFTW_ESTIMATE);
-    if (plan == nullptr) {
+    try {
+        auto plan =
+            FftwfPlan::dft_1d(static_cast<int>(acquisition.fft_size),
+                              reinterpret_cast<fftwf_complex *>(input.data()),
+                              reinterpret_cast<fftwf_complex *>(output.data()),
+                              FFTW_FORWARD, FFTW_ESTIMATE);
+        plan.execute();
+    } catch (const std::bad_alloc &) {
         return {};
     }
-    fftwf_execute(plan);
-    fftwf_destroy_plan(plan);
     return output;
 }
 
@@ -473,11 +475,8 @@ void SignalAnalyzer::submit(const std::span<const std::int16_t> interleaved_iq,
         return;
     }
     const auto now = std::chrono::steady_clock::now();
-    if (now < impl_->next_analysis) {
-        return;
-    }
     std::unique_lock lock(impl_->pending_mutex, std::try_to_lock);
-    if (!lock.owns_lock() || impl_->pending) {
+    if (!lock.owns_lock() || impl_->pending || now < impl_->next_analysis) {
         return;
     }
     if (interleaved_iq.size() >= impl_->pending_samples.size()) {

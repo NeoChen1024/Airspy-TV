@@ -276,6 +276,10 @@ struct SoftViterbi::Impl {
     static DecoderHandle *create_decoder() {
         constexpr std::array<correct_convolutional_polynomial_t, 2> polynomials{
             0117, 0155};
+        // libcorrect lazily initializes a process-global bit-reversal table
+        // without synchronization. Serialize context construction here.
+        static std::mutex creation_mutex;
+        const std::scoped_lock lock(creation_mutex);
 #if defined(HAVE_SSE)
         return correct_convolutional_sse_create(convolutional_rate, 7,
                                                 polynomials.data());
@@ -357,7 +361,18 @@ struct SoftViterbi::Impl {
     }
 
     void run_worker() noexcept {
-        DecoderHandle *decoder = create_decoder();
+        DecoderHandle *decoder = nullptr;
+        try {
+            decoder = create_decoder();
+        } catch (...) {
+            const std::scoped_lock lock(mutex_);
+            if (!worker_error_) {
+                worker_error_ = std::current_exception();
+            }
+            all_finished_.notify_all();
+            queue_space_.notify_all();
+            return;
+        }
         if (decoder == nullptr) {
             const std::scoped_lock lock(mutex_);
             worker_error_ = std::make_exception_ptr(

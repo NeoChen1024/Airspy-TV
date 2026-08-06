@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 
 namespace airspy_tv::dvbt {
 
@@ -32,6 +33,8 @@ enum class WorkerState : int {
 };
 
 struct StreamDecoderStats {
+    bool failed{};
+    std::string error;
     bool ofdm_locked{};
     bool tps_locked{};
     // True once any TPS frame has ever validated (parameters are fix-once);
@@ -170,6 +173,7 @@ class StreamDecoder : public Demodulator {
     StreamDecoder(StreamDecoder &&) = delete;
     StreamDecoder &operator=(StreamDecoder &&) = delete;
 
+    void request_reset() override;
     void reset() override;
     void submit(std::span<const std::int16_t> interleaved_iq,
                 std::uint32_t sample_rate_hz,

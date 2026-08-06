@@ -1,6 +1,7 @@
 #include "airspy_tv/sdr.hpp"
 
 #include "airspy_tv/iq_file.hpp"
+#include "airspy_tv/transport_router.hpp"
 
 #include <SoapySDR/Constants.h>
 #include <SoapySDR/Device.hpp>
@@ -82,6 +83,7 @@ struct SdrDevice::Impl {
     RawIqRecorder recorder;
     TransportStreamRecorder ts_recorder;
     TransportStreamModel transport_model;
+    TransportStreamRouter transport_router{transport_model, ts_recorder};
     SpectrumAnalyzer analyzer;
     std::unique_ptr<Demodulator> demodulator;
     std::thread soapy_worker;
@@ -94,8 +96,6 @@ struct SdrDevice::Impl {
     std::atomic<std::uint32_t> active_channel_bandwidth{6'000'000};
     mutable std::mutex error_mutex;
     std::string async_error;
-    mutable std::mutex transport_sink_mutex;
-    TransportSink transport_sink;
 
     Impl() = default;
 
@@ -116,7 +116,7 @@ struct SdrDevice::Impl {
                 transfer->dropped_samples);
             self->analyzer.reset();
             if (self->demodulator) {
-                self->demodulator->reset();
+                self->demodulator->request_reset();
             }
         }
         self->analyzer.submit(sample_block, self->active_sample_rate,
@@ -161,7 +161,7 @@ struct SdrDevice::Impl {
                     recorder.add_source_dropped_samples(1);
                     analyzer.reset();
                     if (demodulator) {
-                        demodulator->reset();
+                        demodulator->request_reset();
                     }
                 }
                 continue;
@@ -716,16 +716,16 @@ void SdrDevice::set_display_smoothing(const bool fft_enabled,
 }
 
 void SdrDevice::set_demodulator(std::unique_ptr<Demodulator> demodulator) {
+    if (impl_->streaming || impl_->soapy_worker.joinable() ||
+        impl_->file_worker.joinable()) {
+        throw std::logic_error(
+            "cannot replace the demodulator before the source is stopped");
+    }
     impl_->demodulator = std::move(demodulator);
     if (impl_->demodulator) {
         impl_->demodulator->set_transport_callback(
             [this](const std::span<const std::uint8_t> ts) {
-                impl_->transport_model.consume(ts);
-                impl_->ts_recorder.submit(ts);
-                const std::scoped_lock lock(impl_->transport_sink_mutex);
-                if (impl_->transport_sink) {
-                    impl_->transport_sink(ts);
-                }
+                impl_->transport_router.consume(ts);
             });
     }
 }
@@ -769,8 +769,7 @@ bool SdrDevice::start_ts_recording(const std::filesystem::path &path,
 void SdrDevice::stop_ts_recording() { impl_->ts_recorder.stop(); }
 
 void SdrDevice::set_transport_sink(TransportSink sink) {
-    const std::scoped_lock lock(impl_->transport_sink_mutex);
-    impl_->transport_sink = std::move(sink);
+    impl_->transport_router.set_sink(std::move(sink));
 }
 
 bool SdrDevice::is_open() const { return impl_->opened; }

@@ -13,6 +13,12 @@ namespace airspy_tv::dvbt {
 
 inline constexpr std::size_t constellation_snapshot_size = 2048;
 
+enum class SignalAnalysisSource {
+    none,
+    prelock_monitor,
+    demodulator,
+};
+
 struct SignalAnalysisSnapshot {
     std::array<std::complex<float>, constellation_snapshot_size> points{};
     std::size_t point_count{};
@@ -25,6 +31,7 @@ struct SignalAnalysisSnapshot {
     Constellation constellation{Constellation::qam64};
     std::uint64_t sequence{};
     bool locked{};
+    SignalAnalysisSource source{SignalAnalysisSource::none};
 };
 
 // Low-rate one-symbol monitoring path for the GUI. It shares CS16 resampling

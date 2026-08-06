@@ -46,6 +46,9 @@ class Demodulator {
 
     virtual ~Demodulator() = default;
 
+    // Publish a discontinuity and return immediately. Source callbacks use
+    // this path so dropped-sample recovery never waits for decoder workers.
+    virtual void request_reset() = 0;
     virtual void reset() = 0;
     virtual void submit(std::span<const std::int16_t> interleaved_iq,
                         std::uint32_t sample_rate_hz,
