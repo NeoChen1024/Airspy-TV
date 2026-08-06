@@ -15,8 +15,9 @@ enum class PipelineLoadState {
 struct PipelineLoadSample {
     bool active{};
     float realtime_ratio{};
-    float input_queue_fraction{};
-    float fec_queue_fraction{};
+    // Highest pressure among the active demodulator's published queues. The
+    // monitor intentionally does not assume a fixed frontend/demod/FEC shape.
+    float queue_pressure_fraction{};
     std::uint64_t dropped_blocks{};
     std::uint64_t sequence{};
 };
@@ -59,9 +60,8 @@ class PipelineLoadMonitor {
             return state_;
         }
 
-        const float pressure = std::clamp(
-            std::max(sample.input_queue_fraction, sample.fec_queue_fraction),
-            0.0F, 1.0F);
+        const float pressure =
+            std::clamp(sample.queue_pressure_fraction, 0.0F, 1.0F);
         constexpr float overload_pressure = 0.75F;
         constexpr float overload_release_pressure = 0.60F;
         constexpr float slow_enter_ratio = 1.10F;

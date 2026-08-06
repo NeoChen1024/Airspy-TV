@@ -834,6 +834,78 @@ DemodulatorStats StreamDecoder::demodulator_stats() const {
     return result;
 }
 
+SignalSnapshot StreamDecoder::signal_snapshot() const {
+    const auto analysis = analysis_snapshot();
+    const auto statistics = stats();
+    SignalSnapshot result;
+    result.constellation_count =
+        std::min(analysis.point_count, result.constellation.size());
+    std::copy_n(analysis.points.begin(), result.constellation_count,
+                result.constellation.begin());
+    result.mer_db = analysis.mer_db;
+    result.snr_db = analysis.cp_snr_db;
+    result.deepest_notch_db = analysis.deepest_notch_db;
+    result.carrier_offset_hz = analysis.carrier_offset_hz;
+    const float fft_size =
+        analysis.mode == TransmissionMode::k8 ? 8192.0F : 2048.0F;
+    std::uint32_t channel_bandwidth_hz = 0;
+    {
+        const std::scoped_lock lock(impl_->mutex);
+        channel_bandwidth_hz = impl_->parameters.channel_bandwidth_hz;
+    }
+    const float sample_rate_hz =
+        static_cast<float>(channel_bandwidth_hz) * (8.0F / 7.0F);
+    result.carrier_offset_limit_hz = sample_rate_hz / (2.0F * fft_size);
+    result.sequence = analysis.sequence;
+    result.signal_locked = analysis.locked;
+    result.transport_locked = statistics.transport.rs_synchronized &&
+                              statistics.transport.ts_packets != 0;
+    return result;
+}
+
+PipelineSnapshot StreamDecoder::pipeline_snapshot() const {
+    const auto statistics = stats();
+    const auto queue_fraction = [](const std::size_t used,
+                                   const std::size_t capacity) {
+        return capacity == 0 ? 0.0F
+                             : std::clamp(static_cast<float>(used) /
+                                              static_cast<float>(capacity),
+                                          0.0F, 1.0F);
+    };
+
+    PipelineSnapshot result;
+    result.stages[0] = PipelineStageSnapshot{
+        .name = "IQ queue",
+        .queue_fraction =
+            queue_fraction(statistics.queued_input_samples,
+                           statistics.input_queue_capacity_samples),
+        .workers = statistics.resample_workers,
+        .queue_valid = statistics.input_queue_capacity_samples != 0,
+    };
+    result.stages[1] = PipelineStageSnapshot{
+        .name = "Demod",
+        .busy_fraction = statistics.demod_busy_fraction,
+        .workers = statistics.symbol_workers,
+        .busy_valid = true,
+    };
+    result.stages[2] = PipelineStageSnapshot{
+        .name = "FEC queue",
+        .queue_fraction = queue_fraction(statistics.queued_symbols,
+                                         statistics.symbol_queue_capacity),
+        .workers = statistics.transport.viterbi_workers,
+        .queue_valid = statistics.symbol_queue_capacity != 0,
+    };
+    result.stage_count = 3;
+    result.processing_realtime_ratio = statistics.processing_realtime_ratio;
+    result.dropped_blocks = statistics.dropped_blocks;
+    result.transport_bytes = statistics.transport_bytes;
+    result.sequence = statistics.processed_chunks;
+    result.processing = statistics.processing;
+    result.failed = statistics.failed;
+    result.error = statistics.error;
+    return result;
+}
+
 SignalAnalysisSnapshot StreamDecoder::analysis_snapshot() const {
     auto snapshot = impl_->analysis_publisher.snapshot();
     if (snapshot.locked) {
@@ -845,7 +917,7 @@ SignalAnalysisSnapshot StreamDecoder::analysis_snapshot() const {
     return snapshot;
 }
 
-void StreamDecoder::set_snr_smoothing(const bool enabled, const int speed) {
+void StreamDecoder::set_signal_smoothing(const bool enabled, const int speed) {
     impl_->analyzer.set_snr_smoothing(enabled, speed);
     impl_->analysis_publisher.set_smoothing(enabled, speed);
 }

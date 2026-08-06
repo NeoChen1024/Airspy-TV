@@ -715,6 +715,13 @@ void SdrDevice::set_display_smoothing(const bool fft_enabled,
                                   snr_speed);
 }
 
+void SdrDevice::set_demodulator_signal_smoothing(const bool enabled,
+                                                 const int speed) {
+    if (impl_->demodulator) {
+        impl_->demodulator->set_signal_smoothing(enabled, speed);
+    }
+}
+
 void SdrDevice::set_demodulator(std::unique_ptr<Demodulator> demodulator) {
     if (impl_->streaming || impl_->soapy_worker.joinable() ||
         impl_->file_worker.joinable()) {
@@ -800,6 +807,16 @@ TransportRecordingStats SdrDevice::ts_recording_stats() const {
 
 SpectrumSnapshot SdrDevice::spectrum_snapshot() const {
     return impl_->analyzer.snapshot();
+}
+
+SignalSnapshot SdrDevice::signal_snapshot() const {
+    return impl_->demodulator ? impl_->demodulator->signal_snapshot()
+                              : SignalSnapshot{};
+}
+
+PipelineSnapshot SdrDevice::pipeline_snapshot() const {
+    return impl_->demodulator ? impl_->demodulator->pipeline_snapshot()
+                              : PipelineSnapshot{};
 }
 
 std::vector<TransportService> SdrDevice::transport_services() const {

@@ -22,8 +22,7 @@ PipelineLoadSample sample(const std::uint64_t sequence, const float ratio,
                           const std::uint64_t drops = 0) {
     return {.active = true,
             .realtime_ratio = ratio,
-            .input_queue_fraction = queue_fraction,
-            .fec_queue_fraction = 0.0F,
+            .queue_pressure_fraction = queue_fraction,
             .dropped_blocks = drops,
             .sequence = sequence};
 }
@@ -53,14 +52,11 @@ void test_sustained_pressure_transitions_and_recovers() {
     require(monitor.update(sample(3, 1.20F, 0.30F)) ==
                 PipelineLoadState::realtime,
             "slow transition should remain debounced after two windows");
-    require(monitor.update(sample(4, 1.20F, 0.30F)) ==
-                PipelineLoadState::slow,
+    require(monitor.update(sample(4, 1.20F, 0.30F)) == PipelineLoadState::slow,
             "three slow pressured windows should report slow");
-    require(monitor.update(sample(5, 1.0F, 0.05F)) ==
-                PipelineLoadState::slow,
+    require(monitor.update(sample(5, 1.0F, 0.05F)) == PipelineLoadState::slow,
             "slow state should not clear on one healthy window");
-    require(monitor.update(sample(6, 1.0F, 0.05F)) ==
-                PipelineLoadState::slow,
+    require(monitor.update(sample(6, 1.0F, 0.05F)) == PipelineLoadState::slow,
             "slow state should not clear on two healthy windows");
     require(monitor.update(sample(7, 1.0F, 0.05F)) ==
                 PipelineLoadState::realtime,

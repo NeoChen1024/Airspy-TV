@@ -7,6 +7,7 @@
 #include "airspy_tv/mpv_player.hpp"
 #include "byte_rate_tracker.hpp"
 #include "pipeline_load_monitor.hpp"
+#include "receiver_session.hpp"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_dialog.h>
@@ -59,9 +60,12 @@ using airspy_tv::MpvPlayer;
 using airspy_tv::PipelineLoadMonitor;
 using airspy_tv::PipelineLoadSample;
 using airspy_tv::PipelineLoadState;
+using airspy_tv::PipelineSnapshot;
+using airspy_tv::ReceiverSession;
 using airspy_tv::ReceiveStandard;
 using airspy_tv::SdrBackend;
 using airspy_tv::SdrDevice;
+using airspy_tv::SignalSnapshot;
 using airspy_tv::SourceSettings;
 using airspy_tv::SpectrumSnapshot;
 using airspy_tv::TransportDiscontinuity;
@@ -84,8 +88,8 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats);
 
 #include "main_gui.hpp"
 
-#include "main_commands.hpp"
 #include "decoder_diagnostics.hpp"
+#include "main_commands.hpp"
 
 #include "main_cli.hpp"
 
@@ -125,8 +129,8 @@ int main(const int argc, char **argv) {
             ts_output_path = optarg;
             break;
         case opt_sample_rate:
-            sample_rate_hz = static_cast<std::uint32_t>(
-                parse_u64(optarg, "sample rate"));
+            sample_rate_hz =
+                static_cast<std::uint32_t>(parse_u64(optarg, "sample rate"));
             if (sample_rate_hz == 0) {
                 cli_usage_error("sample rate must be non-zero");
             }
@@ -163,8 +167,8 @@ int main(const int argc, char **argv) {
             record_path = optarg;
             break;
         case opt_duration:
-            duration_ms = static_cast<int>(
-                parse_u64(optarg, "recording duration"));
+            duration_ms =
+                static_cast<int>(parse_u64(optarg, "recording duration"));
             if (duration_ms <= 0) {
                 cli_usage_error("recording duration must be positive");
             }
@@ -173,7 +177,8 @@ int main(const int argc, char **argv) {
             center_frequency_hz = parse_u64(optarg, "center frequency");
             break;
         case opt_ppm:
-            frequency_correction_ppm = parse_double(optarg, "frequency correction");
+            frequency_correction_ppm =
+                parse_double(optarg, "frequency correction");
             break;
         case opt_gain:
             airspy_gain = static_cast<int>(parse_u64(optarg, "gain"));
@@ -189,8 +194,8 @@ int main(const int argc, char **argv) {
         }
     }
     if (optind != argc) {
-        cli_usage_error(std::format("unexpected positional argument: '{}'",
-                                    argv[optind]));
+        cli_usage_error(
+            std::format("unexpected positional argument: '{}'", argv[optind]));
     }
 
     const int command_count = (decode_iq_path.has_value() ? 1 : 0) +
@@ -272,10 +277,7 @@ int main(const int argc, char **argv) {
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
     AppState state;
-    state.demodulator = std::make_unique<StreamDecoder>();
-    state.dvbt_demod = state.demodulator.get();
-    state.dvbt_demod->set_parameters(state.dvbt_parameters);
-    state.receiver.set_demodulator(std::move(state.demodulator));
+    state.session.set_dvbt_parameters(state.dvbt.parameters);
     state.window = window;
     std::string player_error;
     if (!state.player.initialize(player_error)) {
@@ -288,12 +290,12 @@ int main(const int argc, char **argv) {
         SDL_Quit();
         return 1;
     }
-    state.receiver.set_transport_sink(
+    state.session.set_transport_sink(
         [&state](const std::span<const std::uint8_t> ts) {
             state.epg.consume(ts);
             state.player.submit(ts);
         });
-    state.dvbt_demod->set_discontinuity_callback(
+    state.session.set_discontinuity_callback(
         [&state](const TransportDiscontinuity discontinuity) {
             state.player.on_discontinuity(discontinuity);
         });
@@ -309,7 +311,7 @@ int main(const int argc, char **argv) {
             }
         }
 
-        const std::string runtime_error = state.receiver.runtime_error();
+        const std::string runtime_error = state.session.runtime_error();
         if (!runtime_error.empty()) {
             state.status = runtime_error;
         }
@@ -330,8 +332,8 @@ int main(const int argc, char **argv) {
         SDL_GL_SwapWindow(window);
     }
 
-    state.receiver.set_transport_sink({});
-    state.receiver.close();
+    state.session.set_transport_sink({});
+    state.session.close();
     state.player.shutdown();
     state.waterfall.destroy();
     ImGui_ImplOpenGL3_Shutdown();

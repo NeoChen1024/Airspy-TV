@@ -397,6 +397,8 @@ struct DecodeResult {
     std::vector<TransportDiscontinuity> discontinuities;
     airspy_tv::dvbt::StreamDecoderStats stats;
     SignalAnalysisSnapshot analysis;
+    airspy_tv::SignalSnapshot signal;
+    airspy_tv::PipelineSnapshot pipeline;
 };
 
 void submit_in_blocks(StreamDecoder &decoder,
@@ -460,6 +462,8 @@ decode_in_blocks(const std::span<const std::int16_t> iq,
         const std::scoped_lock lock(callback_mutex);
         result.stats = decoder.stats();
         result.analysis = decoder.analysis_snapshot();
+        result.signal = decoder.signal_snapshot();
+        result.pipeline = decoder.pipeline_snapshot();
     }
     return result;
 }
@@ -500,13 +504,29 @@ void test_8k_clean_signal() {
             "production signal analysis contains a non-finite value");
     require(result.analysis.cp_snr_db > 10.0F,
             "production CP SNR was not populated from the ideal signal");
+    require(result.signal.signal_locked && result.signal.transport_locked,
+            "common signal snapshot did not expose DVB-T lock state");
+    require(result.signal.constellation_count != 0 &&
+                result.signal.constellation_count <=
+                    result.signal.constellation.size(),
+            "common constellation snapshot has an invalid point count");
+    require(result.signal.carrier_offset_limit_hz > 0.0F,
+            "common signal snapshot lacks a carrier-offset scale");
+    require(result.pipeline.stage_count == 3 &&
+                result.pipeline.stages[0].name == "IQ queue" &&
+                result.pipeline.stages[1].name == "Demod" &&
+                result.pipeline.stages[2].name == "FEC queue",
+            "common pipeline snapshot did not preserve DVB-T stage order");
+    require(result.pipeline.stages[0].queue_valid &&
+                result.pipeline.stages[1].busy_valid &&
+                result.pipeline.stages[2].queue_valid,
+            "common pipeline snapshot has invalid stage metric types");
     require(std::isfinite(result.stats.raw_timing_offset_samples) &&
                 std::isfinite(result.stats.timing_offset_samples) &&
                 std::isfinite(result.stats.physical_timing_offset_samples) &&
                 std::isfinite(result.stats.sample_clock_offset_ppm) &&
                 std::isfinite(result.stats.timing_shift_rate_ppm) &&
-                std::isfinite(
-                    result.stats.rolling_timing_shift_rate_ppm),
+                std::isfinite(result.stats.rolling_timing_shift_rate_ppm),
             "timing telemetry contains a non-finite value");
     require(result.stats.queued_blocks == 0 &&
                 result.stats.queued_input_samples == 0 &&

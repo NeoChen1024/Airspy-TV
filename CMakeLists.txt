@@ -164,6 +164,7 @@ add_executable(airspy-tv
     src/iq_file.cpp
     src/main.cpp
     src/mpv_player.cpp
+    src/receiver_session.cpp
     src/recorder.cpp
     src/sdr.cpp
     src/si_common.cpp

@@ -75,6 +75,7 @@ class SdrDevice {
     bool set_bias_tee(bool enabled, std::string &error);
     void set_display_smoothing(bool fft_enabled, int fft_speed,
                                bool snr_enabled, int snr_speed);
+    void set_demodulator_signal_smoothing(bool enabled, int speed);
     // Install the standard demodulator. The demodulator takes over the
     // MPEG-TS pipeline (service model, TS recorder, transport sink) via its
     // transport callback. Standard-specific parameters are configured on the
@@ -100,6 +101,8 @@ class SdrDevice {
     [[nodiscard]] RecordingStats recording_stats() const;
     [[nodiscard]] TransportRecordingStats ts_recording_stats() const;
     [[nodiscard]] SpectrumSnapshot spectrum_snapshot() const;
+    [[nodiscard]] SignalSnapshot signal_snapshot() const;
+    [[nodiscard]] PipelineSnapshot pipeline_snapshot() const;
     [[nodiscard]] std::vector<TransportService> transport_services() const;
     [[nodiscard]] std::string runtime_error() const;
 

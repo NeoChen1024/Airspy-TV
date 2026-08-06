@@ -160,8 +160,7 @@ class StreamDecoder : public Demodulator {
 
     using TransportCallback =
         std::function<void(std::span<const std::uint8_t>)>;
-    using DiscontinuityCallback =
-        std::function<void(TransportDiscontinuity)>;
+    using DiscontinuityCallback = std::function<void(TransportDiscontinuity)>;
     using EqualizedCallback =
         std::function<void(std::span<const std::complex<float>>,
                            std::span<const float>, std::size_t)>;
@@ -196,10 +195,12 @@ class StreamDecoder : public Demodulator {
     void set_discontinuity_callback(DiscontinuityCallback callback) override;
     void set_equalized_callback(EqualizedCallback callback);
     [[nodiscard]] DemodulatorStats demodulator_stats() const override;
+    [[nodiscard]] SignalSnapshot signal_snapshot() const override;
+    [[nodiscard]] PipelineSnapshot pipeline_snapshot() const override;
     // DVB-T-specific GUI analysis (constellation, MER, CP SNR, TPS state),
     // computed by the demodulator's own monitoring path.
     [[nodiscard]] SignalAnalysisSnapshot analysis_snapshot() const;
-    void set_snr_smoothing(bool enabled, int speed);
+    void set_signal_smoothing(bool enabled, int speed) override;
     [[nodiscard]] StreamDecoderStats stats() const;
 
   private:
