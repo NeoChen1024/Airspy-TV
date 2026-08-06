@@ -249,6 +249,26 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME epg-model COMMAND epg-model-test)
+
+    add_executable(pipeline-load-monitor-test
+        tests/pipeline_load_monitor_test.cpp
+    )
+    target_include_directories(pipeline-load-monitor-test PRIVATE src)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(pipeline-load-monitor-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME pipeline-load-monitor COMMAND pipeline-load-monitor-test)
+
+    add_executable(byte-rate-tracker-test
+        tests/byte_rate_tracker_test.cpp
+    )
+    target_include_directories(byte-rate-tracker-test PRIVATE src)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(byte-rate-tracker-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME byte-rate-tracker COMMAND byte-rate-tracker-test)
 endif()
 
 install(TARGETS airspy-tv RUNTIME DESTINATION bin)

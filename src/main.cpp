@@ -5,6 +5,8 @@
 #include "airspy_tv/epg.hpp"
 #include "airspy_tv/iq_file.hpp"
 #include "airspy_tv/mpv_player.hpp"
+#include "byte_rate_tracker.hpp"
+#include "pipeline_load_monitor.hpp"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_dialog.h>
@@ -46,6 +48,7 @@
 namespace {
 
 using airspy_tv::AirspyGainMode;
+using airspy_tv::ByteRateTracker;
 using airspy_tv::DeviceDescriptor;
 using airspy_tv::EnumerationResult;
 using airspy_tv::EpgEvent;
@@ -53,6 +56,9 @@ using airspy_tv::EpgModel;
 using airspy_tv::EpgSnapshot;
 using airspy_tv::IqFileInfo;
 using airspy_tv::MpvPlayer;
+using airspy_tv::PipelineLoadMonitor;
+using airspy_tv::PipelineLoadSample;
+using airspy_tv::PipelineLoadState;
 using airspy_tv::ReceiveStandard;
 using airspy_tv::SdrBackend;
 using airspy_tv::SdrDevice;

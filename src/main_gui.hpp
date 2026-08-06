@@ -100,6 +100,7 @@ struct AppState {
     std::string status{"Ready"};
     std::string recording_path{"capture.cs16"};
     std::string ts_recording_path{"capture.ts"};
+    ByteRateTracker ts_write_rate;
     std::size_t selected_colormap{};
     float display_floor_dbfs{default_display_floor_dbfs};
     float display_ceiling_dbfs{default_display_ceiling_dbfs};
@@ -110,6 +111,8 @@ struct AppState {
     SpectrumSnapshot spectrum;
     SignalAnalysisSnapshot signal_analysis;
     StreamDecoderStats decoder;
+    PipelineLoadMonitor pipeline_load_monitor;
+    PipelineLoadState pipeline_load{PipelineLoadState::measuring};
     std::vector<TransportService> services;
     std::optional<std::uint16_t> selected_service_id;
     ReceiverParameters dvbt_parameters;
@@ -762,6 +765,15 @@ void draw_source_panel(AppState &state) {
     ImGui::EndDisabled();
     ImGui::TextDisabled("0 = Auto (%zu logical CPUs)",
                         airspy_tv::dvbt::default_viterbi_worker_count());
+    const std::size_t active_workers =
+        state.decoder.resample_workers + state.decoder.symbol_workers +
+        state.decoder.transport.viterbi_workers;
+    if (active_workers != 0) {
+        ImGui::TextDisabled("Workers: %zu resample, %zu symbol, %zu FEC",
+                            state.decoder.resample_workers,
+                            state.decoder.symbol_workers,
+                            state.decoder.transport.viterbi_workers);
+    }
 
     ImGui::SeparatorText("Frequency correction");
     if (file_source) {
@@ -1439,6 +1451,8 @@ void draw_ts_recorder_panel(AppState &state) {
     const bool dialog_open = file_dialog_is_open(state.ts_file_dialog);
     const bool ts_source_available = state.receiver.is_streaming();
     const auto ts_stats = state.receiver.ts_recording_stats();
+    const double ts_write_mib_per_second =
+        state.ts_write_rate.update(ts_stats.active, ts_stats.bytes_written);
 
     draw_disabled_wrapped("Decoded DVB-T transport stream (MPEG-TS)");
     ImGui::TextUnformatted("Output file");
@@ -1478,6 +1492,7 @@ void draw_ts_recorder_panel(AppState &state) {
     ImGui::Text("Written: %.2f MiB",
                 static_cast<double>(ts_stats.bytes_written) /
                     (1024.0 * 1024.0));
+    ImGui::Text("Write rate: %.2f MiB/s", ts_write_mib_per_second);
     ImGui::Text("Queue drops: %llu",
                 static_cast<unsigned long long>(ts_stats.dropped_blocks));
     ImGui::PopID();
@@ -1616,24 +1631,14 @@ void draw_sidebar(AppState &state) {
             ImGui::PopStyleColor();
         }
 
-        const bool ratio_available =
-            state.decoder.processing_realtime_ratio > 0.0F;
-        const bool input_queue_near_full =
-            state.decoder.input_queue_capacity_samples != 0 &&
-            state.decoder.queued_input_samples * 4 >=
-                state.decoder.input_queue_capacity_samples * 3;
         const bool fec_queue_near_full =
             state.decoder.symbol_queue_capacity != 0 &&
             state.decoder.queued_symbols * 4 >=
                 state.decoder.symbol_queue_capacity * 3;
-        const bool cpu_slow =
-            ratio_available && state.decoder.processing_realtime_ratio > 1.0F;
         const bool fec_signal_limited =
             !transport_locked && fec_queue_near_full && pre_viterbi_available &&
             pre_viterbi_ber >= 0.10;
-        const bool cpu_overload =
-            !fec_signal_limited && cpu_slow && input_queue_near_full;
-        const char *pipeline_status = "CPU LOAD";
+        const char *pipeline_status = "PIPELINE LOAD";
         ImVec4 pipeline_colour{0.55F, 0.62F, 0.70F, 1.0F};
         if (state.decoder.failed) {
             pipeline_status = "PIPELINE FAILED";
@@ -1641,14 +1646,14 @@ void draw_sidebar(AppState &state) {
         } else if (fec_signal_limited) {
             pipeline_status = "FEC SIGNAL LIMITED";
             pipeline_colour = ImVec4(1.0F, 0.72F, 0.22F, 1.0F);
-        } else if (cpu_overload) {
-            pipeline_status = "CPU OVERLOAD";
+        } else if (state.pipeline_load == PipelineLoadState::overload) {
+            pipeline_status = "PIPELINE OVERLOAD";
             pipeline_colour = ImVec4(1.0F, 0.38F, 0.25F, 1.0F);
-        } else if (cpu_slow) {
-            pipeline_status = "CPU SLOW";
+        } else if (state.pipeline_load == PipelineLoadState::slow) {
+            pipeline_status = "PIPELINE SLOW";
             pipeline_colour = ImVec4(1.0F, 0.72F, 0.22F, 1.0F);
-        } else if (ratio_available) {
-            pipeline_status = "CPU REALTIME";
+        } else if (state.pipeline_load == PipelineLoadState::realtime) {
+            pipeline_status = "PIPELINE REALTIME";
             pipeline_colour = ImVec4(0.35F, 0.88F, 0.55F, 1.0F);
         }
         const float input_queue_percent =
@@ -1658,17 +1663,23 @@ void draw_sidebar(AppState &state) {
                       static_cast<float>(state.decoder.queued_input_samples) /
                       static_cast<float>(
                           state.decoder.input_queue_capacity_samples);
+        const float fec_queue_percent =
+            state.decoder.symbol_queue_capacity == 0
+                ? 0.0F
+                : 100.0F *
+                      static_cast<float>(state.decoder.queued_symbols) /
+                      static_cast<float>(state.decoder.symbol_queue_capacity);
+        const auto format_percent = [](const float percent) {
+            return std::format("{:3.0f}%",
+                               std::clamp(percent, 0.0F, 100.0F));
+        };
         draw_status_indicator(pipeline_status, pipeline_colour);
-        if (ImGui::BeginTable("cpu-diagnostics", 4,
+        if (ImGui::BeginTable("pipeline-diagnostics", 2,
                               ImGuiTableFlags_SizingStretchProp |
                                   ImGuiTableFlags_PadOuterX)) {
-            ImGui::TableSetupColumn("label-left",
+            ImGui::TableSetupColumn("label",
                                     ImGuiTableColumnFlags_WidthFixed, 72.0F);
-            ImGui::TableSetupColumn("value-left",
-                                    ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("label-right",
-                                    ImGuiTableColumnFlags_WidthFixed, 72.0F);
-            ImGui::TableSetupColumn("value-right",
+            ImGui::TableSetupColumn("value",
                                     ImGuiTableColumnFlags_WidthStretch);
             const auto cell = [](const char *label, const auto &value) {
                 ImGui::TableNextColumn();
@@ -1676,29 +1687,11 @@ void draw_sidebar(AppState &state) {
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(value.c_str());
             };
-            cell(
-                "Demod",
-                state.decoder.demod_busy_fraction > 0.0F
-                    ? std::format(
-                          "{:.0f}% busy",
-                          std::clamp(state.decoder.demod_busy_fraction * 100.0F,
-                                     0.0F, 999.0F))
-                    : std::string{"Measuring"});
-            cell("Threads",
-                 std::format("{} / {} / {}",
-                             worker_state_name(state.decoder.frontend_state),
-                             worker_state_name(state.decoder.demod_state),
-                             worker_state_name(state.decoder.fec_state)));
-            cell("IQ queue",
-                 std::format("{:3.0f}%",
-                             std::clamp(input_queue_percent, 0.0F, 100.0F)));
-            cell("FEC queue", std::to_string(state.decoder.queued_symbols));
+            cell("IQ queue", format_percent(input_queue_percent));
+            cell("Demod", format_percent(
+                              state.decoder.demod_busy_fraction * 100.0F));
+            cell("FEC queue", format_percent(fec_queue_percent));
             cell("Drops", std::to_string(state.decoder.dropped_blocks));
-            cell("Resample", std::to_string(state.decoder.resample_workers));
-            cell("Symbol", std::to_string(state.decoder.symbol_workers));
-            cell("Inner FEC",
-                 std::to_string(state.decoder.transport.viterbi_workers));
-            cell("", std::string{});
             ImGui::EndTable();
         }
         ImGui::Separator();
@@ -2227,6 +2220,26 @@ void draw_application(AppState &state) {
     state.spectrum = state.receiver.spectrum_snapshot();
     state.signal_analysis = state.dvbt_demod->analysis_snapshot();
     state.decoder = state.dvbt_demod->stats();
+    const auto queue_fraction = [](const std::size_t used,
+                                   const std::size_t capacity) {
+        return capacity == 0
+                   ? 0.0F
+                   : std::clamp(static_cast<float>(used) /
+                                    static_cast<float>(capacity),
+                                0.0F, 1.0F);
+    };
+    state.pipeline_load = state.pipeline_load_monitor.update(
+        PipelineLoadSample{
+            .active = state.receiver.is_streaming() || state.decoder.processing,
+            .realtime_ratio = state.decoder.processing_realtime_ratio,
+            .input_queue_fraction = queue_fraction(
+                state.decoder.queued_input_samples,
+                state.decoder.input_queue_capacity_samples),
+            .fec_queue_fraction =
+                queue_fraction(state.decoder.queued_symbols,
+                               state.decoder.symbol_queue_capacity),
+            .dropped_blocks = state.decoder.dropped_blocks,
+            .sequence = state.decoder.processed_chunks});
     // Periodic diagnostics: dump thread states and queue/ring watermarks every
     // few seconds so a mid-stream stall is visible in the terminal.
     {
