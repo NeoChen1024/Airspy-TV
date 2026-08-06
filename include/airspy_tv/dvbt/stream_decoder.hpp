@@ -70,7 +70,28 @@ struct StreamDecoderStats {
     bool fec_skipped{};
     float tracked_carrier_offset_hz{};
     std::size_t acquisition_start{};
+    // Timing-loop telemetry for the most recently published statistics
+    // window. Raw timing is the latest wrapped pilot-slope observation;
+    // timing_offset_samples is the accepted, unwrapped, filtered window mean.
+    float raw_timing_offset_samples{};
     float timing_offset_samples{};
+    // Timing expressed in the physical sample-clock coordinate after adding
+    // back adaptive CIR placement and the loop's own cumulative corrections.
+    float physical_timing_offset_samples{};
+    float observed_timing_drift_samples{};
+    float corrected_timing_drift_samples{};
+    float smoothed_timing_drift_samples{};
+    float sample_clock_offset_ppm{};
+    float cumulative_timing_shift_samples{};
+    float timing_shift_rate_ppm{};
+    float fractional_timing_samples{};
+    float cir_offset_samples{};
+    float timing_confidence{};
+    float cir_confidence{};
+    std::uint64_t timing_measurements{};
+    std::uint64_t timing_accepted_measurements{};
+    std::uint64_t timing_rejected_measurements{};
+    bool timing_drift_ready{};
     // Continual-carrier fade indicator (normalized temporal correlation);
     // ~1 healthy, <= 0.25 freezes the demod during a fade. Surfaced so a
     // stall can be told apart: high fade_indicator with a collapsed MER and

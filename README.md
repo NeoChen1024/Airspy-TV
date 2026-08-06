@@ -233,3 +233,19 @@ The generator writes an application-compatible JSON sidecar and the
 unmodulated source stream as `airspy-tv-ideal.expected.ts`. The current ideal
 regression deterministically recovers packet-aligned TS with a valid PAT and
 PMT.
+
+Sample-clock and LO impairments can be injected independently. Offsets set the
+initial error; drift rates change that error linearly over the fixture:
+
+```sh
+XDG_CACHE_HOME=/tmp/airspy-tv-gnuradio-cache \
+  python3 tools/generate_dvbt_fixture.py /tmp/airspy-tv-drift.cs16 \
+    --duration 120 \
+    --sample-clock-ppm 1.5 \
+    --sample-clock-drift-ppm-per-minute 0.2 \
+    --lo-offset-hz 750 \
+    --lo-drift-hz-per-minute -25
+```
+
+The JSON sidecar records all four impairment parameters while retaining the
+nominal 10 MS/s sample rate expected by the decoder.

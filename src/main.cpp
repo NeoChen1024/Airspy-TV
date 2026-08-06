@@ -1850,6 +1850,37 @@ void draw_sidebar(AppState &state) {
                     "latched before the correlation collapsed.");
             }
         }
+        {
+            const bool timing_valid = state.decoder.ofdm_locked &&
+                                      state.decoder.timing_confidence > 0.0F;
+            const std::string timing_text =
+                !timing_valid
+                    ? "-- smp / -- ppm"
+                    : state.decoder.timing_drift_ready
+                          ? std::format("{:.1f} smp / {:+.3f} ppm",
+                                        state.decoder.timing_offset_samples,
+                                        state.decoder.sample_clock_offset_ppm)
+                          : std::format("{:.1f} smp / -- ppm",
+                                        state.decoder.timing_offset_samples);
+            draw_bipolar_metric(
+                "Timing / SRO", timing_text.c_str(),
+                timing_valid && state.decoder.timing_drift_ready
+                    ? std::clamp(
+                          0.5F + state.decoder.sample_clock_offset_ppm / 10.0F,
+                          0.0F, 1.0F)
+                    : 0.5F,
+                ImVec4(0.95F, 0.72F, 0.30F, 1.0F));
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip(
+                    "Filtered pilot-slope timing and feedback-debiased "
+                    "sample-clock offset.");
+            }
+            const std::string confidence_text = std::format(
+                "{:.1f}%%", state.decoder.timing_confidence * 100.0F);
+            draw_metric("Timing conf", confidence_text.c_str(),
+                        state.decoder.timing_confidence,
+                        ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
+        }
         const std::string mer =
             state.signal_analysis.locked
                 ? std::format("{:.1f} dB", state.signal_analysis.mer_db)
@@ -2648,9 +2679,30 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << " tracked=" << stats.tracked_carrier_offset_hz << " Hz"
                   << " start=" << stats.acquisition_start
                   << " timing=" << stats.timing_offset_samples << " smp"
+                  << " sro=" << stats.sample_clock_offset_ppm << " ppm"
+                  << " shift=" << stats.cumulative_timing_shift_samples
+                  << " smp"
+                  << " tconf=" << stats.timing_confidence
+                  << " sro-ready=" << (stats.timing_drift_ready ? 1 : 0)
                   << " carried=" << (stats.state_carried ? 1 : 0)
                   << " fec-skip=" << (stats.fec_skipped ? 1 : 0) << '\n';
         if (debug) {
+            std::cerr
+                << "  timing: raw=" << stats.raw_timing_offset_samples
+                << " filtered=" << stats.timing_offset_samples
+                << " physical=" << stats.physical_timing_offset_samples
+                << " smp observed-drift="
+                << stats.observed_timing_drift_samples
+                << " corrected-drift="
+                << stats.corrected_timing_drift_samples
+                << " smooth=" << stats.smoothed_timing_drift_samples
+                << " smp/window shift-rate=" << stats.timing_shift_rate_ppm
+                << " ppm frac=" << stats.fractional_timing_samples
+                << " cir=" << stats.cir_offset_samples
+                << " smp cir-conf=" << stats.cir_confidence
+                << " measurements=" << stats.timing_measurements
+                << " accepted=" << stats.timing_accepted_measurements
+                << " rejected=" << stats.timing_rejected_measurements << '\n';
             std::cerr << "  stages: resample=" << stats.resample_time_ms
                       << " ms acquisition=" << stats.acquisition_time_ms
                       << " ms equalization=" << stats.equalization_time_ms
@@ -2804,6 +2856,20 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
               << " acq=" << stats.acquisition_score
               << " fi=" << stats.fade_indicator
               << " mer=" << stats.mer_db << "dB"
+              << " tau=" << stats.timing_offset_samples
+              << " rawtau=" << stats.raw_timing_offset_samples
+              << " phys=" << stats.physical_timing_offset_samples
+              << " sro=" << stats.sample_clock_offset_ppm << "ppm"
+              << " tshift=" << stats.cumulative_timing_shift_samples
+              << " shiftrate=" << stats.timing_shift_rate_ppm << "ppm"
+              << " frac=" << stats.fractional_timing_samples
+              << " tconf=" << stats.timing_confidence
+              << " cir=" << stats.cir_offset_samples
+              << " circonf=" << stats.cir_confidence
+              << " tmeas=" << stats.timing_measurements
+              << " taccept=" << stats.timing_accepted_measurements
+              << " trej=" << stats.timing_rejected_measurements
+              << " sroready=" << (stats.timing_drift_ready ? 1 : 0)
               << " fec-skip=" << stats.fec_skipped
               << " drop=" << stats.dropped_blocks
               << " cpu=" << static_cast<int>(stats.cpu_load * 100.0F) << "%";

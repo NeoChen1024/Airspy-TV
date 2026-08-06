@@ -474,6 +474,21 @@ void test_8k_clean_signal() {
             "8K decoder selected wrong guard interval");
     require(result.stats.dropped_blocks == 0,
             "blocking synthetic input dropped blocks");
+    require(result.stats.timing_measurements > 0,
+            "8K decoder did not publish timing measurements");
+    require(result.stats.timing_measurements ==
+                result.stats.timing_accepted_measurements +
+                    result.stats.timing_rejected_measurements,
+            "timing measurement accounting is inconsistent");
+    require(result.stats.timing_confidence > 0.0F &&
+                result.stats.timing_confidence <= 1.0F,
+            "timing confidence is outside its normalized range");
+    require(std::isfinite(result.stats.raw_timing_offset_samples) &&
+                std::isfinite(result.stats.timing_offset_samples) &&
+                std::isfinite(result.stats.physical_timing_offset_samples) &&
+                std::isfinite(result.stats.sample_clock_offset_ppm) &&
+                std::isfinite(result.stats.timing_shift_rate_ppm),
+            "timing telemetry contains a non-finite value");
     require(result.stats.queued_blocks == 0 &&
                 result.stats.queued_input_samples == 0 &&
                 result.stats.queued_symbols == 0,

@@ -171,103 +171,132 @@ The repository test suite remains green:
 100% tests passed out of 4
 ```
 
-## 5. Improvement opportunities
+## 5. Improvement opportunities and TODOs
 
 The current loop is stable enough for the validation capture. The following
-improvements should be evaluated one at a time against this baseline.
+items must be evaluated one at a time against this baseline.
 
-### 5.1 Fractional-delay or polyphase timing correction
+### 5.1 Validate the remaining timing-coordinate bias terms (TODO)
+
+Two bias corrections are present but still need controlled calibration:
+
+1. `timing_window_shift_response` is currently fixed at `1.0`. Verify its sign
+   and gain with commanded window steps and known sample-clock offsets in 2K
+   and 8K modes, then repeat on the 545/557/581 MHz multipath captures. The
+   corrected physical timing coordinate must not acquire a sawtooth correlated
+   with the loop's own cumulative `shift`.
+2. The CIR rebasing term currently approximates a statistics window's placement
+   with the average of its beginning and ending integer offsets. Validate this
+   against an exact per-symbol, time-weighted CIR offset. If CIR moves at
+   uneven points inside a 400-symbol window, the endpoint average must not be
+   allowed to appear as sample-clock drift.
+
+These tests should compare raw `tau`, physical timing, corrected drift, SRO ppm,
+CIR offset, and shift rate. A stable non-zero `tau` remains valid; this task is
+about removing actuator and placement bias from the derivative.
+
+### 5.2 Fractional-delay or polyphase timing correction (TODO)
 
 The current actuator is an integer-step window correction driven by a
 fractional accumulator. This is robust and cheap, but it quantizes the timing
-correction and can leave a small residual sawtooth.
+correction and applies pending steps near statistics-window boundaries, which
+can leave a small residual sawtooth.
 
-A fractional-delay filter or a polyphase resampler could move the effective
-FFT window continuously. Expected benefits are:
+First evaluate distributing the estimated timing rate through a per-symbol
+phase accumulator. Then prototype a fractional-delay filter or continuously
+adjustable polyphase path behind an opt-in configuration. Expected benefits
+are lower residual `tau` jitter and less periodic phase modulation.
 
-- lower residual `tau` jitter;
-- less periodic phase modulation from integer steps;
-- less growth pressure on the cumulative `shift` counter.
+This must not be introduced merely to force `tau` to zero. The acceptance
+criterion is improved timing/FEC stability, not a numerically small `tau`.
 
-This should not be introduced merely to force `tau` to zero. A non-zero stable
-value can represent channel group delay or an intentional FFT-window margin.
-The acceptance criterion is improved timing/FEC stability, not a numerically
-small `tau` alone.
+### 5.3 CIR-aware initial and adaptive window placement
 
-### 5.2 CIR-aware initial and adaptive window placement
+Adaptive CIR placement is already implemented once per TPS frame. It estimates
+the main-lobe spread, moves the FFT anchor by at most four samples per update,
+and rebases the timing loop onto the window's average position.
 
-The FFT window should remain inside the guard interval with balanced pre- and
-post-ISI margins. The CIR estimate can provide a useful target such as the
-energy centroid or a robust central percentile of the impulse response.
+The remaining TODO is to validate guard-interval margins and the exact rebasing
+described in Section 5.1. The CIR placement path must remain separate from the
+sample-clock drift path: its target is a safe FFT window, not zero channel
+delay.
 
-The CIR placement path must remain separate from the sample-clock drift path:
-a deliberate CIR-window slide changes the measured pilot slope and must be
-rebased with its calibrated response. The target is a safe window location, not
-an assumption that the channel delay should be zero.
-
-### 5.3 A genuine second-order timing loop
+### 5.4 A genuine second-order timing loop (TODO)
 
 The present implementation filters timing differences and integrates them into
 integer window corrections. It handles approximately constant clock offset
 well, but it does not explicitly model changes in the drift rate.
 
-A future second-order loop can maintain:
+Prototype an opt-in loop that maintains:
 
-1. timing phase: the residual window-position error;
-2. timing frequency: the sample-clock offset or `shift` rate;
+1. timing phase: residual window-position error;
+2. timing frequency: sample-clock offset or `shift` rate;
 3. optionally, a very slow drift-rate estimate for thermal changes.
 
-The update gains must be much slower than the OFDM symbol loop and must be
-gated by pilot confidence. The CFO/NCO loop should remain a separate loop,
-with shared-reference correlation used only as a diagnostic or as a carefully
-validated feed-forward aid.
+The update gains must be much slower than the OFDM symbol loop and gated by
+pilot confidence. The CFO/NCO loop remains separate. Correlation caused by a
+shared hardware reference clock should first be measured as telemetry and only
+later considered as a carefully validated feed-forward input.
 
-### 5.4 Confidence-weighted timing updates
+### 5.5 Confidence-weighted timing updates (TODO)
 
-The current branch rejection is deliberately conservative. It can be improved
-by weighting timing updates using:
+The current branch rejection is deliberately conservative. Evaluate weighting
+or holding timing updates using scattered-pilot coverage, channel consistency,
+CIR confidence, fade indicator, MER, and post-Viterbi error indicators. A fade
+or rapidly changing multipath condition should slow or freeze the timing loop;
+genuine signal loss should still use re-acquisition.
 
-- scattered-pilot power and coverage;
-- channel-estimate consistency;
-- CIR stability;
-- continual-carrier quality or fade indicator;
-- recent MER and post-Viterbi error indicators.
+### 5.6 Timing and clock telemetry
 
-During a fade or a rapidly changing multipath condition, the timing loop should
-slow down or hold its last trusted state instead of following a low-confidence
-group-delay estimate. Re-acquisition remains the correct recovery mechanism
-when the signal is genuinely unavailable.
+The decoder now publishes these values independently for each statistics
+window without changing control behavior:
 
-### 5.5 Better timing diagnostics
+- latest raw pilot-slope timing and the accepted, unwrapped, filtered `tau`;
+- physical timing after CIR and cumulative-shift rebasing;
+- observed, feedback-corrected, and smoothed drift;
+- estimated sample-clock offset and actuator shift rate in ppm;
+- cumulative `shift` and fractional-timing accumulator;
+- timing measurement count, rejection count, and coverage confidence;
+- CIR offset and CIR peak-energy confidence;
+- tracked CFO, residual CFO, FEC state, and TS continuity.
 
-Future diagnostics should publish these values independently:
+The GUI surfaces filtered timing, SRO ppm, and timing confidence. Complete
+values are available in periodic diagnostics, `--decode-iq` output, and
+`AIRSPYTV_EVENT_DEBUG=1` timing events.
 
-- raw pilot-slope estimate;
-- unwrapped and filtered `tau`;
-- physical drift estimate after removing loop feedback;
-- cumulative `shift` and its rate;
-- fractional-timing accumulator;
-- pilot/CIR confidence;
-- CFO estimate and residual CFO;
-- FEC and TS continuity.
+## 6. Synthetic clock-drift fixtures
 
-This makes it possible to distinguish a real RF fade, sample-clock drift, LO
-drift, a pilot branch ambiguity, and a downstream FEC alignment problem.
+`tools/generate_dvbt_fixture.py` can inject sample-clock and LO impairments
+independently while its sidecar retains the nominal 10 MS/s decoder rate:
 
-## 6. Recommended implementation order
+- `--sample-clock-ppm` sets the initial receiver sample-clock offset;
+- `--sample-clock-drift-ppm-per-minute` applies a linear thermal-like change;
+- `--lo-offset-hz` sets an independent initial carrier offset;
+- `--lo-drift-hz-per-minute` applies an independent linear LO drift.
+
+The sample-clock impairment is a time warp and the LO impairment is a
+time-varying complex rotation. This permits independent, correlated, and
+deliberately conflicting clock trajectories. Fixtures should cover zero drift,
+both offset signs, slow ramps, and sample/LO combinations before any new loop
+is enabled by default.
+
+## 7. Recommended implementation order
 
 1. Keep the current robust tracker and full-capture replay as the regression
    baseline.
-2. Add timing residual, shift-rate, and confidence telemetry without changing
-   control behavior.
-3. Evaluate fractional-delay correction on the 545 MHz capture and synthetic
-   timing-offset fixtures.
-4. Evaluate CIR-aware window placement, including guard-interval margin checks.
-5. Prototype a second-order timing loop behind an opt-in configuration.
-6. Validate every change against the 545 MHz capture and the 557/581 MHz
-   multipath captures.
+2. Record the new telemetry on ideal, known-drift, 545 MHz, and 557/581 MHz
+   inputs; establish expected sign, gain, confidence, and ppm ranges.
+3. Complete the two bias validations in Section 5.1 and use exact CIR weighting
+   if the endpoint approximation produces measurable false drift.
+4. Add confidence gating as an isolated control change.
+5. Evaluate per-symbol and fractional-delay correction behind an opt-in
+   configuration.
+6. Prototype the second-order timing loop behind a separate opt-in
+   configuration; keep CFO control independent.
+7. Validate every change against all captures and synthetic fixtures before
+   changing the default.
 
-## 7. Acceptance criteria
+## 8. Acceptance criteria
 
 Any future timing-loop change should satisfy all of the following:
 
