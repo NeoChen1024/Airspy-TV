@@ -28,7 +28,8 @@ I/Q file       ─┘        │ copies CS16 blocks, no DSP
                          ▼ StreamDecoder (bounded input queue, ~200 ms)
         ┌─────────────────────────────────────────────────────────┐
         │ front-end thread (StreamDecoder::Impl::frontend_thread) │
-        │   Stage 1  StreamingResampler (one persistent filter)   │
+        │   Stage 1  StreamingResampler pool (persistent primary │
+        │            filter plus history-primed partitions)      │
         │   Stage 2  event-driven acquisition (first anchor only, │
         │            then long-fade / mode-change re-anchors)     │
         │   ring buffer of resampled samples (rate-sized ~0.2 s,  │
@@ -40,7 +41,7 @@ I/Q file       ─┘        │ copies CS16 blocks, no DSP
         │   Stage 3  continuous per-symbol loop: NCO, FFT,        │
         │            pilot/CFO tracking, channel, TPS (carried),  │
         │            payload extraction                           │
-        │   Stage 4  → SymbolPostprocessorPool (≈1/3 budget)      │
+        │   Stage 4  → SymbolPostprocessorPool (3/8 budget)       │
         │            gain, MER, reliability, Max-Log demap,       │
         │            symbol/bit deinterleave, depuncture,         │
         │            soft-byte quantization                       │
@@ -52,7 +53,7 @@ I/Q file       ─┘        │ copies CS16 blocks, no DSP
         │ FEC thread (StreamDecoder::Impl::fec_thread)            │
         │   stateful Decoder (region generations)                 │
         │   └─ Stage 5  TransportDecoder                          │
-        │        SoftViterbi pool (≈2/3 budget)                   │
+        │        SoftViterbi pool (3/8 budget)                    │
         │        12-branch byte deinterleaver                     │
         │        RS(204,188) → energy descrambler → TS packets    │
         └─────────────────────────────────────────────────────────┘
@@ -76,11 +77,12 @@ an input stream, and on receiver resets; those are reported out-of-band as
 | ------------------------------------------------------ | --------------------- | --------------- | ------------------------------------------------------------- |
 | `SdrDevice::airspy_rx_callback`                        | sdr.cpp               | libairspy-owned | copies one block to 4 bounded sinks                           |
 | `run_soapy` / `run_file`                               | sdr.cpp               | 1 each          | blocking read loop, same fan-out                              |
-| `StreamDecoder::Impl::frontend_thread`                 | stream_decoder.cpp    | 1, persistent   | resample, acquisition monitor, ring producer                  |
+| `StreamDecoder::Impl::frontend_thread`                 | stream_decoder.cpp    | 1, persistent   | convert, dispatch resampling, ring producer                   |
+| `StreamingResampler` pool                              | stream_decoder.cpp    | R ≈ N/4         | history-primed liquid-dsp FIR partitions                      |
 | `StreamDecoder::Impl::demod_thread`                    | stream_decoder.cpp    | 1, persistent   | continuous symbol loop, tracking, pool dispatch, MER gate     |
 | `StreamDecoder::Impl::fec_thread`                      | stream_decoder.cpp    | 1, persistent   | stateful FEC decode per region, callback                      |
-| `SymbolPostprocessorPool`                              | stream_decoder.cpp    | S ≈ N/3         | per-symbol postprocessing                                     |
-| `SoftViterbi` pool                                     | transport_decoder.cpp | V = N − S       | overlapping Viterbi windows                                   |
+| `SymbolPostprocessorPool`                              | stream_decoder.cpp    | S ≈ 3N/8        | per-symbol postprocessing                                     |
+| `SoftViterbi` pool                                     | transport_decoder.cpp | V ≈ 3N/8        | overlapping Viterbi windows                                   |
 | `SignalAnalyzer` worker                                | signal_analyzer.cpp   | 1               | one-symbol GUI monitor snapshot                               |
 | `RawIqRecorder` / `TransportStreamRecorder` writer     | recorder.cpp          | 1 each          | disk I/O, 5 s / 24 MiB buffers                                |
 
@@ -93,19 +95,24 @@ that never competes with the symbol pools.
 ## 3. Worker budget allocation
 
 `ReceiverParameters::worker_threads` (0 = auto) is the only knob. It is
-**fixed before a source opens**; changing it reconstructs both pools.
+**fixed before a source opens**; changing it reconstructs all three pools.
 
 `allocate_workers(total)` in stream_decoder.cpp:
 
 ```text
 total   = requested == 0 ? hardware_concurrency : requested
-if total <= 1             -> { symbol = 1, viterbi = 1 }
-symbol  = max(1, total / 3)          (SymbolPostprocessorPool)
-viterbi = max(1, total - symbol)     (SoftViterbi pool)
-resample workers = 1                 (streaming resampler is serial)
+if total <= 2             -> { resample = 1, symbol = 1, viterbi = 1 }
+resample = max(1, total / 4)         (StreamingResampler pool)
+remaining = total - resample
+symbol  = max(1, remaining / 2)      (SymbolPostprocessorPool)
+viterbi = max(1, remaining - symbol) (SoftViterbi pool)
 ```
 
-Example at 16 threads: resampler 1, symbol pool 5, Viterbi pool 11.
+This is exactly 2/8 resample + 3/8 symbol + 3/8 Viterbi for multiples of eight:
+8 threads become 2 + 3 + 3, and 16 become 4 + 6 + 6. Every stage retains at
+least one worker; after assigning the resampler quarter, an odd remaining
+worker goes to Viterbi. Budgets below three necessarily oversubscribe to keep
+all three stages operational.
 
 ## 4. Source paths (sdr.cpp)
 
@@ -147,14 +154,20 @@ incremented; the pipeline re-acquires cleanly instead of decoding garbage.
 ### 5.2 Stage 1 — streaming resampling (`StreamingResampler`)
 
 - Target rate is the DVB-T nominal baseband rate: `bandwidth × 8/7`.
-- One liquid-dsp `rresamp_crcf` rational resampler (`create_kaiser(p, q, 12,
-  −1, 60)` with `p = (bw×8)/gcd`, `q = (rate×7)/gcd`) whose polyphase filter
-  state and input accumulator carry across the whole capture. Input is
-  accumulated until a full decimation block is available, then executed in
-  blocks; there is no per-chunk filter reset, so the output is one continuous
-  stream (the old partitioned resampler re-warmed 16 filter states on every
-  7 M-sample chunk). Resampling is memory-bandwidth-bound, so the single
-  serial filter is both simpler and correct.
+- The pool contains R liquid-dsp `rresamp_crcf` filters (`create_kaiser(p, q,
+  12, -1, 60)` with `p = (bw*8)/gcd`, `q = (rate*7)/gcd`). The primary filter
+  processes partition 0 with state carried from the prior input block. Every
+  other partition resets its filter and primes it with the preceding `m*q`
+  input samples before writing directly into its disjoint output range. The
+  final partition's filter becomes the next primary filter, making the result
+  bit-identical to one serial continuous filter across input-block seams.
+- Only the incomplete decimation block (`< q` samples) and the rolling FIR
+  history (`m*q`, 420 samples for 10 Msps to 6 MHz DVB-T) are copied. Complete
+  blocks are processed directly from the caller's conversion buffer, and the
+  output uses overwrite storage without value initialization.
+- Inputs too small to provide at least 1024 decimation blocks per active worker
+  stay on the primary filter. This avoids pool synchronization overhead for
+  small live/test submissions without changing stream state.
 
 ### 5.3 Stage 2 — event-driven acquisition (`acquire_ofdm`)
 
@@ -411,21 +424,25 @@ pipeline stages. The demod window is ~400 symbols (~0.6 s):
 
 ```text
 demod_window_wall_time_ms / demod_busy_time_ms / demod_busy_fraction
-last_resample_block_time_ms / last_acquisition_time_ms
+last_frontend_block_wall_time_ms / last_frontend_convert_time_ms
+last_frontend_resample_time_ms / last_frontend_ring_copy_time_ms
+last_frontend_ring_wait_time_ms / last_acquisition_time_ms
 symbol_preprocess_work_time_ms / symbol_demap_work_time_ms
 symbol_deinterleave_work_time_ms
 symbol_depuncture_work_time_ms / fec_work_time_ms / transport_work_time_ms
 processing_realtime_ratio = wall_time / input_seconds
-resample_workers (1) / symbol_workers / viterbi_workers
+resample_workers / symbol_workers / viterbi_workers
 ```
 
 The demod values are elapsed wall/busy time for the serial demod thread. The
-`last_*` values describe one front-end event and do not cover the same window.
-Symbol values are aggregate work completed by the symbol pool, and FEC work is
-aggregate elapsed work in the FEC thread. Transport work is measured inside
-FEC work, so those values are a subset relationship, not values to add. Worker
-results can cross a demod statistics boundary because both pools are
-asynchronous.
+`last_frontend_*` values split one input block into conversion, pure liquid-dsp
+resampling, ring copy, and ring-space wait; block wall time also includes
+configuration and synchronization overhead. `last_acquisition_time_ms` is a
+separate demod event. Symbol values are aggregate work completed by the symbol
+pool, and FEC work is aggregate elapsed work in the FEC thread. Transport work
+is measured inside FEC work, so those values are a subset relationship, not
+values to add. Worker results can cross a demod statistics boundary because
+both pools are asynchronous.
 
 Quality counters: `mer_db`, pre/post-Viterbi BER (from survivor re-encoding and
 RS corrections), `rs_uncorrectable_packets`, `tei_packets`, `ts_packets`,

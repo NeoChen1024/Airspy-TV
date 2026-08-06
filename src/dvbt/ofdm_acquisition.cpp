@@ -1,4 +1,5 @@
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
+#include "airspy_tv/thread_name.hpp"
 
 #include <liquid.h>
 #include <volk/volk.h>
@@ -15,6 +16,7 @@
 #include <numeric>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -35,7 +37,11 @@ struct Cs16Resampler::Impl {
         workers.reserve(worker_count);
         try {
             for (std::size_t index = 0; index < worker_count; ++index) {
-                workers.emplace_back([this, index] { run(index); });
+                workers.emplace_back([this, index] {
+                    set_current_thread_name("an-resample-" +
+                                            std::to_string(index));
+                    run(index);
+                });
             }
         } catch (...) {
             stop_and_join();

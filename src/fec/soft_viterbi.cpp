@@ -1,4 +1,5 @@
 #include "airspy_tv/fec/soft_viterbi.hpp"
+#include "airspy_tv/thread_name.hpp"
 
 #if defined(AIRSPY_TV_USE_AVX2_VITERBI) && defined(__AVX2__)
 #include "viterbi/viterbi_decoder_core.h"
@@ -24,6 +25,7 @@ extern "C" {
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -57,7 +59,11 @@ struct SoftViterbi::Impl {
         workers_.reserve(worker_count_);
         try {
             for (std::size_t index = 0; index < worker_count_; ++index) {
-                workers_.emplace_back([this] { run_worker(); });
+                workers_.emplace_back([this, index] {
+                    set_current_thread_name("dvbt-vit-" +
+                                            std::to_string(index));
+                    run_worker();
+                });
             }
         } catch (...) {
             {

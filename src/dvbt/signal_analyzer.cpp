@@ -1,4 +1,5 @@
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
+#include "airspy_tv/thread_name.hpp"
 
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 
@@ -312,7 +313,11 @@ struct SignalAnalyzer::Impl {
     bool configuration_locked{};
     std::thread worker;
 
-    Impl() : worker([this] { run(); }) {}
+    Impl()
+        : worker([this] {
+              set_current_thread_name("dvbt-analyzer");
+              run();
+          }) {}
 
     Impl(const Impl &) = delete;
     Impl &operator=(const Impl &) = delete;

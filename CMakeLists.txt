@@ -42,6 +42,11 @@ set(BUILD_BENCHMARKS OFF CACHE BOOL "Disable liquid-dsp benchmarks" FORCE)
 set(BUILD_SHARED_LIBS ON CACHE BOOL "Build liquid-dsp shared library" FORCE)
 set(BUILD_STATIC_LIBS OFF CACHE BOOL "Disable liquid-dsp static library" FORCE)
 set(ENABLE_LOGGING OFF CACHE BOOL "Disable liquid-dsp logging" FORCE)
+# liquid-dsp controls call-site compilation separately from ENABLE_LOGGING.
+# Keep only exceptional fatal call sites so trace calls do not remain in DSP
+# inner loops as no-op logger invocations.
+set(LOGGING_LEVEL "fatal" CACHE STRING
+    "Compile only fatal liquid-dsp logging call sites" FORCE)
 add_subdirectory(contrib/liquid-dsp EXCLUDE_FROM_ALL)
 
 # libcorrect's legacy CMakeLists injects a private ASan flag whenever the

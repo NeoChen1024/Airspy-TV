@@ -51,12 +51,16 @@ struct StreamDecoderStats {
     float residual_carrier_offset_hz{};
     float processing_realtime_ratio{};
     // Timing scopes are deliberately explicit: wall/busy values describe the
-    // serial demod window, "last" values describe one front-end event, and
-    // worker values are aggregate work completed since the prior marker.
+    // serial demod window, frontend values describe the most recent input
+    // block, and worker values are aggregate work since the prior marker.
     float demod_busy_fraction{};
     float demod_window_wall_time_ms{};
     float demod_busy_time_ms{};
-    float last_resample_block_time_ms{};
+    float last_frontend_block_wall_time_ms{};
+    float last_frontend_convert_time_ms{};
+    float last_frontend_resample_time_ms{};
+    float last_frontend_ring_copy_time_ms{};
+    float last_frontend_ring_wait_time_ms{};
     float last_acquisition_time_ms{};
     float symbol_preprocess_work_time_ms{};
     float symbol_demap_work_time_ms{};

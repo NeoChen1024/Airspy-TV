@@ -2724,13 +2724,19 @@ int decode_iq_cli(const std::filesystem::path &source,
                 << " measurements=" << stats.timing_measurements
                 << " accepted=" << stats.timing_accepted_measurements
                 << " rejected=" << stats.timing_rejected_measurements << '\n';
-            std::cerr << "  pipeline: demod-wall="
+            std::cerr << "  pipeline: frontend-wall="
+                      << stats.last_frontend_block_wall_time_ms
+                      << " ms convert=" << stats.last_frontend_convert_time_ms
+                      << " ms resample=" << stats.last_frontend_resample_time_ms
+                      << " ms ring-copy="
+                      << stats.last_frontend_ring_copy_time_ms
+                      << " ms ring-wait="
+                      << stats.last_frontend_ring_wait_time_ms << " ms\n"
+                      << "            demod-wall="
                       << stats.demod_window_wall_time_ms
                       << " ms demod-busy=" << stats.demod_busy_time_ms << " ms ("
                       << stats.demod_busy_fraction * 100.0F
-                      << "%) last-resample-block="
-                      << stats.last_resample_block_time_ms
-                      << " ms last-acquisition="
+                      << "%) last-acquisition="
                       << stats.last_acquisition_time_ms << " ms; workers "
                       << "resample=" << stats.resample_workers
                       << " symbol=" << stats.symbol_workers

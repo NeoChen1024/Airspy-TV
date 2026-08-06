@@ -437,7 +437,7 @@ decode_in_blocks(const std::span<const std::int16_t> iq,
                             .guard_interval = GuardInterval::gi_1_4,
                             .constellation = Constellation::qpsk,
                             .code_rate = CodeRate::rate_1_2,
-                            .worker_threads = 4});
+                            .worker_threads = 8});
     decoder.set_transport_callback(
         [&result, &callback_mutex](const std::span<const std::uint8_t> output) {
             const std::scoped_lock lock(callback_mutex);
@@ -474,6 +474,10 @@ void test_8k_clean_signal() {
             "8K decoder selected wrong guard interval");
     require(result.stats.dropped_blocks == 0,
             "blocking synthetic input dropped blocks");
+    require(result.stats.resample_workers == 2 &&
+                result.stats.symbol_workers == 3 &&
+                result.stats.transport.viterbi_workers == 3,
+            "8-thread worker budget must split 2 resample + 3 symbol + 3 FEC");
     require(result.stats.timing_measurements > 0,
             "8K decoder did not publish timing measurements");
     require(result.stats.timing_measurements ==

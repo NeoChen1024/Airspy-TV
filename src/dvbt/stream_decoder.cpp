@@ -5,6 +5,7 @@
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
 #include "airspy_tv/dvbt/tps_decoder.hpp"
+#include "airspy_tv/thread_name.hpp"
 
 #include <fftw3.h>
 #include <liquid/liquid.h>
@@ -27,10 +28,13 @@
 #include <mutex>
 #include <numbers>
 #include <numeric>
+#include <new>
 #include <optional>
 #include <ranges>
 #include <span>
+#include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -411,6 +415,7 @@ struct PostprocessedSymbol {
 };
 
 struct WorkerAllocation {
+    std::size_t resample{};
     std::size_t symbol{};
     std::size_t viterbi{};
 };
@@ -420,11 +425,13 @@ allocate_workers(const std::size_t requested_threads) noexcept {
     const std::size_t total = requested_threads == 0
                                   ? default_viterbi_worker_count()
                                   : requested_threads;
-    if (total <= 1) {
-        return {1, 1};
+    if (total <= 2) {
+        return {1, 1, 1};
     }
-    const std::size_t symbol = std::max<std::size_t>(1, total / 3);
-    return {symbol, std::max<std::size_t>(1, total - symbol)};
+    const std::size_t resample = std::max<std::size_t>(1, total / 4);
+    const std::size_t remaining = total - resample;
+    const std::size_t symbol = std::max<std::size_t>(1, remaining / 2);
+    return {resample, symbol, std::max<std::size_t>(1, remaining - symbol)};
 }
 
 [[nodiscard]] std::size_t
@@ -471,7 +478,11 @@ class SymbolPostprocessorPool {
         workers_.reserve(worker_count_);
         try {
             for (std::size_t index = 0; index < worker_count_; ++index) {
-                workers_.emplace_back([this] { run_worker(); });
+                workers_.emplace_back([this, index] {
+                    set_current_thread_name("dvbt-sym-" +
+                                            std::to_string(index));
+                    run_worker();
+                });
             }
         } catch (...) {
             stop_and_join();
@@ -725,46 +736,113 @@ class SymbolPostprocessorPool {
     bool stopping_{};
 };
 
-// Single-threaded rational resampler with persistent filter state. The old
-// chunked pipeline recreated the filter (and its 16-worker partition) on every
-// 7M-sample chunk, forcing each chunk to re-warm the transient and re-run
-// acquisition; this object streams one continuous filter state across the
-// whole capture (resampling is memory-bandwidth-bound, so a thread split does
-// not help — one thread is the right granularity).
-class StreamingResampler {
+class OverwriteComplexBuffer {
   public:
-    ~StreamingResampler() {
-        if (filter_ != nullptr) {
-            rresamp_crcf_destroy(filter_);
+    ~OverwriteComplexBuffer() {
+        if (data_ != nullptr) {
+            volk_free(data_);
         }
     }
-    StreamingResampler() = default;
-    StreamingResampler(const StreamingResampler &) = delete;
-    StreamingResampler &operator=(const StreamingResampler &) = delete;
-    StreamingResampler(StreamingResampler &&other) noexcept {
+    OverwriteComplexBuffer() = default;
+    OverwriteComplexBuffer(const OverwriteComplexBuffer &) = delete;
+    OverwriteComplexBuffer &operator=(const OverwriteComplexBuffer &) = delete;
+    OverwriteComplexBuffer(OverwriteComplexBuffer &&other) noexcept {
         *this = std::move(other);
     }
-    StreamingResampler &operator=(StreamingResampler &&other) noexcept {
+    OverwriteComplexBuffer &operator=(OverwriteComplexBuffer &&other) noexcept {
         if (this != &other) {
-            if (filter_ != nullptr) {
-                rresamp_crcf_destroy(filter_);
+            if (data_ != nullptr) {
+                volk_free(data_);
             }
-            filter_ = other.filter_;
-            rate_ = other.rate_;
-            bandwidth_ = other.bandwidth_;
-            other.filter_ = nullptr;
+            data_ = std::exchange(other.data_, nullptr);
+            size_ = std::exchange(other.size_, 0);
+            capacity_ = std::exchange(other.capacity_, 0);
         }
         return *this;
     }
 
+    void resize_for_overwrite(const std::size_t size) {
+        static_assert(std::is_trivially_copyable_v<std::complex<float>> &&
+                      std::is_trivially_destructible_v<std::complex<float>>);
+        if (size > capacity_) {
+            auto *next = static_cast<std::complex<float> *>(volk_malloc(
+                sizeof(std::complex<float>) * size, volk_get_alignment()));
+            if (next == nullptr) {
+                throw std::bad_alloc{};
+            }
+            if (data_ != nullptr) {
+                volk_free(data_);
+            }
+            data_ = next;
+            capacity_ = size;
+        }
+        size_ = size;
+    }
+
+    [[nodiscard]] std::complex<float> *data() noexcept { return data_; }
+    [[nodiscard]] std::span<const std::complex<float>> view() const noexcept {
+        return {data_, size_};
+    }
+
+  private:
+    std::complex<float> *data_{};
+    std::size_t size_{};
+    std::size_t capacity_{};
+};
+
+// Parallel rational resampler with one persistent primary filter. Partition 0
+// carries the exact stream state across calls; the other filters are reset and
+// primed from the preceding m*Q input samples before processing their disjoint
+// ranges. This preserves the continuous serial result while allowing the FIR
+// work in a large input block to scale across cores.
+class StreamingResampler {
+  public:
+    explicit StreamingResampler(const std::size_t worker_count)
+        : worker_count_(std::max<std::size_t>(worker_count, 1)),
+          filters_(worker_count_, nullptr) {
+        workers_.reserve(worker_count_);
+        try {
+            for (std::size_t index = 0; index < worker_count_; ++index) {
+                workers_.emplace_back([this, index] {
+                    set_current_thread_name("dvbt-resamp-" +
+                                            std::to_string(index));
+                    run_worker(index);
+                });
+            }
+        } catch (...) {
+            stop_and_join();
+            throw;
+        }
+    }
+    ~StreamingResampler() {
+        stop_and_join();
+        destroy_filters();
+    }
+    StreamingResampler(const StreamingResampler &) = delete;
+    StreamingResampler &operator=(const StreamingResampler &) = delete;
+    StreamingResampler(StreamingResampler &&) = delete;
+    StreamingResampler &operator=(StreamingResampler &&) = delete;
+
+    [[nodiscard]] std::size_t worker_count() const noexcept {
+        return worker_count_;
+    }
+
+    void reset() {
+        destroy_filters();
+        rate_ = 0;
+        bandwidth_ = 0;
+        interpolation_ = 0;
+        decimation_ = 0;
+        residual_.clear();
+        history_.clear();
+        output_.resize_for_overwrite(0);
+    }
+
     void configure(const std::uint32_t rate, const std::uint32_t bandwidth) {
-        if (filter_ != nullptr && rate == rate_ && bandwidth == bandwidth_) {
+        if (configured() && rate == rate_ && bandwidth == bandwidth_) {
             return;
         }
-        if (filter_ != nullptr) {
-            rresamp_crcf_destroy(filter_);
-            filter_ = nullptr;
-        }
+        reset();
         // Nominal DVB-T output rate is bandwidth * 8 / 7 samples/second.
         const std::uint64_t interpolation =
             static_cast<std::uint64_t>(bandwidth) * 8U;
@@ -773,46 +851,80 @@ class StreamingResampler {
         const unsigned int p =
             static_cast<unsigned int>(interpolation / divisor);
         const unsigned int q = static_cast<unsigned int>(decimation / divisor);
-        filter_ = rresamp_crcf_create_kaiser(p, q, resampler_semi_length, -1.0F,
-                                             60.0F);
-        if (filter_ == nullptr) {
-            throw std::runtime_error("failed to create streaming resampler");
+        for (auto &filter : filters_) {
+            filter = rresamp_crcf_create_kaiser(p, q, resampler_semi_length,
+                                                -1.0F, 60.0F);
+            if (filter == nullptr) {
+                destroy_filters();
+                throw std::runtime_error(
+                    "failed to create streaming resampler");
+            }
         }
         rate_ = rate;
         bandwidth_ = bandwidth;
         interpolation_ = p;
         decimation_ = q;
-        accumulator_.clear();
+        residual_.clear();
+        residual_.reserve(decimation_);
+        history_.clear();
+        history_.reserve(resampler_semi_length * decimation_);
     }
 
-    // Consumes the input and appends the produced samples to `output`. The
-    // input is accumulated until a full decimation block is available, then
-    // executed through the persistent filter state (which carries the poly-
-    // phase delay line across calls, so the output is a continuous stream
-    // with no per-block transient). The residual input (< one block) stays
-    // in the accumulator for the next call.
-    void process(const std::span<const std::complex<float>> input,
-                 std::vector<std::complex<float>> &output) {
-        output.clear();
+    // Full decimation blocks are processed directly from the caller's input;
+    // only the short tail crossing a call boundary is copied into residual_.
+    // output_ is raw overwrite storage because liquid fills every output
+    // sample, avoiding std::vector's redundant value initialization.
+    [[nodiscard]] std::span<const std::complex<float>>
+    process(std::span<const std::complex<float>> input) {
         if (!configured()) {
-            return;
+            output_.resize_for_overwrite(0);
+            return {};
         }
-        accumulator_.insert(accumulator_.end(), input.begin(), input.end());
-        const std::size_t blocks = accumulator_.size() / decimation_;
+        const std::size_t blocks =
+            (residual_.size() + input.size()) / decimation_;
         if (blocks == 0) {
-            return;
+            residual_.insert(residual_.end(), input.begin(), input.end());
+            output_.resize_for_overwrite(0);
+            return {};
         }
-        output.resize(blocks * interpolation_);
-        rresamp_crcf_execute_block(filter_, accumulator_.data(),
-                                   static_cast<unsigned int>(blocks),
-                                   output.data());
-        accumulator_.erase(accumulator_.begin(),
-                           accumulator_.begin() + static_cast<std::ptrdiff_t>(
-                                                      blocks * decimation_));
+        if (blocks > std::numeric_limits<unsigned int>::max()) {
+            throw std::length_error("resampler block count exceeds liquid API");
+        }
+        output_.resize_for_overwrite(blocks * interpolation_);
+        std::size_t output_offset = 0;
+
+        if (!residual_.empty()) {
+            const std::size_t needed = decimation_ - residual_.size();
+            residual_.insert(residual_.end(), input.begin(),
+                             input.begin() +
+                                 static_cast<std::ptrdiff_t>(needed));
+            if (rresamp_crcf_execute_block(filters_.front(), residual_.data(),
+                                           1, output_.data()) != LIQUID_OK) {
+                throw std::runtime_error("streaming resampler boundary failed");
+            }
+            output_offset += interpolation_;
+            input = input.subspan(needed);
+            append_history(residual_);
+            residual_.clear();
+        }
+
+        const std::size_t direct_blocks = input.size() / decimation_;
+        if (direct_blocks != 0) {
+            process_direct(input.first(direct_blocks * decimation_),
+                           direct_blocks, output_.data() + output_offset);
+            output_offset += direct_blocks * interpolation_;
+            append_history(input.first(direct_blocks * decimation_));
+            input = input.subspan(direct_blocks * decimation_);
+        }
+        residual_.assign(input.begin(), input.end());
+        if (output_offset != blocks * interpolation_) {
+            throw std::logic_error("resampler output size mismatch");
+        }
+        return output_.view();
     }
 
     [[nodiscard]] bool configured() const noexcept {
-        return filter_ != nullptr;
+        return !filters_.empty() && filters_.front() != nullptr;
     }
     [[nodiscard]] std::uint32_t rate() const noexcept { return rate_; }
     [[nodiscard]] std::uint32_t bandwidth() const noexcept {
@@ -820,12 +932,195 @@ class StreamingResampler {
     }
 
   private:
-    rresamp_crcf filter_{};
+    static constexpr std::size_t minimum_partition_blocks = 1024;
+
+    void destroy_filters() noexcept {
+        for (auto &filter : filters_) {
+            if (filter != nullptr) {
+                rresamp_crcf_destroy(filter);
+                filter = nullptr;
+            }
+        }
+    }
+
+    void append_history(const std::span<const std::complex<float>> samples) {
+        const std::size_t capacity = resampler_semi_length * decimation_;
+        if (samples.size() >= capacity) {
+            history_.assign(samples.end() -
+                                static_cast<std::ptrdiff_t>(capacity),
+                            samples.end());
+            return;
+        }
+        if (history_.size() + samples.size() > capacity) {
+            const std::size_t discard =
+                history_.size() + samples.size() - capacity;
+            history_.erase(history_.begin(),
+                           history_.begin() +
+                               static_cast<std::ptrdiff_t>(discard));
+        }
+        history_.insert(history_.end(), samples.begin(), samples.end());
+    }
+
+    void process_direct(const std::span<const std::complex<float>> input,
+                        const std::size_t blocks,
+                        std::complex<float> *const output) {
+        const std::size_t active_workers = std::min(
+            worker_count_,
+            std::max<std::size_t>(1, blocks / minimum_partition_blocks));
+        if (active_workers == 1) {
+            if (rresamp_crcf_execute_block(
+                    filters_.front(),
+                    const_cast<std::complex<float> *>(input.data()),
+                    static_cast<unsigned int>(blocks), output) != LIQUID_OK) {
+                throw std::runtime_error("streaming resampler failed");
+            }
+            return;
+        }
+
+        {
+            const std::scoped_lock lock(worker_mutex_);
+            task_input_ = input.data();
+            task_output_ = output;
+            task_blocks_ = blocks;
+            task_active_workers_ = active_workers;
+            task_history_blocks_ = history_.size() / decimation_;
+            task_error_ = nullptr;
+            task_remaining_ = active_workers;
+            ++task_generation_;
+        }
+        task_ready_.notify_all();
+        std::unique_lock lock(worker_mutex_);
+        task_done_.wait(lock, [this] { return task_remaining_ == 0; });
+        if (task_error_ != nullptr) {
+            std::rethrow_exception(task_error_);
+        }
+        // The final partition owns the filter state at the end of this input
+        // range. Promote it to primary so the next process() call continues
+        // from exactly the same state as a serial resampler.
+        std::swap(filters_.front(), filters_[active_workers - 1]);
+    }
+
+    void run_worker(const std::size_t index) {
+        std::uint64_t seen_generation = 0;
+        while (true) {
+            const std::complex<float> *input = nullptr;
+            std::complex<float> *output = nullptr;
+            std::size_t blocks = 0;
+            std::size_t active_workers = 0;
+            std::size_t history_blocks = 0;
+            {
+                std::unique_lock lock(worker_mutex_);
+                task_ready_.wait(lock, [this, seen_generation] {
+                    return stopping_ || task_generation_ != seen_generation;
+                });
+                if (stopping_) {
+                    return;
+                }
+                seen_generation = task_generation_;
+                if (index >= task_active_workers_) {
+                    continue;
+                }
+                input = task_input_;
+                output = task_output_;
+                blocks = task_blocks_;
+                active_workers = task_active_workers_;
+                history_blocks = task_history_blocks_;
+            }
+
+            try {
+                const std::size_t begin = blocks * index / active_workers;
+                const std::size_t end = blocks * (index + 1) / active_workers;
+                auto filter = filters_[index];
+                if (index != 0) {
+                    if (rresamp_crcf_reset(filter) != LIQUID_OK) {
+                        throw std::runtime_error(
+                            "resampler partition reset failed");
+                    }
+                    const std::size_t current_history =
+                        std::min<std::size_t>(begin, resampler_semi_length);
+                    const std::size_t prior_history =
+                        std::min(history_blocks,
+                                 resampler_semi_length - current_history);
+                    for (std::size_t block = history_blocks - prior_history;
+                         block < history_blocks; ++block) {
+                        if (rresamp_crcf_write(
+                                filter, history_.data() +
+                                            block * decimation_) != LIQUID_OK) {
+                            throw std::runtime_error(
+                                "resampler history priming failed");
+                        }
+                    }
+                    for (std::size_t block = begin - current_history;
+                         block < begin; ++block) {
+                        if (rresamp_crcf_write(
+                                filter, const_cast<std::complex<float> *>(
+                                            input + block * decimation_)) !=
+                            LIQUID_OK) {
+                            throw std::runtime_error(
+                                "resampler partition priming failed");
+                        }
+                    }
+                }
+                if (rresamp_crcf_execute_block(
+                        filter,
+                        const_cast<std::complex<float> *>(input +
+                                                          begin * decimation_),
+                        static_cast<unsigned int>(end - begin),
+                        output + begin * interpolation_) != LIQUID_OK) {
+                    throw std::runtime_error("resampler partition failed");
+                }
+            } catch (...) {
+                const std::scoped_lock lock(worker_mutex_);
+                if (task_error_ == nullptr) {
+                    task_error_ = std::current_exception();
+                }
+            }
+
+            {
+                const std::scoped_lock lock(worker_mutex_);
+                --task_remaining_;
+                if (task_remaining_ == 0) {
+                    task_done_.notify_one();
+                }
+            }
+        }
+    }
+
+    void stop_and_join() noexcept {
+        {
+            const std::scoped_lock lock(worker_mutex_);
+            stopping_ = true;
+        }
+        task_ready_.notify_all();
+        for (auto &worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    const std::size_t worker_count_;
+    std::vector<rresamp_crcf> filters_;
+    std::vector<std::thread> workers_;
+    std::mutex worker_mutex_;
+    std::condition_variable task_ready_;
+    std::condition_variable task_done_;
+    const std::complex<float> *task_input_{};
+    std::complex<float> *task_output_{};
+    std::size_t task_blocks_{};
+    std::size_t task_active_workers_{};
+    std::size_t task_history_blocks_{};
+    std::size_t task_remaining_{};
+    std::uint64_t task_generation_{};
+    std::exception_ptr task_error_;
+    bool stopping_{};
     std::uint32_t rate_{};
     std::uint32_t bandwidth_{};
     std::size_t interpolation_{};
     std::size_t decimation_{};
-    std::vector<std::complex<float>> accumulator_;
+    std::vector<std::complex<float>> residual_;
+    std::vector<std::complex<float>> history_;
+    OverwriteComplexBuffer output_;
 };
 
 } // namespace
@@ -983,9 +1278,18 @@ struct StreamDecoder::Impl {
 
     Impl()
         : ring(ring_minimum_samples),
-          frontend_thread([this] { run_frontend(); }),
-          demod_thread([this] { run_demod(); }),
-          fec_thread([this] { run_fec(); }) {}
+          frontend_thread([this] {
+              set_current_thread_name("dvbt-frontend");
+              run_frontend();
+          }),
+          demod_thread([this] {
+              set_current_thread_name("dvbt-demod");
+              run_demod();
+          }),
+          fec_thread([this] {
+              set_current_thread_name("dvbt-fec");
+              run_fec();
+          }) {}
     ~Impl() {
         cancel_requested = true;
         {
@@ -1064,18 +1368,17 @@ struct StreamDecoder::Impl {
 
     // ------------------------------------------------------------------ //
     // Front-end thread: cs16 -> resampled cfloat -> ring, plus the rolling
-    // acquisition window. Runs independently of the demod so symbol extraction
-    // is never blocked behind resampling (or vice versa); the 16-way partition
-    // of the old resampler is gone because resampling is memory-bandwidth-
-    // bound and a single streaming filter state is both simpler and correct.
+    // acquisition window. Runs independently of the demod and dispatches large
+    // input blocks to a persistent resampler pool; partition 0 carries the
+    // continuous filter state across submissions.
     // ------------------------------------------------------------------ //
     void run_frontend() {
-        StreamingResampler resampler;
+        std::unique_ptr<StreamingResampler> resampler;
         std::vector<std::complex<float>> convert_buffer;
-        std::vector<std::complex<float>> resample_buffer;
         while (true) {
             Block block;
             bool close_ring = false;
+            std::size_t block_resample_workers = 1;
             {
                 std::unique_lock lock(mutex);
                 frontend_state.store(
@@ -1110,7 +1413,9 @@ struct StreamDecoder::Impl {
                     ++latest_generation;
                     current_bandwidth = 0;
                     demod_busy_time_sum_ms = 0.0;
-                    resampler = StreamingResampler{};
+                    if (resampler != nullptr) {
+                        resampler->reset();
+                    }
                     reset_frontend_state();
                     input_not_full.notify_all();
                     fec_not_full.notify_all();
@@ -1134,6 +1439,10 @@ struct StreamDecoder::Impl {
                     input_not_full.notify_one();
                     ++latest.input_blocks;
                     frontend_busy = true;
+                    block_resample_workers =
+                        allocate_workers(parameters.worker_threads).resample;
+                    frontend_state.store(
+                        static_cast<int>(WorkerState::processing));
                 }
             }
             if (close_ring) {
@@ -1143,6 +1452,13 @@ struct StreamDecoder::Impl {
                 continue;
             }
             if (!block.samples.empty()) {
+                const auto frontend_block_started_at =
+                    std::chrono::steady_clock::now();
+                if (resampler == nullptr ||
+                    resampler->worker_count() != block_resample_workers) {
+                    resampler = std::make_unique<StreamingResampler>(
+                        block_resample_workers);
+                }
                 // A flush followed by new submits resumes the same stream:
                 // reopen the ring so the demod continues past the seam.
                 if (ring_closed) {
@@ -1163,12 +1479,12 @@ struct StreamDecoder::Impl {
                         ring.resize(ring_capacity_for(block.rate));
                     }
                 }
-                if (resampler.configured() &&
-                    (resampler.rate() != block.rate ||
-                     resampler.bandwidth() != block.bandwidth)) {
+                if (resampler->configured() &&
+                    (resampler->rate() != block.rate ||
+                     resampler->bandwidth() != block.bandwidth)) {
                     // Retune: drop the filter state and invalidate the sync;
                     // the demod re-acquires itself on the new rate.
-                    resampler = StreamingResampler{};
+                    resampler->reset();
                     {
                         const std::scoped_lock lock(mutex);
                         current_bandwidth = block.bandwidth;
@@ -1185,18 +1501,22 @@ struct StreamDecoder::Impl {
                     }
                     ring_data.notify_all();
                 }
-                if (!resampler.configured()) {
-                    resampler.configure(block.rate, block.bandwidth);
+                if (!resampler->configured()) {
+                    resampler->configure(block.rate, block.bandwidth);
                 }
                 const std::size_t complex_count = block.samples.size() / 2;
+                const auto convert_started_at =
+                    std::chrono::steady_clock::now();
                 convert_buffer.resize(complex_count);
                 volk_16i_s32f_convert_32f(
                     reinterpret_cast<float *>(convert_buffer.data()),
                     block.samples.data(), input_scale,
                     static_cast<unsigned int>(complex_count * 2));
+                const float convert_time_ms = duration_ms(convert_started_at);
                 const auto resample_started_at =
                     std::chrono::steady_clock::now();
-                resampler.process(convert_buffer, resample_buffer);
+                const auto resampled = resampler->process(convert_buffer);
+                const float resample_time_ms = duration_ms(resample_started_at);
                 // Push to the ring incrementally: the ring (sized to ~0.2 s
                 // of the input rate) holds no more than a block, so each
                 // iteration pushes only what fits and waits for the demod to
@@ -1207,17 +1527,26 @@ struct StreamDecoder::Impl {
                 // flush then closes the ring and the demod drains what is
                 // there.
                 std::size_t pushed = 0;
-                while (pushed < resample_buffer.size()) {
+                float ring_wait_time_ms = 0.0F;
+                float ring_copy_time_ms = 0.0F;
+                while (pushed < resampled.size()) {
                     std::unique_lock lock(mutex);
                     frontend_state.store(
                         static_cast<int>(WorkerState::waiting_ring_space));
+                    const auto ring_wait_started_at =
+                        std::chrono::steady_clock::now();
                     ring_space.wait(lock, [this] {
                         return stopping || reset_requested || flush_requested ||
                                ring_write_pos - ring_read_pos < ring.size();
                     });
+                    ring_wait_time_ms += duration_ms(ring_wait_started_at);
                     if (stopping) {
+                        frontend_state.store(
+                            static_cast<int>(WorkerState::exited));
                         return;
                     }
+                    frontend_state.store(
+                        static_cast<int>(WorkerState::processing));
                     // Abandon the push only when the demod is genuinely not
                     // consuming (the ring is full AND it is not busy — the
                     // acquisition-retry stall): then the flush/reset would
@@ -1233,11 +1562,19 @@ struct StreamDecoder::Impl {
                     }
                     const std::size_t used = ring_write_pos - ring_read_pos;
                     const std::size_t chunk = std::min(
-                        ring.size() - used, resample_buffer.size() - pushed);
-                    for (std::size_t i = 0; i < chunk; ++i) {
-                        ring[(ring_write_pos + i) % ring.size()] =
-                            resample_buffer[pushed + i];
+                        ring.size() - used, resampled.size() - pushed);
+                    const auto ring_copy_started_at =
+                        std::chrono::steady_clock::now();
+                    const std::size_t write_index = ring_write_pos % ring.size();
+                    const std::size_t first =
+                        std::min(chunk, ring.size() - write_index);
+                    std::copy_n(resampled.data() + pushed, first,
+                                ring.data() + write_index);
+                    if (first < chunk) {
+                        std::copy_n(resampled.data() + pushed + first,
+                                    chunk - first, ring.data());
                     }
+                    ring_copy_time_ms += duration_ms(ring_copy_started_at);
                     ring_write_pos += chunk;
                     pushed += chunk;
                     ring_data.notify_all();
@@ -1245,8 +1582,12 @@ struct StreamDecoder::Impl {
                 {
                     const std::scoped_lock lock(mutex);
                     latest.processed_input_samples += complex_count;
-                    latest.last_resample_block_time_ms =
-                        duration_ms(resample_started_at);
+                    latest.last_frontend_block_wall_time_ms =
+                        duration_ms(frontend_block_started_at);
+                    latest.last_frontend_convert_time_ms = convert_time_ms;
+                    latest.last_frontend_resample_time_ms = resample_time_ms;
+                    latest.last_frontend_ring_copy_time_ms = ring_copy_time_ms;
+                    latest.last_frontend_ring_wait_time_ms = ring_wait_time_ms;
                     current_bandwidth = block.bandwidth;
                 }
             }
@@ -1279,7 +1620,7 @@ struct StreamDecoder::Impl {
             std::array<std::vector<std::size_t>, 4> pilot_indices;
             std::array<std::vector<std::size_t>, 4> payload_indices;
             std::optional<DecoderParameters> decoder_parameters;
-            WorkerAllocation workers{1, 1};
+            WorkerAllocation workers{1, 1, 1};
             SymbolPostprocessorPool *postprocessor = nullptr;
             struct PendingSymbol {
                 std::vector<std::complex<float>> payload;
@@ -2228,7 +2569,7 @@ struct StreamDecoder::Impl {
                 latest.symbol_depuncture_work_time_ms = depuncture_time_sum;
                 latest.last_acquisition_time_ms = acquisition_time_ms;
                 latest.symbol_workers = workers.symbol;
-                latest.resample_workers = 1;
+                latest.resample_workers = workers.resample;
                 latest.state_carried = last_reanchor_carried;
                 latest.fec_skipped = in_hopeless_region;
                 ++latest.processed_chunks;
