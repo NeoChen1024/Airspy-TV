@@ -50,19 +50,21 @@ struct StreamDecoderStats {
     float mer_db{};
     float residual_carrier_offset_hz{};
     float processing_realtime_ratio{};
-    // Fraction of the stats window the demod was actually busy processing
-    // symbols (busy wall time / window wall time), i.e. the pipeline CPU
-    // load. Unlike processing_realtime_ratio it is not clamped to ~1.0 by a
-    // live source feeding at real-time rate.
-    float cpu_load{};
-    float resample_time_ms{};
-    float acquisition_time_ms{};
-    float equalization_time_ms{};
-    float fec_time_ms{};
-    float demap_time_ms{};
-    float deinterleave_time_ms{};
-    float depuncture_time_ms{};
-    float transport_time_ms{};
+    // Timing scopes are deliberately explicit: wall/busy values describe the
+    // serial demod window, "last" values describe one front-end event, and
+    // worker values are aggregate work completed since the prior marker.
+    float demod_busy_fraction{};
+    float demod_window_wall_time_ms{};
+    float demod_busy_time_ms{};
+    float last_resample_block_time_ms{};
+    float last_acquisition_time_ms{};
+    float symbol_preprocess_work_time_ms{};
+    float symbol_demap_work_time_ms{};
+    float symbol_deinterleave_work_time_ms{};
+    float symbol_depuncture_work_time_ms{};
+    // FEC work includes transport work; these two values are not additive.
+    float fec_work_time_ms{};
+    float transport_work_time_ms{};
     std::size_t resample_workers{};
     std::size_t symbol_workers{};
     std::uint64_t pilot_phase_discontinuities{};

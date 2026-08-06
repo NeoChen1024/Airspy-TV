@@ -404,6 +404,7 @@ struct PostprocessedSymbol {
     std::vector<std::uint8_t> mother_metrics;
     std::size_t symbol_index{};
     float mer_db{};
+    float preprocess_time_ms{};
     float demap_time_ms{};
     float deinterleave_time_ms{};
     float depuncture_time_ms{};
@@ -539,6 +540,7 @@ class SymbolPostprocessorPool {
     };
 
     [[nodiscard]] PostprocessedSymbol process(Task task) const {
+        const auto preprocess_started_at = std::chrono::steady_clock::now();
         std::vector<std::complex<float>> nearest(task.carriers.size());
         for (int iteration = 0; iteration < 2; ++iteration) {
             reference_.slice_nearest(task.carriers, nearest);
@@ -621,6 +623,10 @@ class SymbolPostprocessorPool {
                 .symbol_index = task.symbol_index,
                 .mer_db = static_cast<float>(
                     -10.0 * std::log10(std::max(mean_error, 1.0e-12))),
+                .preprocess_time_ms =
+                    std::chrono::duration<float, std::milli>(
+                        demap_started_at - preprocess_started_at)
+                        .count(),
                 .demap_time_ms = std::chrono::duration<float, std::milli>(
                                      deinterleave_started_at - demap_started_at)
                                      .count(),
@@ -953,7 +959,7 @@ struct StreamDecoder::Impl {
     // Demod symbol-processing wall time accumulated over the current stats
     // window (written by the demod thread, consumed by publish_stats_window
     // on the same thread).
-    double window_busy_ms{};
+    double demod_busy_time_sum_ms{};
     bool stopping{};
     bool reset_requested{};
     bool flush_requested{};
@@ -1103,7 +1109,7 @@ struct StreamDecoder::Impl {
                     latest = {};
                     ++latest_generation;
                     current_bandwidth = 0;
-                    window_busy_ms = 0.0;
+                    demod_busy_time_sum_ms = 0.0;
                     resampler = StreamingResampler{};
                     reset_frontend_state();
                     input_not_full.notify_all();
@@ -1239,7 +1245,8 @@ struct StreamDecoder::Impl {
                 {
                     const std::scoped_lock lock(mutex);
                     latest.processed_input_samples += complex_count;
-                    latest.resample_time_ms = duration_ms(resample_started_at);
+                    latest.last_resample_block_time_ms =
+                        duration_ms(resample_started_at);
                     current_bandwidth = block.bandwidth;
                 }
             }
@@ -1316,6 +1323,7 @@ struct StreamDecoder::Impl {
             int lock_hold = 0;
             std::uint64_t window_symbol_count = 0;
             double mer_sum = 0.0;
+            float preprocess_time_sum = 0.0F;
             float demap_time_sum = 0.0F;
             float deinterleave_time_sum = 0.0F;
             float depuncture_time_sum = 0.0F;
@@ -1331,7 +1339,7 @@ struct StreamDecoder::Impl {
             float fade_indicator = 1.0F;
             // Wall-clock start of the current symbol's processing segment
             // (FFT through payload), for the CPU-load estimate.
-            std::chrono::steady_clock::time_point symbol_busy_start{};
+            std::chrono::steady_clock::time_point demod_busy_started_at{};
             // Closed-loop sample-clock tracking: the windowed mean tau is
             // dominated by the channel's mean group delay (multipath) plus a
             // slow sample-clock drift, so a P-loop on the absolute value
@@ -1785,6 +1793,7 @@ struct StreamDecoder::Impl {
                                                batch) {
                 for (auto &symbol : batch) {
                     mer_sum += symbol.mer_db;
+                    preprocess_time_sum += symbol.preprocess_time_ms;
                     demap_time_sum += symbol.demap_time_ms;
                     deinterleave_time_sum += symbol.deinterleave_time_ms;
                     depuncture_time_sum += symbol.depuncture_time_ms;
@@ -2203,21 +2212,21 @@ struct StreamDecoder::Impl {
                     input_seconds > 0.0F
                         ? (window_wall / 1000.0F) / input_seconds
                         : 0.0F;
-                // CPU load: the demod's busy time inside the wall-clock
-                // window. Unlike processing_realtime_ratio it is not pinned
-                // near 1.0 by a live source feeding at real-time rate — busy
-                // time only accumulates while symbols are actually processed.
-                latest.cpu_load =
+                latest.demod_busy_fraction =
                     window_wall > 0.0F
                         ? static_cast<float>(
-                              window_busy_ms / static_cast<double>(window_wall))
+                              demod_busy_time_sum_ms /
+                              static_cast<double>(window_wall))
                         : 0.0F;
-                window_busy_ms = 0.0;
-                latest.equalization_time_ms = window_wall;
-                latest.demap_time_ms = demap_time_sum;
-                latest.deinterleave_time_ms = deinterleave_time_sum;
-                latest.depuncture_time_ms = depuncture_time_sum;
-                latest.acquisition_time_ms = acquisition_time_ms;
+                latest.demod_window_wall_time_ms = window_wall;
+                latest.demod_busy_time_ms =
+                    static_cast<float>(demod_busy_time_sum_ms);
+                demod_busy_time_sum_ms = 0.0;
+                latest.symbol_preprocess_work_time_ms = preprocess_time_sum;
+                latest.symbol_demap_work_time_ms = demap_time_sum;
+                latest.symbol_deinterleave_work_time_ms = deinterleave_time_sum;
+                latest.symbol_depuncture_work_time_ms = depuncture_time_sum;
+                latest.last_acquisition_time_ms = acquisition_time_ms;
                 latest.symbol_workers = workers.symbol;
                 latest.resample_workers = 1;
                 latest.state_carried = last_reanchor_carried;
@@ -2413,7 +2422,7 @@ struct StreamDecoder::Impl {
                     }
                     demod_state.store(
                         static_cast<int>(WorkerState::processing));
-                    symbol_busy_start = std::chrono::steady_clock::now();
+                    demod_busy_started_at = std::chrono::steady_clock::now();
                     {
                         const std::scoped_lock lock(mutex);
                         ring_read_pos = needed;
@@ -3070,6 +3079,7 @@ struct StreamDecoder::Impl {
                             window_symbol_count = 0;
                             window_cir_offset_sum = 0.0;
                             mer_sum = 0.0;
+                            preprocess_time_sum = 0.0F;
                             demap_time_sum = 0.0F;
                             deinterleave_time_sum = 0.0F;
                             depuncture_time_sum = 0.0F;
@@ -3079,7 +3089,8 @@ struct StreamDecoder::Impl {
                             timing_raw_count = 0;
                             timing_rejected_count = 0;
                         }
-                        window_busy_ms += duration_ms(symbol_busy_start);
+                        demod_busy_time_sum_ms +=
+                            duration_ms(demod_busy_started_at);
                         continue;
                     }
                     if (postprocessor == nullptr) {
@@ -3125,7 +3136,8 @@ struct StreamDecoder::Impl {
                     ++symbol_count;
                     ++window_symbol_count;
                     advance_symbol();
-                    window_busy_ms += duration_ms(symbol_busy_start);
+                    demod_busy_time_sum_ms +=
+                        duration_ms(demod_busy_started_at);
                     if (window_symbol_count >= stats_window_symbols) {
                         publish_stats_window();
                         static_cast<void>(
@@ -3138,6 +3150,7 @@ struct StreamDecoder::Impl {
                         window_symbol_count = 0;
                         window_cir_offset_sum = 0.0;
                         mer_sum = 0.0;
+                        preprocess_time_sum = 0.0F;
                         demap_time_sum = 0.0F;
                         deinterleave_time_sum = 0.0F;
                         depuncture_time_sum = 0.0F;
@@ -3217,6 +3230,7 @@ struct StreamDecoder::Impl {
                     window_symbol_count = 0;
                     window_cir_offset_sum = 0.0;
                     mer_sum = 0.0;
+                    preprocess_time_sum = 0.0F;
                     demap_time_sum = 0.0F;
                     deinterleave_time_sum = 0.0F;
                     depuncture_time_sum = 0.0F;
@@ -3365,10 +3379,10 @@ struct StreamDecoder::Impl {
                     decoder_transport_time_ms = total_transport_time_ms;
                     const std::scoped_lock guard(mutex);
                     if (item.generation == latest_generation) {
-                        latest.fec_time_ms = fec_work_ms;
+                        latest.fec_work_time_ms = fec_work_ms;
                         latest.transport_bytes += window_transport_bytes;
                         latest.transport = decoder->stats();
-                        latest.transport_time_ms = window_transport_time_ms;
+                        latest.transport_work_time_ms = window_transport_time_ms;
                     }
                     fec_work_ms = 0.0F;
                     window_transport_bytes = 0;
@@ -3382,10 +3396,10 @@ struct StreamDecoder::Impl {
                     decoder_transport_time_ms = total_transport_time_ms;
                     const std::scoped_lock guard(mutex);
                     if (item.generation == latest_generation) {
-                        latest.fec_time_ms = fec_work_ms;
+                        latest.fec_work_time_ms = fec_work_ms;
                         latest.transport_bytes += window_transport_bytes;
                         latest.transport = decoder->stats();
-                        latest.transport_time_ms = window_transport_time_ms;
+                        latest.transport_work_time_ms = window_transport_time_ms;
                     }
                     fec_work_ms = 0.0F;
                     window_transport_bytes = 0;

@@ -1743,11 +1743,12 @@ void draw_sidebar(AppState &state) {
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(value.c_str());
             };
-            cell("Load",
-                 state.decoder.cpu_load > 0.0F
+            cell("Demod",
+                 state.decoder.demod_busy_fraction > 0.0F
                      ? std::format("{:.0f}% busy",
-                                   std::clamp(state.decoder.cpu_load * 100.0F,
-                                              0.0F, 999.0F))
+                                   std::clamp(
+                                       state.decoder.demod_busy_fraction * 100.0F,
+                                       0.0F, 999.0F))
                      : std::string{"Measuring"});
             cell("Threads",
                  std::format("{} / {} / {}",
@@ -2682,7 +2683,8 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << " bytes diag=[fe=" << worker_state_name(stats.frontend_state)
                   << " dm=" << worker_state_name(stats.demod_state)
                   << " fec=" << worker_state_name(stats.fec_state)
-                  << " cpu=" << static_cast<int>(stats.cpu_load * 100.0F)
+                  << " dm-busy="
+                  << static_cast<int>(stats.demod_busy_fraction * 100.0F)
                   << "% ring=" << stats.ring_used_samples << "/"
                   << stats.ring_capacity_samples << "]"
                   << " realtime-speed=" << realtime_speed << "x";
@@ -2722,17 +2724,27 @@ int decode_iq_cli(const std::filesystem::path &source,
                 << " measurements=" << stats.timing_measurements
                 << " accepted=" << stats.timing_accepted_measurements
                 << " rejected=" << stats.timing_rejected_measurements << '\n';
-            std::cerr << "  stages: resample=" << stats.resample_time_ms
-                      << " ms acquisition=" << stats.acquisition_time_ms
-                      << " ms equalization=" << stats.equalization_time_ms
-                      << " ms FEC=" << stats.fec_time_ms << " ms; workers "
+            std::cerr << "  pipeline: demod-wall="
+                      << stats.demod_window_wall_time_ms
+                      << " ms demod-busy=" << stats.demod_busy_time_ms << " ms ("
+                      << stats.demod_busy_fraction * 100.0F
+                      << "%) last-resample-block="
+                      << stats.last_resample_block_time_ms
+                      << " ms last-acquisition="
+                      << stats.last_acquisition_time_ms << " ms; workers "
                       << "resample=" << stats.resample_workers
                       << " symbol=" << stats.symbol_workers
                       << " Viterbi=" << stats.transport.viterbi_workers << '\n';
-            std::cerr << "  FEC detail: demap=" << stats.demap_time_ms
-                      << " ms deinterleave=" << stats.deinterleave_time_ms
-                      << " ms depuncture/quantize=" << stats.depuncture_time_ms
-                      << " ms transport=" << stats.transport_time_ms << " ms\n";
+            std::cerr << "  worker work (aggregate): symbol-preprocess="
+                      << stats.symbol_preprocess_work_time_ms
+                      << " ms symbol-demap=" << stats.symbol_demap_work_time_ms
+                      << " ms symbol-deinterleave="
+                      << stats.symbol_deinterleave_work_time_ms
+                      << " ms symbol-depuncture/quantize="
+                      << stats.symbol_depuncture_work_time_ms
+                      << " ms FEC=" << stats.fec_work_time_ms
+                      << " ms (transport subset="
+                      << stats.transport_work_time_ms << " ms)\n";
             std::cerr << "  TPS: " << (stats.tps_locked ? "locked" : "unlocked")
                       << '\n';
             if (stats.transport.pre_viterbi_compared_bits != 0) {
@@ -2892,7 +2904,8 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
               << " sroready=" << (stats.timing_drift_ready ? 1 : 0)
               << " fec-skip=" << stats.fec_skipped
               << " drop=" << stats.dropped_blocks
-              << " cpu=" << static_cast<int>(stats.cpu_load * 100.0F) << "%";
+              << " dm-busy="
+              << static_cast<int>(stats.demod_busy_fraction * 100.0F) << "%";
     if (stats.processing_realtime_ratio > 0.0F) {
         std::cerr << " rt=" << (1.0F / stats.processing_realtime_ratio) << "x";
     }

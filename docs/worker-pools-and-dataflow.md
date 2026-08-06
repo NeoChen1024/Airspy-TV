@@ -406,16 +406,26 @@ latency).
 
 ## 9. Diagnostics (`StreamDecoderStats`)
 
-Per-window stage timings (visible in the GUI "Signal Quality" panel and via
-`--decode-iq -d`); a window is ~400 symbols (~0.6 s):
+Timing telemetry is grouped by scope instead of being presented as additive
+pipeline stages. The demod window is ~400 symbols (~0.6 s):
 
 ```text
-resample_time_ms / acquisition_time_ms / equalization_time_ms
-demap_time_ms / deinterleave_time_ms / depuncture_time_ms   (summed over symbols)
-fec_time_ms / transport_time_ms
+demod_window_wall_time_ms / demod_busy_time_ms / demod_busy_fraction
+last_resample_block_time_ms / last_acquisition_time_ms
+symbol_preprocess_work_time_ms / symbol_demap_work_time_ms
+symbol_deinterleave_work_time_ms
+symbol_depuncture_work_time_ms / fec_work_time_ms / transport_work_time_ms
 processing_realtime_ratio = wall_time / input_seconds
 resample_workers (1) / symbol_workers / viterbi_workers
 ```
+
+The demod values are elapsed wall/busy time for the serial demod thread. The
+`last_*` values describe one front-end event and do not cover the same window.
+Symbol values are aggregate work completed by the symbol pool, and FEC work is
+aggregate elapsed work in the FEC thread. Transport work is measured inside
+FEC work, so those values are a subset relationship, not values to add. Worker
+results can cross a demod statistics boundary because both pools are
+asynchronous.
 
 Quality counters: `mer_db`, pre/post-Viterbi BER (from survivor re-encoding and
 RS corrections), `rs_uncorrectable_packets`, `tei_packets`, `ts_packets`,
