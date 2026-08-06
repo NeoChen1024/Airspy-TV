@@ -1,13 +1,9 @@
 #include "airspy_tv/fec/outer_fec.hpp"
 #include "airspy_tv/debug.hpp"
-
-extern "C" {
-#include <correct.h>
-}
+#include "airspy_tv/fec/reed_solomon.hpp"
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -63,51 +59,6 @@ class ByteDeinterleaver {
   private:
     std::array<std::deque<std::uint8_t>, outer_interleaver_branches> queues_;
     std::size_t branch_{};
-};
-
-class ReedSolomon {
-  public:
-    ReedSolomon() {
-        codec_ = correct_reed_solomon_create(
-            correct_rs_primitive_polynomial_8_4_3_2_0, 0, 1, 16);
-        if (codec_ == nullptr) {
-            throw std::runtime_error("failed to create DVB Reed-Solomon");
-        }
-    }
-
-    ~ReedSolomon() {
-        if (codec_ != nullptr) {
-            correct_reed_solomon_destroy(codec_);
-        }
-    }
-
-    ReedSolomon(const ReedSolomon &) = delete;
-    ReedSolomon &operator=(const ReedSolomon &) = delete;
-
-    [[nodiscard]] bool decode(const std::span<const std::uint8_t> encoded,
-                              const std::span<std::uint8_t> decoded,
-                              std::uint64_t *corrected_payload_bits = nullptr) {
-        if (encoded.size() != rs_packet_size ||
-            decoded.size() != ts_packet_size) {
-            throw std::invalid_argument("DVB RS block size mismatch");
-        }
-        const bool valid =
-            correct_reed_solomon_decode(codec_, encoded.data(), encoded.size(),
-                                        decoded.data()) ==
-            static_cast<ssize_t>(decoded.size());
-        if (valid && corrected_payload_bits != nullptr) {
-            *corrected_payload_bits = 0;
-            for (std::size_t index = 0; index < decoded.size(); ++index) {
-                *corrected_payload_bits += static_cast<std::uint64_t>(
-                    std::popcount(static_cast<unsigned int>(encoded[index] ^
-                                                            decoded[index])));
-            }
-        }
-        return valid;
-    }
-
-  private:
-    correct_reed_solomon *codec_{};
 };
 
 class EnergyDescrambler {
@@ -228,7 +179,7 @@ struct AlignmentEvidence {
 
 [[nodiscard]] AlignmentEvidence
 find_rs_alignment(const std::span<const std::uint8_t> bytes,
-                  ReedSolomon &reed_solomon) {
+                  DvbReedSolomon &reed_solomon) {
     constexpr std::size_t required_packets = 16;
     constexpr std::size_t required_bytes = required_packets * rs_packet_size;
     if (bytes.size() < required_bytes) {
@@ -583,7 +534,7 @@ struct OuterFec::Impl {
     std::array<std::vector<std::uint8_t>, outer_interleaver_branches>
         outer_candidates;
     std::size_t selected_outer_phase{outer_interleaver_branches};
-    ReedSolomon reed_solomon;
+    DvbReedSolomon reed_solomon;
     EnergyDescrambler energy_descrambler;
     std::vector<std::uint8_t> rs_bytes;
     OuterFecStats statistics;

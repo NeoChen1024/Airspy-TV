@@ -17,9 +17,9 @@ cross-cutting cleanup is in
   `Demodulator` boundary.
 - The DVB-T path supports 2K/8K, guard intervals 1/4 through 1/32, QPSK,
   16-QAM, 64-QAM, and all non-hierarchical convolutional code rates.
-- Continuous resampling, OFDM acquisition/tracking, symbol workers, AVX2
-  Viterbi workers with a portable libcorrect fallback, outer FEC, and MPEG-TS
-  output are integrated in `dvbt::StreamDecoder`.
+- Continuous resampling, OFDM acquisition/tracking, symbol workers,
+  ViterbiDecoderCpp workers with a portable scalar fallback, outer FEC, and
+  MPEG-TS output are integrated in `dvbt::StreamDecoder`.
 - Playback, TS recording, service discovery, now/next EPG, and common signal
   and pipeline snapshots run in process.
 - `ReceiverSession` owns source and demodulator lifecycle. Common GUI panels
@@ -62,7 +62,7 @@ transport/playback observability, portability, and new-standard DSP.
 
 - Run full ASan/UBSan/LSan validation after substantial pipeline changes.
 - Extend ThreadSanitizer lifecycle stress beyond deterministic short cases.
-- Exercise portable non-AVX builds regularly so the libcorrect fallback does
+- Exercise portable non-AVX builds regularly so the scalar Viterbi backend does
   not silently regress.
 - Maintain explicit optimized-debug, assertion-debug, portable-release, and
   sanitizer build configurations.

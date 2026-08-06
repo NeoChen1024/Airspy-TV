@@ -49,60 +49,28 @@ set(LOGGING_LEVEL "fatal" CACHE STRING
     "Compile only fatal liquid-dsp logging call sites" FORCE)
 add_subdirectory(contrib/liquid-dsp EXCLUDE_FROM_ALL)
 
-# libcorrect's legacy CMakeLists injects a private ASan flag whenever the
-# enclosing build type is Debug, without propagating the ASan runtime to its
-# consumers. Isolate that subproject policy while keeping Airspy TV's own
-# selected build type unchanged.
-set(AIRSPY_TV_BUILD_TYPE "${CMAKE_BUILD_TYPE}")
-set(CMAKE_BUILD_TYPE Release)
-# libcorrect caches a failed SIMD probe across build-policy changes. Re-run it
-# so an existing Debug tree does not remain permanently pinned to scalar
-# Viterbi after switching to optimized Debug flags.
-unset(HAVE_SSE)
-unset(HAVE_SSE CACHE)
-add_subdirectory(contrib/libcorrect EXCLUDE_FROM_ALL)
-set(CMAKE_BUILD_TYPE "${AIRSPY_TV_BUILD_TYPE}")
-unset(AIRSPY_TV_BUILD_TYPE)
+add_subdirectory(contrib/libfec EXCLUDE_FROM_ALL)
 
-# ViterbiDecoderCpp (LGPL-2.1, header-only) AVX2 soft Viterbi backend. The
-# decoder type is a compile-time template choice; its AVX2 intrinsics require
-# -mavx2 (implied by the default AIRSPY_TV_NATIVE_ARCH=-march=native). When
-# AVX2 is unavailable at compile time, soft_viterbi.cpp falls back to
-# libcorrect's convolutional decoder automatically.
-option(AIRSPY_TV_USE_AVX2_VITERBI
-       "Use ViterbiDecoderCpp AVX2 for the soft Viterbi decoder" ON)
-if(AIRSPY_TV_USE_AVX2_VITERBI)
-    add_library(viterbi-decoder INTERFACE)
-    target_include_directories(viterbi-decoder SYSTEM INTERFACE
-        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/viterbi-decoder-cpp/include")
-    target_compile_features(viterbi-decoder INTERFACE cxx_std_17)
-    # The AVX2 intrinsics only compile when the translation unit is built with
-    # -mavx2 (implied by the default -march=native). Warn when the current
-    # target cannot provide it, so the silent libcorrect fallback in
-    # soft_viterbi.cpp is not mistaken for an AVX2 build. try_compile does not
-    # inherit add_compile_options, so mirror the TU's actual flags here.
-    include(CheckCXXSourceCompiles)
-    unset(AIRSPY_TV_HAVE_AVX2)
-    unset(AIRSPY_TV_HAVE_AVX2 CACHE)
-    set(_airspy_tv_check_flags "")
-    if(AIRSPY_TV_NATIVE_ARCH AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        # Mirror the TU's actual flags: with -march=native the probe result
-        # matches what soft_viterbi.cpp sees via __AVX2__, including on hosts
-        # whose CPU lacks AVX2 (where the TU silently falls back).
-        set(_airspy_tv_check_flags "-march=native")
-    endif()
-    set(CMAKE_REQUIRED_FLAGS "${_airspy_tv_check_flags}")
-    check_cxx_source_compiles("
-        #include <immintrin.h>
-        int main() { __m256i x = _mm256_setzero_si256(); (void)x; return 0; }
-    " AIRSPY_TV_HAVE_AVX2)
-    unset(CMAKE_REQUIRED_FLAGS)
-    if(NOT AIRSPY_TV_HAVE_AVX2)
-        message(WARNING "AIRSPY_TV_USE_AVX2_VITERBI is ON but the compiler "
-                        "target lacks AVX2 (e.g. AIRSPY_TV_NATIVE_ARCH=OFF); "
-                        "soft_viterbi.cpp will fall back to libcorrect.")
-    endif()
+# ViterbiDecoderCpp (LGPL-2.1, header-only) provides AVX2, SSE4.1, AArch64
+# NEON, and scalar soft-Viterbi backends selected at compile time.
+add_library(viterbi-decoder INTERFACE)
+target_include_directories(viterbi-decoder SYSTEM INTERFACE
+    "${CMAKE_CURRENT_SOURCE_DIR}/contrib/viterbi-decoder-cpp/include")
+target_compile_features(viterbi-decoder INTERFACE cxx_std_17)
+
+# Migrate the old AVX2-specific option when reusing an existing build tree.
+set(_airspy_tv_simd_viterbi_default ON)
+if(DEFINED AIRSPY_TV_USE_AVX2_VITERBI AND
+   NOT DEFINED AIRSPY_TV_USE_SIMD_VITERBI)
+    set(_airspy_tv_simd_viterbi_default
+        "${AIRSPY_TV_USE_AVX2_VITERBI}")
+    message(DEPRECATION "AIRSPY_TV_USE_AVX2_VITERBI is deprecated; use "
+                        "AIRSPY_TV_USE_SIMD_VITERBI")
 endif()
+option(AIRSPY_TV_USE_SIMD_VITERBI
+       "Use available ViterbiDecoderCpp SIMD for soft Viterbi"
+       "${_airspy_tv_simd_viterbi_default}")
+unset(_airspy_tv_simd_viterbi_default)
 
 set(TINYCOLORMAP_BUILD_TOOLS OFF CACHE INTERNAL
     "Disable tinycolormap optional tools")
@@ -132,17 +100,15 @@ target_link_libraries(imgui PUBLIC SDL3::SDL3 OpenGL::GL)
 add_library(airspy-tv-common STATIC
     src/debug.cpp
     src/fec/outer_fec.cpp
+    src/fec/reed_solomon.cpp
     src/fec/soft_viterbi.cpp
 )
 target_include_directories(airspy-tv-common PUBLIC include)
-target_include_directories(airspy-tv-common SYSTEM PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libcorrect/include")
 target_link_libraries(airspy-tv-common PUBLIC Threads::Threads
-    PRIVATE correct_static)
-if(AIRSPY_TV_USE_AVX2_VITERBI)
-    target_link_libraries(airspy-tv-common PRIVATE viterbi-decoder)
+    PRIVATE libfec::rs viterbi-decoder)
+if(AIRSPY_TV_USE_SIMD_VITERBI)
     target_compile_definitions(airspy-tv-common PRIVATE
-        AIRSPY_TV_USE_AVX2_VITERBI=1)
+        AIRSPY_TV_USE_SIMD_VITERBI=1)
 endif()
 
 add_library(airspy-tv-dvbt STATIC
@@ -208,13 +174,21 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME dvbt-inner-decoder COMMAND dvbt-inner-decoder-test)
 
+    add_executable(reed-solomon-test
+        tests/reed_solomon_test.cpp
+    )
+    target_link_libraries(reed-solomon-test PRIVATE airspy-tv-common)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(reed-solomon-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME reed-solomon COMMAND reed-solomon-test)
+
     add_executable(dvbt-transport-decoder-test
         tests/dvbt_transport_decoder_test.cpp
     )
-    target_include_directories(dvbt-transport-decoder-test SYSTEM PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libcorrect/include")
     target_link_libraries(dvbt-transport-decoder-test PRIVATE
-        airspy-tv-dvbt correct_static)
+        airspy-tv-dvbt)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(dvbt-transport-decoder-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -224,10 +198,8 @@ if(BUILD_TESTING)
     add_executable(dvbt-stream-decoder-test
         tests/dvbt_stream_decoder_test.cpp
     )
-    target_include_directories(dvbt-stream-decoder-test SYSTEM PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/contrib/libcorrect/include")
     target_link_libraries(dvbt-stream-decoder-test PRIVATE
-        airspy-tv-dvbt correct_static)
+        airspy-tv-dvbt)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(dvbt-stream-decoder-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)

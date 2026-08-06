@@ -18,13 +18,13 @@ namespace airspy_tv::fec {
 // feed arbitrary sizes instead.
 inline constexpr std::size_t viterbi_output_bytes = 7680 / 8;
 
-// Soft-input rate-1/2 convolutional (171,133) decoder built on libcorrect with
-// an ordered worker pool. Input is mother-code metrics in transmission order;
-// punctured streams must be depunctured by the caller before process().
-// process() quantizes float LLRs onto the internal 0..255 scale, while
-// process_soft() accepts pre-quantized bytes (128 is the neutral erasure
-// inserted for punctures). Results are returned in transmission order and
-// flush() drains the pool.
+// Soft-input rate-1/2 convolutional (171,133) decoder built on
+// ViterbiDecoderCpp with an ordered worker pool. Input is mother-code metrics
+// in transmission order; punctured streams must be depunctured by the caller
+// before process(). process() quantizes float LLRs onto the internal 0..255
+// scale, while process_soft() accepts pre-quantized bytes (128 is the neutral
+// erasure inserted for punctures). Results are returned in transmission order
+// and flush() drains the pool.
 class SoftViterbi {
   public:
     explicit SoftViterbi(std::size_t requested_workers);

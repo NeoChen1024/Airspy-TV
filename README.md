@@ -79,8 +79,9 @@ Required system libraries:
 - FFTW3f and VOLK
 - a C++20 compiler and CMake 3.25 or newer
 
-Dear ImGui, nlohmann/json, tinycolormap, liquid-dsp, libcorrect, and
-ViterbiDecoderCpp are pinned under `contrib/` as Git submodules.
+Dear ImGui, nlohmann/json, tinycolormap, liquid-dsp, and ViterbiDecoderCpp are
+pinned under `contrib/` as Git submodules. The minimized libfec Reed-Solomon
+subset is vendored directly under `contrib/libfec`.
 
 ```sh
 git submodule update --init --recursive
@@ -97,9 +98,9 @@ build.
 Builds also default to `-march=native`. Use
 `-DAIRSPY_TV_NATIVE_ARCH=OFF` when producing a portable binary for a different
 CPU. The default soft-Viterbi backend is ViterbiDecoderCpp's AVX2-u16
-implementation when the compiler target supports AVX2. A build without that
-path falls back to libcorrect; configure explicitly with
-`-DAIRSPY_TV_USE_AVX2_VITERBI=OFF` to exercise the fallback.
+implementation when the compiler target supports AVX2, with SSE4.1 and AArch64
+NEON selected on suitable targets and a scalar backend used otherwise.
+Configure with `-DAIRSPY_TV_USE_SIMD_VITERBI=OFF` to force the scalar backend.
 
 ## Using the receiver
 
@@ -211,8 +212,8 @@ Independent symbol postprocessing is dispatched to a worker pool and rejoined
 by sequence. A separate FEC thread sends overlapping mother-code windows to
 the Viterbi pool, performs another ordered join, then serializes convolutional
 byte deinterleaving, RS(204,188), energy descrambling, and MPEG-TS output. The
-optimized backend uses AVX2 ViterbiDecoderCpp; libcorrect remains the portable
-Viterbi fallback and provides the Reed-Solomon implementation.
+soft Viterbi stage uses the best compile-time ViterbiDecoderCpp backend, with a
+portable scalar fallback. A minimized libfec subset provides RS(204,188).
 
 There are no per-chunk decoder seams or packet-overlap joins. Generation-tagged
 reset and retune handling suppress stale worker results before they can reach

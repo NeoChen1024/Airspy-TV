@@ -1,16 +1,15 @@
 #include "airspy_tv/fec/soft_viterbi.hpp"
 #include "airspy_tv/thread_name.hpp"
 
-#if defined(AIRSPY_TV_USE_AVX2_VITERBI) && defined(__AVX2__)
 #include "viterbi/viterbi_decoder_core.h"
+#include "viterbi/viterbi_decoder_scalar.h"
+#if defined(AIRSPY_TV_USE_SIMD_VITERBI) && defined(__AVX2__)
 #include "viterbi/x86/viterbi_decoder_avx_u16.h"
-#else
-extern "C" {
-#include <correct.h>
-#if defined(HAVE_SSE)
-#include <correct-sse.h>
-#endif
-}
+#elif defined(AIRSPY_TV_USE_SIMD_VITERBI) && defined(__SSE4_1__)
+#include "viterbi/x86/viterbi_decoder_sse_u16.h"
+#elif defined(AIRSPY_TV_USE_SIMD_VITERBI) && defined(__aarch64__) &&             \
+    defined(__ARM_NEON)
+#include "viterbi/arm/viterbi_decoder_neon_u16.h"
 #endif
 
 #include <algorithm>
@@ -193,20 +192,32 @@ struct SoftViterbi::Impl {
         std::uint64_t compared_metrics{};
     };
 
-#if defined(AIRSPY_TV_USE_AVX2_VITERBI) && defined(__AVX2__)
     static constexpr std::size_t constraint_length = 7;
     using DecoderHandle =
         ViterbiDecoder_Core<constraint_length, convolutional_rate,
                             std::uint16_t, std::int16_t>;
+#if defined(AIRSPY_TV_USE_SIMD_VITERBI) && defined(__AVX2__)
     using DecoderType =
         ViterbiDecoder_AVX_u16<constraint_length, convolutional_rate>;
+#elif defined(AIRSPY_TV_USE_SIMD_VITERBI) && defined(__SSE4_1__)
+    using DecoderType =
+        ViterbiDecoder_SSE_u16<constraint_length, convolutional_rate>;
+#elif defined(AIRSPY_TV_USE_SIMD_VITERBI) && defined(__aarch64__) &&             \
+    defined(__ARM_NEON)
+    using DecoderType =
+        ViterbiDecoder_NEON_u16<constraint_length, convolutional_rate>;
+#else
+    using DecoderType =
+        ViterbiDecoder_Scalar<constraint_length, convolutional_rate,
+                              std::uint16_t, std::int16_t>;
+#endif
     using BranchTable =
         ViterbiBranchTable<constraint_length, convolutional_rate,
                            std::int16_t>;
 
-    // DVB-T generator polynomials (171, 133 octal) in the libfec reversed
-    // convention — the same values as libcorrect's {0117, 0155}. The branch
-    // table is read-only once built, so all workers share one instance.
+    // DVB-T generator polynomials (171, 133 octal) in Phil Karn's reversed
+    // convention. The branch table is read-only once built, so all workers
+    // share one instance.
     static BranchTable &shared_branch_table() {
         static constexpr std::array<std::uint8_t, 2> polynomials{79, 109};
         static BranchTable table(polynomials.data(), 127, -127);
@@ -265,56 +276,6 @@ struct SoftViterbi::Impl {
         decoder->chainback(decoded.data(), viterbi_window_bits);
         return extract_output(decoded, task);
     }
-#else
-    using DecoderHandle =
-#if defined(HAVE_SSE)
-        correct_convolutional_sse;
-#else
-        correct_convolutional;
-#endif
-
-    static DecoderHandle *create_decoder() {
-        constexpr std::array<correct_convolutional_polynomial_t, 2> polynomials{
-            0117, 0155};
-        // libcorrect lazily initializes a process-global bit-reversal table
-        // without synchronization. Serialize context construction here.
-        static std::mutex creation_mutex;
-        const std::scoped_lock lock(creation_mutex);
-#if defined(HAVE_SSE)
-        return correct_convolutional_sse_create(convolutional_rate, 7,
-                                                polynomials.data());
-#else
-        return correct_convolutional_create(convolutional_rate, 7,
-                                            polynomials.data());
-#endif
-    }
-
-    static void destroy_decoder(DecoderHandle *decoder) {
-#if defined(HAVE_SSE)
-        correct_convolutional_sse_destroy(decoder);
-#else
-        correct_convolutional_destroy(decoder);
-#endif
-    }
-
-    static Result decode(DecoderHandle *decoder, const Task &task) {
-        std::array<std::uint8_t, viterbi_window_bits / 8> decoded{};
-#if defined(HAVE_SSE)
-        const ssize_t decoded_bytes = correct_convolutional_sse_decode_soft(
-            decoder, task.metrics.data(), task.metrics.size(), decoded.data());
-#else
-        const ssize_t decoded_bytes = correct_convolutional_decode_soft(
-            decoder, task.metrics.data(), task.metrics.size(), decoded.data());
-#endif
-        if (decoded_bytes < static_cast<ssize_t>(
-                                (viterbi_margin_bits + viterbi_output_bits) /
-                                8)) {
-            throw std::runtime_error("libcorrect Viterbi decode failed");
-        }
-        return extract_output(decoded, task);
-    }
-#endif
-
     // Shared by both backends: slice the 7680-bit output out of the 8192-bit
     // window and estimate the pre-Viterbi BER by re-encoding the survivor
     // path against the received mother-code metrics. The traceback margins

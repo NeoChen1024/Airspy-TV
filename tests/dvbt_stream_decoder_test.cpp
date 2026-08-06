@@ -2,10 +2,7 @@
 
 #include "airspy_tv/dvbt/inner_decoder.hpp"
 #include "airspy_tv/dvbt/soft_demapper.hpp"
-
-extern "C" {
-#include <correct.h>
-}
+#include "airspy_tv/fec/reed_solomon.hpp"
 #include <fftw3.h>
 
 #include <algorithm>
@@ -37,6 +34,7 @@ using airspy_tv::dvbt::SignalAnalysisSource;
 using airspy_tv::dvbt::StreamDecoder;
 using airspy_tv::dvbt::SymbolDeinterleaver;
 using airspy_tv::dvbt::TransmissionMode;
+using airspy_tv::fec::DvbReedSolomon;
 
 constexpr std::size_t ts_packet_size = 188;
 constexpr std::size_t rs_packet_size = 204;
@@ -135,19 +133,14 @@ energy_scramble(const std::span<const std::uint8_t> transport_stream) {
 
 [[nodiscard]] std::vector<std::uint8_t>
 rs_encode(const std::span<const std::uint8_t> randomized) {
-    correct_reed_solomon *codec = correct_reed_solomon_create(
-        correct_rs_primitive_polynomial_8_4_3_2_0, 0, 1, 16);
-    require(codec != nullptr, "create RS encoder");
+    DvbReedSolomon codec;
     std::vector<std::uint8_t> output((randomized.size() / ts_packet_size) *
                                      rs_packet_size);
     for (std::size_t input = 0, encoded = 0; input < randomized.size();
          input += ts_packet_size, encoded += rs_packet_size) {
-        const ssize_t size = correct_reed_solomon_encode(
-            codec, randomized.data() + input, ts_packet_size,
-            output.data() + encoded);
-        require(size == 255, "RS encoder returned an unexpected length");
+        codec.encode(randomized.subspan(input, ts_packet_size),
+                     std::span{output}.subspan(encoded, rs_packet_size));
     }
-    correct_reed_solomon_destroy(codec);
     return output;
 }
 

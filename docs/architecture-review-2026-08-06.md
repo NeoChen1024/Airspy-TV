@@ -56,18 +56,17 @@ in CI:
 
 - default Debug uses `-O3 -DNDEBUG` unless `AIRSPY_TV_OPTIMIZED_DEBUG=OFF`;
 - `AIRSPY_TV_NATIVE_ARCH=ON` adds `-march=native`;
-- libcorrect configuration temporarily changes global `CMAKE_BUILD_TYPE`,
-  which is fragile for multi-config generators;
-- non-AVX builds use a different Viterbi backend and need regular coverage.
+- non-AVX builds select a different ViterbiDecoderCpp backend and need regular
+  coverage.
 
 Recommended direction:
 
 1. define explicit optimized-debug, assertion-debug, portable-release, and
    sanitizer presets;
-2. stop mutating global `CMAKE_BUILD_TYPE` around vendored dependencies;
-3. make host-native optimization an explicit release/profile choice for
+2. make host-native optimization an explicit release/profile choice for
    distributable builds;
-4. keep both Viterbi paths buildable until portable coverage is routine.
+3. keep SIMD and scalar Viterbi paths buildable until portable coverage is
+   routine.
 
 ### Medium: GUI code is type-separated but still physically concentrated
 

@@ -179,17 +179,16 @@ thread that publishes recovered TS bytes.
 
 `SoftViterbi` divides the mother-code metric stream into overlapping windows
 with traceback margins. The default optimized build uses the AVX2-u16
-`ViterbiDecoderCpp` backend. Builds without the enabled AVX2 path use
-libcorrect (SSE when available) as the portable fallback. Each worker owns its
-mutable decoder context; completed windows are joined in sequence before the
-stateful outer chain.
+`ViterbiDecoderCpp` backend. Other compile targets select SSE4.1, AArch64 NEON,
+or the portable scalar backend. Each worker owns its mutable decoder context;
+completed windows are joined in sequence before the stateful outer chain.
 
 After Viterbi, processing is serialized:
 
 ```text
 ordered decoded bytes
   -> 12-branch convolutional byte deinterleaver
-  -> RS(204,188)
+  -> libfec RS(204,188)
   -> energy descrambler
   -> 188-byte MPEG-TS packets
 ```
