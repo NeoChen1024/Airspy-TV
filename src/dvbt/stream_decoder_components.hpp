@@ -338,7 +338,7 @@ class OverwriteComplexBuffer {
   public:
     ~OverwriteComplexBuffer() {
         if (data_ != nullptr) {
-            volk_free(data_);
+            ::operator delete(data_, alignment);
         }
     }
     OverwriteComplexBuffer() = default;
@@ -350,7 +350,7 @@ class OverwriteComplexBuffer {
     OverwriteComplexBuffer &operator=(OverwriteComplexBuffer &&other) noexcept {
         if (this != &other) {
             if (data_ != nullptr) {
-                volk_free(data_);
+                ::operator delete(data_, alignment);
             }
             data_ = std::exchange(other.data_, nullptr);
             size_ = std::exchange(other.size_, 0);
@@ -363,13 +363,14 @@ class OverwriteComplexBuffer {
         static_assert(std::is_trivially_copyable_v<std::complex<float>> &&
                       std::is_trivially_destructible_v<std::complex<float>>);
         if (size > capacity_) {
-            auto *next = static_cast<std::complex<float> *>(volk_malloc(
-                sizeof(std::complex<float>) * size, volk_get_alignment()));
-            if (next == nullptr) {
-                throw std::bad_alloc{};
+            if (size > std::numeric_limits<std::size_t>::max() /
+                           sizeof(std::complex<float>)) {
+                throw std::bad_array_new_length{};
             }
+            auto *next = static_cast<std::complex<float> *>(::operator new(
+                sizeof(std::complex<float>) * size, alignment));
             if (data_ != nullptr) {
-                volk_free(data_);
+                ::operator delete(data_, alignment);
             }
             data_ = next;
             capacity_ = size;
@@ -383,6 +384,7 @@ class OverwriteComplexBuffer {
     }
 
   private:
+    static constexpr std::align_val_t alignment{64};
     std::complex<float> *data_{};
     std::size_t size_{};
     std::size_t capacity_{};

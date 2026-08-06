@@ -1,8 +1,8 @@
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
+#include "airspy_tv/dsp/vector_ops.hpp"
 #include "airspy_tv/thread_name.hpp"
 
 #include <liquid.h>
-#include <volk/volk.h>
 
 #include <algorithm>
 #include <cmath>
@@ -24,7 +24,6 @@
 namespace airspy_tv::dvbt {
 namespace {
 
-constexpr float input_scale = 32768.0F;
 constexpr float minimum_power = 1.0e-12F;
 constexpr unsigned int resampler_semi_length = 12;
 
@@ -75,9 +74,8 @@ struct Cs16Resampler::Impl {
         }
 
         std::vector<std::complex<float>> next_input(next_blocks * next_q);
-        volk_16i_s32f_convert_32f(
-            reinterpret_cast<float *>(next_input.data()), interleaved_iq.data(),
-            input_scale, static_cast<unsigned int>(next_input.size() * 2));
+        dsp::convert_cs16_to_cf32(
+            interleaved_iq.first(next_input.size() * 2), next_input);
         std::vector<std::complex<float>> next_output(next_blocks * next_p);
 
         {

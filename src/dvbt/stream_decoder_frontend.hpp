@@ -137,10 +137,7 @@ void StreamDecoder::Impl::run_frontend() {
             const std::size_t complex_count = block.samples.size() / 2;
             const auto convert_started_at = std::chrono::steady_clock::now();
             convert_buffer.resize(complex_count);
-            volk_16i_s32f_convert_32f(
-                reinterpret_cast<float *>(convert_buffer.data()),
-                block.samples.data(), input_scale,
-                static_cast<unsigned int>(complex_count * 2));
+            dsp::convert_cs16_to_cf32(block.samples, convert_buffer);
             const float convert_time_ms = duration_ms(convert_started_at);
             const auto resample_started_at = std::chrono::steady_clock::now();
             const auto resampled = resampler->process(convert_buffer);

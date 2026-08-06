@@ -31,7 +31,6 @@ pkg_check_modules(AIRSPY REQUIRED IMPORTED_TARGET libairspy)
 pkg_check_modules(FFTW3F REQUIRED IMPORTED_TARGET fftw3f)
 pkg_check_modules(FONTCONFIG REQUIRED IMPORTED_TARGET fontconfig)
 pkg_check_modules(MPV REQUIRED IMPORTED_TARGET mpv)
-pkg_check_modules(VOLK REQUIRED IMPORTED_TARGET volk)
 
 set(JSON_BuildTests OFF CACHE INTERNAL "Disable nlohmann/json tests")
 add_subdirectory(contrib/json EXCLUDE_FROM_ALL)
@@ -124,7 +123,7 @@ add_library(airspy-tv-dvbt STATIC
 )
 target_include_directories(airspy-tv-dvbt PUBLIC include)
 target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F airspy-tv-common
-    Threads::Threads PRIVATE liquid::liquid PkgConfig::VOLK)
+    Threads::Threads PRIVATE liquid::liquid)
 
 add_executable(airspy-tv
     src/epg.cpp
@@ -149,7 +148,6 @@ target_link_libraries(airspy-tv PRIVATE
     PkgConfig::FFTW3F
     PkgConfig::FONTCONFIG
     PkgConfig::MPV
-    PkgConfig::VOLK
     SoapySDR
     Threads::Threads
 )
@@ -243,6 +241,16 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME byte-rate-tracker COMMAND byte-rate-tracker-test)
+
+    add_executable(vector-ops-test
+        tests/vector_ops_test.cpp
+    )
+    target_include_directories(vector-ops-test PRIVATE include)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(vector-ops-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME vector-ops COMMAND vector-ops-test)
 endif()
 
 install(TARGETS airspy-tv RUNTIME DESTINATION bin)

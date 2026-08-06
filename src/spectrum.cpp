@@ -1,14 +1,15 @@
 #include "airspy_tv/spectrum.hpp"
+#include "airspy_tv/dsp/vector_ops.hpp"
 #include "airspy_tv/fftw_plan.hpp"
 
 #include <fftw3.h>
-#include <volk/volk.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <complex>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -26,7 +27,6 @@ namespace {
 
 constexpr std::size_t scalar_count = spectrum_fft_size * 2;
 constexpr auto capture_interval = std::chrono::milliseconds(5);
-constexpr float input_scale = 32768.0F;
 constexpr float minimum_power = 1.0e-14F;
 constexpr float fft_rate_hz =
     1000.0F / static_cast<float>(capture_interval.count());
@@ -120,34 +120,13 @@ void update_channel_metrics(SpectrumSnapshot &snapshot,
     snapshot.channel_metrics_valid = true;
 }
 
-struct VolkDeleter {
-    template <typename Value> void operator()(Value *pointer) const noexcept {
-        volk_free(pointer);
-    }
-};
-
-template <typename Value>
-// NOLINTBEGIN(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
-using VolkBuffer = std::unique_ptr<Value[], VolkDeleter>;
-// NOLINTEND(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
-
-template <typename Value>
-VolkBuffer<Value> make_volk_buffer(const std::size_t count) {
-    auto *pointer = static_cast<Value *>(
-        volk_malloc(sizeof(Value) * count, volk_get_alignment()));
-    if (pointer == nullptr) {
-        throw std::bad_alloc();
-    }
-    return VolkBuffer<Value>(pointer);
-}
-
 } // namespace
 
 struct SpectrumAnalyzer::Impl {
     std::array<std::int16_t, scalar_count> pending_samples{};
     std::array<std::int16_t, scalar_count> staging_samples{};
     std::size_t staging_count{};
-    VolkBuffer<std::int16_t> worker_samples;
+    std::vector<std::int16_t> worker_samples;
     mutable std::mutex pending_mutex;
     std::condition_variable pending_ready;
     bool pending{};
@@ -164,13 +143,13 @@ struct SpectrumAnalyzer::Impl {
     std::atomic<bool> snr_smoothing{true};
     std::atomic<int> snr_smoothing_speed{20};
 
-    VolkBuffer<lv_32fc_t> input;
-    VolkBuffer<lv_32fc_t> windowed;
-    VolkBuffer<lv_32fc_t> fft_output;
-    VolkBuffer<float> window;
-    VolkBuffer<float> power;
-    VolkBuffer<float> shifted_power;
-    VolkBuffer<float> smoothed_bins_dbfs;
+    std::vector<std::complex<float>> input;
+    std::vector<std::complex<float>> windowed;
+    std::vector<std::complex<float>> fft_output;
+    std::vector<float> window;
+    std::vector<float> power;
+    std::vector<float> shifted_power;
+    std::vector<float> smoothed_bins_dbfs;
     float window_sum{};
     float smoothed_signal_power_dbfs{};
     float smoothed_rf_snr_db{};
@@ -180,14 +159,11 @@ struct SpectrumAnalyzer::Impl {
     std::thread worker;
 
     Impl()
-        : worker_samples(make_volk_buffer<std::int16_t>(scalar_count)),
-          input(make_volk_buffer<lv_32fc_t>(spectrum_fft_size)),
-          windowed(make_volk_buffer<lv_32fc_t>(spectrum_fft_size)),
-          fft_output(make_volk_buffer<lv_32fc_t>(spectrum_fft_size)),
-          window(make_volk_buffer<float>(spectrum_fft_size)),
-          power(make_volk_buffer<float>(spectrum_fft_size)),
-          shifted_power(make_volk_buffer<float>(spectrum_fft_size)),
-          smoothed_bins_dbfs(make_volk_buffer<float>(spectrum_fft_size)) {
+        : worker_samples(scalar_count), input(spectrum_fft_size),
+          windowed(spectrum_fft_size), fft_output(spectrum_fft_size),
+          window(spectrum_fft_size), power(spectrum_fft_size),
+          shifted_power(spectrum_fft_size),
+          smoothed_bins_dbfs(spectrum_fft_size) {
         for (std::size_t index = 0; index < spectrum_fft_size; ++index) {
             const float phase =
                 (2.0F * std::numbers::pi_v<float> * static_cast<float>(index)) /
@@ -198,11 +174,11 @@ struct SpectrumAnalyzer::Impl {
             window_sum += window[index];
         }
 
-        static_assert(sizeof(lv_32fc_t) == sizeof(fftwf_complex));
+        static_assert(sizeof(std::complex<float>) == sizeof(fftwf_complex));
         plan = FftwfPlan::dft_1d(
             static_cast<int>(spectrum_fft_size),
-            reinterpret_cast<fftwf_complex *>(windowed.get()),
-            reinterpret_cast<fftwf_complex *>(fft_output.get()), FFTW_FORWARD,
+            reinterpret_cast<fftwf_complex *>(windowed.data()),
+            reinterpret_cast<fftwf_complex *>(fft_output.data()), FFTW_FORWARD,
             FFTW_ESTIMATE);
         worker = std::thread([this] { run(); });
     }
@@ -234,7 +210,7 @@ struct SpectrumAnalyzer::Impl {
                 if (stopping) {
                     break;
                 }
-                std::ranges::copy(pending_samples, worker_samples.get());
+                std::ranges::copy(pending_samples, worker_samples.begin());
                 sample_rate = pending_sample_rate;
                 channel_bandwidth = pending_channel_bandwidth;
                 pending = false;
@@ -249,26 +225,15 @@ struct SpectrumAnalyzer::Impl {
 
     void process(const std::uint32_t sample_rate,
                  const std::uint32_t channel_bandwidth) {
-        volk_16i_s32f_convert_32f(reinterpret_cast<float *>(input.get()),
-                                  worker_samples.get(), input_scale,
-                                  static_cast<unsigned int>(scalar_count));
-
-        volk_32fc_magnitude_squared_32f(
-            power.get(), input.get(),
-            static_cast<unsigned int>(spectrum_fft_size));
-        float total_power = 0.0F;
-        volk_32f_accumulator_s32f(&total_power, power.get(),
-                                  static_cast<unsigned int>(spectrum_fft_size));
+        dsp::convert_cs16_to_cf32(worker_samples, input);
+        dsp::magnitude_squared(input, power);
+        const float total_power = dsp::sum(power);
         const float signal_power =
             total_power / static_cast<float>(spectrum_fft_size);
 
-        volk_32fc_32f_multiply_32fc(
-            windowed.get(), input.get(), window.get(),
-            static_cast<unsigned int>(spectrum_fft_size));
+        dsp::multiply_real(input, window, windowed);
         plan.execute();
-        volk_32fc_magnitude_squared_32f(
-            power.get(), fft_output.get(),
-            static_cast<unsigned int>(spectrum_fft_size));
+        dsp::magnitude_squared(fft_output, power);
 
         const float normalization = window_sum * window_sum;
         SpectrumSnapshot next;
@@ -306,7 +271,7 @@ struct SpectrumAnalyzer::Impl {
         }
         update_channel_metrics(
             next,
-            std::span<const float>{shifted_power.get(), spectrum_fft_size},
+            shifted_power,
             channel_bandwidth);
         const float snr_alpha =
             snr_smoothing ? std::min(static_cast<float>(std::max(

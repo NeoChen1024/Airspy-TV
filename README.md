@@ -76,7 +76,7 @@ Required system libraries:
 - SDL3 and OpenGL
 - libairspy and SoapySDR
 - libmpv and Fontconfig
-- FFTW3f and VOLK
+- FFTW3f
 - a C++20 compiler and CMake 3.25 or newer
 
 Dear ImGui, nlohmann/json, tinycolormap, liquid-dsp, and ViterbiDecoderCpp are

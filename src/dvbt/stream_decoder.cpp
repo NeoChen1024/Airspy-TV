@@ -1,6 +1,7 @@
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 
 #include "airspy_tv/debug.hpp"
+#include "airspy_tv/dsp/vector_ops.hpp"
 #include "airspy_tv/dvbt/analysis_publisher.hpp"
 #include "airspy_tv/dvbt/decoder.hpp"
 #include "airspy_tv/dvbt/inner_decoder.hpp"
@@ -14,7 +15,6 @@
 
 #include <fftw3.h>
 #include <liquid/liquid.h>
-#include <volk/volk.h>
 
 #include <algorithm>
 #include <array>
@@ -47,7 +47,6 @@ namespace airspy_tv::dvbt {
 namespace {
 
 constexpr float minimum_power = 1.0e-12F;
-constexpr float input_scale = 32768.0F;
 constexpr std::size_t acquisition_samples = 350'000;
 constexpr std::size_t buffer_duration_denominator = 5;
 constexpr std::size_t initial_symbol_queue_capacity = 256;
