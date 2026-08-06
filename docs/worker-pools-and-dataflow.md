@@ -386,7 +386,7 @@ dropped blocks instead of unbounded growth:
 | Viterbi windows     | `max(2×workers, 1024)` windows                                                   | FEC thread → pool                 |
 | Raw I/Q recorder    | 5 s of samples                                                                   | source thread → writer thread     |
 | TS recorder         | 24 MiB                                                                           | FEC thread → writer thread        |
-| mpv playback        | 24 MiB; drop-old fallback on overflow, controlled restart on `retune`            | FEC thread → mpv queue            |
+| mpv playback        | 8 MiB; buffer below 1 MiB and resume at 2 MiB; drop-old fallback on overflow      | FEC thread → mpv queue            |
 
 The ring holds absolute stream positions (`uint64`); the demod only frees what
 it has consumed (`ring_read_pos`), so the front-end can run ahead without ever

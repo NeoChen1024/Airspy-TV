@@ -2078,8 +2078,8 @@ void draw_playback_panel(AppState &state) {
         ImGui::SetTooltip(
             "Decoded TS bytes queued for libmpv vs the queue capacity; growth "
             "here means playback is not keeping up (stalled audio device or a "
-            "paused player). Playback buffers to 4 MiB at startup/recovery, "
-            "and re-enters buffering below 2 MiB.");
+            "paused player). Playback buffers to 2 MiB at startup/recovery, "
+            "and re-enters buffering below 1 MiB.");
     }
     ImGui::Text("Dropped frames  %lld   (VO %lld)",
                 static_cast<long long>(telemetry.dropped_frames),

@@ -33,8 +33,8 @@ namespace {
 
 constexpr std::size_t transport_packet_size = 188;
 constexpr std::size_t playback_queue_capacity = 8U << 20U;
-constexpr std::size_t playback_queue_low_watermark = 2U << 20U;
-constexpr std::size_t playback_queue_resume_watermark = 4U << 20U;
+constexpr std::size_t playback_queue_low_watermark = 1U << 20U;
+constexpr std::size_t playback_queue_resume_watermark = 2U << 20U;
 
 [[nodiscard]] std::string mpv_error(const std::string_view operation,
                                     const int code) {
