@@ -91,15 +91,68 @@ frozen stale lock; normal acquisition must still take over.
 ### 3. Fractional timing correction
 
 The current integer-step actuator is stable but produces pulse-density
-corrections and a small residual sawtooth. Evaluate, behind an opt-in setting:
+corrections and a small residual sawtooth. The selected experiment is an
+opt-in variable-ratio arbitrary resampler that can eventually replace the
+fixed-ratio liquid-dsp rational resampler.
 
-1. distributing the estimated timing rate with a per-symbol phase accumulator;
-2. a fractional-delay filter;
-3. a continuously adjustable polyphase resampling path.
+The resampler should combine the nominal input-to-DVB-baseband rate conversion
+with a continuously adjustable fractional-delay polyphase FIR. Its input phase
+increment is approximately:
+
+```text
+nominal_input_samples_per_output
+    * (1 + sro_correction_ppm * 1e-6)
+```
+
+This resampler is a common source-tree DSP routine, not a DVB-T-specific
+component. DVB-T is only the first consumer. The same implementation should be
+usable by future DVB-T2, DVB-S/S2, DVB-C, and other broadcast demodulators,
+with each standard supplying its own nominal input/output rate profile,
+bandwidth constraints, filter requirements, and timing-loop command. Standard
+specific code must not depend on the resampler's internal phase, history, or
+worker implementation.
+
+The correction sign must be established with positive and negative synthetic
+SRO fixtures. The implementation must:
+
+- retain fractional phase and FIR history across input blocks;
+- snapshot the target SRO correction at a block boundary and slew toward it
+  instead of changing the rate abruptly within a block;
+- emit a variable number of output samples while preserving the configured
+  nominal baseband time axis for the consuming demodulator;
+- remain continuous across arbitrary input block boundaries, flushes, and
+  normal streaming operation;
+- keep reset and retune behavior explicit rather than carrying stale phase or
+  filter state into a new stream generation.
+
+Use a block-local Q32.32 phase accumulator for the scalar reference
+implementation. The upper 32 bits identify the input sample within the current
+work buffer and the lower 32 bits hold the fractional phase. Rebase the phase
+whenever consumed input is discarded, retaining only the FIR context required
+by future outputs. An unbounded absolute input position is not required by the
+DSP algorithm; a separate `uint64_t` cumulative sample counter is optional for
+telemetry and deterministic test diagnostics. A practical polyphase bank may
+use 1024 or 4096 phases and derive its index, plus optional interpolation, from
+the Q32.32 fractional field.
+
+The SRO estimator and second-order clock model remain owned by the consuming
+demodulator, while the arbitrary resampler remains a common actuator. The
+interface should carry a standard-neutral target rate and SRO correction
+command; DVB-T's FFT-window actuator is only one possible downstream residual
+timing actuator. Once that feedback path is enabled, do not also integrate the
+same SRO estimate into the existing integer FFT-window actuator: that would
+double-correct the clock error. Keep standard-specific timing movement for
+residual timing phase and channel-delay placement.
+
+Implement and validate a portable scalar kernel first. Then benchmark optional
+SSE4.1-compatible, AVX2, and AVX2/FMA FIR kernels while retaining the scalar
+path as the numerical reference. Preserve the current resampler worker-budget
+model where parallel output partitions provide a measured benefit.
 
 Compare residual timing jitter, pilot phase modulation, MER, FEC errors, CPU
-cost, and queue pressure. Do not adopt a fractional path merely because it
-makes the displayed `tau` numerically closer to zero.
+cost, output-rate error, block-boundary continuity, and queue pressure. Do not
+adopt a fractional path merely because it makes the displayed `tau`
+numerically closer to zero.
 
 ### 4. Second-order clock model
 
@@ -118,13 +171,18 @@ default.
 
 ### 5. Sample-clock and LO-clock relationship
 
-Continue treating timing and CFO as independent control loops. Use fixtures
-with independent, correlated, and deliberately conflicting sample/LO drift to
-measure whether a shared hardware reference produces useful correlation.
+Treat SRO and CFO as independent estimator states and independent control loops
+without exception. Do not rely on a shared hardware reference and do not add
+feed-forward between the loops. SDR front ends may be superheterodyne, low-IF,
+zero-IF, direct-sampling, or include additional digital conversion stages, so
+the observed relationship between LO error and sample-clock error is
+hardware- and topology-dependent. A second-order drift model makes an assumed
+cross-loop relationship still less reliable.
 
-Only consider feed-forward between the loops after telemetry demonstrates a
-stable relationship across receivers and temperatures. A shared reference is
-not sufficient evidence by itself.
+Continue generating independent, correlated, and deliberately conflicting
+sample/LO drift fixtures, but use them to prove that each loop remains correct
+when the other changes. Correlation is a test dimension, not a controller
+input.
 
 ## Experiment matrix
 
@@ -149,11 +207,15 @@ queue watermarks, and dropped blocks.
 1. Complete 2K, 557/581 MHz, and synthetic CIR-bias validation.
 2. Establish expected confidence and ppm ranges for those inputs.
 3. Add confidence gating as an isolated control change.
-4. Evaluate per-symbol/fractional correction behind an opt-in setting.
-5. Evaluate the second-order loop behind a separate opt-in setting.
-6. Measure sample/LO correlation only after both estimators are independently
-   validated.
-7. Repeat the full regression matrix before changing any default.
+4. Implement the portable scalar arbitrary resampler behind an opt-in setting
+   and validate its fixed-rate response before enabling feedback.
+5. Validate phase/history continuity across random block boundaries, then
+   connect the SRO estimate while separating the long-term resampler actuator
+   from residual FFT-window correction.
+6. Evaluate the second-order SRO loop behind a separate opt-in setting.
+7. Add and benchmark optional SIMD resampler kernels against the scalar
+   numerical reference.
+8. Repeat the full regression matrix before changing any default.
 
 ## Acceptance criteria
 
@@ -165,5 +227,10 @@ Any timing-loop change must satisfy all of the following:
 - correct recovery after genuine fades and signal loss;
 - no regression on 557/581 MHz captures or synthetic SRO/CFO fixtures;
 - no unexplained bias across actuator or CIR-placement changes;
+- continuous arbitrary-resampler phase and FIR state across input block
+  boundaries;
+- bounded output-rate error for constant, ramping, and reversing SRO;
+- scalar and enabled SIMD resampler paths remain numerically equivalent within
+  the defined FIR tolerance;
 - no regression in the native decoder tests;
 - no unacceptable increase in CPU load, queue depth, latency, or dropped input.
