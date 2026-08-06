@@ -292,7 +292,7 @@ payload_indices(const std::size_t phase) {
 }
 
 [[nodiscard]] std::vector<std::int16_t>
-make_iq(const std::span<const float> metrics) {
+make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F) {
     const MaxLogDemapper demapper{Constellation::qpsk};
     const SymbolDeinterleaver symbol_permutation{TransmissionMode::k8};
     const auto points = demapper.constellation_points();
@@ -337,7 +337,7 @@ make_iq(const std::span<const float> metrics) {
                                  ? 1U
                                  : 0U);
                 }
-                value = points[label];
+                value = points[label] * payload_gain;
                 ++payload_position;
             }
             const auto bin = static_cast<std::ptrdiff_t>(carrier) -
@@ -584,6 +584,50 @@ void test_8k_reset_then_new_stream() {
             "two finite 8K streams did not produce two stream-end events");
 }
 
+void test_8k_reset_after_hopeless_stream() {
+    // Regression for file re-open after a decode failure. The first stream
+    // has valid OFDM pilots but no payload energy, so it establishes several
+    // hopeless MER windows. A subsequent reset must clear that recovery
+    // state before the new stream's first pilot lock.
+    const auto encoded = encode_transport();
+    const auto clean_iq = make_iq(encoded.metrics);
+    const auto hopeless_symbol_block = make_iq(encoded.metrics, 0.0F);
+    std::vector<std::int16_t> hopeless_iq;
+    hopeless_iq.reserve(hopeless_symbol_block.size() * 5);
+    for (int copy = 0; copy < 5; ++copy) {
+        hopeless_iq.insert(hopeless_iq.end(), hopeless_symbol_block.begin(),
+                           hopeless_symbol_block.end());
+    }
+    constexpr std::array<std::size_t, 5> block_sizes{4097, 8191, 12345, 777,
+                                                     16384};
+
+    std::vector<std::uint8_t> output;
+    std::mutex callback_mutex;
+    StreamDecoder decoder;
+    decoder.set_parameters({.channel_bandwidth_hz = channel_bandwidth,
+                            .mode = TransmissionMode::k8,
+                            .guard_interval = GuardInterval::gi_1_4,
+                            .constellation = Constellation::qpsk,
+                            .code_rate = CodeRate::rate_1_2,
+                            .worker_threads = 4});
+    decoder.set_transport_callback(
+        [&output, &callback_mutex](const std::span<const std::uint8_t> bytes) {
+            const std::scoped_lock lock(callback_mutex);
+            output.insert(output.end(), bytes.begin(), bytes.end());
+        });
+
+    submit_in_blocks(decoder, hopeless_iq, block_sizes);
+    decoder.flush();
+    decoder.wait_until_idle();
+    decoder.reset();
+
+    submit_in_blocks(decoder, clean_iq, block_sizes);
+    decoder.flush();
+    decoder.wait_until_idle();
+    require(has_known_run(output, encoded.transport),
+            "8K reset after a hopeless stream did not recover cleanly");
+}
+
 void test_8k_non_acquirable_stream_drains() {
     const std::vector<std::int16_t> silence(symbols * symbol_size * 2, 0);
     constexpr std::array<std::size_t, 3> block_sizes{7001, 12003, 4099};
@@ -720,6 +764,7 @@ int main() {
         };
         run("clean", test_8k_clean_signal);
         run("reset-new", test_8k_reset_then_new_stream);
+        run("reset-hopeless", test_8k_reset_after_hopeless_stream);
         run("reset-live", test_8k_reset_live_resume);
         run("reset-wait", test_8k_reset_while_demod_waiting);
         run("no-acq", test_8k_non_acquirable_stream_drains);

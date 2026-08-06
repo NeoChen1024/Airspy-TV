@@ -202,7 +202,7 @@ if(BUILD_TESTING)
         target_compile_options(dvbt-stream-decoder-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
-    foreach(STREAM_CASE clean reset-new reset-live reset-wait no-acq)
+    foreach(STREAM_CASE clean reset-new reset-hopeless reset-live reset-wait no-acq)
         add_test(NAME dvbt-stream-decoder-${STREAM_CASE}
                  COMMAND dvbt-stream-decoder-test)
         set_tests_properties(dvbt-stream-decoder-${STREAM_CASE} PROPERTIES

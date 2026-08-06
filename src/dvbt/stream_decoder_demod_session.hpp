@@ -1,6 +1,18 @@
 // Demod session, acquisition, and ring-coordination helpers.
 
 void StreamDecoder::Impl::demod_cold_seed(DemodRuntimeState &state) {
+    // DemodRuntimeState lives for the worker thread rather than for one
+    // source. A new acquisition must not inherit a recovery decision from a
+    // previous file / retune: before the first pilot lock, previous_phase and
+    // carrier_offset deliberately hold sentinels, so carrying a stale
+    // hopeless-window count into the freeze path would turn those sentinels
+    // into an out-of-range PilotLock.
+    state.lock_hold = 0;
+    state.frozen_symbol_count = 0;
+    state.hopeless_window_count = 0;
+    state.stable_pending_offset = std::numeric_limits<int>::max();
+    state.stable_pending_count = 0;
+    state.tps_mismatch_symbols = 0;
     frontend.tracked_cfo_phase =
         std::arg(sync.phase) / static_cast<float>(state.fft_size);
     frontend.residual_phase_ema = 0.0F;

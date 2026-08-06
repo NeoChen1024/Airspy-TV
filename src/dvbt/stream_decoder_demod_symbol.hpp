@@ -148,12 +148,15 @@ StreamDecoder::Impl::demod_lock_pilots(DemodRuntimeState &state) {
     auto &stable_pending_count = state.stable_pending_count;
 
     PilotLock lock;
-    if (lock_hold > 0) {
+    const bool has_previous_lock =
+        frontend.previous_phase >= 0 && frontend.previous_phase < 4 &&
+        frontend.carrier_offset != std::numeric_limits<int>::max();
+    if (lock_hold > 0 && has_previous_lock) {
         --lock_hold;
         lock = PilotLock{static_cast<int>(frontend.previous_phase),
                          frontend.carrier_offset};
-    } else if ((fade_indicator <= 0.25F && frontend.previous_phase >= 0) ||
-               hopeless_window_count >= 4) {
+    } else if (has_previous_lock &&
+               (fade_indicator <= 0.25F || hopeless_window_count >= 4)) {
         if (airspy_tv::is_debug_enabled() && frozen_symbol_count == 0) {
             // Distinguish a real fade (fi collapsed) from a
             // decode-stuck state (fi healthy but MER below the
@@ -209,6 +212,9 @@ StreamDecoder::Impl::demod_lock_pilots(DemodRuntimeState &state) {
             return std::nullopt;
         }
     } else {
+        // A cold seed has no prior grid to freeze. Discard a stale hold
+        // request and establish / verify a real pilot lock instead.
+        lock_hold = 0;
         if (frontend.carrier_offset == std::numeric_limits<int>::max()) {
             // First healthy lock after (re-)acquisition: the
             // grid is unknown, so run the full offset search
