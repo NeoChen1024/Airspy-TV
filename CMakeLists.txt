@@ -130,6 +130,7 @@ target_include_directories(imgui SYSTEM PUBLIC
 target_link_libraries(imgui PUBLIC SDL3::SDL3 OpenGL::GL)
 
 add_library(airspy-tv-common STATIC
+    src/debug.cpp
     src/fec/outer_fec.cpp
     src/fec/soft_viterbi.cpp
 )

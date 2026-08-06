@@ -63,7 +63,7 @@ void StreamDecoder::Impl::demod_process_batch(
         const bool hopeless = static_cast<float>(window_mer) < floor;
         state.hopeless_window_count =
             hopeless ? state.hopeless_window_count + 1 : 0;
-        if (event_debug_enabled() && hopeless) {
+        if (airspy_tv::is_debug_enabled() && hopeless) {
             std::fprintf(
                 stderr,
                 "[evt] hopeless mer=%.2f floor=%.2f "
@@ -315,7 +315,7 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
         fractional_timing +=
             smoothed_timing_drift / timing_window_shift_response;
         fractional_timing = std::clamp(fractional_timing, -4.0, 4.0);
-        if (event_debug_enabled() && timing_count != 0 &&
+        if (airspy_tv::is_debug_enabled() && timing_count != 0 &&
             window_symbols >= stats_window_symbols) {
             std::fprintf(
                 stderr,

@@ -118,7 +118,6 @@ def validate_scenario(
     log_path = work_dir / f"dvbt-clock-{scenario.name}.log"
     env = os.environ.copy()
     env["XDG_CACHE_HOME"] = str(work_dir / "cache")
-    env["AIRSPYTV_EVENT_DEBUG"] = "1"
 
     generator = run_checked(
         [

@@ -195,7 +195,7 @@ transmission parameters (`--dvbt-mode`, `--dvbt-channel-bandwidth`,
 `--dvbt-guard`, `--dvbt-modulation`, `--dvbt-code-rate`) default to
 auto-detection from the TPS and can be forced when the signal is marginal or
 the capture metadata is incomplete. Pass `-d` or `--debug` to include worker
-allocation, per-stage timings, and detailed FEC statistics.
+allocation, per-stage timings, tracking events, and detailed FEC diagnostics.
 
 ## Decoder architecture
 

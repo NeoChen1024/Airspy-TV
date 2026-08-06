@@ -232,7 +232,7 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
                 now_available = ring_write_pos - ring_read_pos;
             }
             if (cancel || duration_ms(wait_started) > 1000.0F) {
-                if (event_debug_enabled() && !cancel) {
+                if (airspy_tv::is_debug_enabled() && !cancel) {
                     std::fprintf(
                         stderr, "[evt] acq wait-timeout avail=%llu\n",
                         static_cast<unsigned long long>(now_available));
@@ -304,7 +304,7 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
         sync.bandwidth = bandwidth;
         sync.resampled_rate = resampled_rate;
         latest.acquisition_score = acquisition.score;
-        if (event_debug_enabled()) {
+        if (airspy_tv::is_debug_enabled()) {
             std::fprintf(stderr,
                          "[evt] acq ok score=%.3f start=%llu mode=%d g=%d\n",
                          acquisition.score,

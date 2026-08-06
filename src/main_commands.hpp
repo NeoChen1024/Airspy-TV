@@ -162,7 +162,7 @@ int inspect_iq_cli(const std::filesystem::path &path,
 int decode_iq_cli(const std::filesystem::path &source,
                   const std::filesystem::path &destination,
                   const std::uint32_t raw_sample_rate_hz,
-                  const ReceiverParameters &parameters, const bool debug) {
+                  const ReceiverParameters &parameters) {
     IqFileInfo info;
     std::string error;
     if (!airspy_tv::resolve_iq_file(source, raw_sample_rate_hz, 0, info,
@@ -198,7 +198,7 @@ int decode_iq_cli(const std::filesystem::path &source,
     StreamDecoder decoder;
     ReceiverParameters decoder_parameters = parameters;
     decoder.set_parameters(decoder_parameters);
-    if (debug) {
+    if (airspy_tv::is_debug_enabled()) {
         std::cerr << "Decoder worker budget="
                   << (decoder_parameters.worker_threads == 0
                           ? airspy_tv::dvbt::default_viterbi_worker_count()
@@ -282,6 +282,9 @@ int decode_iq_cli(const std::filesystem::path &source,
     std::uint64_t reported_transport_bytes = 0;
     std::uint64_t reported_phase_discontinuities = 0;
     const auto report_chunk = [&](const StreamDecoderStats &stats) {
+        if (!airspy_tv::is_debug_enabled()) {
+            return;
+        }
         reported_processed_chunks = stats.processed_chunks;
         reported_processed_samples = stats.processed_input_samples;
         reported_transport_bytes = stats.transport_bytes;
@@ -317,76 +320,68 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << " sro-ready=" << (stats.timing_drift_ready ? 1 : 0)
                   << " carried=" << (stats.state_carried ? 1 : 0)
                   << " fec-skip=" << (stats.fec_skipped ? 1 : 0) << '\n';
-        if (debug) {
-            std::cerr << "  timing: raw=" << stats.raw_timing_offset_samples
-                      << " filtered=" << stats.timing_offset_samples
-                      << " physical=" << stats.physical_timing_offset_samples
-                      << " smp observed-drift="
-                      << stats.observed_timing_drift_samples
-                      << " corrected-drift="
-                      << stats.corrected_timing_drift_samples
-                      << " smooth=" << stats.smoothed_timing_drift_samples
-                      << " smp/current-window shift-rate="
-                      << stats.timing_shift_rate_ppm
-                      << " ppm rolling-shift-rate="
-                      << stats.rolling_timing_shift_rate_ppm
-                      << " ppm frac=" << stats.fractional_timing_samples
-                      << " cir=" << stats.cir_offset_samples
-                      << " smp cir-conf=" << stats.cir_confidence
-                      << " measurements=" << stats.timing_measurements
-                      << " accepted=" << stats.timing_accepted_measurements
-                      << " rejected=" << stats.timing_rejected_measurements
-                      << '\n';
-            std::cerr << "  pipeline: frontend-wall="
-                      << stats.last_frontend_block_wall_time_ms
-                      << " ms convert=" << stats.last_frontend_convert_time_ms
-                      << " ms resample=" << stats.last_frontend_resample_time_ms
-                      << " ms ring-copy="
-                      << stats.last_frontend_ring_copy_time_ms
-                      << " ms ring-wait="
-                      << stats.last_frontend_ring_wait_time_ms << " ms\n"
-                      << "            demod-wall="
-                      << stats.demod_window_wall_time_ms
-                      << " ms demod-busy=" << stats.demod_busy_time_ms
-                      << " ms (" << stats.demod_busy_fraction * 100.0F
-                      << "%) last-acquisition="
-                      << stats.last_acquisition_time_ms << " ms; workers "
-                      << "resample=" << stats.resample_workers
-                      << " symbol=" << stats.symbol_workers
-                      << " Viterbi=" << stats.transport.viterbi_workers << '\n';
-            std::cerr << "  worker work (aggregate): symbol-preprocess="
-                      << stats.symbol_preprocess_work_time_ms
-                      << " ms symbol-demap=" << stats.symbol_demap_work_time_ms
-                      << " ms symbol-deinterleave="
-                      << stats.symbol_deinterleave_work_time_ms
-                      << " ms symbol-depuncture/quantize="
-                      << stats.symbol_depuncture_work_time_ms
-                      << " ms FEC=" << stats.fec_work_time_ms
-                      << " ms (transport subset="
-                      << stats.transport_work_time_ms << " ms)\n";
-            std::cerr << "  TPS: " << (stats.tps_locked ? "locked" : "unlocked")
-                      << '\n';
-            if (stats.transport.pre_viterbi_compared_bits != 0) {
-                const double pre_viterbi_ber =
+        std::cerr << "  timing: raw=" << stats.raw_timing_offset_samples
+                  << " filtered=" << stats.timing_offset_samples
+                  << " physical=" << stats.physical_timing_offset_samples
+                  << " smp observed-drift="
+                  << stats.observed_timing_drift_samples
+                  << " corrected-drift=" << stats.corrected_timing_drift_samples
+                  << " smooth=" << stats.smoothed_timing_drift_samples
+                  << " smp/current-window shift-rate="
+                  << stats.timing_shift_rate_ppm << " ppm rolling-shift-rate="
+                  << stats.rolling_timing_shift_rate_ppm
+                  << " ppm frac=" << stats.fractional_timing_samples
+                  << " cir=" << stats.cir_offset_samples
+                  << " smp cir-conf=" << stats.cir_confidence
+                  << " measurements=" << stats.timing_measurements
+                  << " accepted=" << stats.timing_accepted_measurements
+                  << " rejected=" << stats.timing_rejected_measurements << '\n';
+        std::cerr << "  pipeline: frontend-wall="
+                  << stats.last_frontend_block_wall_time_ms
+                  << " ms convert=" << stats.last_frontend_convert_time_ms
+                  << " ms resample=" << stats.last_frontend_resample_time_ms
+                  << " ms ring-copy=" << stats.last_frontend_ring_copy_time_ms
+                  << " ms ring-wait=" << stats.last_frontend_ring_wait_time_ms
+                  << " ms\n"
+                  << "            demod-wall="
+                  << stats.demod_window_wall_time_ms
+                  << " ms demod-busy=" << stats.demod_busy_time_ms << " ms ("
+                  << stats.demod_busy_fraction * 100.0F
+                  << "%) last-acquisition=" << stats.last_acquisition_time_ms
+                  << " ms; workers "
+                  << "resample=" << stats.resample_workers
+                  << " symbol=" << stats.symbol_workers
+                  << " Viterbi=" << stats.transport.viterbi_workers << '\n';
+        std::cerr << "  worker work (aggregate): symbol-preprocess="
+                  << stats.symbol_preprocess_work_time_ms
+                  << " ms symbol-demap=" << stats.symbol_demap_work_time_ms
+                  << " ms symbol-deinterleave="
+                  << stats.symbol_deinterleave_work_time_ms
+                  << " ms symbol-depuncture/quantize="
+                  << stats.symbol_depuncture_work_time_ms
+                  << " ms FEC=" << stats.fec_work_time_ms
+                  << " ms (transport subset=" << stats.transport_work_time_ms
+                  << " ms)\n";
+        std::cerr << "  TPS: " << (stats.tps_locked ? "locked" : "unlocked")
+                  << '\n';
+        if (stats.transport.pre_viterbi_compared_bits != 0) {
+            const double pre_viterbi_ber =
+                static_cast<double>(stats.transport.pre_viterbi_error_bits) /
+                static_cast<double>(stats.transport.pre_viterbi_compared_bits);
+            std::cerr << std::format("  BER: pre-Viterbi={:.3e}",
+                                     pre_viterbi_ber);
+            if (stats.transport.post_viterbi_compared_bits != 0) {
+                const double post_viterbi_ber =
                     static_cast<double>(
-                        stats.transport.pre_viterbi_error_bits) /
+                        stats.transport.post_viterbi_error_bits) /
                     static_cast<double>(
-                        stats.transport.pre_viterbi_compared_bits);
-                std::cerr << std::format("  BER: pre-Viterbi={:.3e}",
-                                         pre_viterbi_ber);
-                if (stats.transport.post_viterbi_compared_bits != 0) {
-                    const double post_viterbi_ber =
-                        static_cast<double>(
-                            stats.transport.post_viterbi_error_bits) /
-                        static_cast<double>(
-                            stats.transport.post_viterbi_compared_bits);
-                    std::cerr << std::format(" post-Viterbi={:.3e}",
-                                             post_viterbi_ber);
-                } else {
-                    std::cerr << " post-Viterbi=--";
-                }
-                std::cerr << '\n';
+                        stats.transport.post_viterbi_compared_bits);
+                std::cerr << std::format(" post-Viterbi={:.3e}",
+                                         post_viterbi_ber);
+            } else {
+                std::cerr << " post-Viterbi=--";
             }
+            std::cerr << '\n';
         }
         const std::uint64_t phase_delta =
             stats.pilot_phase_discontinuities - reported_phase_discontinuities;
@@ -410,7 +405,8 @@ int decode_iq_cli(const std::filesystem::path &source,
                                 info.sample_rate_hz);
         if (scalar_count == block.size()) {
             const auto progress = decoder.stats();
-            if (progress.processed_chunks != reported_processed_chunks) {
+            if (airspy_tv::is_debug_enabled() &&
+                progress.processed_chunks != reported_processed_chunks) {
                 report_chunk(progress);
             }
         }
@@ -419,8 +415,9 @@ int decode_iq_cli(const std::filesystem::path &source,
     output.flush();
 
     const auto stats = decoder.stats();
-    if (reported_processed_samples != stats.processed_input_samples ||
-        reported_transport_bytes != stats.transport_bytes) {
+    if (airspy_tv::is_debug_enabled() &&
+        (reported_processed_samples != stats.processed_input_samples ||
+         reported_transport_bytes != stats.transport_bytes)) {
         report_chunk(stats);
     }
     const double input_seconds = static_cast<double>(input_complex_samples) /
@@ -429,7 +426,7 @@ int decode_iq_cli(const std::filesystem::path &source,
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       started_at)
             .count();
-    if (debug) {
+    if (airspy_tv::is_debug_enabled()) {
         std::cerr << "decoded " << input_complex_samples << " complex samples ("
                   << input_seconds << " s) in " << wall_seconds
                   << " s, TS=" << stats.transport_bytes

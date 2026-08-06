@@ -1,4 +1,5 @@
 #include "airspy_tv/fec/outer_fec.hpp"
+#include "airspy_tv/debug.hpp"
 
 extern "C" {
 #include <correct.h>
@@ -10,7 +11,6 @@ extern "C" {
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <span>
@@ -32,11 +32,6 @@ constexpr std::size_t minimum_alignment_rs_evidence = 4;
 // EnergyDescrambler::process_corrupt() to preserve TS cadence; only a much
 // longer run is treated as evidence of a false outer-phase lock.
 constexpr std::size_t uncorrectable_reset_threshold = 512;
-
-[[nodiscard]] bool fec_debug_enabled() noexcept {
-    static const bool enabled = std::getenv("AIRSPYTV_FEC_DEBUG") != nullptr;
-    return enabled;
-}
 
 class ByteDeinterleaver {
   public:
@@ -360,21 +355,20 @@ struct OuterFec::Impl {
                 evidence[phase] =
                     find_rs_alignment(outer_candidates[phase], reed_solomon);
             }
-            if (fec_debug_enabled()) {
-                std::fprintf(stderr, "[fec] align-search #%llu",
-                             static_cast<unsigned long long>(
-                                 alignment_search_count));
-                for (std::size_t phase = 0;
-                     phase < outer_candidates.size(); ++phase) {
+            if (airspy_tv::is_debug_enabled()) {
+                std::fprintf(
+                    stderr, "[fec] align-search #%llu",
+                    static_cast<unsigned long long>(alignment_search_count));
+                for (std::size_t phase = 0; phase < outer_candidates.size();
+                     ++phase) {
                     const auto &candidate_evidence = evidence[phase];
-                    std::fprintf(
-                        stderr, " p%zu=%u/%zu@%zu", phase,
-                        candidate_evidence.sync_distance,
-                        candidate_evidence.rs_successes,
-                        candidate_evidence.start ==
-                                std::numeric_limits<std::size_t>::max()
-                            ? 0
-                            : candidate_evidence.start);
+                    std::fprintf(stderr, " p%zu=%u/%zu@%zu", phase,
+                                 candidate_evidence.sync_distance,
+                                 candidate_evidence.rs_successes,
+                                 candidate_evidence.start ==
+                                         std::numeric_limits<std::size_t>::max()
+                                     ? 0
+                                     : candidate_evidence.start);
                 }
                 std::fputc('\n', stderr);
             }
@@ -414,7 +408,7 @@ struct OuterFec::Impl {
                 if (pending_alignment_phase != selected_phase) {
                     pending_alignment_phase = selected_phase;
                     statistics.rs_synchronized = false;
-                    if (fec_debug_enabled()) {
+                    if (airspy_tv::is_debug_enabled()) {
                         std::fprintf(
                             stderr,
                             "[fec] align-pending phase=%zu sync=%u rs=%zu\n",
@@ -435,7 +429,7 @@ struct OuterFec::Impl {
                 energy_descrambler.start_at_energy_phase(
                     selected_evidence.energy_phase);
                 statistics.rs_synchronized = true;
-                if (fec_debug_enabled()) {
+                if (airspy_tv::is_debug_enabled()) {
                     std::fprintf(
                         stderr,
                         "[fec] align-lock phase=%zu start=%zu sync=%u "
@@ -448,9 +442,8 @@ struct OuterFec::Impl {
                 }
             } else {
                 pending_alignment_phase = outer_interleaver_branches;
-                if (fec_debug_enabled()) {
-                    std::fprintf(stderr,
-                                 "[fec] align-miss searches=%llu\n",
+                if (airspy_tv::is_debug_enabled()) {
+                    std::fprintf(stderr, "[fec] align-miss searches=%llu\n",
                                  static_cast<unsigned long long>(
                                      alignment_search_count));
                 }
@@ -477,15 +470,14 @@ struct OuterFec::Impl {
                 randomized, &corrected_payload_bits);
             rs_bytes.erase(rs_bytes.begin(), rs_bytes.begin() + rs_packet_size);
             ++statistics.rs_packets;
-            if (fec_debug_enabled() && statistics.rs_packets <= 4) {
-                std::fprintf(stderr,
-                             "[fec] rs-attempt #%llu valid=%d sync=0x%02x "
-                             "rsbuf=%zu energy=%d\n",
-                             static_cast<unsigned long long>(
-                                 statistics.rs_packets),
-                             valid ? 1 : 0, received_randomized.front(),
-                             rs_bytes.size(),
-                             energy_descrambler.synchronized() ? 1 : 0);
+            if (airspy_tv::is_debug_enabled() && statistics.rs_packets <= 4) {
+                std::fprintf(
+                    stderr,
+                    "[fec] rs-attempt #%llu valid=%d sync=0x%02x "
+                    "rsbuf=%zu energy=%d\n",
+                    static_cast<unsigned long long>(statistics.rs_packets),
+                    valid ? 1 : 0, received_randomized.front(), rs_bytes.size(),
+                    energy_descrambler.synchronized() ? 1 : 0);
             }
             // Count every codeword once it has been selected by a valid outer
             // phase. The old accounting only advanced after a successful RS
@@ -499,7 +491,7 @@ struct OuterFec::Impl {
                 ++statistics.rs_uncorrectable_packets;
                 statistics.corrected_payload_bits += ts_packet_size * 8;
                 ++uncorrectable_since_sync;
-                if (fec_debug_enabled() &&
+                if (airspy_tv::is_debug_enabled() &&
                     (uncorrectable_since_sync == 1 ||
                      uncorrectable_since_sync == 8 ||
                      uncorrectable_since_sync == 32 ||
@@ -518,8 +510,7 @@ struct OuterFec::Impl {
                         selected_outer_phase, rs_bytes.size(),
                         energy_descrambler.synchronized() ? 1 : 0);
                 }
-                if (uncorrectable_since_sync >=
-                    uncorrectable_reset_threshold) {
+                if (uncorrectable_since_sync >= uncorrectable_reset_threshold) {
                     // A long run of consecutive RS failures means the
                     // selected outer phase is almost certainly wrong (a
                     // false lock from a fade-corrupted search window). Drop
@@ -543,7 +534,7 @@ struct OuterFec::Impl {
                     statistics.outer_deinterleaver_phase = -1;
                     statistics.outer_sync_distance = 0;
                     statistics.outer_rs_evidence = 0;
-                    if (fec_debug_enabled()) {
+                    if (airspy_tv::is_debug_enabled()) {
                         std::fprintf(
                             stderr,
                             "[fec] outer-reset reason=rs-failure-streak "
@@ -564,7 +555,8 @@ struct OuterFec::Impl {
                 }
                 continue;
             }
-            if (fec_debug_enabled() && uncorrectable_since_sync >= 8) {
+            if (airspy_tv::is_debug_enabled() &&
+                uncorrectable_since_sync >= 8) {
                 std::fprintf(stderr,
                              "[fec] rs-recover previous-streak=%zu total=%llu "
                              "phase=%zu\n",
@@ -606,8 +598,7 @@ struct OuterFec::Impl {
     // searches are throttled so a noisy interval cannot monopolize the FEC
     // worker.  This is many times longer than one RS alignment window, while
     // the candidate buffers continue to retain the newest window.
-    static constexpr std::size_t alignment_search_interval =
-        32 * 32 * 204;
+    static constexpr std::size_t alignment_search_interval = 32 * 32 * 204;
     std::size_t alignment_search_bytes{};
     std::uint64_t alignment_search_count{};
     std::size_t pending_alignment_phase{outer_interleaver_branches};

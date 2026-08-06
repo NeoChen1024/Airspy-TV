@@ -1,5 +1,6 @@
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 
+#include "airspy_tv/debug.hpp"
 #include "airspy_tv/dvbt/analysis_publisher.hpp"
 #include "airspy_tv/dvbt/decoder.hpp"
 #include "airspy_tv/dvbt/inner_decoder.hpp"
@@ -52,14 +53,6 @@ constexpr std::size_t buffer_duration_denominator = 5;
 constexpr std::size_t initial_symbol_queue_capacity = 256;
 constexpr std::size_t ts_packet_size = 188;
 
-// Event-driven debug dump: when AIRSPYTV_EVENT_DEBUG is set, key pipeline
-// transitions (fade enter/exit, TPS lock/unlock, carrier drift, re-anchor,
-// acquisition) print their internal state to stderr immediately so a 10 s
-// polling diag does not miss the instant a transient event damages the grid.
-[[nodiscard]] inline bool event_debug_enabled() {
-    static const bool enabled = std::getenv("AIRSPYTV_EVENT_DEBUG") != nullptr;
-    return enabled;
-}
 // Resampled-sample ring shared by the front-end thread (producer) and the
 // demod thread (consumer). The ring is sized at run time from the input rate
 // to retain ~0.2 s of baseband (the baseband rate is always <= the input

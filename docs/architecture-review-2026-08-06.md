@@ -103,13 +103,11 @@ adding DVB-C or DVB-T2:
 
 ### Low: long-lived diagnostics need explicit retention policy
 
-Periodic decoder diagnostics and event logs are valuable during current clock
-research but can produce very large files. Define which diagnostics are:
-
-- always-on low-rate health telemetry;
-- enabled only by `--debug`;
-- enabled only by `AIRSPYTV_EVENT_DEBUG=1`;
-- suitable for machine-readable long-run regression summaries.
+User-visible and fatal errors remain unconditional; decoder diagnostics, event
+logs, and FEC traces now share the `--debug` flag. These verbose logs can still
+produce very large files during clock research. Define which measurements
+should also be emitted as compact, machine-readable long-run regression
+summaries, and rate-limit repeated human-readable events where appropriate.
 
 This should reduce ad-hoc log parsing without removing the detailed data needed
 for AFC and FEC investigations.

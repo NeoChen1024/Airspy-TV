@@ -28,7 +28,7 @@ Use the following as the reference before changing timing control:
 - Full capture: `545M-DVB-T-公視-3.cs16`, 10 MS/s CS16, approximately 363.9
   GB and 151.6 minutes.
 - Offline decoder: the native `StreamDecoder` through `--decode-iq`.
-- Event logging: `AIRSPYTV_EVENT_DEBUG=1`.
+- Event logging: pass `--debug` to the receiver CLI.
 - Synthetic tools:
   - `tools/generate_dvbt_fixture.py`
   - `tools/validate_dvbt_clock_drift.py`

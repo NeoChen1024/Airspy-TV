@@ -1,14 +1,14 @@
 // Per-symbol carrier, pilot, channel, timing, and TPS helpers.
 
 bool StreamDecoder::Impl::demod_maybe_reacquire(DemodRuntimeState &state) {
-    if (event_debug_enabled()) {
+    if (airspy_tv::is_debug_enabled()) {
         std::fprintf(stderr,
                      "[evt] re-anchor triggered fi=%.3f off=%d sym=%llu\n",
                      state.fade_indicator, frontend.carrier_offset,
                      static_cast<unsigned long long>(state.symbol_count));
     }
     const float reanchor_score = demod_run_acquisition(state, true);
-    if (event_debug_enabled()) {
+    if (airspy_tv::is_debug_enabled()) {
         std::fprintf(stderr, "[evt] re-anchor score=%.3f stable_off=%d\n",
                      reanchor_score, frontend.stable_carrier_offset);
     }
@@ -154,7 +154,7 @@ StreamDecoder::Impl::demod_lock_pilots(DemodRuntimeState &state) {
                          frontend.carrier_offset};
     } else if ((fade_indicator <= 0.25F && frontend.previous_phase >= 0) ||
                hopeless_window_count >= 4) {
-        if (event_debug_enabled() && frozen_symbol_count == 0) {
+        if (airspy_tv::is_debug_enabled() && frozen_symbol_count == 0) {
             // Distinguish a real fade (fi collapsed) from a
             // decode-stuck state (fi healthy but MER below the
             // decode floor — the carrier grid drifted off,
@@ -239,7 +239,7 @@ StreamDecoder::Impl::demod_lock_pilots(DemodRuntimeState &state) {
         if (frontend.previous_phase >= 0 &&
             lock.phase != (frontend.previous_phase + 1) % 4) {
             ++frontend.phase_discontinuities;
-            if (event_debug_enabled()) {
+            if (airspy_tv::is_debug_enabled()) {
                 std::fprintf(stderr,
                              "[evt] phase-jump %d->%d sym=%llu "
                              "fi=%.3f off=%d\n",
@@ -276,7 +276,7 @@ StreamDecoder::Impl::demod_lock_pilots(DemodRuntimeState &state) {
         }
         const auto was_frozen = frozen_symbol_count;
         frozen_symbol_count = 0;
-        if (event_debug_enabled() && was_frozen > 0) {
+        if (airspy_tv::is_debug_enabled() && was_frozen > 0) {
             std::fprintf(stderr,
                          "[evt] fade exit fi=%.3f off=%d "
                          "sym=%llu\n",
@@ -341,7 +341,8 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
         const auto previous_filtered_tau = timing_tracker.filtered();
         const auto accepted_tau = timing_tracker.observe(*measured_tau);
         if (accepted_tau.has_value()) {
-            if (event_debug_enabled() && previous_filtered_tau.has_value() &&
+            if (airspy_tv::is_debug_enabled() &&
+                previous_filtered_tau.has_value() &&
                 std::abs(*accepted_tau - *previous_filtered_tau) >
                     timing_outlier_limit_samples) {
                 std::fprintf(stderr,
@@ -354,7 +355,7 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
             timing_acc += *accepted_tau * (2.0 * std::numbers::pi_v<double>) /
                           static_cast<double>(fft_size);
             ++timing_count;
-        } else if (event_debug_enabled()) {
+        } else if (airspy_tv::is_debug_enabled()) {
             ++timing_rejected_count;
             const auto filtered_tau = timing_tracker.filtered();
             std::fprintf(stderr,
@@ -550,7 +551,7 @@ DemodFlow StreamDecoder::Impl::demod_process_tps(DemodRuntimeState &state) {
     }
     if (!decoder_parameters && matching_tps &&
         frontend.tps_snapshot.parameters.hierarchy == 0U) {
-        if (event_debug_enabled()) {
+        if (airspy_tv::is_debug_enabled()) {
             std::fprintf(
                 stderr,
                 "[evt] TPS lock mode=%d g=%d const=%d "

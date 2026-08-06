@@ -1,5 +1,6 @@
 #include "airspy_tv/sdr.hpp"
 
+#include "airspy_tv/debug.hpp"
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 #include "airspy_tv/epg.hpp"
@@ -94,7 +95,6 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats);
 #include "main_cli.hpp"
 
 int main(const int argc, char **argv) {
-    bool debug = false;
     std::optional<std::filesystem::path> inspect_iq_path;
     std::optional<std::filesystem::path> decode_iq_path;
     std::optional<std::filesystem::path> ts_output_path;
@@ -115,7 +115,7 @@ int main(const int argc, char **argv) {
             print_cli_usage();
             return 0;
         case 'd':
-            debug = true;
+            airspy_tv::debug_enabled.store(true, std::memory_order_relaxed);
             break;
         case opt_enumerate:
             return enumerate_cli();
@@ -215,7 +215,7 @@ int main(const int argc, char **argv) {
             cli_usage_error("--decode-iq requires --ts-output");
         }
         return decode_iq_cli(*decode_iq_path, *ts_output_path, sample_rate_hz,
-                             dvbt_parameters, debug);
+                             dvbt_parameters);
     }
     if (record_path.has_value()) {
         SourceSettings settings;
