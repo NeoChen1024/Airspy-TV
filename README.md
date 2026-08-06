@@ -249,3 +249,18 @@ XDG_CACHE_HOME=/tmp/airspy-tv-gnuradio-cache \
 
 The JSON sidecar records all four impairment parameters while retaining the
 nominal 10 MS/s sample rate expected by the decoder.
+
+Run the end-to-end clock regression to generate and decode sample-clock-only,
+LO-only, and independent sample/LO drift fixtures:
+
+```sh
+python3 tools/validate_dvbt_clock_drift.py \
+  --build-dir build \
+  --duration 20
+```
+
+By default, generated fixtures, decoder logs, and transport streams use a
+temporary directory that is removed after the run. Pass `--work-dir PATH` to
+retain those artifacts for inspection. The validator checks the recovered SRO
+and CFO independently, requires non-empty TS output, and rejects timing/FEC
+failure events.

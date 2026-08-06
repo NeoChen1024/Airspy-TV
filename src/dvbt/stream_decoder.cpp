@@ -1346,15 +1346,18 @@ struct StreamDecoder::Impl {
             // fractional timing that nudges the symbol period by +/-1 sample
             // when it crosses +/-0.5.
             double last_windowed_timing = 0.0;
-            double smoothed_timing_drift = 0.0;
+            double smoothed_sample_clock_ppm = 0.0;
             double fractional_timing = 0.0;
-            // Tau history for the robust first-difference drift estimate
-            // (immune to the loop's own period steps; see publish_stats_window).
+            // Physical timing and nominal sample position for the robust
+            // first-difference SRO estimate. Sample positions make the slope
+            // independent of full versus partial statistics-window length.
             static constexpr std::size_t tau_history_n = 24;
             static constexpr std::size_t tau_history_min = 16;
             std::array<double, tau_history_n> tau_history{};
+            std::array<double, tau_history_n> tau_sample_history{};
             std::size_t tau_history_head = 0;
             std::size_t tau_history_count = 0;
+            double timing_elapsed_samples = 0.0;
             // Cumulative FFT-window displacement applied by the period steps
             // (each +/-1-sample step on next_symbol_start), retained for
             // diagnostics. The publish loop adds the calibrated response
@@ -1372,7 +1375,16 @@ struct StreamDecoder::Impl {
             // even when no timing measurement is accepted; the control
             // baseline above deliberately waits for valid timing.
             double last_telemetry_window_shift = 0.0;
-            int cir_off_window_begin = 0;
+            double window_cir_offset_sum = 0.0;
+            // Rolling actuator rate is diagnostics only. Keep the raw
+            // per-window pulse rate too, since it proves integer-step timing.
+            static constexpr std::size_t shift_rate_history_n = 64;
+            std::array<double, shift_rate_history_n> shift_rate_steps{};
+            std::array<double, shift_rate_history_n> shift_rate_samples{};
+            std::size_t shift_rate_history_head = 0;
+            std::size_t shift_rate_history_count = 0;
+            double rolling_shift_steps = 0.0;
+            double rolling_shift_samples = 0.0;
             // Integer CIR window offset currently applied to
             // `next_symbol_start`; the per-frame estimate only nudges the
             // anchor by the difference, so mid-stream updates move the FFT
@@ -1454,6 +1466,33 @@ struct StreamDecoder::Impl {
             };
 
             std::size_t symbol_queue_capacity = initial_symbol_queue_capacity;
+            const auto reset_timing_state =
+                [&](const std::size_t tracker_fft_size,
+                    const bool reset_window_cir) {
+                    fractional_timing = 0.0;
+                    smoothed_sample_clock_ppm = 0.0;
+                    accumulated_window_shift = 0.0;
+                    last_windowed_timing = 0.0;
+                    last_windowed_cir_avg = 0.0;
+                    last_timing_window_shift = 0.0;
+                    last_telemetry_window_shift = 0.0;
+                    tau_history.fill(0.0);
+                    tau_sample_history.fill(0.0);
+                    tau_history_head = 0;
+                    tau_history_count = 0;
+                    timing_elapsed_samples = 0.0;
+                    if (reset_window_cir) {
+                        window_cir_offset_sum = 0.0;
+                    }
+                    shift_rate_steps.fill(0.0);
+                    shift_rate_samples.fill(0.0);
+                    shift_rate_history_head = 0;
+                    shift_rate_history_count = 0;
+                    rolling_shift_steps = 0.0;
+                    rolling_shift_samples = 0.0;
+                    cir_confidence = 0.0;
+                    timing_tracker.reset(tracker_fft_size);
+                };
             // Handles a sync version change (first anchor, re-anchor, or
             // reset). Returns true when the demod must act (grid (re)built or
             // abandoned). Called with the mutex held.
@@ -1488,18 +1527,10 @@ struct StreamDecoder::Impl {
                     have_grid = false;
                     frontend.valid = false;
                     frontend.just_seeded = false;
-                    fractional_timing = 0.0;
-                    smoothed_timing_drift = 0.0;
-                    accumulated_window_shift = 0.0;
                     frontend.cir_offset = 0.0F;
                     frontend.cir_symbol_count = 0;
                     applied_cir_offset = 0;
-                    cir_confidence = 0.0;
-                    last_windowed_cir_avg = 0.0;
-                    last_timing_window_shift = 0.0;
-                    last_telemetry_window_shift = 0.0;
-                    timing_tracker.reset();
-                    cir_off_window_begin = 0;
+                    reset_timing_state(0, true);
                     return true;
                 }
                 const bool mode_changed =
@@ -1552,15 +1583,7 @@ struct StreamDecoder::Impl {
                     // The timing loop's reference grid changed: its residual
                     // fraction and drift state have no meaning against the
                     // new boundary.
-                    fractional_timing = 0.0;
-                    smoothed_timing_drift = 0.0;
-                    accumulated_window_shift = 0.0;
-                    last_windowed_cir_avg = 0.0;
-                    last_timing_window_shift = 0.0;
-                    last_telemetry_window_shift = 0.0;
-                    cir_confidence = 0.0;
-                    timing_tracker.reset(fft_size);
-                    cir_off_window_begin = applied_cir_offset;
+                    reset_timing_state(fft_size, true);
                     have_grid = true;
                     demod_busy = true;
                     return true;
@@ -1599,15 +1622,7 @@ struct StreamDecoder::Impl {
                 stable_pending_count = 0;
                 // The boundary moved: the timing loop restarts against the
                 // newly anchored grid.
-                fractional_timing = 0.0;
-                smoothed_timing_drift = 0.0;
-                accumulated_window_shift = 0.0;
-                last_windowed_cir_avg = 0.0;
-                last_timing_window_shift = 0.0;
-                last_telemetry_window_shift = 0.0;
-                cir_confidence = 0.0;
-                timing_tracker.reset(fft_size);
-                cir_off_window_begin = applied_cir_offset;
+                reset_timing_state(fft_size, false);
                 return true;
             };
 
@@ -1906,6 +1921,9 @@ struct StreamDecoder::Impl {
             const auto publish_stats_window = [&]() {
                 const float window_wall = duration_ms(window_started_at);
                 const std::uint64_t window_symbols = window_symbol_count;
+                const double window_sample_count =
+                    static_cast<double>(window_symbols) *
+                    static_cast<double>(period);
                 const float input_seconds =
                     sync.resampled_rate > 0.0F
                         ? static_cast<float>(window_symbols) *
@@ -1919,14 +1937,42 @@ struct StreamDecoder::Impl {
                               static_cast<float>(fft_size) /
                               (2.0F * std::numbers::pi_v<float>);
                 const double window_cir_avg =
-                    0.5 * (static_cast<double>(cir_off_window_begin) +
-                           static_cast<double>(applied_cir_offset));
+                    window_symbols == 0
+                        ? static_cast<double>(applied_cir_offset)
+                        : window_cir_offset_sum /
+                              static_cast<double>(window_symbols);
                 double observed_drift = 0.0;
                 double corrected_drift = 0.0;
                 double window_shift = 0.0;
                 const double telemetry_window_shift =
                     accumulated_window_shift - last_telemetry_window_shift;
                 last_telemetry_window_shift = accumulated_window_shift;
+                if (shift_rate_history_count == shift_rate_history_n) {
+                    rolling_shift_steps -=
+                        shift_rate_steps[shift_rate_history_head];
+                    rolling_shift_samples -=
+                        shift_rate_samples[shift_rate_history_head];
+                } else {
+                    ++shift_rate_history_count;
+                }
+                shift_rate_steps[shift_rate_history_head] =
+                    telemetry_window_shift;
+                shift_rate_samples[shift_rate_history_head] =
+                    window_sample_count;
+                rolling_shift_steps += telemetry_window_shift;
+                rolling_shift_samples += window_sample_count;
+                shift_rate_history_head =
+                    (shift_rate_history_head + 1) % shift_rate_history_n;
+                const double rolling_shift_rate_ppm =
+                    rolling_shift_samples > 0.0
+                        ? rolling_shift_steps * 1.0e6 /
+                              rolling_shift_samples
+                        : 0.0;
+                const double timing_sample_position =
+                    timing_elapsed_samples + 0.5 * window_sample_count;
+                timing_elapsed_samples += window_sample_count;
+                double smoothed_timing_drift =
+                    smoothed_sample_clock_ppm * window_sample_count / 1.0e6;
                 if (timing_count != 0) {
                     // Closed-loop sample-clock tracking: the windowed mean
                     // tau is dominated by the channel's mean group delay
@@ -1979,6 +2025,8 @@ struct StreamDecoder::Impl {
                         static_cast<double>(timing_offset) + window_cir_avg +
                         timing_window_shift_response *
                             accumulated_window_shift;
+                    tau_sample_history[tau_history_head] =
+                        timing_sample_position;
                     tau_history_head = (tau_history_head + 1) % tau_history_n;
                     if (tau_history_count < tau_history_n) {
                         ++tau_history_count;
@@ -2005,25 +2053,38 @@ struct StreamDecoder::Impl {
                                  tau_history_count + i) %
                                 tau_history_n;
                             const std::size_t idx1 = (idx0 + 1) % tau_history_n;
-                            diffs[i] = tau_history[idx1] - tau_history[idx0];
+                            const double sample_span =
+                                tau_sample_history[idx1] -
+                                tau_sample_history[idx0];
+                            diffs[i] =
+                                sample_span > 0.0
+                                    ? (tau_history[idx1] - tau_history[idx0]) *
+                                          1.0e6 / sample_span
+                                    : 0.0;
                         }
-                        std::nth_element(
+                        std::sort(
                             diffs.begin(),
                             diffs.begin() +
-                                static_cast<std::ptrdiff_t>(diffs_count / 2),
-                            diffs.begin() +
                                 static_cast<std::ptrdiff_t>(diffs_count));
-                        const double drift_estimate =
+                        const double drift_estimate_ppm =
                             diffs_count % 2 != 0
                                 ? diffs[diffs_count / 2]
                                 : 0.5 * (diffs[diffs_count / 2 - 1] +
                                          diffs[diffs_count / 2]);
-                        smoothed_timing_drift =
-                            0.1 * drift_estimate +
-                            0.9 * smoothed_timing_drift;
+                        smoothed_sample_clock_ppm =
+                            0.1 * drift_estimate_ppm +
+                            0.9 * smoothed_sample_clock_ppm;
                     }
+                    const double drift_limit_ppm =
+                        4.0 * 1.0e6 /
+                        (static_cast<double>(stats_window_symbols) *
+                         static_cast<double>(period));
+                    smoothed_sample_clock_ppm = std::clamp(
+                        smoothed_sample_clock_ppm, -drift_limit_ppm,
+                        drift_limit_ppm);
                     smoothed_timing_drift =
-                        std::clamp(smoothed_timing_drift, -4.0, 4.0);
+                        smoothed_sample_clock_ppm * window_sample_count /
+                        1.0e6;
                     fractional_timing +=
                         smoothed_timing_drift / timing_window_shift_response;
                     fractional_timing =
@@ -2034,7 +2095,8 @@ struct StreamDecoder::Impl {
                                      "[evt] tloop raw=%.2f tau=%.2f "
                                      "phys=%.2f shift=%.1f drift=%.3f "
                                      "smooth=%.3f sro=%+.4fppm frac=%.2f "
-                                     "conf=%.3f cir=%.1f/%.3f ready=%d\n",
+                                     "act=%+.4f/%+.4fppm conf=%.3f "
+                                     "cir=%.2f/%.3f ready=%d\n",
                                      latest_raw_timing,
                                      static_cast<double>(timing_offset),
                                      static_cast<double>(timing_offset) +
@@ -2044,10 +2106,13 @@ struct StreamDecoder::Impl {
                                      accumulated_window_shift,
                                      corrected_drift,
                                      smoothed_timing_drift,
-                                     smoothed_timing_drift * 1.0e6 /
-                                         (static_cast<double>(window_symbols) *
-                                          static_cast<double>(period)),
+                                     smoothed_sample_clock_ppm,
                                      fractional_timing,
+                                     window_sample_count > 0.0
+                                         ? telemetry_window_shift * 1.0e6 /
+                                               window_sample_count
+                                         : 0.0,
+                                     rolling_shift_rate_ppm,
                                      static_cast<double>(timing_count) /
                                          static_cast<double>(window_symbols),
                                      window_cir_avg, cir_confidence,
@@ -2092,14 +2157,8 @@ struct StreamDecoder::Impl {
                     static_cast<float>(corrected_drift);
                 latest.smoothed_timing_drift_samples =
                     static_cast<float>(smoothed_timing_drift);
-                const double window_sample_count =
-                    static_cast<double>(window_symbols) *
-                    static_cast<double>(period);
                 latest.sample_clock_offset_ppm =
-                    window_sample_count > 0.0
-                        ? static_cast<float>(smoothed_timing_drift * 1.0e6 /
-                                             window_sample_count)
-                        : 0.0F;
+                    static_cast<float>(smoothed_sample_clock_ppm);
                 latest.cumulative_timing_shift_samples =
                     static_cast<float>(accumulated_window_shift);
                 latest.timing_shift_rate_ppm =
@@ -2107,6 +2166,8 @@ struct StreamDecoder::Impl {
                         ? static_cast<float>(telemetry_window_shift * 1.0e6 /
                                              window_sample_count)
                         : 0.0F;
+                latest.rolling_timing_shift_rate_ppm =
+                    static_cast<float>(rolling_shift_rate_ppm);
                 latest.fractional_timing_samples =
                     static_cast<float>(fractional_timing);
                 latest.cir_offset_samples = static_cast<float>(window_cir_avg);
@@ -2733,6 +2794,11 @@ struct StreamDecoder::Impl {
                             ++timing_rejected_count;
                         }
                     }
+                    // This symbol was demodulated with the current CIR anchor.
+                    // Accumulate the exact applied position before the CIR
+                    // update below can move the anchor for the next symbol.
+                    window_cir_offset_sum +=
+                        static_cast<double>(applied_cir_offset);
                     // CIR / delay-spread estimate (scattered pilots -> IFFT ->
                     // impulse response) for adaptive FFT-window placement.
                     // Once per TPS frame: negligible cost. When the measured
@@ -3009,10 +3075,10 @@ struct StreamDecoder::Impl {
                         ++window_symbol_count;
                         if (window_symbol_count >= stats_window_symbols) {
                             publish_stats_window();
-                            cir_off_window_begin = applied_cir_offset;
                             window_started_at =
                                 std::chrono::steady_clock::now();
                             window_symbol_count = 0;
+                            window_cir_offset_sum = 0.0;
                             mer_sum = 0.0;
                             demap_time_sum = 0.0F;
                             deinterleave_time_sum = 0.0F;
@@ -3072,7 +3138,6 @@ struct StreamDecoder::Impl {
                     window_busy_ms += duration_ms(symbol_busy_start);
                     if (window_symbol_count >= stats_window_symbols) {
                         publish_stats_window();
-                        cir_off_window_begin = applied_cir_offset;
                         static_cast<void>(
                             enqueue_fec({.kind = FecItem::Kind::stats,
                                          .generation = latest_generation,
@@ -3081,6 +3146,7 @@ struct StreamDecoder::Impl {
                                          .symbol_index = 0}));
                         window_started_at = std::chrono::steady_clock::now();
                         window_symbol_count = 0;
+                        window_cir_offset_sum = 0.0;
                         mer_sum = 0.0;
                         demap_time_sum = 0.0F;
                         deinterleave_time_sum = 0.0F;
@@ -3157,9 +3223,9 @@ struct StreamDecoder::Impl {
                 // Publish a final partial-window stats snapshot.
                 if (window_symbol_count != 0 || mer_sum != 0.0) {
                     publish_stats_window();
-                    cir_off_window_begin = applied_cir_offset;
                     window_started_at = std::chrono::steady_clock::now();
                     window_symbol_count = 0;
+                    window_cir_offset_sum = 0.0;
                     mer_sum = 0.0;
                     demap_time_sum = 0.0F;
                     deinterleave_time_sum = 0.0F;

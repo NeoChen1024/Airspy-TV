@@ -83,7 +83,9 @@ struct StreamDecoderStats {
     float smoothed_timing_drift_samples{};
     float sample_clock_offset_ppm{};
     float cumulative_timing_shift_samples{};
+    // Per-window integer actuator output and its rolling 64-window average.
     float timing_shift_rate_ppm{};
+    float rolling_timing_shift_rate_ppm{};
     float fractional_timing_samples{};
     float cir_offset_samples{};
     float timing_confidence{};

@@ -176,20 +176,22 @@ The repository test suite remains green:
 The current loop is stable enough for the validation capture. The following
 items must be evaluated one at a time against this baseline.
 
-### 5.1 Validate the remaining timing-coordinate bias terms (TODO)
+### 5.1 Timing-coordinate bias validation
 
-Two bias corrections are present but still need controlled calibration:
+The two known bias sources now have explicit accounting:
 
-1. `timing_window_shift_response` is currently fixed at `1.0`. Verify its sign
-   and gain with commanded window steps and known sample-clock offsets in 2K
-   and 8K modes, then repeat on the 545/557/581 MHz multipath captures. The
-   corrected physical timing coordinate must not acquire a sawtooth correlated
-   with the loop's own cumulative `shift`.
-2. The CIR rebasing term currently approximates a statistics window's placement
-   with the average of its beginning and ending integer offsets. Validate this
-   against an exact per-symbol, time-weighted CIR offset. If CIR moves at
-   uneven points inside a 400-symbol window, the endpoint average must not be
-   allowed to appear as sample-clock drift.
+1. `timing_window_shift_response` remains fixed at `1.0`. The full 545 MHz
+   replay validates its sign and gain in the current 8K path: windows without
+   an actuator step averaged 0.6807 corrected samples of drift, windows with a
+   step averaged 0.7103, and reconstructed physical timing never moved
+   backward. The remaining TODO is to repeat commanded-step and known-SRO
+   validation in 2K mode and on the 557/581 MHz multipath captures.
+2. CIR rebasing now accumulates the exact `applied_cir_offset` used for every
+   symbol and uses that time-weighted mean for each full or partial statistics
+   window. This replaces the beginning/end-point average. The 545 MHz replay
+   had zero CIR movement throughout, so the implementation still needs a
+   synthetic mid-window CIR-step test and validation on captures with dynamic
+   CIR placement.
 
 These tests should compare raw `tau`, physical timing, corrected drift, SRO ppm,
 CIR offset, and shift rate. A stable non-zero `tau` remains valid; this task is
@@ -200,7 +202,8 @@ about removing actuator and placement bias from the derivative.
 The current actuator is an integer-step window correction driven by a
 fractional accumulator. This is robust and cheap, but it quantizes the timing
 correction and applies pending steps near statistics-window boundaries, which
-can leave a small residual sawtooth.
+can leave a small residual sawtooth. The instantaneous actuator telemetry is
+therefore pulse-density data, not a smooth clock estimate.
 
 First evaluate distributing the estimated timing rate through a per-symbol
 phase accumulator. Then prototype a fractional-delay filter or continuously
@@ -254,15 +257,23 @@ window without changing control behavior:
 - latest raw pilot-slope timing and the accepted, unwrapped, filtered `tau`;
 - physical timing after CIR and cumulative-shift rebasing;
 - observed, feedback-corrected, and smoothed drift;
-- estimated sample-clock offset and actuator shift rate in ppm;
+- estimated sample-clock offset and instantaneous actuator shift rate in ppm;
+- actuator shift rate averaged over the latest 64 statistics windows;
 - cumulative `shift` and fractional-timing accumulator;
 - timing measurement count, rejection count, and coverage confidence;
 - CIR offset and CIR peak-energy confidence;
 - tracked CFO, residual CFO, FEC state, and TS continuity.
 
-The GUI surfaces filtered timing, SRO ppm, and timing confidence. Complete
-values are available in periodic diagnostics, `--decode-iq` output, and
-`AIRSPYTV_EVENT_DEBUG=1` timing events.
+The SRO estimator stores physical timing together with the nominal sample
+position of each observation and computes slopes directly in ppm. Consequently,
+a final partial statistics window is normalized by its actual sample span and
+cannot turn a full-window correction into a false ppm spike.
+
+The GUI surfaces filtered timing, SRO ppm, timing confidence, and the rolling
+actuator rate. Complete values are available in periodic diagnostics,
+`--decode-iq` output, and `AIRSPYTV_EVENT_DEBUG=1` timing events. The raw
+instantaneous actuator rate may alternate between zero and one integer-step
+pulse; the rolling rate is the useful long-term comparison with SRO.
 
 ## 6. Synthetic clock-drift fixtures
 
@@ -280,14 +291,29 @@ deliberately conflicting clock trajectories. Fixtures should cover zero drift,
 both offset signs, slow ramps, and sample/LO combinations before any new loop
 is enabled by default.
 
+`tools/validate_dvbt_clock_drift.py` automates three 20-second end-to-end
+fixtures. The current results are:
+
+| Scenario | Measured SRO | Expected SRO | Measured CFO | Expected CFO | TS bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Sample clock only | +0.1339 ppm | +0.1885 ppm | +0.01 Hz | 0.00 Hz | 37,276,828 |
+| LO only | +0.0000 ppm | 0.0000 ppm | +108.22 Hz | +108.45 Hz | 37,276,828 |
+| Independent clocks | -0.0844 ppm | -0.1087 ppm | -107.69 Hz | -107.32 Hz | 37,276,828 |
+
+The sample-clock estimate starts after an approximately 10-second history
+warm-up and is still converging in a 20-second fixture. The regression therefore
+uses a convergence-aware SRO tolerance while keeping the CFO check independent.
+Use a retained work directory and a longer duration when evaluating loop
+dynamics rather than regression correctness.
+
 ## 7. Recommended implementation order
 
 1. Keep the current robust tracker and full-capture replay as the regression
    baseline.
-2. Record the new telemetry on ideal, known-drift, 545 MHz, and 557/581 MHz
-   inputs; establish expected sign, gain, confidence, and ppm ranges.
-3. Complete the two bias validations in Section 5.1 and use exact CIR weighting
-   if the endpoint approximation produces measurable false drift.
+2. Repeat timing-response validation in 2K mode and on the 557/581 MHz
+   multipath captures; add a synthetic mid-window CIR movement case.
+3. Record the completed telemetry on those remaining inputs and establish
+   expected confidence and ppm ranges.
 4. Add confidence gating as an isolated control change.
 5. Evaluate per-symbol and fractional-delay correction behind an opt-in
    configuration.

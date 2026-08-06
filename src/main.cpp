@@ -1880,6 +1880,21 @@ void draw_sidebar(AppState &state) {
             draw_metric("Timing conf", confidence_text.c_str(),
                         state.decoder.timing_confidence,
                         ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
+            const std::string actuator_text = std::format(
+                "{:+.3f} ppm",
+                state.decoder.rolling_timing_shift_rate_ppm);
+            draw_bipolar_metric(
+                "Timing actuator", actuator_text.c_str(),
+                std::clamp(
+                    0.5F +
+                        state.decoder.rolling_timing_shift_rate_ppm / 10.0F,
+                    0.0F, 1.0F),
+                ImVec4(0.52F, 0.82F, 1.0F, 1.0F));
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip(
+                    "Integer timing corrections averaged over 64 statistics "
+                    "windows.");
+            }
         }
         const std::string mer =
             state.signal_analysis.locked
@@ -2682,6 +2697,7 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << " sro=" << stats.sample_clock_offset_ppm << " ppm"
                   << " shift=" << stats.cumulative_timing_shift_samples
                   << " smp"
+                  << " act=" << stats.rolling_timing_shift_rate_ppm << " ppm"
                   << " tconf=" << stats.timing_confidence
                   << " sro-ready=" << (stats.timing_drift_ready ? 1 : 0)
                   << " carried=" << (stats.state_carried ? 1 : 0)
@@ -2696,7 +2712,10 @@ int decode_iq_cli(const std::filesystem::path &source,
                 << " corrected-drift="
                 << stats.corrected_timing_drift_samples
                 << " smooth=" << stats.smoothed_timing_drift_samples
-                << " smp/window shift-rate=" << stats.timing_shift_rate_ppm
+                << " smp/current-window shift-rate="
+                << stats.timing_shift_rate_ppm
+                << " ppm rolling-shift-rate="
+                << stats.rolling_timing_shift_rate_ppm
                 << " ppm frac=" << stats.fractional_timing_samples
                 << " cir=" << stats.cir_offset_samples
                 << " smp cir-conf=" << stats.cir_confidence
@@ -2862,6 +2881,7 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
               << " sro=" << stats.sample_clock_offset_ppm << "ppm"
               << " tshift=" << stats.cumulative_timing_shift_samples
               << " shiftrate=" << stats.timing_shift_rate_ppm << "ppm"
+              << " rollrate=" << stats.rolling_timing_shift_rate_ppm << "ppm"
               << " frac=" << stats.fractional_timing_samples
               << " tconf=" << stats.timing_confidence
               << " cir=" << stats.cir_offset_samples
