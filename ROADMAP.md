@@ -2,7 +2,7 @@
 
 Airspy TV is a native SDR television receiver. DVB-T is the implemented
 standard; the current priority is to harden that receiver and its playback
-path before expanding to DVB-C, DVB-T2, or other standards.
+path before expanding to other standards.
 
 This document intentionally tracks unfinished work. Detailed timing research
 is in [docs/clock-tracking.md](docs/clock-tracking.md), current pipeline
@@ -140,20 +140,12 @@ MPEG-TS, and common GUI panels consume `SignalSnapshot` and
 `PipelineSnapshot`. Standard-specific parameters and diagnostics must remain
 typed rather than growing a universal mode structure.
 
-### DVB-C
+### DVB-T2
 
-DVB-C is the smallest next DSP delta. It can reuse the MPEG-TS, SI/EPG,
-recording, playback, RS(204,188), convolutional byte deinterleaving, and energy
-descrambling infrastructure. New work includes symbol timing and carrier
-recovery, equalization, QAM 16/32/64/128/256 mapping, framing, and deterministic
-reference fixtures.
-
-### DVB-T2 and DTMB
-
-These require separate OFDM/signalling chains and LDPC+BCH FEC. Reuse should
+DVB-T2 requires a separate OFDM/signalling chain and LDPC+BCH FEC. Reuse should
 stop at source/session infrastructure, common telemetry contracts, MPEG-TS
-routing, SI/EPG, recording, and playback. Do not add T2 or DTMB branches inside
-the DVB-T decoder.
+routing, SI/EPG, recording, and playback. Do not add T2 branches inside the
+DVB-T decoder.
 
 ### ATSC and analog television
 
@@ -172,7 +164,7 @@ and lifecycle APIs are stable.
 5. Complete timestamp/playback diagnostics and multi-hour regressions.
 6. Finish the architecture-review cleanup without changing data-flow
    invariants.
-7. Begin DVB-C as the first second-standard implementation.
+7. Begin the first second-standard implementation.
 
 ## Release gates
 

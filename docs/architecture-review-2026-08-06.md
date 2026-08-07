@@ -90,13 +90,13 @@ demodulator replacement while splitting the files.
 
 `DemodulatorStats` remains alongside the newer `SignalSnapshot` and
 `PipelineSnapshot`, although the common GUI now uses the snapshots. Before
-adding DVB-C or DVB-T2:
+adding another standard:
 
 - decide whether `DemodulatorStats` still has a non-GUI consumer;
 - remove it if the common snapshots fully replace it;
 - keep standard-specific parameters and diagnostics in separate typed state;
-- avoid a universal parameter structure containing DVB-T, DVB-C, and DVB-T2
-  fields;
+- avoid a universal parameter structure containing fields for multiple
+  standards;
 - add the next standard through the `ReceiverSession` factory/transaction and
   common snapshot contracts.
 

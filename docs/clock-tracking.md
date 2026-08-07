@@ -106,11 +106,11 @@ nominal_input_samples_per_output
 
 This resampler is a common source-tree DSP routine, not a DVB-T-specific
 component. DVB-T is only the first consumer. The same implementation should be
-usable by future DVB-T2, DVB-S/S2, DVB-C, and other broadcast demodulators,
-with each standard supplying its own nominal input/output rate profile,
-bandwidth constraints, filter requirements, and timing-loop command. Standard
-specific code must not depend on the resampler's internal phase, history, or
-worker implementation.
+usable by future DVB-T2, DVB-S/S2, and other broadcast demodulators, with each
+standard supplying its own nominal input/output rate profile, bandwidth
+constraints, filter requirements, and timing-loop command. Standard-specific
+code must not depend on the resampler's internal phase, history, or worker
+implementation.
 
 The correction sign must be established with positive and negative synthetic
 SRO fixtures. The implementation must:

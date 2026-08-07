@@ -3,9 +3,9 @@
 ## Scope
 
 This review covers the application/GUI boundary needed to add another
-television standard such as DVB-C or DVB-T2. It does not implement either DSP
-chain. The goal is to make a future demodulator replaceable without exposing
-its lifetime or standard-specific types to common GUI code.
+television standard such as DVB-T2. It does not implement that DSP chain. The
+goal is to make a future demodulator replaceable without exposing its lifetime
+or standard-specific types to common GUI code.
 
 ## Result
 
@@ -90,10 +90,10 @@ The GUI state is divided into:
 The constellation and signal-quality panels use common snapshots. DVB-T FEC
 and timing information is displayed in a separately labelled diagnostics
 panel. The demodulator panel owns the standard selector and conditionally
-shows DVB-T settings; future DVB-C or DVB-T2 settings should be implemented as
+shows DVB-T settings; future standard settings should be implemented as
 separate typed sections rather than added to a universal parameter structure.
 
-## Adding DVB-C or DVB-T2
+## Adding another standard
 
 The remaining integration steps for a new standard are intentionally local:
 
