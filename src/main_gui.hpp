@@ -1799,20 +1799,31 @@ void draw_sidebar(AppState &state) {
             draw_metric("Timing conf", confidence_text.c_str(),
                         state.dvbt.decoder.timing_confidence,
                         ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
+            const bool sro_resampler_ready =
+                state.dvbt.decoder.sro_resampler_ready;
             const std::string actuator_text =
-                std::format("{:+.3f} ppm",
-                            state.dvbt.decoder.rolling_timing_shift_rate_ppm);
+                sro_resampler_ready
+                    ? std::format("{:+.3f} / {:+.3f} ppm",
+                                  state.dvbt.decoder.sro_resampler_command_ppm,
+                                  state.dvbt.decoder.sro_resampler_applied_ppm)
+                    : "warming up";
             draw_bipolar_metric(
-                "Timing actuator", actuator_text.c_str(),
-                std::clamp(
-                    0.5F + state.dvbt.decoder.rolling_timing_shift_rate_ppm /
-                               10.0F,
-                    0.0F, 1.0F),
+                "SRO cmd / applied", actuator_text.c_str(),
+                sro_resampler_ready
+                    ? std::clamp(
+                          0.5F +
+                              state.dvbt.decoder.sro_resampler_applied_ppm /
+                                  10.0F,
+                          0.0F, 1.0F)
+                    : 0.5F,
                 ImVec4(0.52F, 0.82F, 1.0F, 1.0F));
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
                 ImGui::SetTooltip(
-                    "Integer timing corrections averaged over 64 statistics "
-                    "windows.");
+                    "DVB-T timing-loop command and correction currently "
+                    "applied by the common variable-rate resampler.\n"
+                    "Requested ratio %.12f, effective ratio %.12f.",
+                    state.dvbt.decoder.resampler_requested_ratio,
+                    state.dvbt.decoder.resampler_effective_ratio);
             }
         }
         const auto ber_quality = [](const double ber) {

@@ -35,8 +35,12 @@ class ArbitraryResampler {
     void reset() noexcept;
 
     // Ratio is output samples per input sample. Updating it preserves stream
-    // phase and FIR history; the new Q32.32 step applies on the next block.
+    // phase and FIR history. With no slew limit, the new Q32.32 step applies
+    // on the next block.
     void set_ratio(double output_per_input);
+    // Limit block-boundary phase-step changes in ppm of the nominal step per
+    // second of input. Zero (the default) applies ratio changes immediately.
+    void set_max_slew_rate(double ppm_per_second);
 
     [[nodiscard]] std::span<const std::complex<float>>
     process(std::span<const std::complex<float>> input);
@@ -46,6 +50,7 @@ class ArbitraryResampler {
     [[nodiscard]] double nominal_ratio() const noexcept;
     [[nodiscard]] double requested_ratio() const noexcept;
     [[nodiscard]] double effective_ratio() const noexcept;
+    [[nodiscard]] double max_slew_rate() const noexcept;
     [[nodiscard]] std::uint64_t phase_step_q32() const noexcept;
     [[nodiscard]] std::size_t filter_taps() const noexcept;
 

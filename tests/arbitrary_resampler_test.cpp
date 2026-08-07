@@ -188,6 +188,38 @@ void test_rate_change_continuity_and_counts() {
             "reconfiguration must apply a new nominal ratio");
 }
 
+void test_bounded_ratio_slew() {
+    constexpr ResamplerConfig config =
+        make_test_config(1'000'000.0, 1'000'000.0);
+    const auto input = make_input(250'000);
+    ArbitraryResampler resampler{1};
+    resampler.configure(config);
+    resampler.set_max_slew_rate(2.0);
+    require(resampler.max_slew_rate() == 2.0, "configured slew telemetry");
+
+    (void)resampler.process(input);
+    resampler.set_ratio(1.0 / (1.0 + 20.0e-6));
+    (void)resampler.process(input);
+    const double first_correction_ppm =
+        (1.0 / resampler.effective_ratio() - 1.0) * 1.0e6;
+    require(first_correction_ppm > 0.45 && first_correction_ppm < 0.55,
+            "slew must be limited by elapsed input duration");
+
+    for (int block = 0; block < 39; ++block) {
+        (void)resampler.process(input);
+    }
+    const double final_correction_ppm =
+        (1.0 / resampler.effective_ratio() - 1.0) * 1.0e6;
+    require(std::abs(final_correction_ppm - 20.0) < 0.01,
+            "bounded slew must converge to the requested ratio");
+
+    resampler.reset();
+    resampler.set_ratio(1.0);
+    (void)resampler.process(input);
+    require(std::abs(resampler.effective_ratio() - 1.0) < 1.0e-9,
+            "reset must clear pending slew state");
+}
+
 [[nodiscard]] double measure_tone_gain(ArbitraryResampler &resampler,
                                        const ResamplerConfig &config,
                                        const double frequency_hz) {
@@ -260,6 +292,7 @@ int main() {
         test_sparse_output_boundaries();
         test_reset_and_ratio_telemetry();
         test_rate_change_continuity_and_counts();
+        test_bounded_ratio_slew();
         test_dvbt_stopband_attenuation();
         std::cout << "Arbitrary resampler tests passed\n";
         return 0;

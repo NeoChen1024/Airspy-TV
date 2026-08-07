@@ -47,6 +47,8 @@ so GNU Radio appears only as an offline test fixture.
 - Real-time replay of application sidecars and raw `airspy_rx` INT16_IQ files.
 - Decoder-paced offline I/Q-to-MPEG-TS extraction without realtime throttling
   or file-input drops.
+- Continuous DVB-T sample-clock correction through the common variable-rate
+  arbitrary resampler, independently of LO/CFO tracking.
 
 ## Current status
 
@@ -273,6 +275,10 @@ python3 tools/validate_dvbt_clock_drift.py \
   --build-dir build \
   --duration 20
 ```
+
+The decoder always feeds the DVB-T timing estimator's SRO command into the
+common variable-rate resampler. The validator checks both the estimated and
+applied correction; there is no separate legacy integer timing-actuator mode.
 
 By default, generated fixtures, decoder logs, and transport streams use a
 temporary directory that is removed after the run. Pass `--work-dir PATH` to

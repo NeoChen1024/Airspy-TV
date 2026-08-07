@@ -518,8 +518,8 @@ void test_8k_clean_signal() {
                 std::isfinite(result.stats.timing_offset_samples) &&
                 std::isfinite(result.stats.physical_timing_offset_samples) &&
                 std::isfinite(result.stats.sample_clock_offset_ppm) &&
-                std::isfinite(result.stats.timing_shift_rate_ppm) &&
-                std::isfinite(result.stats.rolling_timing_shift_rate_ppm),
+                std::isfinite(result.stats.sro_resampler_command_ppm) &&
+                std::isfinite(result.stats.sro_resampler_applied_ppm),
             "timing telemetry contains a non-finite value");
     require(result.stats.queued_blocks == 0 &&
                 result.stats.queued_input_samples == 0 &&

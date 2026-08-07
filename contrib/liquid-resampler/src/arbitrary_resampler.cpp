@@ -391,6 +391,7 @@ struct ArbitraryResampler::Impl {
 
     void reset() noexcept {
         phase_q32 = 0;
+        slew_step_credit = 0.0L;
         applied_step_q32.store(0U, std::memory_order_relaxed);
         if (configured_) {
             std::ranges::fill(history, std::complex<float>{});
@@ -413,6 +414,53 @@ struct ArbitraryResampler::Impl {
         target_step_q32.store(quantized, std::memory_order_release);
     }
 
+    void set_max_slew_rate(const double ppm_per_second) {
+        if (!(ppm_per_second >= 0.0) || !std::isfinite(ppm_per_second)) {
+            throw std::invalid_argument(
+                "resampler slew rate must be finite and non-negative");
+        }
+        max_slew_rate_ppm_per_second.store(ppm_per_second,
+                                           std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::uint64_t
+    next_applied_step(const std::size_t input_samples) noexcept {
+        const std::uint64_t target =
+            target_step_q32.load(std::memory_order_acquire);
+        const std::uint64_t current =
+            applied_step_q32.load(std::memory_order_relaxed);
+        const double slew =
+            max_slew_rate_ppm_per_second.load(std::memory_order_relaxed);
+        if (current == 0U || current == target || slew == 0.0) {
+            slew_step_credit = 0.0L;
+            return target;
+        }
+
+        const long double nominal_step =
+            static_cast<long double>(q32_one) *
+            static_cast<long double>(config.input_rate_hz) /
+            static_cast<long double>(config.output_rate_hz);
+        slew_step_credit += nominal_step * static_cast<long double>(slew) *
+                            static_cast<long double>(input_samples) /
+                            static_cast<long double>(config.input_rate_hz) /
+                            1.0e6L;
+        const long double whole_steps = std::floor(slew_step_credit);
+        if (whole_steps < 1.0L) {
+            return current;
+        }
+        const auto allowance = static_cast<std::uint64_t>(std::min(
+            whole_steps, static_cast<long double>(
+                             std::numeric_limits<std::uint64_t>::max())));
+        slew_step_credit -= static_cast<long double>(allowance);
+
+        if (target > current) {
+            const std::uint64_t distance = target - current;
+            return current + std::min(distance, allowance);
+        }
+        const std::uint64_t distance = current - target;
+        return current - std::min(distance, allowance);
+    }
+
     [[nodiscard]] std::span<const std::complex<float>>
     process(const std::span<const std::complex<float>> input) {
         if (!configured_ || input.empty()) {
@@ -421,8 +469,7 @@ struct ArbitraryResampler::Impl {
         }
         static_assert(sizeof(std::complex<float>) == 2U * sizeof(float));
 
-        const std::uint64_t step =
-            target_step_q32.load(std::memory_order_acquire);
+        const std::uint64_t step = next_applied_step(input.size());
         applied_step_q32.store(step, std::memory_order_relaxed);
         const std::uint64_t phase_at_block_start = phase_q32;
         if (input.size() > std::numeric_limits<std::uint32_t>::max()) {
@@ -579,9 +626,11 @@ struct ArbitraryResampler::Impl {
     std::vector<std::complex<float>> boundary;
     OutputBuffer output;
     std::atomic<double> requested_ratio_{};
+    std::atomic<double> max_slew_rate_ppm_per_second{};
     std::atomic<std::uint64_t> target_step_q32{};
     std::atomic<std::uint64_t> applied_step_q32{};
     std::uint64_t phase_q32{};
+    long double slew_step_credit{};
 
     std::vector<std::thread> workers;
     std::mutex worker_mutex;
@@ -613,6 +662,10 @@ void ArbitraryResampler::reset() noexcept { impl_->reset(); }
 
 void ArbitraryResampler::set_ratio(const double output_per_input) {
     impl_->set_ratio(output_per_input);
+}
+
+void ArbitraryResampler::set_max_slew_rate(const double ppm_per_second) {
+    impl_->set_max_slew_rate(ppm_per_second);
 }
 
 std::span<const std::complex<float>> ArbitraryResampler::process(
@@ -648,6 +701,10 @@ double ArbitraryResampler::effective_ratio() const noexcept {
     return step == 0U ? 0.0
                       : static_cast<double>(q32_one) /
                             static_cast<double>(step);
+}
+
+double ArbitraryResampler::max_slew_rate() const noexcept {
+    return impl_->max_slew_rate_ppm_per_second.load(std::memory_order_relaxed);
 }
 
 std::uint64_t ArbitraryResampler::phase_step_q32() const noexcept {

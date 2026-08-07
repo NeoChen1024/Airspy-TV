@@ -65,17 +65,15 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
               << " rawtau=" << stats.raw_timing_offset_samples
               << " phys=" << stats.physical_timing_offset_samples
               << " sro=" << stats.sample_clock_offset_ppm << "ppm"
-              << " tshift=" << stats.cumulative_timing_shift_samples
-              << " shiftrate=" << stats.timing_shift_rate_ppm << "ppm"
-              << " rollrate=" << stats.rolling_timing_shift_rate_ppm << "ppm"
-              << " frac=" << stats.fractional_timing_samples
+              << " srocmd=" << stats.sro_resampler_command_ppm << "ppm"
+              << " sroapply=" << stats.sro_resampler_applied_ppm << "ppm"
               << " tconf=" << stats.timing_confidence
               << " cir=" << stats.cir_offset_samples
               << " circonf=" << stats.cir_confidence
               << " tmeas=" << stats.timing_measurements
               << " taccept=" << stats.timing_accepted_measurements
               << " trej=" << stats.timing_rejected_measurements
-              << " sroready=" << (stats.timing_drift_ready ? 1 : 0)
+              << " sroready=" << (stats.sro_resampler_ready ? 1 : 0)
               << " fec-skip=" << stats.fec_skipped
               << " drop=" << stats.dropped_blocks << " dm-busy="
               << static_cast<int>(stats.demod_busy_fraction * 100.0F) << "%";

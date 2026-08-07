@@ -337,13 +337,20 @@ class SymbolPostprocessorPool {
 class StreamingResampler {
   public:
     explicit StreamingResampler(const std::size_t worker_count)
-        : resampler_(worker_count, "dvbt-resamp-") {}
+        : resampler_(worker_count, "dvbt-resamp-") {
+        resampler_.set_max_slew_rate(sro_slew_rate_ppm_per_second);
+    }
 
     [[nodiscard]] std::size_t worker_count() const noexcept {
         return resampler_.worker_count();
     }
 
-    void reset() { resampler_.reset(); }
+    void reset() {
+        if (configured()) {
+            resampler_.set_ratio(resampler_.nominal_ratio());
+        }
+        resampler_.reset();
+    }
 
     void configure(const std::uint32_t rate, const std::uint32_t bandwidth) {
         if (configured() && rate == rate_ && bandwidth == bandwidth_) {
@@ -359,6 +366,28 @@ class StreamingResampler {
         return resampler_.process(input);
     }
 
+    void set_sro_correction_ppm(const double correction_ppm) {
+        const double scale = 1.0 + correction_ppm * 1.0e-6;
+        if (!(scale > 0.0) || !std::isfinite(scale)) {
+            throw std::invalid_argument("invalid SRO resampler correction");
+        }
+        resampler_.set_ratio(resampler_.nominal_ratio() / scale);
+    }
+
+    [[nodiscard]] double applied_sro_correction_ppm() const noexcept {
+        const double ratio = resampler_.effective_ratio();
+        return ratio > 0.0 ? (resampler_.nominal_ratio() / ratio - 1.0) * 1.0e6
+                           : 0.0;
+    }
+
+    [[nodiscard]] double requested_ratio() const noexcept {
+        return resampler_.requested_ratio();
+    }
+
+    [[nodiscard]] double effective_ratio() const noexcept {
+        return resampler_.effective_ratio();
+    }
+
     [[nodiscard]] bool configured() const noexcept {
         return resampler_.configured();
     }
@@ -368,6 +397,7 @@ class StreamingResampler {
     }
 
   private:
+    static constexpr double sro_slew_rate_ppm_per_second = 0.5;
     liquid_resampler::ArbitraryResampler resampler_;
     std::uint32_t rate_{};
     std::uint32_t bandwidth_{};

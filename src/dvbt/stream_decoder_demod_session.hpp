@@ -76,29 +76,20 @@ void StreamDecoder::Impl::demod_build_grid(DemodRuntimeState &state) {
 void StreamDecoder::Impl::demod_reset_timing(DemodRuntimeState &state,
                                              const std::size_t tracker_fft_size,
                                              const bool reset_window_cir) {
-    state.fractional_timing = 0.0;
     state.smoothed_sample_clock_ppm = 0.0;
     state.latest_cp_snr_db = 0.0F;
     state.latest_deepest_notch_db = 0.0F;
-    state.accumulated_window_shift = 0.0;
     state.last_windowed_timing = 0.0;
     state.last_windowed_cir_avg = 0.0;
-    state.last_timing_window_shift = 0.0;
-    state.last_telemetry_window_shift = 0.0;
     state.tau_history.fill(0.0);
     state.tau_sample_history.fill(0.0);
+    state.tau_resampler_correction_history.fill(0.0);
     state.tau_history_head = 0;
     state.tau_history_count = 0;
     state.timing_elapsed_samples = 0.0;
     if (reset_window_cir) {
         state.window_cir_offset_sum = 0.0;
     }
-    state.shift_rate_steps.fill(0.0);
-    state.shift_rate_samples.fill(0.0);
-    state.shift_rate_history_head = 0;
-    state.shift_rate_history_count = 0;
-    state.rolling_shift_steps = 0.0;
-    state.rolling_shift_samples = 0.0;
     state.cir_confidence = 0.0;
     state.timing_tracker.reset(tracker_fft_size);
 }

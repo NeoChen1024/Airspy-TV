@@ -144,28 +144,18 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
     auto &fft_size = state.fft_size;
     auto &applied_cir_offset = state.applied_cir_offset;
     auto &window_cir_offset_sum = state.window_cir_offset_sum;
-    auto &accumulated_window_shift = state.accumulated_window_shift;
-    auto &last_telemetry_window_shift = state.last_telemetry_window_shift;
-    constexpr std::size_t shift_rate_history_n =
-        DemodRuntimeState::shift_rate_history_n;
-    auto &shift_rate_history_count = state.shift_rate_history_count;
-    auto &shift_rate_steps = state.shift_rate_steps;
-    auto &shift_rate_samples = state.shift_rate_samples;
-    auto &shift_rate_history_head = state.shift_rate_history_head;
-    auto &rolling_shift_steps = state.rolling_shift_steps;
-    auto &rolling_shift_samples = state.rolling_shift_samples;
     auto &timing_elapsed_samples = state.timing_elapsed_samples;
     auto &smoothed_sample_clock_ppm = state.smoothed_sample_clock_ppm;
     auto &last_windowed_timing = state.last_windowed_timing;
     auto &last_windowed_cir_avg = state.last_windowed_cir_avg;
-    auto &last_timing_window_shift = state.last_timing_window_shift;
     constexpr std::size_t tau_history_n = DemodRuntimeState::tau_history_n;
     constexpr std::size_t tau_history_min = DemodRuntimeState::tau_history_min;
     auto &tau_history = state.tau_history;
     auto &tau_sample_history = state.tau_sample_history;
+    auto &tau_resampler_correction_history =
+        state.tau_resampler_correction_history;
     auto &tau_history_head = state.tau_history_head;
     auto &tau_history_count = state.tau_history_count;
-    auto &fractional_timing = state.fractional_timing;
     auto &latest_raw_timing = state.latest_raw_timing;
     auto &cir_confidence = state.cir_confidence;
 
@@ -190,27 +180,6 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             ? static_cast<double>(applied_cir_offset)
             : window_cir_offset_sum / static_cast<double>(window_symbols);
     double observed_drift = 0.0;
-    double corrected_drift = 0.0;
-    double window_shift = 0.0;
-    const double telemetry_window_shift =
-        accumulated_window_shift - last_telemetry_window_shift;
-    last_telemetry_window_shift = accumulated_window_shift;
-    if (shift_rate_history_count == shift_rate_history_n) {
-        rolling_shift_steps -= shift_rate_steps[shift_rate_history_head];
-        rolling_shift_samples -= shift_rate_samples[shift_rate_history_head];
-    } else {
-        ++shift_rate_history_count;
-    }
-    shift_rate_steps[shift_rate_history_head] = telemetry_window_shift;
-    shift_rate_samples[shift_rate_history_head] = window_sample_count;
-    rolling_shift_steps += telemetry_window_shift;
-    rolling_shift_samples += window_sample_count;
-    shift_rate_history_head =
-        (shift_rate_history_head + 1) % shift_rate_history_n;
-    const double rolling_shift_rate_ppm =
-        rolling_shift_samples > 0.0
-            ? rolling_shift_steps * 1.0e6 / rolling_shift_samples
-            : 0.0;
     const double timing_sample_position =
         timing_elapsed_samples + 0.5 * window_sample_count;
     timing_elapsed_samples += window_sample_count;
@@ -223,9 +192,7 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
         // chase the channel (a constant ~+35 samples at the 581
         // capture). Track only the slow drift between consecutive
         // windows — the sample-clock offset — with a long time
-        // constant, and accumulate it into the fractional timing
-        // the symbol advance consumes. Bounded so a pathological
-        // estimate cannot walk the window far off grid. The CIR
+        // constant, and apply it through the frontend resampler. The CIR
         // window slides shift tau by exactly the slide, so both
         // references are expressed relative to the window's
         // average position, keeping the drift estimate blind to
@@ -237,32 +204,15 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                          (last_windowed_timing + last_windowed_cir_avg);
         last_windowed_timing = static_cast<double>(timing_offset);
         last_windowed_cir_avg = window_cir_avg;
-        window_shift = accumulated_window_shift - last_timing_window_shift;
-        last_timing_window_shift = accumulated_window_shift;
-        // A positive window step makes the measured pilot slope
-        // move negative by only the channel-dependent response
-        // fraction. Add that known response back so the loop
-        // estimates physical sample-clock drift instead of
-        // cancelling its own correction in the measurement.
-        corrected_drift =
-            observed_drift + timing_window_shift_response * window_shift;
-        // The per-window drift is corrected for the loop's own
-        // period steps above: a step moves the measured tau by
-        // approximately one sample, so treating that step as
-        // physical drift would bias the compensation —
-        // the tau sawtooth (ramping 0 -> 62 samples until the
-        // pilot verify collapses, one badlock per ~38000
-        // symbols). Keep a physical-coordinate history and use a
-        // median first difference instead: a handful of outliers
-        // cannot move the estimate away from true clock drift.
-        // Store the timing coordinate after undoing the known
-        // response of all integer window corrections. The median
-        // first-difference estimator below must see physical
-        // sample-clock drift, not the loop's sawtooth response.
+        // Store timing in the CIR-rebased physical coordinate. The median
+        // first-difference estimator below sees residual sample-clock drift;
+        // the applied resampler correction is added back per interval to
+        // recover the source SRO without an integer-window feedback path.
         tau_history[tau_history_head] =
-            static_cast<double>(timing_offset) + window_cir_avg +
-            timing_window_shift_response * accumulated_window_shift;
+            static_cast<double>(timing_offset) + window_cir_avg;
         tau_sample_history[tau_history_head] = timing_sample_position;
+        tau_resampler_correction_history[tau_history_head] =
+            sro_resampler_applied_ppm.load(std::memory_order_relaxed);
         tau_history_head = (tau_history_head + 1) % tau_history_n;
         if (tau_history_count < tau_history_n) {
             ++tau_history_count;
@@ -290,19 +240,27 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                 const std::size_t idx1 = (idx0 + 1) % tau_history_n;
                 const double sample_span =
                     tau_sample_history[idx1] - tau_sample_history[idx0];
-                diffs[i] = sample_span > 0.0
-                               ? (tau_history[idx1] - tau_history[idx0]) *
-                                     1.0e6 / sample_span
-                               : 0.0;
+                const double residual_sro =
+                    sample_span > 0.0
+                        ? (tau_history[idx1] - tau_history[idx0]) * 1.0e6 /
+                              sample_span
+                        : 0.0;
+                // The applied rate changes only at front-end block
+                // boundaries. Endpoint averaging is the interval correction
+                // for this slow slew to first order, and keeps old history
+                // from being de-biased with the newest (larger) command.
+                diffs[i] = residual_sro +
+                           0.5 * (tau_resampler_correction_history[idx0] +
+                                  tau_resampler_correction_history[idx1]);
             }
             std::sort(diffs.begin(),
                       diffs.begin() + static_cast<std::ptrdiff_t>(diffs_count));
-            const double drift_estimate_ppm =
+            const double source_sro_estimate_ppm =
                 diffs_count % 2 != 0 ? diffs[diffs_count / 2]
                                      : 0.5 * (diffs[diffs_count / 2 - 1] +
                                               diffs[diffs_count / 2]);
             smoothed_sample_clock_ppm =
-                0.1 * drift_estimate_ppm + 0.9 * smoothed_sample_clock_ppm;
+                0.1 * source_sro_estimate_ppm + 0.9 * smoothed_sample_clock_ppm;
         }
         const double drift_limit_ppm =
             4.0 * 1.0e6 /
@@ -312,28 +270,29 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             smoothed_sample_clock_ppm, -drift_limit_ppm, drift_limit_ppm);
         smoothed_timing_drift =
             smoothed_sample_clock_ppm * window_sample_count / 1.0e6;
-        fractional_timing +=
-            smoothed_timing_drift / timing_window_shift_response;
-        fractional_timing = std::clamp(fractional_timing, -4.0, 4.0);
+        const double confidence =
+            window_symbols == 0 ? 0.0
+                                : static_cast<double>(timing_count) /
+                                      static_cast<double>(window_symbols);
+        if (tau_history_count >= tau_history_min && confidence >= 0.75) {
+            sro_resampler_command_ppm.store(smoothed_sample_clock_ppm,
+                                            std::memory_order_relaxed);
+            sro_resampler_ready.store(true, std::memory_order_relaxed);
+        }
         if (airspy_tv::is_debug_enabled() && timing_count != 0 &&
             window_symbols >= stats_window_symbols) {
             std::fprintf(
                 stderr,
                 "[evt] tloop raw=%.2f tau=%.2f "
-                "phys=%.2f shift=%.1f drift=%.3f "
-                "smooth=%.3f sro=%+.4fppm frac=%.2f "
-                "act=%+.4f/%+.4fppm conf=%.3f "
+                "phys=%.2f drift=%.3f smooth=%.3f sro=%+.4fppm "
+                "resamp=%+.4f/%+.4fppm conf=%.3f "
                 "cir=%.2f/%.3f ready=%d\n",
                 latest_raw_timing, static_cast<double>(timing_offset),
-                static_cast<double>(timing_offset) + window_cir_avg +
-                    timing_window_shift_response * accumulated_window_shift,
-                accumulated_window_shift, corrected_drift,
-                smoothed_timing_drift, smoothed_sample_clock_ppm,
-                fractional_timing,
-                window_sample_count > 0.0
-                    ? telemetry_window_shift * 1.0e6 / window_sample_count
-                    : 0.0,
-                rolling_shift_rate_ppm,
+                static_cast<double>(timing_offset) + window_cir_avg,
+                observed_drift, smoothed_timing_drift,
+                smoothed_sample_clock_ppm,
+                sro_resampler_command_ppm.load(std::memory_order_relaxed),
+                sro_resampler_applied_ppm.load(std::memory_order_relaxed),
                 static_cast<double>(timing_count) /
                     static_cast<double>(window_symbols),
                 window_cir_avg, cir_confidence,
@@ -347,9 +306,6 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             .timing_offset = timing_offset,
             .cir_offset = window_cir_avg,
             .observed_drift = observed_drift,
-            .corrected_drift = corrected_drift,
-            .timing_shift = telemetry_window_shift,
-            .rolling_shift_rate_ppm = rolling_shift_rate_ppm,
             .smoothed_timing_drift = smoothed_timing_drift};
 }
 
@@ -357,11 +313,9 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     auto &period = state.period;
     auto &timing_count = state.timing_count;
     auto &fft_size = state.fft_size;
-    auto &accumulated_window_shift = state.accumulated_window_shift;
     constexpr std::size_t tau_history_min = DemodRuntimeState::tau_history_min;
     auto &tau_history_count = state.tau_history_count;
     auto &smoothed_sample_clock_ppm = state.smoothed_sample_clock_ppm;
-    auto &fractional_timing = state.fractional_timing;
     auto &latest_raw_timing = state.latest_raw_timing;
     auto &cir_confidence = state.cir_confidence;
     auto &guard_size = state.guard_size;
@@ -382,14 +336,10 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     const DemodWindowMetrics metrics = demod_update_timing_window(state);
     const float window_wall = metrics.wall_time_ms;
     const std::uint64_t window_symbols = metrics.symbol_count;
-    const double window_sample_count = metrics.sample_count;
     const float input_seconds = metrics.input_seconds;
     const float timing_offset = metrics.timing_offset;
     const double window_cir_avg = metrics.cir_offset;
     const double observed_drift = metrics.observed_drift;
-    const double corrected_drift = metrics.corrected_drift;
-    const double telemetry_window_shift = metrics.timing_shift;
-    const double rolling_shift_rate_ppm = metrics.rolling_shift_rate_ppm;
     const double smoothed_timing_drift = metrics.smoothed_timing_drift;
     const std::scoped_lock lock(mutex);
     latest.ofdm_locked = true;
@@ -414,25 +364,19 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     latest.physical_timing_offset_samples =
         timing_count == 0
             ? 0.0F
-            : static_cast<float>(
-                  static_cast<double>(timing_offset) + window_cir_avg +
-                  timing_window_shift_response * accumulated_window_shift);
+            : static_cast<float>(static_cast<double>(timing_offset) +
+                                 window_cir_avg);
     latest.observed_timing_drift_samples = static_cast<float>(observed_drift);
-    latest.corrected_timing_drift_samples = static_cast<float>(corrected_drift);
     latest.smoothed_timing_drift_samples =
         static_cast<float>(smoothed_timing_drift);
     latest.sample_clock_offset_ppm =
         static_cast<float>(smoothed_sample_clock_ppm);
-    latest.cumulative_timing_shift_samples =
-        static_cast<float>(accumulated_window_shift);
-    latest.timing_shift_rate_ppm =
-        window_sample_count > 0.0
-            ? static_cast<float>(telemetry_window_shift * 1.0e6 /
-                                 window_sample_count)
-            : 0.0F;
-    latest.rolling_timing_shift_rate_ppm =
-        static_cast<float>(rolling_shift_rate_ppm);
-    latest.fractional_timing_samples = static_cast<float>(fractional_timing);
+    latest.sro_resampler_ready =
+        sro_resampler_ready.load(std::memory_order_relaxed);
+    latest.sro_resampler_command_ppm = static_cast<float>(
+        sro_resampler_command_ppm.load(std::memory_order_relaxed));
+    latest.sro_resampler_applied_ppm = static_cast<float>(
+        sro_resampler_applied_ppm.load(std::memory_order_relaxed));
     latest.cir_offset_samples = static_cast<float>(window_cir_avg);
     latest.timing_confidence =
         window_symbols == 0 ? 0.0F
@@ -496,17 +440,7 @@ void StreamDecoder::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
 }
 
 void StreamDecoder::Impl::demod_advance_symbol(DemodRuntimeState &state) {
-    // Consume the closed-loop fractional timing correction as integer steps.
     state.next_symbol_start += state.period;
-    if (state.fractional_timing >= 0.5) {
-        ++state.next_symbol_start;
-        state.accumulated_window_shift += 1.0;
-        state.fractional_timing -= 1.0;
-    } else if (state.fractional_timing <= -0.5) {
-        --state.next_symbol_start;
-        state.accumulated_window_shift -= 1.0;
-        state.fractional_timing += 1.0;
-    }
     state.nco_phase =
         std::remainder(state.nco_phase + frontend.tracked_cfo_phase *
                                              static_cast<float>(state.period),

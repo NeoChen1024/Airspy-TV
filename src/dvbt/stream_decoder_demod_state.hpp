@@ -11,9 +11,6 @@ struct DemodWindowMetrics {
     float timing_offset{};
     double cir_offset{};
     double observed_drift{};
-    double corrected_drift{};
-    double timing_shift{};
-    double rolling_shift_rate_ppm{};
     double smoothed_timing_drift{};
 };
 
@@ -80,30 +77,20 @@ struct DemodRuntimeState {
     std::chrono::steady_clock::time_point window_started_at{
         std::chrono::steady_clock::now()};
 
-    // Sample-clock estimator and integer/fractional timing actuator.
+    // Sample-clock estimator and variable-rate resampler actuator.
     static constexpr std::size_t tau_history_n = 24;
     static constexpr std::size_t tau_history_min = 16;
-    static constexpr std::size_t shift_rate_history_n = 64;
     TimingSlopeTracker timing_tracker;
     double last_windowed_timing{};
     double smoothed_sample_clock_ppm{};
-    double fractional_timing{};
     std::array<double, tau_history_n> tau_history{};
     std::array<double, tau_history_n> tau_sample_history{};
+    std::array<double, tau_history_n> tau_resampler_correction_history{};
     std::size_t tau_history_head{};
     std::size_t tau_history_count{};
     double timing_elapsed_samples{};
-    double accumulated_window_shift{};
     double last_windowed_cir_avg{};
-    double last_timing_window_shift{};
-    double last_telemetry_window_shift{};
     double window_cir_offset_sum{};
-    std::array<double, shift_rate_history_n> shift_rate_steps{};
-    std::array<double, shift_rate_history_n> shift_rate_samples{};
-    std::size_t shift_rate_history_head{};
-    std::size_t shift_rate_history_count{};
-    double rolling_shift_steps{};
-    double rolling_shift_samples{};
     int applied_cir_offset{};
     double cir_confidence{};
     float acquisition_time_ms{};

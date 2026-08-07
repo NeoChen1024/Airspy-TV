@@ -84,18 +84,17 @@ struct StreamDecoderStats {
     // timing_offset_samples is the accepted, unwrapped, filtered window mean.
     float raw_timing_offset_samples{};
     float timing_offset_samples{};
-    // Timing expressed in the physical sample-clock coordinate after adding
-    // back adaptive CIR placement and the loop's own cumulative corrections.
+    // Timing after adding back adaptive CIR placement. Resampler rate
+    // correction is reported separately.
     float physical_timing_offset_samples{};
     float observed_timing_drift_samples{};
-    float corrected_timing_drift_samples{};
     float smoothed_timing_drift_samples{};
     float sample_clock_offset_ppm{};
-    float cumulative_timing_shift_samples{};
-    // Per-window integer actuator output and its rolling 64-window average.
-    float timing_shift_rate_ppm{};
-    float rolling_timing_shift_rate_ppm{};
-    float fractional_timing_samples{};
+    bool sro_resampler_ready{};
+    float sro_resampler_command_ppm{};
+    float sro_resampler_applied_ppm{};
+    double resampler_requested_ratio{};
+    double resampler_effective_ratio{};
     float cir_offset_samples{};
     float timing_confidence{};
     float cir_confidence{};

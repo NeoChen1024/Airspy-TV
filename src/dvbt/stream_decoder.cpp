@@ -37,6 +37,7 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -112,11 +113,6 @@ struct PilotLock {
 constexpr std::size_t timing_pilot_spacing = 12;
 constexpr std::size_t timing_filter_history_size = 7;
 constexpr double timing_outlier_limit_samples = 24.0;
-// A one-sample FFT-window correction produces essentially a one-sample change
-// in the unwrapped pilot-slope coordinate. Keep this explicit because the
-// response is used both to de-bias the drift history and to convert the drift
-// estimate back into the integer window-step accumulator.
-constexpr double timing_window_shift_response = 1.0;
 
 [[nodiscard]] std::optional<double> estimate_scattered_timing_tau(
     const std::span<const std::complex<float>> channel, const std::size_t phase,
@@ -413,6 +409,11 @@ struct StreamDecoder::Impl {
     OfdmTrackingState frontend;
     StreamDecoderStats latest;
     std::atomic<bool> cancel_requested{};
+    // The demod estimates source SRO; the front-end owns and applies the
+    // common resampler. These atomics are the only cross-thread control path.
+    std::atomic<double> sro_resampler_command_ppm{};
+    std::atomic<double> sro_resampler_applied_ppm{};
+    std::atomic<bool> sro_resampler_ready{};
     // Where each pipeline thread is parked, for diagnostics (see
     // WorkerState). Written by the owning thread, read lock-free by stats().
     std::atomic<int> frontend_state{static_cast<int>(WorkerState::idle)};
@@ -709,6 +710,9 @@ void StreamDecoder::request_reset() {
     {
         const std::scoped_lock lock(impl_->mutex);
         impl_->cancel_requested = true;
+        impl_->sro_resampler_command_ppm.store(0.0, std::memory_order_relaxed);
+        impl_->sro_resampler_applied_ppm.store(0.0, std::memory_order_relaxed);
+        impl_->sro_resampler_ready.store(false, std::memory_order_relaxed);
         const std::uint64_t generation =
             impl_->latest_generation.fetch_add(1) + 1;
         impl_->reset_request_generation = generation;
@@ -799,6 +803,12 @@ StreamDecoderStats StreamDecoder::stats() const {
         static_cast<WorkerState>(impl_->demod_state.load());
     statistics.fec_state = static_cast<WorkerState>(impl_->fec_state.load());
     statistics.fec_processing = impl_->fec_worker_busy;
+    statistics.sro_resampler_command_ppm = static_cast<float>(
+        impl_->sro_resampler_command_ppm.load(std::memory_order_relaxed));
+    statistics.sro_resampler_applied_ppm = static_cast<float>(
+        impl_->sro_resampler_applied_ppm.load(std::memory_order_relaxed));
+    statistics.sro_resampler_ready =
+        impl_->sro_resampler_ready.load(std::memory_order_relaxed);
     statistics.processing = impl_->frontend_busy || impl_->demod_busy ||
                             impl_->fec_worker_busy || !impl_->queue.empty() ||
                             !impl_->fec_queue.empty();

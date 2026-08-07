@@ -29,6 +29,7 @@ SCENARIOS = {
     scenario.name: scenario
     for scenario in (
         Scenario("sample-clock", 0.18, 0.03, 0.0, 0.0),
+        Scenario("sample-clock-negative", -0.18, -0.03, 0.0, 0.0),
         Scenario("lo", 0.0, 0.0, 100.0, 30.0),
         Scenario("independent", -0.12, 0.04, -120.0, 45.0),
     )
@@ -39,6 +40,8 @@ INPUT_RE = re.compile(r"\binput=(\d+) samples\b")
 TS_RE = re.compile(r"\bTS=(\d+) bytes\b")
 TRACKED_RE = re.compile(rf"\btracked=({NUMBER}) Hz\b")
 SRO_RE = re.compile(rf"\bsro=({NUMBER}) ppm\b")
+SRO_COMMAND_RE = re.compile(rf"\bsro-command=({NUMBER}) ppm\b")
+SRO_APPLIED_RE = re.compile(rf"\bsro-applied=({NUMBER}) ppm\b")
 READY_RE = re.compile(r"\bsro-ready=([01])\b")
 FINAL_TS_RE = re.compile(r"\bTS=(\d+) bytes, symbols=")
 
@@ -48,6 +51,8 @@ class ClockSample:
     time_seconds: float
     sro_ppm: float
     tracked_cfo_hz: float
+    sro_command_ppm: float
+    sro_applied_ppm: float
 
 
 def run_checked(
@@ -78,6 +83,8 @@ def parse_decoder_log(text: str, sample_rate: int) -> tuple[list[ClockSample], i
             ts_match = TS_RE.search(line)
             tracked_match = TRACKED_RE.search(line)
             sro_match = SRO_RE.search(line)
+            command_match = SRO_COMMAND_RE.search(line)
+            applied_match = SRO_APPLIED_RE.search(line)
             ready_match = READY_RE.search(line)
             if ts_match:
                 final_ts_bytes = max(final_ts_bytes, int(ts_match.group(1)))
@@ -90,6 +97,12 @@ def parse_decoder_log(text: str, sample_rate: int) -> tuple[list[ClockSample], i
                     time_seconds=int(input_match.group(1)) / sample_rate,
                     sro_ppm=float(sro_match.group(1)),
                     tracked_cfo_hz=float(tracked_match.group(1)),
+                    sro_command_ppm=(
+                        float(command_match.group(1)) if command_match else 0.0
+                    ),
+                    sro_applied_ppm=(
+                        float(applied_match.group(1)) if applied_match else 0.0
+                    ),
                 )
             )
         elif line.startswith("decoded "):
@@ -137,19 +150,17 @@ def validate_scenario(
         ],
         env,
     )
-    decoder = run_checked(
-        [
-            str(build_dir / "airspy-tv"),
-            "--decode-iq",
-            str(fixture) + ".json",
-            "--ts-output",
-            str(transport),
-            "--decoder-threads",
-            str(decoder_threads),
-            "--debug",
-        ],
-        env,
-    )
+    decoder_command = [
+        str(build_dir / "airspy-tv"),
+        "--decode-iq",
+        str(fixture) + ".json",
+        "--ts-output",
+        str(transport),
+        "--decoder-threads",
+        str(decoder_threads),
+        "--debug",
+    ]
+    decoder = run_checked(decoder_command, env)
     decoder_log = decoder.stdout + decoder.stderr
     log_path.write_text(generator.stdout + generator.stderr + decoder_log)
     metadata = json.loads(Path(str(fixture) + ".json").read_text())
@@ -165,12 +176,18 @@ def validate_scenario(
         raise RuntimeError(f"{scenario.name}: decoder produced no transport stream")
     failure_markers = (
         "outer-reset",
-        "align-miss",
         "badlock",
         "timing-branch",
         "decoder thread exception",
     )
     found = [marker for marker in failure_markers if marker in decoder_log]
+    # Initial outer-FEC acquisition may need more than one search window. An
+    # align miss is a failure only after the first confirmed lock.
+    _, lock_marker, after_first_align_lock = decoder_log.partition(
+        "[fec] align-lock"
+    )
+    if lock_marker and "align-miss" in after_first_align_lock:
+        found.append("post-lock align-miss")
     if found:
         raise RuntimeError(f"{scenario.name}: failure events: {', '.join(found)}")
 
@@ -207,10 +224,43 @@ def validate_scenario(
             f"{expected_cfo:+.2f} +/- {cfo_tolerance:.2f} Hz"
         )
 
+    measured_command = statistics.median(
+        sample.sro_command_ppm for sample in tail
+    )
+    measured_applied = statistics.median(
+        sample.sro_applied_ppm for sample in tail
+    )
+    if abs(expected_sro) >= 0.02:
+        if math.copysign(1.0, measured_applied) != math.copysign(
+            1.0, expected_sro
+        ):
+            raise RuntimeError(
+                f"{scenario.name}: applied SRO correction has wrong sign: "
+                f"{measured_applied:+.4f} ppm for {expected_sro:+.4f} ppm"
+            )
+        feedback_tolerance = max(0.08, abs(expected_sro) * 0.45)
+        if not math.isclose(
+            measured_applied, expected_sro, abs_tol=feedback_tolerance
+        ):
+            raise RuntimeError(
+                f"{scenario.name}: applied SRO correction "
+                f"{measured_applied:+.4f} ppm, expected {expected_sro:+.4f} "
+                f"+/- {feedback_tolerance:.4f} ppm"
+            )
+    elif abs(measured_applied) > 0.08:
+        raise RuntimeError(
+            f"{scenario.name}: zero-SRO fixture received "
+            f"{measured_applied:+.4f} ppm correction"
+        )
+    feedback_summary = (
+        f", command={measured_command:+.4f} ppm, "
+        f"applied={measured_applied:+.4f} ppm"
+    )
+
     print(
         f"PASS {scenario.name}: SRO={measured_sro:+.4f} ppm "
         f"(expected {expected_sro:+.4f}), CFO={measured_cfo:+.2f} Hz "
-        f"(expected {expected_cfo:+.2f}), TS={ts_bytes} bytes"
+        f"(expected {expected_cfo:+.2f}){feedback_summary}, TS={ts_bytes} bytes"
     )
     if generator.stderr:
         print(f"  generator diagnostics retained in {log_path.parent}")

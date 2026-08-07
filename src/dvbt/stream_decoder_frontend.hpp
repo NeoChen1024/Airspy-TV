@@ -121,6 +121,9 @@ void StreamDecoder::Impl::run_frontend() {
                 // Retune: drop the filter state and invalidate the sync;
                 // the demod re-acquires itself on the new rate.
                 resampler->reset();
+                sro_resampler_command_ppm.store(0.0, std::memory_order_relaxed);
+                sro_resampler_applied_ppm.store(0.0, std::memory_order_relaxed);
+                sro_resampler_ready.store(false, std::memory_order_relaxed);
                 {
                     const std::scoped_lock lock(mutex);
                     current_bandwidth = block.bandwidth;
@@ -132,6 +135,9 @@ void StreamDecoder::Impl::run_frontend() {
                 ring_data.notify_all();
             }
             resampler->configure(block.rate, block.bandwidth);
+            const double sro_command =
+                sro_resampler_command_ppm.load(std::memory_order_relaxed);
+            resampler->set_sro_correction_ppm(sro_command);
             const std::size_t complex_count = block.samples.size() / 2;
             const auto convert_started_at = std::chrono::steady_clock::now();
             convert_buffer.resize(complex_count);
@@ -140,6 +146,9 @@ void StreamDecoder::Impl::run_frontend() {
             const auto resample_started_at = std::chrono::steady_clock::now();
             const auto resampled = resampler->process(convert_buffer);
             const float resample_time_ms = duration_ms(resample_started_at);
+            const double applied_sro = resampler->applied_sro_correction_ppm();
+            sro_resampler_applied_ppm.store(applied_sro,
+                                            std::memory_order_relaxed);
             // Push to the ring incrementally: the ring (sized to ~0.2 s
             // of the input rate) holds no more than a block, so each
             // iteration pushes only what fits and waits for the demod to
@@ -209,6 +218,14 @@ void StreamDecoder::Impl::run_frontend() {
                     latest.last_frontend_resample_time_ms = resample_time_ms;
                     latest.last_frontend_ring_copy_time_ms = ring_copy_time_ms;
                     latest.last_frontend_ring_wait_time_ms = ring_wait_time_ms;
+                    latest.sro_resampler_command_ppm =
+                        static_cast<float>(sro_command);
+                    latest.sro_resampler_applied_ppm =
+                        static_cast<float>(applied_sro);
+                    latest.resampler_requested_ratio =
+                        resampler->requested_ratio();
+                    latest.resampler_effective_ratio =
+                        resampler->effective_ratio();
                     current_bandwidth = block.bandwidth;
                 }
             }

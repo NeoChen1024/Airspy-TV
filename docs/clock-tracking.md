@@ -13,7 +13,7 @@ The production baseline now includes:
   verification;
 - branch unwrapping and outlier rejection;
 - feedback-debiased physical timing and SRO telemetry;
-- integer timing corrections driven by a fractional accumulator;
+- variable-rate resampler correction as the sole long-term SRO actuator;
 - independent sample-clock and LO/CFO tracking;
 - adaptive CIR-based FFT-window placement;
 - synthetic sample-clock and LO drift generation and validation tools.
@@ -43,21 +43,7 @@ control-loop experiments require longer retained fixtures.
 
 ## Open validation work
 
-### 1. Timing-coordinate bias
-
-Two compensation paths are implemented but still need broader validation.
-
-#### Window-step response
-
-`timing_window_shift_response = 1.0` has the correct sign and gain on the 8K
-545 MHz capture. Remaining work:
-
-- repeat commanded `+1/-1` window-step tests in 2K mode;
-- run known positive and negative SRO fixtures in both 2K and 8K modes;
-- repeat the measurement on the 557 and 581 MHz multipath captures;
-- verify that physical timing remains continuous across actuator steps.
-
-#### CIR rebasing
+### 1. CIR timing-coordinate rebasing
 
 The timing coordinate uses the exact time-weighted mean of
 `applied_cir_offset`, but the 545 MHz capture did not exercise CIR movement.
@@ -68,10 +54,9 @@ Remaining work:
 - validate captures with naturally changing CIR placement;
 - verify the available guard-interval margin before and after each move.
 
-For both paths, record raw `tau`, filtered timing, physical timing, corrected
-drift, SRO ppm, CIR offset/confidence, cumulative shift, and actuator rate. A
-stable non-zero residual `tau` is acceptable; continuity and unbiased drift are
-the criteria.
+Record raw `tau`, filtered timing, physical timing, residual drift, estimated
+SRO, commanded/applied correction, and CIR offset/confidence. A stable non-zero
+residual `tau` is acceptable; continuity and unbiased drift are the criteria.
 
 ### 2. Confidence-gated timing updates
 
@@ -88,13 +73,13 @@ Test fades, rapidly changing multipath, low MER, and genuine signal loss
 separately. Confidence gating must not turn loss of signal into a permanently
 frozen stale lock; normal acquisition must still take over.
 
-### 3. Fractional timing correction
+### 3. Variable-rate SRO correction
 
-The current integer-step actuator is stable but produces pulse-density
-corrections and a small residual sawtooth. The frontend now uses the vendored
-common variable-ratio arbitrary resampler at its nominal fixed ratio. SRO
-feedback is deliberately not connected yet, so the existing FFT-window loop
-remains the only timing actuator.
+The frontend uses the vendored common variable-ratio arbitrary resampler for
+both nominal input-rate conversion and long-term SRO correction. This is the
+only DVB-T sample-clock actuator; the former fractional accumulator and
+integer FFT-window sample steps have been removed. Adaptive CIR placement
+remains a separate channel-delay operation.
 
 The resampler should combine the nominal input-to-DVB-baseband rate conversion
 with a continuously adjustable fractional-delay polyphase FIR. Its input phase
@@ -113,26 +98,92 @@ constraints, filter requirements, and timing-loop command. Standard-specific
 code must not depend on the resampler's internal phase, history, or worker
 implementation.
 
-The common implementation already provides persistent FIR history, block-local
-Q32.32 phase, variable output counts, block-boundary rate updates, explicit
-reset behavior, output-range parallelism, and portable/SSE4.1/AVX2-FMA/NEON
-kernels. Callers provide absolute passband and stopband edges; the filter is
-automatically sized to a 16-tap boundary for an 80 dB Kaiser target. Focused
-tests cover arbitrary input segmentation, worker-count equivalence, reset,
-steady-state gain, ratio quantization, rate changes, and end-to-end stopband
-tone sweeps for DVB-T 5/6/7/8 MHz configurations at 10 MS/s.
+The common implementation provides persistent FIR history, block-local Q32.32
+phase, variable output counts, block-boundary target updates, a configurable
+ppm/second slew limit, explicit reset behavior, output-range parallelism, and
+portable/SSE4.1/AVX2-FMA/NEON kernels. Callers provide absolute passband and
+stopband edges; the filter is automatically sized to a 16-tap boundary for an
+80 dB Kaiser target. Focused tests cover arbitrary input segmentation,
+worker-count equivalence, reset, steady-state gain, ratio quantization, bounded
+rate changes, and end-to-end stopband tone sweeps for DVB-T 5/6/7/8 MHz
+configurations at 10 MS/s.
 
-Remaining integration work is:
+The DVB-T controller uses a 0.5 ppm/second slew and a confidence gate of 0.75.
+Once the timing history is ready, the demod thread publishes source SRO through
+an atomic command and the frontend applies it as
+`nominal_output_per_input / (1 + sro_ppm * 1e-6)`. The estimator adds the
+interval-average applied correction back to each residual timing difference,
+avoiding history-lag overshoot. Adaptive CIR placement remains independent.
 
-- establish the correction sign with positive and negative synthetic SRO
-  fixtures;
-- add a bounded slew from the current ratio toward the block-boundary target;
-- expose the standard-neutral target-rate control through the demodulator
-  integration without leaking resampler internals;
-- transfer long-term SRO correction from the integer FFT-window actuator to
-  the resampler without running both integrators at once;
-- validate flush, retune, queue-pressure, and long-capture behavior with
-  variable-rate feedback enabled.
+Twenty-second synthetic 8K/6 MHz tests established both signs. For targets of
+about +0.189 and -0.189 ppm, applied correction reached about +0.157 and -0.157
+ppm by the final window, residual drift fell from roughly 0.75 to 0.16 samples
+per statistics window, cumulative integer timing shift stayed at zero, and
+both runs produced 37,045,776 TS bytes with no RS failures or TEI packets.
+
+A 30-second prefix of the real 545 MHz PTV capture produced byte-identical
+55,929,248-byte transport streams with feedback on and off. Both paths saw the
+same 27 RS/TEI packets in this marginal-MER segment. Feedback converged to
+about +0.163 ppm, held cumulative integer timing shift at zero instead of 18
+samples, and kept filtered timing near 15.8 samples. This is a smoke test, not
+a substitute for the full 2.5-hour replay.
+
+The full 151.6-minute replay decoded all 90,973,175,808 complex input samples
+into 16,977,139,404 TS bytes and 90,303,933 packets. There was one initial
+outer-FEC alignment lock and no later `align-miss`, bad lock, timing-branch
+event, outer-FEC reset, or decoder exception. After timing-history warm-up,
+filtered timing stayed between -6.052 and +17.249 samples, cumulative integer
+timing shift remained exactly zero, and the SRO command ranged from about
++0.149 to +0.195 ppm. The median absolute command-to-applied error after the
+first 30 seconds was 0.000175 ppm. TS output continued for the entire replay;
+the longest interval with an unchanged TS counter in the 0.6-second telemetry
+was about 0.8 seconds.
+
+The replay reported 700 RS failures and 700 TEI packets. Of these, 27 were at
+startup, 672 were concentrated in one approximately 48.2--49.4-second
+marginal-MER burst, and only one occurred during the remaining two hours. A
+same-build 60-second A/B replay covering that burst was deterministic: the
+integer-actuator baseline reported 679 failures and resampler feedback reported
+699, while both produced the same 595,284 packets and 111,913,392 bytes. Only
+216 packets differed; 658 failed in both runs, with 21 baseline-only and 41
+feedback-only failures. This localized 20-packet difference is not evidence of
+a timing runaway and is small relative to the common failure burst. The
+resampler path is therefore the production path, while marginal-signal
+characterization remains useful for future loop tuning.
+
+Additional same-build full-capture A/B replays produced the following results.
+Packet and TEI counts in this table were measured directly from the emitted
+188-byte transport streams so that they remain cumulative across demodulator
+session resets.
+
+| Capture | Baseline packets / TEI | Feedback packets / TEI | Result |
+| --- | ---: | ---: | --- |
+| `557mhz-horizontal` | 1,487,603 / 0 | 1,487,603 / 0 | Byte-identical; no bad lock or outer reset |
+| `557mhz-vertical` | 724,527 / 84,932 | 723,700 / 112,582 | Severe loss/recovery stress case; 16 outer resets in both paths |
+| `581mhz` | 973,084 / 1,537 | 973,084 / 1,558 | Same output count; feedback had 21 additional TEI packets |
+| `581mhz-2` | 1,257,810 / 0 | 1,257,810 / 0 | Byte-identical; no bad lock or outer reset |
+| `581mhz-3` | 1,437,707 / 26 | 1,437,707 / 26 | Byte-identical |
+
+The clean captures show that feedback does not alter decoded output when the
+channel has adequate margin. `581mhz` contains a deep disturbance and recovers
+in both modes; feedback recorded 52 bad-lock events versus 55 in the baseline,
+with one outer reset in each. `557mhz-vertical` has a median MER near 17 dB,
+extended intervals below 18 dB, repeated reacquisition, and is not a valid
+steady-state SRO measurement. It is nevertheless useful for validating command
+hold, reset, and recovery behavior. The separate `557M-DVB-T.cs16` capture has
+intrinsically insufficient MER to decode and is retained only as an expected
+acquisition-failure fixture.
+
+The A/B runs also exposed a diagnostics limitation: `transport_bytes` is
+cumulative, while final CLI RS/TEI/packet counters reflect only the current FEC
+session after a demodulator reset. Until those counters are made cumulative,
+cross-session validation must inspect the emitted TS and event log rather than
+the final summary alone.
+
+Remaining integration work is to validate flush, retune, queue pressure,
+ramping/reversing SRO, and 2K mode with variable-rate correction. The
+short 557/581 MHz matrix is complete, but the marginal-signal FEC delta and
+loss/recovery hold policy still need characterization.
 
 Use a block-local Q32.32 phase accumulator for the scalar reference
 implementation. The upper 32 bits identify the input sample within the current
@@ -147,11 +198,9 @@ the Q32.32 fractional field.
 The SRO estimator and second-order clock model remain owned by the consuming
 demodulator, while the arbitrary resampler remains a common actuator. The
 interface should carry a standard-neutral target rate and SRO correction
-command; DVB-T's FFT-window actuator is only one possible downstream residual
-timing actuator. Once that feedback path is enabled, do not also integrate the
-same SRO estimate into the existing integer FFT-window actuator: that would
-double-correct the clock error. Keep standard-specific timing movement for
-residual timing phase and channel-delay placement.
+command. Standard-specific timing movement remains available for acquisition
+and channel-delay placement, but it must not integrate the same long-term SRO
+estimate and double-correct the clock error.
 
 Benchmark the portable, SSE4.1, AVX2/FMA, and NEON kernels on their supported
 architectures, retaining the portable path as the numerical reference.
@@ -216,15 +265,11 @@ queue watermarks, and dropped blocks.
 1. Complete 2K, 557/581 MHz, and synthetic CIR-bias validation.
 2. Establish expected confidence and ppm ranges for those inputs.
 3. Add confidence gating as an isolated control change.
-4. Implement the portable scalar arbitrary resampler behind an opt-in setting
-   and validate its fixed-rate response before enabling feedback.
-5. Validate phase/history continuity across random block boundaries, then
-   connect the SRO estimate while separating the long-term resampler actuator
-   from residual FFT-window correction.
+4. Run the remaining 2K, queue-pressure, retune, and ramping/reversal matrix
+   against the variable-rate resampler path.
+5. Characterize the marginal-signal FEC delta against a same-build baseline.
 6. Evaluate the second-order SRO loop behind a separate opt-in setting.
-7. Add and benchmark optional SIMD resampler kernels against the scalar
-   numerical reference.
-8. Repeat the full regression matrix before changing any default.
+7. Repeat the full regression matrix after each controller change.
 
 ## Acceptance criteria
 

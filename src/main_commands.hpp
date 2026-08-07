@@ -313,9 +313,11 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << " start=" << stats.acquisition_start
                   << " timing=" << stats.timing_offset_samples << " smp"
                   << " sro=" << stats.sample_clock_offset_ppm << " ppm"
-                  << " shift=" << stats.cumulative_timing_shift_samples
-                  << " smp"
-                  << " act=" << stats.rolling_timing_shift_rate_ppm << " ppm"
+                  << " sro-act-ready="
+                  << (stats.sro_resampler_ready ? 1 : 0)
+                  << " sro-command=" << stats.sro_resampler_command_ppm
+                  << " ppm sro-applied=" << stats.sro_resampler_applied_ppm
+                  << " ppm resample-ratio=" << stats.resampler_effective_ratio
                   << " tconf=" << stats.timing_confidence
                   << " sro-ready=" << (stats.timing_drift_ready ? 1 : 0)
                   << " carried=" << (stats.state_carried ? 1 : 0)
@@ -325,13 +327,8 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << " physical=" << stats.physical_timing_offset_samples
                   << " smp observed-drift="
                   << stats.observed_timing_drift_samples
-                  << " corrected-drift=" << stats.corrected_timing_drift_samples
                   << " smooth=" << stats.smoothed_timing_drift_samples
-                  << " smp/current-window shift-rate="
-                  << stats.timing_shift_rate_ppm << " ppm rolling-shift-rate="
-                  << stats.rolling_timing_shift_rate_ppm
-                  << " ppm frac=" << stats.fractional_timing_samples
-                  << " cir=" << stats.cir_offset_samples
+                  << " smp/current-window cir=" << stats.cir_offset_samples
                   << " smp cir-conf=" << stats.cir_confidence
                   << " measurements=" << stats.timing_measurements
                   << " accepted=" << stats.timing_accepted_measurements
