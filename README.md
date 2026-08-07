@@ -79,9 +79,10 @@ Required system libraries:
 - FFTW3f
 - a C++20 compiler and CMake 3.25 or newer
 
-Dear ImGui, nlohmann/json, tinycolormap, liquid-dsp, and ViterbiDecoderCpp are
-pinned under `contrib/` as Git submodules. The minimized libfec Reed-Solomon
-subset is vendored directly under `contrib/libfec`.
+Dear ImGui, nlohmann/json, tinycolormap, and ViterbiDecoderCpp are pinned under
+`contrib/` as Git submodules. Minimized MIT-licensed arbitrary-resampler and
+LGPL-licensed libfec Reed-Solomon subsets are vendored directly under
+`contrib/`.
 
 ```sh
 git submodule update --init --recursive

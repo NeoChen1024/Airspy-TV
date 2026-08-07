@@ -21,9 +21,9 @@ struct OfdmAcquisition {
     GuardInterval guard{GuardInterval::gi_1_4};
 };
 
-// Reusable partitioned CS16 resampler. Worker threads and liquid-dsp filter
-// instances remain alive across process() calls; process() itself is
-// synchronous and must only be called by one producer at a time.
+// Reusable partitioned CS16 resampler. Worker threads and filter state remain
+// alive across process() calls; process() itself is synchronous and must only
+// be called by one producer at a time.
 class Cs16Resampler {
   public:
     explicit Cs16Resampler(std::size_t worker_count = 1);

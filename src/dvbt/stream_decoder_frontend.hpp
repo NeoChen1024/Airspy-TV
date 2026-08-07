@@ -3,8 +3,8 @@
 // ------------------------------------------------------------------ //
 // Front-end thread: cs16 -> resampled cfloat -> ring, plus the rolling
 // acquisition window. Runs independently of the demod and dispatches large
-// input blocks to a persistent resampler pool; partition 0 carries the
-// continuous filter state across submissions.
+// input blocks to a persistent output-range resampler pool. Q32.32 phase and
+// FIR history carry the continuous stream state across submissions.
 // ------------------------------------------------------------------ //
 void StreamDecoder::Impl::run_frontend() {
     std::unique_ptr<StreamingResampler> resampler;
@@ -131,9 +131,7 @@ void StreamDecoder::Impl::run_frontend() {
                 }
                 ring_data.notify_all();
             }
-            if (!resampler->configured()) {
-                resampler->configure(block.rate, block.bandwidth);
-            }
+            resampler->configure(block.rate, block.bandwidth);
             const std::size_t complex_count = block.samples.size() / 2;
             const auto convert_started_at = std::chrono::steady_clock::now();
             convert_buffer.resize(complex_count);

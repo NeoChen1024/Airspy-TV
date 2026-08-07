@@ -91,9 +91,10 @@ frozen stale lock; normal acquisition must still take over.
 ### 3. Fractional timing correction
 
 The current integer-step actuator is stable but produces pulse-density
-corrections and a small residual sawtooth. The selected experiment is an
-opt-in variable-ratio arbitrary resampler that can eventually replace the
-fixed-ratio liquid-dsp rational resampler.
+corrections and a small residual sawtooth. The frontend now uses the vendored
+common variable-ratio arbitrary resampler at its nominal fixed ratio. SRO
+feedback is deliberately not connected yet, so the existing FFT-window loop
+remains the only timing actuator.
 
 The resampler should combine the nominal input-to-DVB-baseband rate conversion
 with a continuously adjustable fractional-delay polyphase FIR. Its input phase
@@ -112,18 +113,26 @@ constraints, filter requirements, and timing-loop command. Standard-specific
 code must not depend on the resampler's internal phase, history, or worker
 implementation.
 
-The correction sign must be established with positive and negative synthetic
-SRO fixtures. The implementation must:
+The common implementation already provides persistent FIR history, block-local
+Q32.32 phase, variable output counts, block-boundary rate updates, explicit
+reset behavior, output-range parallelism, and portable/SSE4.1/AVX2-FMA/NEON
+kernels. Callers provide absolute passband and stopband edges; the filter is
+automatically sized to a 16-tap boundary for an 80 dB Kaiser target. Focused
+tests cover arbitrary input segmentation, worker-count equivalence, reset,
+steady-state gain, ratio quantization, rate changes, and end-to-end stopband
+tone sweeps for DVB-T 5/6/7/8 MHz configurations at 10 MS/s.
 
-- retain fractional phase and FIR history across input blocks;
-- snapshot the target SRO correction at a block boundary and slew toward it
-  instead of changing the rate abruptly within a block;
-- emit a variable number of output samples while preserving the configured
-  nominal baseband time axis for the consuming demodulator;
-- remain continuous across arbitrary input block boundaries, flushes, and
-  normal streaming operation;
-- keep reset and retune behavior explicit rather than carrying stale phase or
-  filter state into a new stream generation.
+Remaining integration work is:
+
+- establish the correction sign with positive and negative synthetic SRO
+  fixtures;
+- add a bounded slew from the current ratio toward the block-boundary target;
+- expose the standard-neutral target-rate control through the demodulator
+  integration without leaking resampler internals;
+- transfer long-term SRO correction from the integer FFT-window actuator to
+  the resampler without running both integrators at once;
+- validate flush, retune, queue-pressure, and long-capture behavior with
+  variable-rate feedback enabled.
 
 Use a block-local Q32.32 phase accumulator for the scalar reference
 implementation. The upper 32 bits identify the input sample within the current
@@ -144,10 +153,10 @@ same SRO estimate into the existing integer FFT-window actuator: that would
 double-correct the clock error. Keep standard-specific timing movement for
 residual timing phase and channel-delay placement.
 
-Implement and validate a portable scalar kernel first. Then benchmark optional
-SSE4.1-compatible, AVX2, and AVX2/FMA FIR kernels while retaining the scalar
-path as the numerical reference. Preserve the current resampler worker-budget
-model where parallel output partitions provide a measured benefit.
+Benchmark the portable, SSE4.1, AVX2/FMA, and NEON kernels on their supported
+architectures, retaining the portable path as the numerical reference.
+Preserve the current resampler worker-budget model only where parallel output
+partitions provide a measured benefit.
 
 Compare residual timing jitter, pilot phase modulation, MER, FEC errors, CPU
 cost, output-rate error, block-boundary continuity, and queue pressure. Do not
@@ -188,15 +197,15 @@ input.
 
 Each new algorithm should cover at least:
 
-| Dimension | Cases |
-| --- | --- |
-| DVB-T mode | 2K, 8K |
-| Channel bandwidth | supported 5/6/7/8 MHz cases where fixtures exist |
-| Sample clock | zero, positive/negative offset, linear ramp, reversal |
-| LO clock | zero, positive/negative offset, linear ramp |
-| Clock relationship | independent, correlated, conflicting |
-| Channel | clean synthetic, static multipath, moving CIR, fade, real captures |
-| Input path | deterministic offline replay; live SDR where practical |
+| Dimension          | Cases                                                              |
+| ------------------ | ------------------------------------------------------------------ |
+| DVB-T mode         | 2K, 8K                                                             |
+| Channel bandwidth  | supported 5/6/7/8 MHz cases where fixtures exist                   |
+| Sample clock       | zero, positive/negative offset, linear ramp, reversal              |
+| LO clock           | zero, positive/negative offset, linear ramp                        |
+| Clock relationship | independent, correlated, conflicting                               |
+| Channel            | clean synthetic, static multipath, moving CIR, fade, real captures |
+| Input path         | deterministic offline replay; live SDR where practical             |
 
 Retain machine-readable summaries for SRO error, CFO error, timing confidence,
 branch rejections, actuator rate, MER, FEC failures, TS bytes, processing ratio,

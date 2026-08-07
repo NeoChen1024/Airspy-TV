@@ -35,18 +35,7 @@ pkg_check_modules(MPV REQUIRED IMPORTED_TARGET mpv)
 set(JSON_BuildTests OFF CACHE INTERNAL "Disable nlohmann/json tests")
 add_subdirectory(contrib/json EXCLUDE_FROM_ALL)
 
-set(BUILD_EXAMPLES OFF CACHE BOOL "Disable liquid-dsp examples" FORCE)
-set(BUILD_AUTOTESTS OFF CACHE BOOL "Disable liquid-dsp tests" FORCE)
-set(BUILD_BENCHMARKS OFF CACHE BOOL "Disable liquid-dsp benchmarks" FORCE)
-set(BUILD_SHARED_LIBS ON CACHE BOOL "Build liquid-dsp shared library" FORCE)
-set(BUILD_STATIC_LIBS OFF CACHE BOOL "Disable liquid-dsp static library" FORCE)
-set(ENABLE_LOGGING OFF CACHE BOOL "Disable liquid-dsp logging" FORCE)
-# liquid-dsp controls call-site compilation separately from ENABLE_LOGGING.
-# Keep only exceptional fatal call sites so trace calls do not remain in DSP
-# inner loops as no-op logger invocations.
-set(LOGGING_LEVEL "fatal" CACHE STRING
-    "Compile only fatal liquid-dsp logging call sites" FORCE)
-add_subdirectory(contrib/liquid-dsp EXCLUDE_FROM_ALL)
+add_subdirectory(contrib/liquid-resampler EXCLUDE_FROM_ALL)
 
 add_subdirectory(contrib/libfec EXCLUDE_FROM_ALL)
 
@@ -123,7 +112,7 @@ add_library(airspy-tv-dvbt STATIC
 )
 target_include_directories(airspy-tv-dvbt PUBLIC include)
 target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F airspy-tv-common
-    Threads::Threads PRIVATE liquid::liquid)
+    Threads::Threads PRIVATE liquid-resampler::liquid-resampler)
 
 add_executable(airspy-tv
     src/epg.cpp
@@ -162,6 +151,17 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(arbitrary-resampler-test
+        tests/arbitrary_resampler_test.cpp
+    )
+    target_link_libraries(arbitrary-resampler-test PRIVATE
+        liquid-resampler::liquid-resampler)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(arbitrary-resampler-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME arbitrary-resampler COMMAND arbitrary-resampler-test)
+
     add_executable(dvbt-inner-decoder-test
         tests/dvbt_inner_decoder_test.cpp
     )

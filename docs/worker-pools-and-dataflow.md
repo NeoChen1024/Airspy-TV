@@ -75,7 +75,7 @@ calculation.
 | --- | --- | --- |
 | Source callback/worker | Submit I/Q to spectrum, demodulator, and recorder | Must return promptly |
 | `dvbt-frontend` | Convert CS16, resample, and fill the sample ring | Serial input order |
-| Resampler pool | Process history-primed partitions | Rejoined exactly before ring write |
+| Resampler pool | Process independent output ranges | Rejoined exactly before ring write |
 | `dvbt-demod` | Own acquisition, symbol position, carrier/timing loops, channel state, and TPS | Strict symbol order |
 | Symbol pool (`dvbt-sym-*`) | Reliability, MER, demap, deinterleave, and depuncture independent symbols | Results joined by sequence |
 | `dvbt-fec` | Own decoder regions, outer FEC, TS emission, and final stream-end delivery | Strict FEC/TS order |
@@ -123,8 +123,12 @@ incoming block.
 
 `dvbt-frontend` converts interleaved CS16 to normalized complex samples and
 runs `StreamingResampler` at the DVB-T baseband rate (`bandwidth * 8 / 7`).
-The resampler retains continuous filter state. Parallel partitions restore the
-required history and are rejoined exactly before publication.
+The common arbitrary resampler retains Q32.32 phase and FIR history across
+input blocks. Parallel workers evaluate independent output ranges and rejoin
+exactly before publication. DVB-T configures its passband through the outermost
+active carrier and its stopband at the lower of the input and output Nyquist
+edges. The Kaiser filter is automatically sized and SIMD-aligned for an 80 dB
+stopband target.
 
 Resampled data enters an `AbsoluteSampleRing`. Read and write positions are
 monotonic 64-bit stream coordinates; wrapping affects storage only. The ring

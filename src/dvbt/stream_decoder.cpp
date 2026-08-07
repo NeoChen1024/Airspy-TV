@@ -10,11 +10,12 @@
 #include "airspy_tv/dvbt/tps_decoder.hpp"
 #include "airspy_tv/fftw_plan.hpp"
 #include "airspy_tv/thread_name.hpp"
+#include "liquid_resampler/arbitrary_resampler.hpp"
 
 #include "absolute_sample_ring.hpp"
+#include "resampler_config.hpp"
 
 #include <fftw3.h>
-#include <liquid/liquid.h>
 
 #include <algorithm>
 #include <array>
@@ -31,7 +32,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <numbers>
 #include <numeric>
 #include <optional>
@@ -39,7 +39,6 @@
 #include <span>
 #include <string>
 #include <thread>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -76,8 +75,6 @@ constexpr std::size_t analysis_interval_symbols = 32;
 // falls below the constellation's decode floor are dropped and bracket a
 // fresh FEC trellis at the region edges.
 constexpr std::size_t gate_window_symbols = 68;
-constexpr std::size_t resampler_semi_length = 12;
-
 constexpr std::array continual_2k{
     0,    48,   54,   87,   141,  156,  192,  201,  255,  279,  282,  333,
     432,  450,  483,  525,  531,  618,  636,  714,  759,  765,  780,  804,

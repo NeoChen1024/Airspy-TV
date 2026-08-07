@@ -334,197 +334,33 @@ class SymbolPostprocessorPool {
     bool stopping_{};
 };
 
-class OverwriteComplexBuffer {
-  public:
-    ~OverwriteComplexBuffer() {
-        if (data_ != nullptr) {
-            ::operator delete(data_, alignment);
-        }
-    }
-    OverwriteComplexBuffer() = default;
-    OverwriteComplexBuffer(const OverwriteComplexBuffer &) = delete;
-    OverwriteComplexBuffer &operator=(const OverwriteComplexBuffer &) = delete;
-    OverwriteComplexBuffer(OverwriteComplexBuffer &&other) noexcept {
-        *this = std::move(other);
-    }
-    OverwriteComplexBuffer &operator=(OverwriteComplexBuffer &&other) noexcept {
-        if (this != &other) {
-            if (data_ != nullptr) {
-                ::operator delete(data_, alignment);
-            }
-            data_ = std::exchange(other.data_, nullptr);
-            size_ = std::exchange(other.size_, 0);
-            capacity_ = std::exchange(other.capacity_, 0);
-        }
-        return *this;
-    }
-
-    void resize_for_overwrite(const std::size_t size) {
-        static_assert(std::is_trivially_copyable_v<std::complex<float>> &&
-                      std::is_trivially_destructible_v<std::complex<float>>);
-        if (size > capacity_) {
-            if (size > std::numeric_limits<std::size_t>::max() /
-                           sizeof(std::complex<float>)) {
-                throw std::bad_array_new_length{};
-            }
-            auto *next = static_cast<std::complex<float> *>(::operator new(
-                sizeof(std::complex<float>) * size, alignment));
-            if (data_ != nullptr) {
-                ::operator delete(data_, alignment);
-            }
-            data_ = next;
-            capacity_ = size;
-        }
-        size_ = size;
-    }
-
-    [[nodiscard]] std::complex<float> *data() noexcept { return data_; }
-    [[nodiscard]] std::span<const std::complex<float>> view() const noexcept {
-        return {data_, size_};
-    }
-
-  private:
-    static constexpr std::align_val_t alignment{64};
-    std::complex<float> *data_{};
-    std::size_t size_{};
-    std::size_t capacity_{};
-};
-
-// Parallel rational resampler with one persistent primary filter. Partition 0
-// carries the exact stream state across calls; the other filters are reset and
-// primed from the preceding m*Q input samples before processing their disjoint
-// ranges. This preserves the continuous serial result while allowing the FIR
-// work in a large input block to scale across cores.
 class StreamingResampler {
   public:
     explicit StreamingResampler(const std::size_t worker_count)
-        : worker_count_(std::max<std::size_t>(worker_count, 1)),
-          filters_(worker_count_, nullptr) {
-        workers_.reserve(worker_count_);
-        try {
-            for (std::size_t index = 0; index < worker_count_; ++index) {
-                workers_.emplace_back([this, index] {
-                    set_current_thread_name("dvbt-resamp-" +
-                                            std::to_string(index));
-                    run_worker(index);
-                });
-            }
-        } catch (...) {
-            stop_and_join();
-            throw;
-        }
-    }
-    ~StreamingResampler() {
-        stop_and_join();
-        destroy_filters();
-    }
-    StreamingResampler(const StreamingResampler &) = delete;
-    StreamingResampler &operator=(const StreamingResampler &) = delete;
-    StreamingResampler(StreamingResampler &&) = delete;
-    StreamingResampler &operator=(StreamingResampler &&) = delete;
+        : resampler_(worker_count, "dvbt-resamp-") {}
 
     [[nodiscard]] std::size_t worker_count() const noexcept {
-        return worker_count_;
+        return resampler_.worker_count();
     }
 
-    void reset() {
-        destroy_filters();
-        rate_ = 0;
-        bandwidth_ = 0;
-        interpolation_ = 0;
-        decimation_ = 0;
-        residual_.clear();
-        history_.clear();
-        output_.resize_for_overwrite(0);
-    }
+    void reset() { resampler_.reset(); }
 
     void configure(const std::uint32_t rate, const std::uint32_t bandwidth) {
         if (configured() && rate == rate_ && bandwidth == bandwidth_) {
             return;
         }
-        reset();
-        // Nominal DVB-T output rate is bandwidth * 8 / 7 samples/second.
-        const std::uint64_t interpolation =
-            static_cast<std::uint64_t>(bandwidth) * 8U;
-        const std::uint64_t decimation = static_cast<std::uint64_t>(rate) * 7U;
-        const std::uint64_t divisor = std::gcd(interpolation, decimation);
-        const unsigned int p =
-            static_cast<unsigned int>(interpolation / divisor);
-        const unsigned int q = static_cast<unsigned int>(decimation / divisor);
-        for (auto &filter : filters_) {
-            filter = rresamp_crcf_create_kaiser(p, q, resampler_semi_length,
-                                                -1.0F, 60.0F);
-            if (filter == nullptr) {
-                destroy_filters();
-                throw std::runtime_error(
-                    "failed to create streaming resampler");
-            }
-        }
+        resampler_.configure(make_resampler_config(rate, bandwidth));
         rate_ = rate;
         bandwidth_ = bandwidth;
-        interpolation_ = p;
-        decimation_ = q;
-        residual_.clear();
-        residual_.reserve(decimation_);
-        history_.clear();
-        history_.reserve(resampler_semi_length * decimation_);
     }
 
-    // Full decimation blocks are processed directly from the caller's input;
-    // only the short tail crossing a call boundary is copied into residual_.
-    // output_ is raw overwrite storage because liquid fills every output
-    // sample, avoiding std::vector's redundant value initialization.
     [[nodiscard]] std::span<const std::complex<float>>
     process(std::span<const std::complex<float>> input) {
-        if (!configured()) {
-            output_.resize_for_overwrite(0);
-            return {};
-        }
-        const std::size_t blocks =
-            (residual_.size() + input.size()) / decimation_;
-        if (blocks == 0) {
-            residual_.insert(residual_.end(), input.begin(), input.end());
-            output_.resize_for_overwrite(0);
-            return {};
-        }
-        if (blocks > std::numeric_limits<unsigned int>::max()) {
-            throw std::length_error("resampler block count exceeds liquid API");
-        }
-        output_.resize_for_overwrite(blocks * interpolation_);
-        std::size_t output_offset = 0;
-
-        if (!residual_.empty()) {
-            const std::size_t needed = decimation_ - residual_.size();
-            residual_.insert(residual_.end(), input.begin(),
-                             input.begin() +
-                                 static_cast<std::ptrdiff_t>(needed));
-            if (rresamp_crcf_execute_block(filters_.front(), residual_.data(),
-                                           1, output_.data()) != LIQUID_OK) {
-                throw std::runtime_error("streaming resampler boundary failed");
-            }
-            output_offset += interpolation_;
-            input = input.subspan(needed);
-            append_history(residual_);
-            residual_.clear();
-        }
-
-        const std::size_t direct_blocks = input.size() / decimation_;
-        if (direct_blocks != 0) {
-            process_direct(input.first(direct_blocks * decimation_),
-                           direct_blocks, output_.data() + output_offset);
-            output_offset += direct_blocks * interpolation_;
-            append_history(input.first(direct_blocks * decimation_));
-            input = input.subspan(direct_blocks * decimation_);
-        }
-        residual_.assign(input.begin(), input.end());
-        if (output_offset != blocks * interpolation_) {
-            throw std::logic_error("resampler output size mismatch");
-        }
-        return output_.view();
+        return resampler_.process(input);
     }
 
     [[nodiscard]] bool configured() const noexcept {
-        return !filters_.empty() && filters_.front() != nullptr;
+        return resampler_.configured();
     }
     [[nodiscard]] std::uint32_t rate() const noexcept { return rate_; }
     [[nodiscard]] std::uint32_t bandwidth() const noexcept {
@@ -532,193 +368,7 @@ class StreamingResampler {
     }
 
   private:
-    static constexpr std::size_t minimum_partition_blocks = 1024;
-
-    void destroy_filters() noexcept {
-        for (auto &filter : filters_) {
-            if (filter != nullptr) {
-                rresamp_crcf_destroy(filter);
-                filter = nullptr;
-            }
-        }
-    }
-
-    void append_history(const std::span<const std::complex<float>> samples) {
-        const std::size_t capacity = resampler_semi_length * decimation_;
-        if (samples.size() >= capacity) {
-            history_.assign(samples.end() -
-                                static_cast<std::ptrdiff_t>(capacity),
-                            samples.end());
-            return;
-        }
-        if (history_.size() + samples.size() > capacity) {
-            const std::size_t discard =
-                history_.size() + samples.size() - capacity;
-            history_.erase(history_.begin(),
-                           history_.begin() +
-                               static_cast<std::ptrdiff_t>(discard));
-        }
-        history_.insert(history_.end(), samples.begin(), samples.end());
-    }
-
-    void process_direct(const std::span<const std::complex<float>> input,
-                        const std::size_t blocks,
-                        std::complex<float> *const output) {
-        const std::size_t active_workers = std::min(
-            worker_count_,
-            std::max<std::size_t>(1, blocks / minimum_partition_blocks));
-        if (active_workers == 1) {
-            if (rresamp_crcf_execute_block(
-                    filters_.front(),
-                    const_cast<std::complex<float> *>(input.data()),
-                    static_cast<unsigned int>(blocks), output) != LIQUID_OK) {
-                throw std::runtime_error("streaming resampler failed");
-            }
-            return;
-        }
-
-        {
-            const std::scoped_lock lock(worker_mutex_);
-            task_input_ = input.data();
-            task_output_ = output;
-            task_blocks_ = blocks;
-            task_active_workers_ = active_workers;
-            task_history_blocks_ = history_.size() / decimation_;
-            task_error_ = nullptr;
-            task_remaining_ = active_workers;
-            ++task_generation_;
-        }
-        task_ready_.notify_all();
-        std::unique_lock lock(worker_mutex_);
-        task_done_.wait(lock, [this] { return task_remaining_ == 0; });
-        if (task_error_ != nullptr) {
-            std::rethrow_exception(task_error_);
-        }
-        // The final partition owns the filter state at the end of this input
-        // range. Promote it to primary so the next process() call continues
-        // from exactly the same state as a serial resampler.
-        std::swap(filters_.front(), filters_[active_workers - 1]);
-    }
-
-    void run_worker(const std::size_t index) {
-        std::uint64_t seen_generation = 0;
-        while (true) {
-            const std::complex<float> *input = nullptr;
-            std::complex<float> *output = nullptr;
-            std::size_t blocks = 0;
-            std::size_t active_workers = 0;
-            std::size_t history_blocks = 0;
-            {
-                std::unique_lock lock(worker_mutex_);
-                task_ready_.wait(lock, [this, seen_generation] {
-                    return stopping_ || task_generation_ != seen_generation;
-                });
-                if (stopping_) {
-                    return;
-                }
-                seen_generation = task_generation_;
-                if (index >= task_active_workers_) {
-                    continue;
-                }
-                input = task_input_;
-                output = task_output_;
-                blocks = task_blocks_;
-                active_workers = task_active_workers_;
-                history_blocks = task_history_blocks_;
-            }
-
-            try {
-                const std::size_t begin = blocks * index / active_workers;
-                const std::size_t end = blocks * (index + 1) / active_workers;
-                auto filter = filters_[index];
-                if (index != 0) {
-                    if (rresamp_crcf_reset(filter) != LIQUID_OK) {
-                        throw std::runtime_error(
-                            "resampler partition reset failed");
-                    }
-                    const std::size_t current_history =
-                        std::min<std::size_t>(begin, resampler_semi_length);
-                    const std::size_t prior_history =
-                        std::min(history_blocks,
-                                 resampler_semi_length - current_history);
-                    for (std::size_t block = history_blocks - prior_history;
-                         block < history_blocks; ++block) {
-                        if (rresamp_crcf_write(
-                                filter, history_.data() +
-                                            block * decimation_) != LIQUID_OK) {
-                            throw std::runtime_error(
-                                "resampler history priming failed");
-                        }
-                    }
-                    for (std::size_t block = begin - current_history;
-                         block < begin; ++block) {
-                        if (rresamp_crcf_write(
-                                filter, const_cast<std::complex<float> *>(
-                                            input + block * decimation_)) !=
-                            LIQUID_OK) {
-                            throw std::runtime_error(
-                                "resampler partition priming failed");
-                        }
-                    }
-                }
-                if (rresamp_crcf_execute_block(
-                        filter,
-                        const_cast<std::complex<float> *>(input +
-                                                          begin * decimation_),
-                        static_cast<unsigned int>(end - begin),
-                        output + begin * interpolation_) != LIQUID_OK) {
-                    throw std::runtime_error("resampler partition failed");
-                }
-            } catch (...) {
-                const std::scoped_lock lock(worker_mutex_);
-                if (task_error_ == nullptr) {
-                    task_error_ = std::current_exception();
-                }
-            }
-
-            {
-                const std::scoped_lock lock(worker_mutex_);
-                --task_remaining_;
-                if (task_remaining_ == 0) {
-                    task_done_.notify_one();
-                }
-            }
-        }
-    }
-
-    void stop_and_join() noexcept {
-        {
-            const std::scoped_lock lock(worker_mutex_);
-            stopping_ = true;
-        }
-        task_ready_.notify_all();
-        for (auto &worker : workers_) {
-            if (worker.joinable()) {
-                worker.join();
-            }
-        }
-    }
-
-    const std::size_t worker_count_;
-    std::vector<rresamp_crcf> filters_;
-    std::vector<std::thread> workers_;
-    std::mutex worker_mutex_;
-    std::condition_variable task_ready_;
-    std::condition_variable task_done_;
-    const std::complex<float> *task_input_{};
-    std::complex<float> *task_output_{};
-    std::size_t task_blocks_{};
-    std::size_t task_active_workers_{};
-    std::size_t task_history_blocks_{};
-    std::size_t task_remaining_{};
-    std::uint64_t task_generation_{};
-    std::exception_ptr task_error_;
-    bool stopping_{};
+    liquid_resampler::ArbitraryResampler resampler_;
     std::uint32_t rate_{};
     std::uint32_t bandwidth_{};
-    std::size_t interpolation_{};
-    std::size_t decimation_{};
-    std::vector<std::complex<float>> residual_;
-    std::vector<std::complex<float>> history_;
-    OverwriteComplexBuffer output_;
 };
