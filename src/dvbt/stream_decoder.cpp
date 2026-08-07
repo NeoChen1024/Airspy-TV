@@ -874,24 +874,6 @@ StreamDecoderStats StreamDecoder::stats() const {
     return statistics;
 }
 
-DemodulatorStats StreamDecoder::demodulator_stats() const {
-    const auto statistics = stats();
-    DemodulatorStats result;
-    result.locked = statistics.ofdm_locked;
-    result.mer_db = statistics.mer_db;
-    if (statistics.transport.pre_viterbi_compared_bits != 0) {
-        result.ber =
-            static_cast<float>(statistics.transport.pre_viterbi_error_bits) /
-            static_cast<float>(statistics.transport.pre_viterbi_compared_bits);
-    }
-    result.worker_threads = statistics.resample_workers +
-                            statistics.symbol_workers +
-                            statistics.transport.viterbi_workers;
-    result.transport_bytes = statistics.transport_bytes;
-    result.processing = statistics.processing;
-    return result;
-}
-
 SignalSnapshot StreamDecoder::signal_snapshot() const {
     const auto analysis = analysis_snapshot();
     const auto statistics = stats();

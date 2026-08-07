@@ -90,10 +90,11 @@ add_library(airspy-tv-common STATIC
     src/fec/outer_fec.cpp
     src/fec/reed_solomon.cpp
     src/fec/soft_viterbi.cpp
+    src/jsonl.cpp
 )
 target_include_directories(airspy-tv-common PUBLIC include)
 target_link_libraries(airspy-tv-common PUBLIC Threads::Threads
-    PRIVATE libfec::rs viterbi-decoder)
+    nlohmann_json::nlohmann_json PRIVATE libfec::rs viterbi-decoder)
 if(AIRSPY_TV_USE_SIMD_VITERBI)
     target_compile_definitions(airspy-tv-common PRIVATE
         AIRSPY_TV_USE_SIMD_VITERBI=1)
@@ -151,6 +152,16 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(jsonl-test
+        tests/jsonl_test.cpp
+    )
+    target_link_libraries(jsonl-test PRIVATE airspy-tv-common)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(jsonl-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME jsonl COMMAND jsonl-test)
+
     add_executable(sample-timeline-test
         tests/sample_timeline_test.cpp
     )

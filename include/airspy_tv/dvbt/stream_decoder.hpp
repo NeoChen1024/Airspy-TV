@@ -233,7 +233,6 @@ class StreamDecoder : public Demodulator {
     // block on the decoder or call back into it.
     void set_discontinuity_callback(DiscontinuityCallback callback) override;
     void set_equalized_callback(EqualizedCallback callback);
-    [[nodiscard]] DemodulatorStats demodulator_stats() const override;
     [[nodiscard]] SignalSnapshot signal_snapshot() const override;
     [[nodiscard]] PipelineSnapshot pipeline_snapshot() const override;
     // DVB-T-specific GUI analysis (constellation, MER, CP SNR, TPS state),

@@ -86,27 +86,15 @@ Prefer ordinary translation units over more large inline functions. Keep
 `ReceiverSession` as the only owner of source start/restart/retune and
 demodulator replacement while splitting the files.
 
-### Low: demodulator APIs contain transitional overlap
-
-`DemodulatorStats` remains alongside the newer `SignalSnapshot` and
-`PipelineSnapshot`, although the common GUI now uses the snapshots. Before
-adding another standard:
-
-- decide whether `DemodulatorStats` still has a non-GUI consumer;
-- remove it if the common snapshots fully replace it;
-- keep standard-specific parameters and diagnostics in separate typed state;
-- avoid a universal parameter structure containing fields for multiple
-  standards;
-- add the next standard through the `ReceiverSession` factory/transaction and
-  common snapshot contracts.
-
 ### Low: long-lived diagnostics need explicit retention policy
 
 User-visible and fatal errors remain unconditional; decoder diagnostics, event
 logs, and FEC traces now share the `--debug` flag. These verbose logs can still
-produce very large files during clock research. Define which measurements
-should also be emitted as compact, machine-readable long-run regression
-summaries, and rate-limit repeated human-readable events where appropriate.
+produce very large files during clock research. The proposed report directory,
+JSONL schema, summary statistics, and debug-log transition are specified in
+[machine-readable-performance-report.md](machine-readable-performance-report.md).
+Implement that design and rate-limit repeated human-readable events where
+appropriate.
 
 This should reduce ad-hoc log parsing without removing the detailed data needed
 for AFC and FEC investigations.
@@ -117,9 +105,7 @@ for AFC and FEC investigations.
 2. Add build presets and routine portable/sanitizer configurations.
 3. Split `main_gui.hpp` along the existing common versus standard-specific
    boundaries.
-4. Remove redundant transitional APIs after confirming there are no remaining
-   consumers.
-5. Perform full-capture and live-hardware validation after major DSP or source
+4. Perform full-capture and live-hardware validation after major DSP or source
    changes.
 
 ## Refactoring acceptance criteria

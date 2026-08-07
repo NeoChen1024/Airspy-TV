@@ -14,18 +14,6 @@
 
 namespace airspy_tv {
 
-// Standard-neutral summary of a demodulator, suitable for generic UI panels.
-// Standard-specific detail remains available through the concrete demodulator
-// type (the UI constructs the concrete demodulator and injects it).
-struct DemodulatorStats {
-    bool locked{};
-    float mer_db{};
-    float ber{};
-    std::size_t worker_threads{};
-    std::uint64_t transport_bytes{};
-    bool processing{};
-};
-
 inline constexpr std::size_t common_constellation_snapshot_size = 2048;
 inline constexpr std::size_t common_pipeline_stage_count = 8;
 
@@ -116,7 +104,6 @@ class Demodulator {
     // decoder or call back into it.
     virtual void set_discontinuity_callback(DiscontinuityCallback callback) = 0;
     virtual void set_signal_smoothing(bool enabled, int speed) = 0;
-    [[nodiscard]] virtual DemodulatorStats demodulator_stats() const = 0;
     [[nodiscard]] virtual SignalSnapshot signal_snapshot() const = 0;
     [[nodiscard]] virtual PipelineSnapshot pipeline_snapshot() const = 0;
 };
