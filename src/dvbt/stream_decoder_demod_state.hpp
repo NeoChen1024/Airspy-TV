@@ -72,6 +72,26 @@ struct DemodRuntimeState {
     float demap_time_sum{};
     float deinterleave_time_sum{};
     float depuncture_time_sum{};
+    double ring_wait_time_sum_ms{};
+    double ring_copy_time_sum_ms{};
+    double fft_cfo_time_sum_ms{};
+    double nco_rotate_time_sum_ms{};
+    double fft_execute_time_sum_ms{};
+    double cfo_track_time_sum_ms{};
+    double pilot_lock_time_sum_ms{};
+    double reacquisition_time_sum_ms{};
+    double channel_estimate_time_sum_ms{};
+    double channel_pilot_time_sum_ms{};
+    double channel_notch_time_sum_ms{};
+    double channel_timing_time_sum_ms{};
+    double channel_cir_time_sum_ms{};
+    double channel_interpolate_time_sum_ms{};
+    double channel_tps_extract_time_sum_ms{};
+    double tps_time_sum_ms{};
+    double payload_extract_time_sum_ms{};
+    double symbol_submit_time_sum_ms{};
+    double postprocess_wait_time_sum_ms{};
+    double output_time_sum_ms{};
     double timing_acc{};
     std::uint64_t timing_count{};
     double latest_raw_timing{};
@@ -79,6 +99,7 @@ struct DemodRuntimeState {
     std::uint64_t timing_rejected_count{};
     float fade_indicator{1.0F};
     std::chrono::steady_clock::time_point demod_busy_started_at{};
+    bool demod_busy_active{};
     std::chrono::steady_clock::time_point window_started_at{
         std::chrono::steady_clock::now()};
 

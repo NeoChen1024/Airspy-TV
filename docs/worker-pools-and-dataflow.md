@@ -281,6 +281,10 @@ separates frontend conversion/resampling/ring wait, acquisition, serial demod
 busy time, aggregate symbol-pool work, FEC work, and the transport subset.
 `fec_work_time_ms` already contains `transport_work_time_ms`; they must not be
 added. Asynchronous pool completions may cross a statistics-window boundary.
+Serial demod telemetry further separates sample-ring copy, FFT/CFO, pilot
+lock, channel estimation, TPS, payload extraction, symbol submission, ordered
+postprocessor wait, and output work. FFT/CFO and channel details are nested
+breakdowns and must not be added to their parent stage a second time.
 
 Signal telemetry after lock is published from production carriers. The
 pre-lock analyzer is a fallback only. BER, RS/TEI counters, timing/SRO/CFO,
@@ -312,6 +316,8 @@ DVB-T-specific diagnostics.
   current fraction is a policy, not an automatically tuned optimum.
 - Retain stage telemetry that identifies overload without exposing
   implementation-specific counters through common GUI code.
+- Work through the measured serial DSP optimization and validation plan in
+  [demod-performance-todo.md](demod-performance-todo.md).
 - Keep timing/CIR/second-order-loop experiments in
   [clock-tracking.md](clock-tracking.md).
 - Preserve these ordering, generation, and backpressure invariants while

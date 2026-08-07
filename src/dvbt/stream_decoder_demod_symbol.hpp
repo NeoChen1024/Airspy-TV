@@ -40,6 +40,7 @@ void StreamDecoder::Impl::demod_execute_fft_and_track_cfo(
     auto &period = state.period;
     auto &fade_indicator = state.fade_indicator;
 
+    auto fft_stage_started_at = std::chrono::steady_clock::now();
     const std::uint64_t start = next_symbol_start;
     std::complex<float> nco = std::polar(1.0F, -nco_phase);
     const std::complex<float> nco_step =
@@ -51,7 +52,13 @@ void StreamDecoder::Impl::demod_execute_fft_and_track_cfo(
             nco *= 1.0F / std::sqrt(std::norm(nco));
         }
     }
+    state.nco_rotate_time_sum_ms += duration_ms(fft_stage_started_at);
+
+    fft_stage_started_at = std::chrono::steady_clock::now();
     plan.execute();
+    state.fft_execute_time_sum_ms += duration_ms(fft_stage_started_at);
+
+    fft_stage_started_at = std::chrono::steady_clock::now();
     std::vector<std::complex<float>> current_continual;
     current_continual.reserve(continual_indices.size());
     for (const std::size_t k : continual_indices) {
@@ -129,6 +136,7 @@ void StreamDecoder::Impl::demod_execute_fft_and_track_cfo(
     // the demodulator can re-grab the true grid the moment the
     // signal returns, instead of staying latched on stale or
     // noise-latched values.
+    state.cfo_track_time_sum_ms += duration_ms(fft_stage_started_at);
 }
 
 std::optional<PilotLock>
@@ -318,6 +326,7 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
     auto &tps_indices = state.tps_indices;
     auto &tps_values = state.tps_values;
 
+    auto channel_stage_started_at = std::chrono::steady_clock::now();
     std::vector<std::complex<float>> channel(maximum + 1);
     const auto &pilots = pilot_indices[static_cast<std::size_t>(lock.phase)];
     for (const std::size_t k : pilots) {
@@ -328,10 +337,14 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
                          ? std::complex<float>{sent, 0.0F} / received
                          : std::complex<float>{};
     }
+    state.channel_pilot_time_sum_ms += duration_ms(channel_stage_started_at);
+
+    channel_stage_started_at = std::chrono::steady_clock::now();
     if ((symbol_count % analysis_interval_symbols) == 0U) {
         latest_deepest_notch_db = estimate_channel_notch_db(
             channel, static_cast<std::size_t>(lock.phase), maximum);
     }
+    state.channel_notch_time_sum_ms += duration_ms(channel_stage_started_at);
     // Fractional timing estimate: an FFT-window shift of tau
     // samples ramps arg(channel) linearly across carriers
     // (2*pi*k*tau/N). Estimate it from the fixed-spacing
@@ -339,6 +352,7 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
     // filtered value, and reject isolated group-delay clicks
     // before feeding either the long-term timing loop or the
     // phase verifier.
+    channel_stage_started_at = std::chrono::steady_clock::now();
     if (const auto measured_tau = estimate_scattered_timing_tau(
             channel, static_cast<std::size_t>(lock.phase), maximum, fft_size);
         measured_tau.has_value()) {
@@ -373,9 +387,11 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
             ++timing_rejected_count;
         }
     }
+    state.channel_timing_time_sum_ms += duration_ms(channel_stage_started_at);
     // This symbol was demodulated with the current CIR anchor.
     // Accumulate the exact applied position before the CIR
     // update below can move the anchor for the next symbol.
+    channel_stage_started_at = std::chrono::steady_clock::now();
     window_cir_offset_sum += static_cast<double>(applied_cir_offset);
     // CIR / delay-spread estimate (scattered pilots -> IFFT ->
     // impulse response) for adaptive FFT-window placement.
@@ -497,6 +513,9 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
             cir_confidence = 0.0;
         }
     }
+    state.channel_cir_time_sum_ms += duration_ms(channel_stage_started_at);
+
+    channel_stage_started_at = std::chrono::steady_clock::now();
     for (std::size_t i = 1; i < pilots.size(); ++i) {
         const std::size_t left = pilots[i - 1];
         const std::size_t right = pilots[i];
@@ -511,11 +530,17 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
               channel[pilots.front()]);
     std::fill(channel.begin() + static_cast<std::ptrdiff_t>(pilots.back()),
               channel.end(), channel[pilots.back()]);
+    state.channel_interpolate_time_sum_ms +=
+        duration_ms(channel_stage_started_at);
+
+    channel_stage_started_at = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < tps_indices.size(); ++i) {
         const std::size_t k = tps_indices[i];
         tps_values[i] =
             carrier(fft_out, k, maximum, frontend.carrier_offset) * channel[k];
     }
+    state.channel_tps_extract_time_sum_ms +=
+        duration_ms(channel_stage_started_at);
     return channel;
 }
 

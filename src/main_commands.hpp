@@ -359,6 +359,74 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << "resample=" << stats.resample_workers
                   << " symbol=" << stats.symbol_workers
                   << " Viterbi=" << stats.transport.viterbi_workers << '\n';
+        const auto demod_share = [&stats](const float time_ms) {
+            return stats.demod_busy_time_ms > 0.0F
+                       ? 100.0F * time_ms / stats.demod_busy_time_ms
+                       : 0.0F;
+        };
+        std::cerr << "  demod serial (ms / busy%): ring-wait="
+                  << stats.demod_ring_wait_time_ms << " (outside) ring-copy="
+                  << stats.demod_ring_copy_time_ms << " / "
+                  << demod_share(stats.demod_ring_copy_time_ms)
+                  << "% fft+cfo=" << stats.demod_fft_cfo_time_ms << " / "
+                  << demod_share(stats.demod_fft_cfo_time_ms)
+                  << "% pilot=" << stats.demod_pilot_lock_time_ms << " / "
+                  << demod_share(stats.demod_pilot_lock_time_ms)
+                  << "% reacq=" << stats.demod_reacquisition_time_ms << " / "
+                  << demod_share(stats.demod_reacquisition_time_ms) << "%\n"
+                  << "                            channel="
+                  << stats.demod_channel_estimate_time_ms << " / "
+                  << demod_share(stats.demod_channel_estimate_time_ms)
+                  << "% TPS=" << stats.demod_tps_time_ms << " / "
+                  << demod_share(stats.demod_tps_time_ms)
+                  << "% payload=" << stats.demod_payload_extract_time_ms
+                  << " / " << demod_share(stats.demod_payload_extract_time_ms)
+                  << "% submit=" << stats.demod_symbol_submit_time_ms << " / "
+                  << demod_share(stats.demod_symbol_submit_time_ms) << "%\n"
+                  << "                            post-wait="
+                  << stats.demod_postprocess_wait_time_ms << " / "
+                  << demod_share(stats.demod_postprocess_wait_time_ms)
+                  << "% output=" << stats.demod_output_time_ms << " / "
+                  << demod_share(stats.demod_output_time_ms)
+                  << "% other=" << stats.demod_other_time_ms << " / "
+                  << demod_share(stats.demod_other_time_ms) << "%\n";
+        const auto channel_share = [&stats](const float time_ms) {
+            return stats.demod_channel_estimate_time_ms > 0.0F
+                       ? 100.0F * time_ms /
+                             stats.demod_channel_estimate_time_ms
+                       : 0.0F;
+        };
+        std::cerr << "  channel nested (ms / channel%): pilots="
+                  << stats.demod_channel_pilot_time_ms << " / "
+                  << channel_share(stats.demod_channel_pilot_time_ms)
+                  << "% notch=" << stats.demod_channel_notch_time_ms << " / "
+                  << channel_share(stats.demod_channel_notch_time_ms)
+                  << "% timing=" << stats.demod_channel_timing_time_ms << " / "
+                  << channel_share(stats.demod_channel_timing_time_ms)
+                  << "% CIR=" << stats.demod_channel_cir_time_ms << " / "
+                  << channel_share(stats.demod_channel_cir_time_ms) << "%\n"
+                  << "                                  interpolate="
+                  << stats.demod_channel_interpolate_time_ms << " / "
+                  << channel_share(stats.demod_channel_interpolate_time_ms)
+                  << "% TPS-extract="
+                  << stats.demod_channel_tps_extract_time_ms << " / "
+                  << channel_share(stats.demod_channel_tps_extract_time_ms)
+                  << "% other=" << stats.demod_channel_other_time_ms << " / "
+                  << channel_share(stats.demod_channel_other_time_ms) << "%\n";
+        const auto fft_share = [&stats](const float time_ms) {
+            return stats.demod_fft_cfo_time_ms > 0.0F
+                       ? 100.0F * time_ms / stats.demod_fft_cfo_time_ms
+                       : 0.0F;
+        };
+        std::cerr << "  fft+cfo nested (ms / stage%): NCO="
+                  << stats.demod_nco_rotate_time_ms << " / "
+                  << fft_share(stats.demod_nco_rotate_time_ms)
+                  << "% FFT=" << stats.demod_fft_execute_time_ms << " / "
+                  << fft_share(stats.demod_fft_execute_time_ms)
+                  << "% CFO-track=" << stats.demod_cfo_track_time_ms << " / "
+                  << fft_share(stats.demod_cfo_track_time_ms)
+                  << "% other=" << stats.demod_fft_cfo_other_time_ms << " / "
+                  << fft_share(stats.demod_fft_cfo_other_time_ms) << "%\n";
         std::cerr << "  worker work (aggregate): symbol-preprocess="
                   << stats.symbol_preprocess_work_time_ms
                   << " ms symbol-demap=" << stats.symbol_demap_work_time_ms

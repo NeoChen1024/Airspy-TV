@@ -251,6 +251,7 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
         }
     }
 
+    const auto acquisition_work_started_at = std::chrono::steady_clock::now();
     std::vector<std::complex<float>> window;
     ReceiverParameters acquisition_parameters;
     std::uint64_t base = 0;
@@ -276,6 +277,10 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
     const OfdmAcquisition acquisition =
         acquire_ofdm(std::span(window), acquisition_parameters);
     const float acquisition_elapsed_ms = duration_ms(acquisition_started_at);
+    if (state.demod_busy_active) {
+        state.reacquisition_time_sum_ms +=
+            duration_ms(acquisition_work_started_at);
+    }
     if (acquisition.score < 0.20F) {
         const std::scoped_lock lock(mutex);
         if (acquisition_generation == latest_generation && !reset_requested) {
@@ -477,6 +482,7 @@ StreamDecoder::Impl::demod_read_symbol(DemodRuntimeState &state) {
 
     const std::uint64_t needed =
         next_symbol_start + static_cast<std::uint64_t>(fft_size);
+    const auto ring_wait_started_at = std::chrono::steady_clock::now();
     {
         std::unique_lock lock(mutex);
         demod_state.store(static_cast<int>(WorkerState::waiting_ring_data));
@@ -501,9 +507,16 @@ StreamDecoder::Impl::demod_read_symbol(DemodRuntimeState &state) {
             return DemodInputFlow::end; // end of stream
         }
     }
+    state.ring_wait_time_sum_ms += duration_ms(ring_wait_started_at);
+    demod_busy_started_at = std::chrono::steady_clock::now();
+    state.demod_busy_active = true;
+    const auto ring_copy_started_at = demod_busy_started_at;
     {
         const std::scoped_lock lock(mutex);
         if (sync.version != seen_sync_version) {
+            state.ring_copy_time_sum_ms += duration_ms(ring_copy_started_at);
+            demod_busy_time_sum_ms += duration_ms(demod_busy_started_at);
+            state.demod_busy_active = false;
             return DemodInputFlow::retry;
         }
         for (std::size_t i = 0; i < fft_size; ++i) {
@@ -539,11 +552,11 @@ StreamDecoder::Impl::demod_read_symbol(DemodRuntimeState &state) {
         }
     }
     demod_state.store(static_cast<int>(WorkerState::processing));
-    demod_busy_started_at = std::chrono::steady_clock::now();
     {
         const std::scoped_lock lock(mutex);
         ring_read_pos = needed;
         ring_space.notify_all();
     }
+    state.ring_copy_time_sum_ms += duration_ms(ring_copy_started_at);
     return DemodInputFlow::ready;
 }

@@ -449,6 +449,62 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
             : 0.0F;
     latest.demod_window_wall_time_ms = window_wall;
     latest.demod_busy_time_ms = static_cast<float>(demod_busy_time_sum_ms);
+    latest.demod_ring_wait_time_ms =
+        static_cast<float>(state.ring_wait_time_sum_ms);
+    latest.demod_ring_copy_time_ms =
+        static_cast<float>(state.ring_copy_time_sum_ms);
+    latest.demod_fft_cfo_time_ms =
+        static_cast<float>(state.fft_cfo_time_sum_ms);
+    latest.demod_nco_rotate_time_ms =
+        static_cast<float>(state.nco_rotate_time_sum_ms);
+    latest.demod_fft_execute_time_ms =
+        static_cast<float>(state.fft_execute_time_sum_ms);
+    latest.demod_cfo_track_time_ms =
+        static_cast<float>(state.cfo_track_time_sum_ms);
+    latest.demod_fft_cfo_other_time_ms = static_cast<float>(std::max(
+        0.0, state.fft_cfo_time_sum_ms - state.nco_rotate_time_sum_ms -
+                 state.fft_execute_time_sum_ms - state.cfo_track_time_sum_ms));
+    latest.demod_pilot_lock_time_ms =
+        static_cast<float>(state.pilot_lock_time_sum_ms);
+    latest.demod_reacquisition_time_ms =
+        static_cast<float>(state.reacquisition_time_sum_ms);
+    latest.demod_channel_estimate_time_ms =
+        static_cast<float>(state.channel_estimate_time_sum_ms);
+    latest.demod_channel_pilot_time_ms =
+        static_cast<float>(state.channel_pilot_time_sum_ms);
+    latest.demod_channel_notch_time_ms =
+        static_cast<float>(state.channel_notch_time_sum_ms);
+    latest.demod_channel_timing_time_ms =
+        static_cast<float>(state.channel_timing_time_sum_ms);
+    latest.demod_channel_cir_time_ms =
+        static_cast<float>(state.channel_cir_time_sum_ms);
+    latest.demod_channel_interpolate_time_ms =
+        static_cast<float>(state.channel_interpolate_time_sum_ms);
+    latest.demod_channel_tps_extract_time_ms =
+        static_cast<float>(state.channel_tps_extract_time_sum_ms);
+    const double accounted_channel_time_ms =
+        state.channel_pilot_time_sum_ms + state.channel_notch_time_sum_ms +
+        state.channel_timing_time_sum_ms + state.channel_cir_time_sum_ms +
+        state.channel_interpolate_time_sum_ms +
+        state.channel_tps_extract_time_sum_ms;
+    latest.demod_channel_other_time_ms = static_cast<float>(std::max(
+        0.0, state.channel_estimate_time_sum_ms - accounted_channel_time_ms));
+    latest.demod_tps_time_ms = static_cast<float>(state.tps_time_sum_ms);
+    latest.demod_payload_extract_time_ms =
+        static_cast<float>(state.payload_extract_time_sum_ms);
+    latest.demod_symbol_submit_time_ms =
+        static_cast<float>(state.symbol_submit_time_sum_ms);
+    latest.demod_postprocess_wait_time_ms =
+        static_cast<float>(state.postprocess_wait_time_sum_ms);
+    latest.demod_output_time_ms = static_cast<float>(state.output_time_sum_ms);
+    const double accounted_demod_time_ms =
+        state.ring_copy_time_sum_ms + state.fft_cfo_time_sum_ms +
+        state.pilot_lock_time_sum_ms + state.reacquisition_time_sum_ms +
+        state.channel_estimate_time_sum_ms + state.tps_time_sum_ms +
+        state.payload_extract_time_sum_ms + state.symbol_submit_time_sum_ms +
+        state.postprocess_wait_time_sum_ms + state.output_time_sum_ms;
+    latest.demod_other_time_ms = static_cast<float>(
+        std::max(0.0, demod_busy_time_sum_ms - accounted_demod_time_ms));
     demod_busy_time_sum_ms = 0.0;
     latest.symbol_preprocess_work_time_ms = preprocess_time_sum;
     latest.symbol_demap_work_time_ms = demap_time_sum;
@@ -473,6 +529,26 @@ void StreamDecoder::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
     state.demap_time_sum = 0.0F;
     state.deinterleave_time_sum = 0.0F;
     state.depuncture_time_sum = 0.0F;
+    state.ring_wait_time_sum_ms = 0.0;
+    state.ring_copy_time_sum_ms = 0.0;
+    state.fft_cfo_time_sum_ms = 0.0;
+    state.nco_rotate_time_sum_ms = 0.0;
+    state.fft_execute_time_sum_ms = 0.0;
+    state.cfo_track_time_sum_ms = 0.0;
+    state.pilot_lock_time_sum_ms = 0.0;
+    state.reacquisition_time_sum_ms = 0.0;
+    state.channel_estimate_time_sum_ms = 0.0;
+    state.channel_pilot_time_sum_ms = 0.0;
+    state.channel_notch_time_sum_ms = 0.0;
+    state.channel_timing_time_sum_ms = 0.0;
+    state.channel_cir_time_sum_ms = 0.0;
+    state.channel_interpolate_time_sum_ms = 0.0;
+    state.channel_tps_extract_time_sum_ms = 0.0;
+    state.tps_time_sum_ms = 0.0;
+    state.payload_extract_time_sum_ms = 0.0;
+    state.symbol_submit_time_sum_ms = 0.0;
+    state.postprocess_wait_time_sum_ms = 0.0;
+    state.output_time_sum_ms = 0.0;
     state.timing_acc = 0.0;
     state.timing_count = 0;
     state.latest_raw_timing = 0.0;
@@ -494,9 +570,6 @@ bool StreamDecoder::Impl::demod_dispatch_payload(
     auto &payload_indices = state.payload_indices;
     auto &fft_out = state.fft_out;
     auto &maximum = state.maximum;
-    auto &symbol_count = state.symbol_count;
-    auto &window_symbol_count = state.window_symbol_count;
-    auto &demod_busy_started_at = state.demod_busy_started_at;
     auto &postprocessor = state.postprocessor;
     auto &postprocessor_pending_symbols =
         state.postprocessor_pending_symbols;
@@ -507,22 +580,29 @@ bool StreamDecoder::Impl::demod_dispatch_payload(
             std::vector<std::complex<float>> submitted_payload,
             std::vector<float> submitted_equalizer_power,
             const std::size_t submitted_symbol_index) {
+            auto stage_started_at = std::chrono::steady_clock::now();
             state.postprocessor->submit(std::move(submitted_payload),
                                         std::move(submitted_equalizer_power),
                                         submitted_symbol_index);
+            state.symbol_submit_time_sum_ms += duration_ms(stage_started_at);
             ++postprocessor_pending_symbols;
             if (postprocessor_pending_symbols < gate_window_symbols) {
                 return;
             }
+            stage_started_at = std::chrono::steady_clock::now();
             auto batch = state.postprocessor->take_ordered(gate_window_symbols);
+            state.postprocess_wait_time_sum_ms += duration_ms(stage_started_at);
             if (batch.size() != gate_window_symbols) {
                 throw std::logic_error(
                     "symbol postprocessor returned an incomplete batch");
             }
             postprocessor_pending_symbols -= batch.size();
+            stage_started_at = std::chrono::steady_clock::now();
             demod_process_batch(state, std::move(batch));
+            state.output_time_sum_ms += duration_ms(stage_started_at);
         };
 
+    const auto payload_extract_started_at = std::chrono::steady_clock::now();
     std::vector<std::complex<float>> payload;
     payload.reserve(payload_carrier_count(frontend.mode));
     std::vector<float> equalizer_power;
@@ -533,18 +613,9 @@ bool StreamDecoder::Impl::demod_dispatch_payload(
             carrier(fft_out, k, maximum, frontend.carrier_offset) * channel[k]);
         equalizer_power.push_back(std::norm(channel[k]));
     }
+    state.payload_extract_time_sum_ms +=
+        duration_ms(payload_extract_started_at);
     if (payload.size() != payload_carrier_count(frontend.mode)) {
-        if (window_symbol_count == 0) {
-            state.window_output_begin_sample = state.next_symbol_start;
-        }
-        demod_advance_symbol(state);
-        ++symbol_count;
-        ++window_symbol_count;
-        if (window_symbol_count >= stats_window_symbols) {
-            demod_publish_stats_window(state);
-            demod_reset_stats_window(state);
-        }
-        demod_busy_time_sum_ms += duration_ms(demod_busy_started_at);
         return false;
     }
     if (postprocessor == nullptr) {

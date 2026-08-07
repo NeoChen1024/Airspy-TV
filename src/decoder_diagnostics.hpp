@@ -95,6 +95,72 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
               << " dist=" << transport.outer_sync_distance
               << " evidence=" << transport.outer_rs_evidence;
     std::cerr << '\n';
+    if (stats.demod_busy_time_ms > 0.0F) {
+        const auto share = [&stats](const float time_ms) {
+            return 100.0F * time_ms / stats.demod_busy_time_ms;
+        };
+        std::cerr << "[diag] demod-ms ring-wait="
+                  << stats.demod_ring_wait_time_ms << "(outside) ring-copy="
+                  << stats.demod_ring_copy_time_ms << '('
+                  << share(stats.demod_ring_copy_time_ms) << "%) fft+cfo="
+                  << stats.demod_fft_cfo_time_ms << '('
+                  << share(stats.demod_fft_cfo_time_ms) << "%) pilot="
+                  << stats.demod_pilot_lock_time_ms << '('
+                  << share(stats.demod_pilot_lock_time_ms) << "%) reacq="
+                  << stats.demod_reacquisition_time_ms << '('
+                  << share(stats.demod_reacquisition_time_ms) << "%) channel="
+                  << stats.demod_channel_estimate_time_ms << '('
+                  << share(stats.demod_channel_estimate_time_ms) << "%) TPS="
+                  << stats.demod_tps_time_ms << '('
+                  << share(stats.demod_tps_time_ms) << "%) payload="
+                  << stats.demod_payload_extract_time_ms << '('
+                  << share(stats.demod_payload_extract_time_ms) << "%) submit="
+                  << stats.demod_symbol_submit_time_ms << '('
+                  << share(stats.demod_symbol_submit_time_ms)
+                  << "%) post-wait=" << stats.demod_postprocess_wait_time_ms
+                  << '(' << share(stats.demod_postprocess_wait_time_ms)
+                  << "%) output=" << stats.demod_output_time_ms << '('
+                  << share(stats.demod_output_time_ms) << "%) other="
+                  << stats.demod_other_time_ms << '('
+                  << share(stats.demod_other_time_ms) << "%)\n";
+        const auto channel_share = [&stats](const float time_ms) {
+            return stats.demod_channel_estimate_time_ms > 0.0F
+                       ? 100.0F * time_ms /
+                             stats.demod_channel_estimate_time_ms
+                       : 0.0F;
+        };
+        std::cerr << "[diag] channel-ms pilots="
+                  << stats.demod_channel_pilot_time_ms << '('
+                  << channel_share(stats.demod_channel_pilot_time_ms)
+                  << "%) notch=" << stats.demod_channel_notch_time_ms << '('
+                  << channel_share(stats.demod_channel_notch_time_ms)
+                  << "%) timing=" << stats.demod_channel_timing_time_ms << '('
+                  << channel_share(stats.demod_channel_timing_time_ms)
+                  << "%) CIR=" << stats.demod_channel_cir_time_ms << '('
+                  << channel_share(stats.demod_channel_cir_time_ms)
+                  << "%) interpolate="
+                  << stats.demod_channel_interpolate_time_ms << '('
+                  << channel_share(stats.demod_channel_interpolate_time_ms)
+                  << "%) TPS-extract="
+                  << stats.demod_channel_tps_extract_time_ms << '('
+                  << channel_share(stats.demod_channel_tps_extract_time_ms)
+                  << "%) other=" << stats.demod_channel_other_time_ms << '('
+                  << channel_share(stats.demod_channel_other_time_ms) << "%)\n";
+        const auto fft_share = [&stats](const float time_ms) {
+            return stats.demod_fft_cfo_time_ms > 0.0F
+                       ? 100.0F * time_ms / stats.demod_fft_cfo_time_ms
+                       : 0.0F;
+        };
+        std::cerr << "[diag] fft+cfo-ms NCO="
+                  << stats.demod_nco_rotate_time_ms << '('
+                  << fft_share(stats.demod_nco_rotate_time_ms) << "%) FFT="
+                  << stats.demod_fft_execute_time_ms << '('
+                  << fft_share(stats.demod_fft_execute_time_ms)
+                  << "%) CFO-track=" << stats.demod_cfo_track_time_ms << '('
+                  << fft_share(stats.demod_cfo_track_time_ms) << "%) other="
+                  << stats.demod_fft_cfo_other_time_ms << '('
+                  << fft_share(stats.demod_fft_cfo_other_time_ms) << "%)\n";
+    }
 
     // Stall fingerprints: a worker parked on a wait whose predicate can never
     // be satisfied while the buffer in front of it is full.

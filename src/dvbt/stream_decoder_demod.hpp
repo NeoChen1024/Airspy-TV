@@ -16,6 +16,10 @@ void StreamDecoder::Impl::run_demod() {
         auto &symbol_count = runtime.symbol_count;
         auto &window_symbol_count = runtime.window_symbol_count;
         auto &demod_busy_started_at = runtime.demod_busy_started_at;
+        const auto finish_symbol_attempt = [&] {
+            demod_busy_time_sum_ms += duration_ms(demod_busy_started_at);
+            runtime.demod_busy_active = false;
+        };
         while (true) {
             switch (demod_prepare_stream(runtime)) {
             case DemodFlow::restart:
@@ -52,24 +56,48 @@ void StreamDecoder::Impl::run_demod() {
                 if (input_flow == DemodInputFlow::stop) {
                     return;
                 }
+                auto stage_started_at = std::chrono::steady_clock::now();
                 demod_execute_fft_and_track_cfo(runtime);
+                runtime.fft_cfo_time_sum_ms += duration_ms(stage_started_at);
+
+                stage_started_at = std::chrono::steady_clock::now();
+                const double reacquisition_before =
+                    runtime.reacquisition_time_sum_ms;
                 const auto pilot_lock = demod_lock_pilots(runtime);
+                runtime.pilot_lock_time_sum_ms += std::max(
+                    0.0, static_cast<double>(duration_ms(stage_started_at)) -
+                             (runtime.reacquisition_time_sum_ms -
+                              reacquisition_before));
                 if (!pilot_lock) {
+                    finish_symbol_attempt();
                     continue;
                 }
                 const PilotLock lock = *pilot_lock;
+                stage_started_at = std::chrono::steady_clock::now();
                 auto channel = demod_estimate_channel(runtime, lock);
-                switch (demod_process_tps(runtime)) {
+                runtime.channel_estimate_time_sum_ms +=
+                    duration_ms(stage_started_at);
+
+                stage_started_at = std::chrono::steady_clock::now();
+                const double tps_reacquisition_before =
+                    runtime.reacquisition_time_sum_ms;
+                const DemodFlow tps_flow = demod_process_tps(runtime);
+                runtime.tps_time_sum_ms += std::max(
+                    0.0, static_cast<double>(duration_ms(stage_started_at)) -
+                             (runtime.reacquisition_time_sum_ms -
+                              tps_reacquisition_before));
+                switch (tps_flow) {
                 case DemodFlow::restart:
+                    finish_symbol_attempt();
                     continue;
                 case DemodFlow::stop:
+                    finish_symbol_attempt();
                     return;
                 case DemodFlow::proceed:
                     break;
                 }
-                if (!demod_dispatch_payload(runtime, lock, channel)) {
-                    continue;
-                }
+                const bool payload_dispatched =
+                    demod_dispatch_payload(runtime, lock, channel);
                 if (window_symbol_count == 0) {
                     runtime.window_output_begin_sample =
                         runtime.next_symbol_start;
@@ -77,7 +105,7 @@ void StreamDecoder::Impl::run_demod() {
                 ++symbol_count;
                 ++window_symbol_count;
                 demod_advance_symbol(runtime);
-                demod_busy_time_sum_ms += duration_ms(demod_busy_started_at);
+                finish_symbol_attempt();
                 if (window_symbol_count >= stats_window_symbols) {
                     demod_publish_stats_window(runtime);
                     static_cast<void>(
@@ -87,6 +115,9 @@ void StreamDecoder::Impl::run_demod() {
                                      .mother_metrics = {},
                                      .symbol_index = 0}));
                     demod_reset_stats_window(runtime);
+                }
+                if (!payload_dispatched) {
+                    continue;
                 }
             }
             demod_finish_stream(runtime);

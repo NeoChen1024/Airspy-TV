@@ -59,6 +59,36 @@ struct StreamDecoderStats {
     float demod_busy_fraction{};
     float demod_window_wall_time_ms{};
     float demod_busy_time_ms{};
+    // Serial demod-thread wall time for the most recently published window.
+    // These buckets are non-overlapping and add up to demod_busy_time_ms with
+    // demod_other_time_ms accounting for loop/control overhead. Ring wait is
+    // outside demod busy time.
+    float demod_ring_wait_time_ms{};
+    float demod_ring_copy_time_ms{};
+    float demod_fft_cfo_time_ms{};
+    // Nested breakdown of demod_fft_cfo_time_ms.
+    float demod_nco_rotate_time_ms{};
+    float demod_fft_execute_time_ms{};
+    float demod_cfo_track_time_ms{};
+    float demod_fft_cfo_other_time_ms{};
+    float demod_pilot_lock_time_ms{};
+    float demod_reacquisition_time_ms{};
+    float demod_channel_estimate_time_ms{};
+    // Nested breakdown of demod_channel_estimate_time_ms. Do not add these to
+    // the top-level serial demod buckets a second time.
+    float demod_channel_pilot_time_ms{};
+    float demod_channel_notch_time_ms{};
+    float demod_channel_timing_time_ms{};
+    float demod_channel_cir_time_ms{};
+    float demod_channel_interpolate_time_ms{};
+    float demod_channel_tps_extract_time_ms{};
+    float demod_channel_other_time_ms{};
+    float demod_tps_time_ms{};
+    float demod_payload_extract_time_ms{};
+    float demod_symbol_submit_time_ms{};
+    float demod_postprocess_wait_time_ms{};
+    float demod_output_time_ms{};
+    float demod_other_time_ms{};
     float last_frontend_block_wall_time_ms{};
     float last_frontend_convert_time_ms{};
     float last_frontend_resample_time_ms{};
