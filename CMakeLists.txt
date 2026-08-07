@@ -116,7 +116,15 @@ target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F airspy-tv-common
     Threads::Threads PRIVATE solid-resampler::solid-resampler)
 
 add_executable(airspy-tv
+    src/decoder_diagnostics.cpp
     src/epg.cpp
+    src/gui/app.cpp
+    src/gui/dvbt_panels.cpp
+    src/gui/media_panels.cpp
+    src/gui/receiver_panels.cpp
+    src/gui/source_panels.cpp
+    src/gui/spectrum_panels.cpp
+    src/gui/widgets.cpp
     src/iq_file.cpp
     src/main.cpp
     src/mpv_player.cpp

@@ -114,6 +114,3 @@ need standard-specific changes.
 - The private DVB-T pointer inside `ReceiverSession` is a non-owning cache of
   the object owned by `SdrDevice`. Its creation, invalidation, and replacement
   are confined to the session transaction, so it cannot dangle in GUI state.
-- DVB-T diagnostics still live in the large `main_gui.hpp`. A later file-level
-  cleanup may move the standard-specific panel into its own translation unit,
-  but the type and lifecycle boundaries no longer depend on that move.
