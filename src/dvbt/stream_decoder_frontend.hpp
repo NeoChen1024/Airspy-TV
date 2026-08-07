@@ -38,6 +38,8 @@ void StreamDecoder::Impl::run_frontend() {
                 }
                 const std::uint64_t generation = reset_request_generation;
                 ring.reset();
+                resampler_timeline.clear();
+                scheduled_sro_commands.clear();
                 if (resampler != nullptr) {
                     resampler->reset();
                 }
@@ -114,6 +116,11 @@ void StreamDecoder::Impl::run_frontend() {
                     ring.size() != ring_capacity_for(block.rate)) {
                     ring.resize(ring_capacity_for(block.rate));
                 }
+                // Acquisition may start as soon as the first bounded
+                // resampler quanta fill its window, before the caller's full
+                // input block completes. Publish stream metadata before any
+                // corresponding output samples become visible.
+                current_bandwidth = block.bandwidth;
             }
             if (resampler->configured() &&
                 (resampler->rate() != block.rate ||
@@ -126,6 +133,8 @@ void StreamDecoder::Impl::run_frontend() {
                 sro_resampler_ready.store(false, std::memory_order_relaxed);
                 {
                     const std::scoped_lock lock(mutex);
+                    resampler_timeline.clear();
+                    scheduled_sro_commands.clear();
                     current_bandwidth = block.bandwidth;
                     sync.valid = false;
                     ++sync.version;
@@ -135,78 +144,138 @@ void StreamDecoder::Impl::run_frontend() {
                 ring_data.notify_all();
             }
             resampler->configure(block.rate, block.bandwidth);
-            const double sro_command =
-                sro_resampler_command_ppm.load(std::memory_order_relaxed);
-            resampler->set_sro_correction_ppm(sro_command);
             const std::size_t complex_count = block.samples.size() / 2;
             const auto convert_started_at = std::chrono::steady_clock::now();
             convert_buffer.resize(complex_count);
             dsp::convert_cs16_to_cf32(block.samples, convert_buffer);
             const float convert_time_ms = duration_ms(convert_started_at);
-            const auto resample_started_at = std::chrono::steady_clock::now();
-            const auto resampled = resampler->process(convert_buffer);
-            const float resample_time_ms = duration_ms(resample_started_at);
-            const double applied_sro = resampler->applied_sro_correction_ppm();
-            sro_resampler_applied_ppm.store(applied_sro,
-                                            std::memory_order_relaxed);
-            // Push to the ring incrementally: the ring (sized to ~0.2 s
-            // of the input rate) holds no more than a block, so each
-            // iteration pushes only what fits and waits for the demod to
-            // free space. A
-            // flush or reset arriving mid-push abandons the push instead
-            // of blocking forever behind a demod that is not consuming
-            // (e.g. a stream whose acquisition can never succeed): the
-            // flush then closes the ring and the demod drains what is
-            // there.
-            std::size_t pushed = 0;
+            float resample_time_ms = 0.0F;
             float ring_wait_time_ms = 0.0F;
             float ring_copy_time_ms = 0.0F;
-            while (pushed < resampled.size()) {
-                std::unique_lock lock(mutex);
-                frontend_state.store(
-                    static_cast<int>(WorkerState::waiting_ring_space));
-                const auto ring_wait_started_at =
+            double applied_sro = resampler->applied_sro_correction_ppm();
+            std::size_t input_offset = 0;
+            bool abandoned = false;
+            const std::size_t maximum_quantum =
+                resampler_quantum_samples(block.rate);
+            while (input_offset < complex_count && !abandoned) {
+                const std::uint64_t input_begin =
+                    block.stamp.begin_sample + input_offset;
+                std::size_t segment =
+                    std::min(maximum_quantum, complex_count - input_offset);
+                std::optional<ScheduledSroCommand> command_to_apply;
+                {
+                    const std::scoped_lock lock(mutex);
+                    while (!scheduled_sro_commands.empty()) {
+                        const auto &next = scheduled_sro_commands.front();
+                        if (next.generation != block.generation ||
+                            next.source_epoch != block.stamp.stream_epoch) {
+                            scheduled_sro_commands.pop_front();
+                            continue;
+                        }
+                        if (next.effective_input_sample <= input_begin) {
+                            command_to_apply = next;
+                            scheduled_sro_commands.pop_front();
+                            continue;
+                        }
+                        const std::uint64_t distance =
+                            next.effective_input_sample - input_begin;
+                        if (distance < segment) {
+                            segment = static_cast<std::size_t>(distance);
+                        }
+                        break;
+                    }
+                    latest.sro_pending_commands =
+                        scheduled_sro_commands.size();
+                }
+                if (command_to_apply.has_value()) {
+                    resampler->set_sro_correction_ppm(
+                        command_to_apply->target_ppm);
+                    const std::uint64_t late =
+                        input_begin - command_to_apply->effective_input_sample;
+                    const std::scoped_lock lock(mutex);
+                    latest.sro_applied_input_sample = input_begin;
+                    latest.sro_schedule_late_samples = late;
+                }
+                if (segment == 0) {
+                    continue;
+                }
+
+                const auto resample_started_at =
                     std::chrono::steady_clock::now();
-                ring_space.wait(lock, [this] {
-                    return stopping || reset_requested || flush_requested ||
-                           ring_write_pos - ring_read_pos < ring.size();
-                });
-                ring_wait_time_ms += duration_ms(ring_wait_started_at);
-                if (stopping) {
-                    frontend_state.store(static_cast<int>(WorkerState::exited));
-                    return;
+                const auto resampled = resampler->process(
+                    std::span{convert_buffer}.subspan(input_offset, segment));
+                resample_time_ms += duration_ms(resample_started_at);
+                applied_sro = resampler->applied_sro_correction_ppm();
+                sro_resampler_applied_ppm.store(applied_sro,
+                                                std::memory_order_relaxed);
+                std::uint64_t output_begin = 0;
+                {
+                    const std::scoped_lock lock(mutex);
+                    output_begin = ring_write_pos;
+                    resampler_timeline.append({
+                        .stream_epoch = block.stamp.stream_epoch,
+                        .input_begin = input_begin,
+                        .input_end = input_begin + segment,
+                        .output_begin = output_begin,
+                        .output_end = output_begin + resampled.size(),
+                        .input_rate_hz = block.rate,
+                        .applied_correction_ppm = applied_sro,
+                    });
                 }
-                frontend_state.store(static_cast<int>(WorkerState::processing));
-                // Abandon the push only when the demod is genuinely not
-                // consuming (the ring is full AND it is not busy — the
-                // acquisition-retry stall): then the flush/reset would
-                // otherwise wait forever behind the push. If the demod is
-                // keeping up (it frees ring space as it decodes), finish
-                // the push so no submitted data is dropped at the end of
-                // a stream.
-                if (reset_requested || block.generation != latest_generation ||
-                    (flush_requested && !demod_busy && !acquisition_pending &&
-                     ring_write_pos - ring_read_pos >= ring.size())) {
-                    break;
+
+                // Push incrementally. At most one bounded resampler quantum
+                // exists beyond the ring, which makes the scheduled-control
+                // lead finite and independent of caller block size.
+                std::size_t pushed = 0;
+                while (pushed < resampled.size()) {
+                    std::unique_lock lock(mutex);
+                    frontend_state.store(
+                        static_cast<int>(WorkerState::waiting_ring_space));
+                    const auto ring_wait_started_at =
+                        std::chrono::steady_clock::now();
+                    ring_space.wait(lock, [this] {
+                        return stopping || reset_requested || flush_requested ||
+                               ring_write_pos - ring_read_pos < ring.size();
+                    });
+                    ring_wait_time_ms += duration_ms(ring_wait_started_at);
+                    if (stopping) {
+                        frontend_state.store(
+                            static_cast<int>(WorkerState::exited));
+                        return;
+                    }
+                    frontend_state.store(
+                        static_cast<int>(WorkerState::processing));
+                    if (reset_requested ||
+                        block.generation != latest_generation ||
+                        (flush_requested && !demod_busy &&
+                         !acquisition_pending &&
+                         ring_write_pos - ring_read_pos >= ring.size())) {
+                        resampler_timeline.truncate_after(ring_write_pos);
+                        abandoned = true;
+                        break;
+                    }
+                    const std::size_t used = ring_write_pos - ring_read_pos;
+                    const std::size_t chunk = std::min(
+                        ring.size() - used, resampled.size() - pushed);
+                    const auto ring_copy_started_at =
+                        std::chrono::steady_clock::now();
+                    const std::size_t write_index = ring_write_pos % ring.size();
+                    const std::size_t first =
+                        std::min(chunk, ring.size() - write_index);
+                    std::copy_n(resampled.data() + pushed, first,
+                                ring.data() + write_index);
+                    if (first < chunk) {
+                        std::copy_n(resampled.data() + pushed + first,
+                                    chunk - first, ring.data());
+                    }
+                    ring_copy_time_ms += duration_ms(ring_copy_started_at);
+                    ring_write_pos += chunk;
+                    pushed += chunk;
+                    ring_data.notify_all();
                 }
-                const std::size_t used = ring_write_pos - ring_read_pos;
-                const std::size_t chunk =
-                    std::min(ring.size() - used, resampled.size() - pushed);
-                const auto ring_copy_started_at =
-                    std::chrono::steady_clock::now();
-                const std::size_t write_index = ring_write_pos % ring.size();
-                const std::size_t first =
-                    std::min(chunk, ring.size() - write_index);
-                std::copy_n(resampled.data() + pushed, first,
-                            ring.data() + write_index);
-                if (first < chunk) {
-                    std::copy_n(resampled.data() + pushed + first,
-                                chunk - first, ring.data());
+                if (!abandoned) {
+                    input_offset += segment;
                 }
-                ring_copy_time_ms += duration_ms(ring_copy_started_at);
-                ring_write_pos += chunk;
-                pushed += chunk;
-                ring_data.notify_all();
             }
             {
                 const std::scoped_lock lock(mutex);
@@ -218,8 +287,6 @@ void StreamDecoder::Impl::run_frontend() {
                     latest.last_frontend_resample_time_ms = resample_time_ms;
                     latest.last_frontend_ring_copy_time_ms = ring_copy_time_ms;
                     latest.last_frontend_ring_wait_time_ms = ring_wait_time_ms;
-                    latest.sro_resampler_command_ppm =
-                        static_cast<float>(sro_command);
                     latest.sro_resampler_applied_ppm =
                         static_cast<float>(applied_sro);
                     latest.resampler_requested_ratio =

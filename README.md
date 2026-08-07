@@ -277,8 +277,10 @@ python3 tools/validate_dvbt_clock_drift.py \
 ```
 
 The decoder always feeds the DVB-T timing estimator's SRO command into the
-common variable-rate resampler. The validator checks both the estimated and
-applied correction; there is no separate legacy integer timing-actuator mode.
+common variable-rate resampler. Commands use a fixed sample-domain activation
+horizon and each applied ratio is tracked against the exact input/output sample
+span which it generated. The validator checks both the estimated and applied
+correction; there is no separate legacy integer timing-actuator mode.
 
 By default, generated fixtures, decoder logs, and transport streams use a
 temporary directory that is removed after the run. Pass `--work-dir PATH` to

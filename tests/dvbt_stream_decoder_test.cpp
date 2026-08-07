@@ -427,7 +427,8 @@ void submit_in_blocks(StreamDecoder &decoder,
 
 [[nodiscard]] DecodeResult
 decode_in_blocks(const std::span<const std::int16_t> iq,
-                 const std::span<const std::size_t> block_sizes) {
+                 const std::span<const std::size_t> block_sizes,
+                 const std::size_t worker_threads = 8) {
     DecodeResult result;
     std::mutex callback_mutex;
     StreamDecoder decoder;
@@ -436,7 +437,7 @@ decode_in_blocks(const std::span<const std::int16_t> iq,
                             .guard_interval = GuardInterval::gi_1_4,
                             .constellation = Constellation::qpsk,
                             .code_rate = CodeRate::rate_1_2,
-                            .worker_threads = 8});
+                            .worker_threads = worker_threads});
     decoder.set_transport_callback(
         [&result, &callback_mutex](const std::span<const std::uint8_t> output) {
             const std::scoped_lock lock(callback_mutex);
@@ -459,6 +460,19 @@ decode_in_blocks(const std::span<const std::int16_t> iq,
         result.pipeline = decoder.pipeline_snapshot();
     }
     return result;
+}
+
+void test_8k_worker_count_parity() {
+    const auto encoded = encode_transport();
+    const auto iq = make_iq(encoded.metrics);
+    constexpr std::array<std::size_t, 8> block_sizes{17,  4097,  12345, 8191,
+                                                     777, 16384, 251,   10003};
+    const auto serial = decode_in_blocks(iq, block_sizes, 1);
+    const auto parallel = decode_in_blocks(iq, block_sizes, 8);
+    require(!serial.transport.empty(),
+            "worker-parity reference produced no transport stream");
+    require(serial.transport == parallel.transport,
+            "symbol worker count changed ordered transport output");
 }
 
 void test_8k_clean_signal() {
@@ -763,6 +777,7 @@ int main() {
             }
         };
         run("clean", test_8k_clean_signal);
+        run("worker-parity", test_8k_worker_count_parity);
         run("reset-new", test_8k_reset_then_new_stream);
         run("reset-hopeless", test_8k_reset_after_hopeless_stream);
         run("reset-live", test_8k_reset_live_resume);

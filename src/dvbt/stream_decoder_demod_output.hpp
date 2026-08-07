@@ -130,6 +130,7 @@ bool StreamDecoder::Impl::demod_start_decoder(DemodRuntimeState &state) {
         // A cancelled stream can leave completed symbols behind.
         static_cast<void>(symbol_postprocessor->flush());
     }
+    state.postprocessor_pending_symbols = 0;
     state.postprocessor = symbol_postprocessor.get();
     return true;
 }
@@ -144,7 +145,6 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
     auto &fft_size = state.fft_size;
     auto &applied_cir_offset = state.applied_cir_offset;
     auto &window_cir_offset_sum = state.window_cir_offset_sum;
-    auto &timing_elapsed_samples = state.timing_elapsed_samples;
     auto &smoothed_sample_clock_ppm = state.smoothed_sample_clock_ppm;
     auto &last_windowed_timing = state.last_windowed_timing;
     auto &last_windowed_cir_avg = state.last_windowed_cir_avg;
@@ -152,8 +152,8 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
     constexpr std::size_t tau_history_min = DemodRuntimeState::tau_history_min;
     auto &tau_history = state.tau_history;
     auto &tau_sample_history = state.tau_sample_history;
-    auto &tau_resampler_correction_history =
-        state.tau_resampler_correction_history;
+    auto &tau_interval_correction_history =
+        state.tau_interval_correction_history;
     auto &tau_history_head = state.tau_history_head;
     auto &tau_history_count = state.tau_history_count;
     auto &latest_raw_timing = state.latest_raw_timing;
@@ -180,9 +180,11 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             ? static_cast<double>(applied_cir_offset)
             : window_cir_offset_sum / static_cast<double>(window_symbols);
     double observed_drift = 0.0;
-    const double timing_sample_position =
-        timing_elapsed_samples + 0.5 * window_sample_count;
-    timing_elapsed_samples += window_sample_count;
+    const std::uint64_t output_begin_sample =
+        state.window_output_begin_sample;
+    const std::uint64_t output_end_sample = state.next_symbol_start;
+    const std::uint64_t timing_sample_position =
+        output_begin_sample + (output_end_sample - output_begin_sample) / 2;
     double smoothed_timing_drift =
         smoothed_sample_clock_ppm * window_sample_count / 1.0e6;
     if (timing_count != 0) {
@@ -211,8 +213,21 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
         tau_history[tau_history_head] =
             static_cast<double>(timing_offset) + window_cir_avg;
         tau_sample_history[tau_history_head] = timing_sample_position;
-        tau_resampler_correction_history[tau_history_head] =
-            sro_resampler_applied_ppm.load(std::memory_order_relaxed);
+        double interval_correction = 0.0;
+        {
+            const std::scoped_lock lock(mutex);
+            if (state.last_timing_sample_position.has_value()) {
+                interval_correction =
+                    resampler_timeline
+                        .average_correction(*state.last_timing_sample_position,
+                                            timing_sample_position)
+                        .value_or(0.0);
+            }
+            resampler_timeline.discard_before(timing_sample_position);
+        }
+        tau_interval_correction_history[tau_history_head] =
+            interval_correction;
+        state.last_timing_sample_position = timing_sample_position;
         tau_history_head = (tau_history_head + 1) % tau_history_n;
         if (tau_history_count < tau_history_n) {
             ++tau_history_count;
@@ -238,20 +253,18 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                     (tau_history_head + tau_history_n - tau_history_count + i) %
                     tau_history_n;
                 const std::size_t idx1 = (idx0 + 1) % tau_history_n;
-                const double sample_span =
-                    tau_sample_history[idx1] - tau_sample_history[idx0];
+                const double sample_span = static_cast<double>(
+                    tau_sample_history[idx1] - tau_sample_history[idx0]);
                 const double residual_sro =
                     sample_span > 0.0
                         ? (tau_history[idx1] - tau_history[idx0]) * 1.0e6 /
                               sample_span
                         : 0.0;
-                // The applied rate changes only at front-end block
-                // boundaries. Endpoint averaging is the interval correction
-                // for this slow slew to first order, and keeps old history
-                // from being de-biased with the newest (larger) command.
+                // Add back the correction that actually produced the output
+                // samples between these timing measurements. This remains
+                // correct when queue occupancy changes the wall-clock delay.
                 diffs[i] = residual_sro +
-                           0.5 * (tau_resampler_correction_history[idx0] +
-                                  tau_resampler_correction_history[idx1]);
+                           tau_interval_correction_history[idx1];
             }
             std::sort(diffs.begin(),
                       diffs.begin() + static_cast<std::ptrdiff_t>(diffs_count));
@@ -275,9 +288,33 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                                 : static_cast<double>(timing_count) /
                                       static_cast<double>(window_symbols);
         if (tau_history_count >= tau_history_min && confidence >= 0.75) {
-            sro_resampler_command_ppm.store(smoothed_sample_clock_ppm,
-                                            std::memory_order_relaxed);
-            sro_resampler_ready.store(true, std::memory_order_relaxed);
+            const std::scoped_lock lock(mutex);
+            const std::uint64_t command_output_sample = ring_read_pos;
+            const auto mapped =
+                resampler_timeline.input_at_output(command_output_sample);
+            if (mapped.has_value()) {
+                const std::uint64_t fixed_delay = sro_fixed_delay_samples(
+                    mapped->input_rate_hz, current_bandwidth);
+                scheduled_sro_commands.push_back({
+                    .generation = state.demod_generation,
+                    .source_epoch = mapped->stream_epoch,
+                    .command_output_sample = command_output_sample,
+                    .command_input_sample = mapped->input_sample,
+                    .effective_input_sample = mapped->input_sample + fixed_delay,
+                    .fixed_delay_samples = fixed_delay,
+                    .target_ppm = smoothed_sample_clock_ppm,
+                });
+                latest.sro_command_output_sample = command_output_sample;
+                latest.sro_command_input_sample = mapped->input_sample;
+                latest.sro_effective_input_sample =
+                    mapped->input_sample + fixed_delay;
+                latest.sro_fixed_delay_samples = fixed_delay;
+                latest.sro_input_sample_rate_hz = mapped->input_rate_hz;
+                latest.sro_pending_commands = scheduled_sro_commands.size();
+                sro_resampler_command_ppm.store(smoothed_sample_clock_ppm,
+                                                std::memory_order_relaxed);
+                sro_resampler_ready.store(true, std::memory_order_relaxed);
+            }
         }
         if (airspy_tv::is_debug_enabled() && timing_count != 0 &&
             window_symbols >= stats_window_symbols) {
@@ -306,7 +343,10 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             .timing_offset = timing_offset,
             .cir_offset = window_cir_avg,
             .observed_drift = observed_drift,
-            .smoothed_timing_drift = smoothed_timing_drift};
+            .smoothed_timing_drift = smoothed_timing_drift,
+            .output_begin_sample = output_begin_sample,
+            .output_midpoint_sample = timing_sample_position,
+            .output_end_sample = output_end_sample};
 }
 
 void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
@@ -426,6 +466,7 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
 void StreamDecoder::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
     state.window_started_at = std::chrono::steady_clock::now();
     state.window_symbol_count = 0;
+    state.window_output_begin_sample = 0;
     state.window_cir_offset_sum = 0.0;
     state.mer_sum = 0.0;
     state.preprocess_time_sum = 0.0F;
@@ -457,7 +498,30 @@ bool StreamDecoder::Impl::demod_dispatch_payload(
     auto &window_symbol_count = state.window_symbol_count;
     auto &demod_busy_started_at = state.demod_busy_started_at;
     auto &postprocessor = state.postprocessor;
+    auto &postprocessor_pending_symbols =
+        state.postprocessor_pending_symbols;
     auto &pending_symbols = state.pending_symbols;
+
+    const auto submit_postprocessor =
+        [this, &state, &postprocessor_pending_symbols](
+            std::vector<std::complex<float>> submitted_payload,
+            std::vector<float> submitted_equalizer_power,
+            const std::size_t submitted_symbol_index) {
+            state.postprocessor->submit(std::move(submitted_payload),
+                                        std::move(submitted_equalizer_power),
+                                        submitted_symbol_index);
+            ++postprocessor_pending_symbols;
+            if (postprocessor_pending_symbols < gate_window_symbols) {
+                return;
+            }
+            auto batch = state.postprocessor->take_ordered(gate_window_symbols);
+            if (batch.size() != gate_window_symbols) {
+                throw std::logic_error(
+                    "symbol postprocessor returned an incomplete batch");
+            }
+            postprocessor_pending_symbols -= batch.size();
+            demod_process_batch(state, std::move(batch));
+        };
 
     std::vector<std::complex<float>> payload;
     payload.reserve(payload_carrier_count(frontend.mode));
@@ -470,6 +534,9 @@ bool StreamDecoder::Impl::demod_dispatch_payload(
         equalizer_power.push_back(std::norm(channel[k]));
     }
     if (payload.size() != payload_carrier_count(frontend.mode)) {
+        if (window_symbol_count == 0) {
+            state.window_output_begin_sample = state.next_symbol_start;
+        }
         demod_advance_symbol(state);
         ++symbol_count;
         ++window_symbol_count;
@@ -505,15 +572,14 @@ bool StreamDecoder::Impl::demod_dispatch_payload(
                     (static_cast<std::size_t>(lock.phase) + 68 -
                      (distance % 68)) %
                     68;
-                postprocessor->submit(std::move(pending.payload),
-                                      std::move(pending.equalizer_power),
-                                      symbol_index);
+                submit_postprocessor(std::move(pending.payload),
+                                     std::move(pending.equalizer_power),
+                                     symbol_index);
             }
         }
         const std::size_t symbol_index = static_cast<std::size_t>(lock.phase);
-        postprocessor->submit(std::move(payload), std::move(equalizer_power),
-                              symbol_index);
-        demod_process_batch(state, postprocessor->take_ready());
+        submit_postprocessor(std::move(payload), std::move(equalizer_power),
+                             symbol_index);
     }
     return true;
 }
@@ -530,7 +596,13 @@ void StreamDecoder::Impl::demod_finish_stream(DemodRuntimeState &state) {
     // --- end of stream: drain the postprocessor, the gate, and the
     //     FEC decoder, then wait for the next stream ---
     if (postprocessor != nullptr) {
-        demod_process_batch(state, postprocessor->flush());
+        auto tail = postprocessor->flush();
+        if (tail.size() != state.postprocessor_pending_symbols) {
+            throw std::logic_error(
+                "symbol postprocessor flush lost ordered results");
+        }
+        state.postprocessor_pending_symbols = 0;
+        demod_process_batch(state, std::move(tail));
     }
     if (!gate_buffer.empty() && decoder_parameters) {
         double window_mer = 0.0;

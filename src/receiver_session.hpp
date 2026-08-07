@@ -55,6 +55,7 @@ class ReceiverSession {
     [[nodiscard]] DvbTSessionSnapshot dvbt_snapshot() const;
     [[nodiscard]] SignalSnapshot signal_snapshot() const;
     [[nodiscard]] PipelineSnapshot pipeline_snapshot() const;
+    [[nodiscard]] InputTimelineSnapshot input_timeline_snapshot() const;
 
     bool open_device_and_start(const DeviceDescriptor &descriptor,
                                SourceSettings &settings, std::string &error);

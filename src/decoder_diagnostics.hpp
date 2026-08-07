@@ -67,6 +67,9 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
               << " sro=" << stats.sample_clock_offset_ppm << "ppm"
               << " srocmd=" << stats.sro_resampler_command_ppm << "ppm"
               << " sroapply=" << stats.sro_resampler_applied_ppm << "ppm"
+              << " srodelay=" << stats.sro_fixed_delay_samples << "smp"
+              << " srolate=" << stats.sro_schedule_late_samples << "smp"
+              << " sropending=" << stats.sro_pending_commands
               << " tconf=" << stats.timing_confidence
               << " cir=" << stats.cir_offset_samples
               << " circonf=" << stats.cir_confidence

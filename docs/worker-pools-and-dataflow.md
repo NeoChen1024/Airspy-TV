@@ -124,11 +124,19 @@ incoming block.
 `dvbt-frontend` converts interleaved CS16 to normalized complex samples and
 runs `StreamingResampler` at the DVB-T baseband rate (`bandwidth * 8 / 7`).
 The common arbitrary resampler retains Q32.32 phase and FIR history across
-input blocks. Parallel workers evaluate independent output ranges and rejoin
-exactly before publication. DVB-T configures its passband through the outermost
-active carrier and its stopband at the lower of the input and output Nyquist
-edges. The Kaiser filter is automatically sized and SIMD-aligned for an 80 dB
-stopband target.
+input blocks. Caller blocks are split into bounded 50 ms processing quanta;
+parallel workers evaluate independent output ranges inside each quantum and
+rejoin exactly before publication. DVB-T configures its passband through the
+outermost active carrier and its stopband at the lower of the input and output
+Nyquist edges. The Kaiser filter is automatically sized and SIMD-aligned for
+an 80 dB stopband target.
+
+The source assigns every input block a monotonic `uint64_t` sample range and a
+stream epoch. Resampler spans retain the corresponding input range, absolute
+ring output range, and applied SRO correction. The timing loop schedules each
+new ratio at a future input-sample boundary beyond the maximum generated-ahead
+lead, so queue occupancy changes wall-clock delivery time but not the
+signal-domain control delay.
 
 Resampled data enters an `AbsoluteSampleRing`. Read and write positions are
 monotonic 64-bit stream coordinates; wrapping affects storage only. The ring
@@ -141,7 +149,7 @@ thread rather than overwriting unread samples.
 `dvbt-demod` is the owner of all state that depends on symbol history:
 
 - initial acquisition and event-driven cold re-anchor;
-- useful-symbol position and integer/fractional timing state;
+- useful-symbol position and timing state;
 - CFO NCO, residual phase loop, and integer carrier grid;
 - FFT, continual/scattered-pilot tracking, and channel estimation;
 - adaptive CIR-based FFT-window placement;
@@ -171,9 +179,12 @@ is dispatched to `SymbolPostprocessorPool`:
 - depuncturing and soft-metric quantization.
 
 Workers may finish out of order. Sequence numbers restore symbol order before
-the windowed MER gate and stateful transport decoder. A TPS-frame-sized gate
-brackets hopeless regions with FEC end/begin items so corrupted state does not
-poison later recovery.
+the windowed MER gate and stateful transport decoder. The demod thread consumes
+results at a fixed 68-symbol barrier, so MER-driven freeze and re-acquisition
+decisions occur at the same signal position regardless of worker completion
+timing. Pool backpressure counts queued, running, and completed-but-unconsumed
+symbols together. A TPS-frame-sized gate brackets hopeless regions with FEC
+end/begin items so corrupted state does not poison later recovery.
 
 ### FEC and transport
 

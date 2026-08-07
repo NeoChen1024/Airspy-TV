@@ -270,6 +270,8 @@ int decode_iq_cli(const std::filesystem::path &source,
         });
 
     const auto started_at = std::chrono::steady_clock::now();
+    airspy_tv::InputSampleTimeline input_timeline;
+    input_timeline.begin_stream(info.sample_rate_hz);
     // Submit in ~0.2 s spans (the decoder's ingestion budget) rather than a
     // fixed 0.7 s block: the queue and ring are sized from the same budget,
     // so chunking must not exceed it or it silently becomes the latency.
@@ -318,6 +320,14 @@ int decode_iq_cli(const std::filesystem::path &source,
                   << " sro-command=" << stats.sro_resampler_command_ppm
                   << " ppm sro-applied=" << stats.sro_resampler_applied_ppm
                   << " ppm resample-ratio=" << stats.resampler_effective_ratio
+                  << " sro-delay="
+                  << (stats.sro_input_sample_rate_hz != 0
+                          ? 1000.0 *
+                                static_cast<double>(stats.sro_fixed_delay_samples) /
+                                stats.sro_input_sample_rate_hz
+                          : 0.0)
+                  << " ms sro-late=" << stats.sro_schedule_late_samples
+                  << " smp sro-pending=" << stats.sro_pending_commands
                   << " tconf=" << stats.timing_confidence
                   << " sro-ready=" << (stats.timing_drift_ready ? 1 : 0)
                   << " carried=" << (stats.state_carried ? 1 : 0)
@@ -398,8 +408,11 @@ int decode_iq_cli(const std::filesystem::path &source,
         const std::size_t scalar_count =
             static_cast<std::size_t>(bytes_read) / sizeof(block.front());
         input_complex_samples += scalar_count / 2;
+        const airspy_tv::InputSampleStamp stamp =
+            input_timeline.stamp(scalar_count / 2, info.sample_rate_hz);
         decoder.submit_blocking(std::span(block).first(scalar_count),
-                                info.sample_rate_hz);
+                                info.sample_rate_hz,
+                                decoder_parameters.channel_bandwidth_hz, stamp);
         if (scalar_count == block.size()) {
             const auto progress = decoder.stats();
             if (airspy_tv::is_debug_enabled() &&

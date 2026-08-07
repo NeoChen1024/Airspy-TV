@@ -12,6 +12,9 @@ struct DemodWindowMetrics {
     double cir_offset{};
     double observed_drift{};
     double smoothed_timing_drift{};
+    std::uint64_t output_begin_sample{};
+    std::uint64_t output_midpoint_sample{};
+    std::uint64_t output_end_sample{};
 };
 
 struct DemodRuntimeState {
@@ -37,6 +40,7 @@ struct DemodRuntimeState {
     std::optional<DecoderParameters> decoder_parameters;
     WorkerAllocation workers{1, 1, 1};
     SymbolPostprocessorPool *postprocessor{};
+    std::size_t postprocessor_pending_symbols{};
     std::deque<PendingSymbol> pending_symbols;
     std::deque<PostprocessedSymbol> gate_buffer;
     std::size_t symbol_queue_capacity{initial_symbol_queue_capacity};
@@ -62,6 +66,7 @@ struct DemodRuntimeState {
 
     // Per-statistics-window accumulators.
     std::uint64_t window_symbol_count{};
+    std::uint64_t window_output_begin_sample{};
     double mer_sum{};
     float preprocess_time_sum{};
     float demap_time_sum{};
@@ -84,11 +89,11 @@ struct DemodRuntimeState {
     double last_windowed_timing{};
     double smoothed_sample_clock_ppm{};
     std::array<double, tau_history_n> tau_history{};
-    std::array<double, tau_history_n> tau_sample_history{};
-    std::array<double, tau_history_n> tau_resampler_correction_history{};
+    std::array<std::uint64_t, tau_history_n> tau_sample_history{};
+    std::array<double, tau_history_n> tau_interval_correction_history{};
     std::size_t tau_history_head{};
     std::size_t tau_history_count{};
-    double timing_elapsed_samples{};
+    std::optional<std::uint64_t> last_timing_sample_position;
     double last_windowed_cir_avg{};
     double window_cir_offset_sum{};
     int applied_cir_offset{};

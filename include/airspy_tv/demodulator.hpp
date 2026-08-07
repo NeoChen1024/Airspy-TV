@@ -1,5 +1,6 @@
 #pragma once
 
+#include "airspy_tv/sample_timeline.hpp"
 #include "airspy_tv/transport_stream.hpp"
 
 #include <array>
@@ -97,12 +98,14 @@ class Demodulator {
     virtual void reset() = 0;
     virtual void submit(std::span<const std::int16_t> interleaved_iq,
                         std::uint32_t sample_rate_hz,
-                        std::uint32_t channel_bandwidth_hz) = 0;
+                        std::uint32_t channel_bandwidth_hz,
+                        InputSampleStamp stamp = {}) = 0;
     // Decoder-paced file input: wait for queue capacity instead of dropping an
     // input block. Live SDR callbacks should continue to use submit().
     virtual void submit_blocking(std::span<const std::int16_t> interleaved_iq,
                                  std::uint32_t sample_rate_hz,
-                                 std::uint32_t channel_bandwidth_hz) = 0;
+                                 std::uint32_t channel_bandwidth_hz,
+                                 InputSampleStamp stamp = {}) = 0;
     // Process any final partial chunk, then wait until all queued input has
     // completed. This is intended for finite, decoder-paced file input.
     virtual void flush() = 0;

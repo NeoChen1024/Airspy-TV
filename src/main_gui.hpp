@@ -1818,10 +1818,28 @@ void draw_sidebar(AppState &state) {
                     : 0.5F,
                 ImVec4(0.52F, 0.82F, 1.0F, 1.0F));
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                const double scheduled_delay_ms =
+                    state.dvbt.decoder.sro_input_sample_rate_hz != 0
+                        ? 1000.0 * static_cast<double>(
+                                       state.dvbt.decoder.sro_fixed_delay_samples) /
+                              state.dvbt.decoder.sro_input_sample_rate_hz
+                        : 0.0;
                 ImGui::SetTooltip(
                     "DVB-T timing-loop command and correction currently "
                     "applied by the common variable-rate resampler.\n"
+                    "Scheduled delay %.3f ms, late %llu samples, pending %zu.\n"
+                    "Command input %llu, target %llu, applied %llu.\n"
                     "Requested ratio %.12f, effective ratio %.12f.",
+                    scheduled_delay_ms,
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.sro_schedule_late_samples),
+                    state.dvbt.decoder.sro_pending_commands,
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.sro_command_input_sample),
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.sro_effective_input_sample),
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.sro_applied_input_sample),
                     state.dvbt.decoder.resampler_requested_ratio,
                     state.dvbt.decoder.resampler_effective_ratio);
             }

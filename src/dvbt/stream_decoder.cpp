@@ -1,6 +1,7 @@
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 
 #include "airspy_tv/debug.hpp"
+#include "airspy_tv/dsp/resampler_timeline.hpp"
 #include "airspy_tv/dsp/vector_ops.hpp"
 #include "airspy_tv/dvbt/analysis_publisher.hpp"
 #include "airspy_tv/dvbt/decoder.hpp"
@@ -59,6 +60,8 @@ constexpr std::size_t ts_packet_size = 188;
 // lookahead and scheduling jitter — the proven 1 Mi behaviour for low input
 // rates.
 constexpr std::size_t ring_minimum_samples = 1'048'576;
+constexpr std::size_t resampler_quantum_denominator = 20;
+constexpr std::size_t minimum_sro_delay_denominator = 2;
 
 [[nodiscard]] std::size_t
 ring_capacity_for(const std::uint32_t sample_rate_hz) noexcept {
@@ -66,6 +69,36 @@ ring_capacity_for(const std::uint32_t sample_rate_hz) noexcept {
                     (static_cast<std::size_t>(sample_rate_hz) +
                      buffer_duration_denominator - 1) /
                         buffer_duration_denominator);
+}
+
+[[nodiscard]] std::size_t
+resampler_quantum_samples(const std::uint32_t sample_rate_hz) noexcept {
+    return std::max<std::size_t>(
+        1, (static_cast<std::size_t>(sample_rate_hz) +
+            resampler_quantum_denominator - 1) /
+               resampler_quantum_denominator);
+}
+
+[[nodiscard]] std::uint64_t
+sro_fixed_delay_samples(const std::uint32_t input_rate_hz,
+                        const std::uint32_t bandwidth_hz) noexcept {
+    const std::uint64_t minimum =
+        (static_cast<std::uint64_t>(input_rate_hz) +
+         minimum_sro_delay_denominator - 1) /
+        minimum_sro_delay_denominator;
+    if (bandwidth_hz == 0) {
+        return minimum;
+    }
+    const long double output_rate =
+        static_cast<long double>(bandwidth_hz) * 8.0L / 7.0L;
+    const long double ring_input_equivalent =
+        static_cast<long double>(ring_capacity_for(input_rate_hz)) *
+        static_cast<long double>(input_rate_hz) / output_rate;
+    const long double bounded_lead =
+        std::ceil(ring_input_equivalent) +
+        2.0L * static_cast<long double>(
+                   resampler_quantum_samples(input_rate_hz));
+    return std::max(minimum, static_cast<std::uint64_t>(bounded_lead));
 }
 // Demod statistics window: 400 OFDM symbols (~0.6 s at 8K/guard-1/4), the
 // report cadence for the CLI (the demod no longer reports once per submitted
@@ -348,6 +381,17 @@ struct StreamDecoder::Impl {
         std::uint32_t rate{};
         std::uint32_t bandwidth{};
         std::uint64_t generation{};
+        InputSampleStamp stamp;
+    };
+
+    struct ScheduledSroCommand {
+        std::uint64_t generation{};
+        std::uint64_t source_epoch{};
+        std::uint64_t command_output_sample{};
+        std::uint64_t command_input_sample{};
+        std::uint64_t effective_input_sample{};
+        std::uint64_t fixed_delay_samples{};
+        double target_ppm{};
     };
 
     // Acquisition result published by the front-end thread. `version` is
@@ -383,6 +427,7 @@ struct StreamDecoder::Impl {
     std::size_t queued_complex_samples{};
     std::size_t input_queue_capacity_samples{};
     std::size_t fec_queue_capacity{initial_symbol_queue_capacity};
+    InputSampleTimeline fallback_input_timeline;
     // Circular buffer of resampled samples. Positions are absolute uint64
     // stream offsets; the ring retains [ring_read_pos, ring_write_pos).
     AbsoluteSampleRing ring;
@@ -390,6 +435,8 @@ struct StreamDecoder::Impl {
     std::uint64_t &ring_read_pos{ring.read_position};
     bool &ring_closed{ring.closed};
     SyncState sync;
+    dsp::ResamplerRateTimeline resampler_timeline;
+    std::deque<ScheduledSroCommand> scheduled_sro_commands;
     // The most recent block's bandwidth, published by the front-end; the demod
     // reads it when it runs its event-driven acquisitions (the resampled rate
     // = bandwidth * 8/7 feeds the sync + realtime stats).
@@ -626,17 +673,22 @@ StreamDecoder::~StreamDecoder() noexcept = default;
 
 void StreamDecoder::submit(const std::span<const std::int16_t> interleaved_iq,
                            const std::uint32_t sample_rate_hz,
-                           const std::uint32_t channel_bandwidth_hz) {
+                           const std::uint32_t channel_bandwidth_hz,
+                           InputSampleStamp stamp) {
     if (interleaved_iq.empty() || sample_rate_hz == 0 ||
         (interleaved_iq.size() % 2) != 0) {
         return;
+    }
+    const std::size_t incoming_samples = interleaved_iq.size() / 2;
+    if (!stamp.valid_for(incoming_samples, sample_rate_hz)) {
+        stamp = impl_->fallback_input_timeline.stamp(incoming_samples,
+                                                     sample_rate_hz);
     }
     if (!impl_->analysis_publisher.locked()) {
         impl_->analyzer.submit(interleaved_iq, sample_rate_hz,
                                channel_bandwidth_hz);
     }
     const std::scoped_lock lock(impl_->mutex);
-    const std::size_t incoming_samples = interleaved_iq.size() / 2;
     impl_->input_queue_capacity_samples =
         std::max(buffered_input_samples(sample_rate_hz), incoming_samples);
     if (impl_->queued_complex_samples + incoming_samples >
@@ -647,7 +699,7 @@ void StreamDecoder::submit(const std::span<const std::int16_t> interleaved_iq,
     impl_->queue.push_back({std::vector<std::int16_t>(interleaved_iq.begin(),
                                                       interleaved_iq.end()),
                             sample_rate_hz, channel_bandwidth_hz,
-                            impl_->latest_generation.load()});
+                            impl_->latest_generation.load(), stamp});
     impl_->queued_complex_samples += incoming_samples;
     impl_->input_ready.notify_one();
 }
@@ -655,13 +707,17 @@ void StreamDecoder::submit(const std::span<const std::int16_t> interleaved_iq,
 void StreamDecoder::submit_blocking(
     const std::span<const std::int16_t> interleaved_iq,
     const std::uint32_t sample_rate_hz,
-    const std::uint32_t channel_bandwidth_hz) {
+    const std::uint32_t channel_bandwidth_hz, InputSampleStamp stamp) {
     if (interleaved_iq.empty() || sample_rate_hz == 0 ||
         (interleaved_iq.size() % 2) != 0) {
         return;
     }
-    std::unique_lock lock(impl_->mutex);
     const std::size_t incoming_samples = interleaved_iq.size() / 2;
+    if (!stamp.valid_for(incoming_samples, sample_rate_hz)) {
+        stamp = impl_->fallback_input_timeline.stamp(incoming_samples,
+                                                     sample_rate_hz);
+    }
+    std::unique_lock lock(impl_->mutex);
     impl_->input_queue_capacity_samples =
         std::max(buffered_input_samples(sample_rate_hz), incoming_samples);
     impl_->input_not_full.wait(lock, [this, incoming_samples] {
@@ -675,7 +731,7 @@ void StreamDecoder::submit_blocking(
     impl_->queue.push_back({std::vector<std::int16_t>(interleaved_iq.begin(),
                                                       interleaved_iq.end()),
                             sample_rate_hz, channel_bandwidth_hz,
-                            impl_->latest_generation.load()});
+                            impl_->latest_generation.load(), stamp});
     impl_->queued_complex_samples += incoming_samples;
     impl_->input_ready.notify_one();
 }
@@ -707,6 +763,7 @@ void StreamDecoder::wait_until_idle() {
 void StreamDecoder::request_reset() {
     impl_->analyzer.reset();
     impl_->analysis_publisher.reset();
+    impl_->fallback_input_timeline.mark_discontinuity();
     {
         const std::scoped_lock lock(impl_->mutex);
         impl_->cancel_requested = true;
@@ -719,6 +776,8 @@ void StreamDecoder::request_reset() {
         impl_->reset_requested = true;
         impl_->queue.clear();
         impl_->fec_queue.clear();
+        impl_->scheduled_sro_commands.clear();
+        impl_->resampler_timeline.clear();
         impl_->queued_complex_samples = 0;
         impl_->sync.valid = false;
         ++impl_->sync.version;

@@ -85,6 +85,7 @@ struct SdrDevice::Impl {
     TransportStreamModel transport_model;
     TransportStreamRouter transport_router{transport_model, ts_recorder};
     SpectrumAnalyzer analyzer;
+    InputSampleTimeline input_timeline;
     std::unique_ptr<Demodulator> demodulator;
     std::thread soapy_worker;
     std::thread file_worker;
@@ -98,6 +99,17 @@ struct SdrDevice::Impl {
     std::string async_error;
 
     Impl() = default;
+
+    void submit_source_block(const std::span<const std::int16_t> sample_block) {
+        const auto rate = active_sample_rate.load();
+        const auto bandwidth = active_channel_bandwidth.load();
+        const InputSampleStamp stamp =
+            input_timeline.stamp(sample_block.size() / 2, rate);
+        analyzer.submit(sample_block, rate, bandwidth);
+        if (demodulator) {
+            demodulator->submit(sample_block, rate, bandwidth, stamp);
+        }
+    }
 
     static int airspy_rx_callback(airspy_transfer *transfer) {
         auto *self = static_cast<Impl *>(transfer->ctx);
@@ -114,17 +126,14 @@ struct SdrDevice::Impl {
         if (transfer->dropped_samples != 0) {
             self->recorder.add_source_dropped_samples(
                 transfer->dropped_samples);
+            self->input_timeline.mark_discontinuity(
+                static_cast<std::uint64_t>(transfer->dropped_samples));
             self->analyzer.reset();
             if (self->demodulator) {
                 self->demodulator->request_reset();
             }
         }
-        self->analyzer.submit(sample_block, self->active_sample_rate,
-                              self->active_channel_bandwidth);
-        if (self->demodulator) {
-            self->demodulator->submit(sample_block, self->active_sample_rate,
-                                      self->active_channel_bandwidth);
-        }
+        self->submit_source_block(sample_block);
         self->recorder.submit(sample_block);
         return 0;
     }
@@ -146,12 +155,7 @@ struct SdrDevice::Impl {
             if (received > 0) {
                 const std::span sample_block(
                     samples.data(), static_cast<std::size_t>(received) * 2);
-                analyzer.submit(sample_block, active_sample_rate,
-                                active_channel_bandwidth);
-                if (demodulator) {
-                    demodulator->submit(sample_block, active_sample_rate,
-                                        active_channel_bandwidth);
-                }
+                submit_source_block(sample_block);
                 recorder.submit(sample_block);
                 continue;
             }
@@ -159,6 +163,7 @@ struct SdrDevice::Impl {
                 received == SOAPY_SDR_OVERFLOW) {
                 if (received == SOAPY_SDR_OVERFLOW) {
                     recorder.add_source_dropped_samples(1);
+                    input_timeline.mark_discontinuity();
                     analyzer.reset();
                     if (demodulator) {
                         demodulator->request_reset();
@@ -203,12 +208,7 @@ struct SdrDevice::Impl {
                 break;
             }
             const std::span sample_block(samples.data(), scalar_count);
-            analyzer.submit(sample_block, active_sample_rate,
-                            active_channel_bandwidth);
-            if (demodulator) {
-                demodulator->submit(sample_block, active_sample_rate,
-                                    active_channel_bandwidth);
-            }
+            submit_source_block(sample_block);
             emitted_samples += scalar_count / 2;
 
             const auto elapsed = std::chrono::duration<double>(
@@ -525,6 +525,7 @@ bool SdrDevice::start_stream(const SourceSettings &settings,
 
     impl_->async_error.clear();
     impl_->active_sample_rate = settings.sample_rate_hz;
+    impl_->input_timeline.begin_stream(settings.sample_rate_hz);
     if (impl_->current.backend == SdrBackend::File) {
         impl_->streaming = true;
         impl_->file_worker = std::thread([this] { impl_->run_file(); });
@@ -627,6 +628,7 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
             return false;
         }
         impl_->analyzer.reset();
+        impl_->input_timeline.mark_discontinuity();
         if (impl_->demodulator) {
             impl_->demodulator->reset();
         }
@@ -646,6 +648,7 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
             static_cast<double>(corrected_frequency(
                 frequency_hz, impl_->frequency_correction_ppm)));
         impl_->analyzer.reset();
+        impl_->input_timeline.mark_discontinuity();
         if (impl_->demodulator) {
             impl_->demodulator->reset();
         }
@@ -817,6 +820,10 @@ SignalSnapshot SdrDevice::signal_snapshot() const {
 PipelineSnapshot SdrDevice::pipeline_snapshot() const {
     return impl_->demodulator ? impl_->demodulator->pipeline_snapshot()
                               : PipelineSnapshot{};
+}
+
+InputTimelineSnapshot SdrDevice::input_timeline_snapshot() const {
+    return impl_->input_timeline.snapshot();
 }
 
 std::vector<TransportService> SdrDevice::transport_services() const {

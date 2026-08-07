@@ -109,11 +109,22 @@ rate changes, and end-to-end stopband tone sweeps for DVB-T 5/6/7/8 MHz
 configurations at 10 MS/s.
 
 The DVB-T controller uses a 0.5 ppm/second slew and a confidence gate of 0.75.
-Once the timing history is ready, the demod thread publishes source SRO through
-an atomic command and the frontend applies it as
-`nominal_output_per_input / (1 + sro_ppm * 1e-6)`. The estimator adds the
-interval-average applied correction back to each residual timing difference,
-avoiding history-lag overshoot. Adaptive CIR placement remains independent.
+Once the timing history is ready, the demod thread schedules source SRO as
+`nominal_output_per_input / (1 + sro_ppm * 1e-6)`. Commands are stamped with
+the demod read position at which the completed timing-window estimate becomes
+available, mapped back to the corresponding source input position, and
+activated after a fixed sample-domain horizon. The horizon is at least 0.5
+seconds and is increased when necessary to exceed the ring plus one bounded
+frontend quantum. It therefore does not change with instantaneous queue
+occupancy or offline replay speed.
+
+Every source block carries a monotonic input-sample range and stream epoch.
+The frontend records input/output resampler spans and the correction that
+actually generated each span. Timing-history de-bias uses the weighted
+correction over the exact output interval between measurements, rather than a
+wall-clock snapshot of the frontend's current ratio. Arbitrary caller blocks
+are split into at most 50 ms resampler quanta so generated-ahead data has a
+provable bound. Adaptive CIR placement remains independent.
 
 Twenty-second synthetic 8K/6 MHz tests established both signs. For targets of
 about +0.189 and -0.189 ppm, applied correction reached about +0.157 and -0.157
@@ -180,6 +191,21 @@ session after a demodulator reset. Until those counters are made cumulative,
 cross-session validation must inspect the emitted TS and event log rather than
 the final summary alone.
 
+A later repeated `557mhz-vertical` sweep exposed a separate scheduling issue:
+the symbol pool previously delivered whatever ordered prefix happened to be
+ready after each submit, so the asynchronous MER gate could reach its fourth
+hopeless window at different demod symbol positions. With eight decoder
+threads, identical replays varied by roughly 12,000 usable packets. The demod
+now consumes a fixed 68-symbol ordered batch and the pool bounds all submitted
+but unconsumed work. Repeated eight-thread runs are byte-identical at 707,049
+emitted packets, 103,187 TEI packets, and 603,862 usable packets; the first
+hopeless windows and re-anchor positions are also identical across one and
+eight-thread allocations. Five- and seven-thread allocations form a second
+deterministic numerical path with 605,277 usable packets, a remaining 0.23%
+cross-configuration difference rather than a scheduling-dependent recovery
+shift. The clean `557mhz-horizontal` output remains byte-identical across one
+and eight threads and against the earlier reference stream.
+
 Remaining integration work is to validate flush, retune, queue pressure,
 ramping/reversing SRO, and 2K mode with variable-rate correction. The
 short 557/581 MHz matrix is complete, but the marginal-signal FEC delta and
@@ -189,11 +215,11 @@ Use a block-local Q32.32 phase accumulator for the scalar reference
 implementation. The upper 32 bits identify the input sample within the current
 work buffer and the lower 32 bits hold the fractional phase. Rebase the phase
 whenever consumed input is discarded, retaining only the FIR context required
-by future outputs. An unbounded absolute input position is not required by the
-DSP algorithm; a separate `uint64_t` cumulative sample counter is optional for
-telemetry and deterministic test diagnostics. A practical polyphase bank may
-use 1024 or 4096 phases and derive its index, plus optional interpolation, from
-the Q32.32 fractional field.
+by future outputs. The DSP phase remains block-local, while a separate
+`uint64_t` source timeline stamps each input block for deterministic control
+scheduling, latency telemetry, dropout epochs, and input/output span mapping.
+A practical polyphase bank may use 1024 or 4096 phases and derive its index,
+plus optional interpolation, from the Q32.32 fractional field.
 
 The SRO estimator and second-order clock model remain owned by the consuming
 demodulator, while the arbitrary resampler remains a common actuator. The

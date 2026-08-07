@@ -70,6 +70,10 @@ void StreamDecoder::Impl::run_demod() {
                 if (!demod_dispatch_payload(runtime, lock, channel)) {
                     continue;
                 }
+                if (window_symbol_count == 0) {
+                    runtime.window_output_begin_sample =
+                        runtime.next_symbol_start;
+                }
                 ++symbol_count;
                 ++window_symbol_count;
                 demod_advance_symbol(runtime);

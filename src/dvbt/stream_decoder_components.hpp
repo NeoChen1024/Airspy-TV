@@ -113,7 +113,7 @@ class SymbolPostprocessorPool {
             std::unique_lock lock(mutex_);
             space_available_.wait(lock, [this] {
                 return stopping_ || worker_error_ ||
-                       tasks_.size() < maximum_queued_;
+                       outstanding_ < maximum_queued_;
             });
             rethrow_worker_error();
             if (stopping_) {
@@ -126,18 +126,29 @@ class SymbolPostprocessorPool {
         task_ready_.notify_one();
     }
 
-    [[nodiscard]] std::vector<PostprocessedSymbol> take_ready() {
-        std::scoped_lock lock(mutex_);
+    [[nodiscard]]
+    std::vector<PostprocessedSymbol> take_ordered(const std::size_t count) {
+        std::unique_lock lock(mutex_);
+        finished_.wait(lock, [this, count] {
+            return ordered_ready_locked(count) || worker_error_;
+        });
         rethrow_worker_error();
-        return take_ready_locked();
+        auto output = take_ready_locked(count);
+        lock.unlock();
+        space_available_.notify_all();
+        return output;
     }
 
     [[nodiscard]] std::vector<PostprocessedSymbol> flush() {
         std::unique_lock lock(mutex_);
-        finished_.wait(lock,
-                       [this] { return outstanding_ == 0 || worker_error_; });
+        finished_.wait(lock, [this] {
+            return completed_.size() == outstanding_ || worker_error_;
+        });
         rethrow_worker_error();
-        return take_ready_locked();
+        auto output = take_ready_locked(outstanding_);
+        lock.unlock();
+        space_available_.notify_all();
+        return output;
     }
 
   private:
@@ -267,27 +278,42 @@ class SymbolPostprocessorPool {
                 auto result = process(std::move(task));
                 const std::scoped_lock lock(mutex_);
                 completed_.emplace(sequence, std::move(result));
-                --outstanding_;
             } catch (...) {
                 const std::scoped_lock lock(mutex_);
                 if (!worker_error_) {
                     worker_error_ = std::current_exception();
                 }
-                --outstanding_;
             }
             finished_.notify_all();
-            space_available_.notify_all();
         }
     }
 
-    [[nodiscard]] std::vector<PostprocessedSymbol> take_ready_locked() {
+    [[nodiscard]] bool
+    ordered_ready_locked(const std::size_t count) const noexcept {
+        if (count > outstanding_) {
+            return false;
+        }
+        for (std::size_t offset = 0; offset < count; ++offset) {
+            if (!completed_.contains(next_result_ + offset)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]]
+    std::vector<PostprocessedSymbol> take_ready_locked(const std::size_t count) {
         std::vector<PostprocessedSymbol> output;
-        auto found = completed_.find(next_result_);
-        while (found != completed_.end()) {
+        output.reserve(count);
+        for (std::size_t offset = 0; offset < count; ++offset) {
+            auto found = completed_.find(next_result_);
+            if (found == completed_.end()) {
+                break;
+            }
             output.push_back(std::move(found->second));
             completed_.erase(found);
             ++next_result_;
-            found = completed_.find(next_result_);
+            --outstanding_;
         }
         return output;
     }
@@ -329,6 +355,9 @@ class SymbolPostprocessorPool {
     std::map<std::uint64_t, PostprocessedSymbol> completed_;
     std::uint64_t next_sequence_{};
     std::uint64_t next_result_{};
+    // Submitted results remain outstanding until the demod thread consumes
+    // them. This bounds queued, running, and completed-but-not-yet-joined work
+    // with one budget instead of letting the completed map grow invisibly.
     std::size_t outstanding_{};
     std::exception_ptr worker_error_;
     bool stopping_{};

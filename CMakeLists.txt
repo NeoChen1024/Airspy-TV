@@ -151,6 +151,16 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(sample-timeline-test
+        tests/sample_timeline_test.cpp
+    )
+    target_link_libraries(sample-timeline-test PRIVATE airspy-tv-common)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(sample-timeline-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME sample-timeline COMMAND sample-timeline-test)
+
     add_executable(arbitrary-resampler-test
         tests/arbitrary_resampler_test.cpp
     )
@@ -202,7 +212,8 @@ if(BUILD_TESTING)
         target_compile_options(dvbt-stream-decoder-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
-    foreach(STREAM_CASE clean reset-new reset-hopeless reset-live reset-wait no-acq)
+    foreach(STREAM_CASE clean worker-parity reset-new reset-hopeless reset-live
+                        reset-wait no-acq)
         add_test(NAME dvbt-stream-decoder-${STREAM_CASE}
                  COMMAND dvbt-stream-decoder-test)
         set_tests_properties(dvbt-stream-decoder-${STREAM_CASE} PROPERTIES

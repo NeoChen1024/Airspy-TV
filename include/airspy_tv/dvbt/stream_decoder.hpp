@@ -95,6 +95,14 @@ struct StreamDecoderStats {
     float sro_resampler_applied_ppm{};
     double resampler_requested_ratio{};
     double resampler_effective_ratio{};
+    std::uint64_t sro_command_output_sample{};
+    std::uint64_t sro_command_input_sample{};
+    std::uint64_t sro_effective_input_sample{};
+    std::uint64_t sro_applied_input_sample{};
+    std::uint64_t sro_schedule_late_samples{};
+    std::uint64_t sro_fixed_delay_samples{};
+    std::uint32_t sro_input_sample_rate_hz{};
+    std::size_t sro_pending_commands{};
     float cir_offset_samples{};
     float timing_confidence{};
     float cir_confidence{};
@@ -175,13 +183,15 @@ class StreamDecoder : public Demodulator {
     void reset() override;
     void submit(std::span<const std::int16_t> interleaved_iq,
                 std::uint32_t sample_rate_hz,
-                std::uint32_t channel_bandwidth_hz = 6'000'000) override;
+                std::uint32_t channel_bandwidth_hz = 6'000'000,
+                InputSampleStamp stamp = {}) override;
     // Decoder-paced file input: wait for queue capacity instead of dropping an
     // input block. Live SDR callbacks should continue to use submit().
     void
     submit_blocking(std::span<const std::int16_t> interleaved_iq,
                     std::uint32_t sample_rate_hz,
-                    std::uint32_t channel_bandwidth_hz = 6'000'000) override;
+                    std::uint32_t channel_bandwidth_hz = 6'000'000,
+                    InputSampleStamp stamp = {}) override;
     // Process any final partial chunk, then wait until all queued input has
     // completed. This is intended for finite, decoder-paced file input.
     void flush() override;

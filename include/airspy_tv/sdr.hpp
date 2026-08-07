@@ -103,6 +103,7 @@ class SdrDevice {
     [[nodiscard]] SpectrumSnapshot spectrum_snapshot() const;
     [[nodiscard]] SignalSnapshot signal_snapshot() const;
     [[nodiscard]] PipelineSnapshot pipeline_snapshot() const;
+    [[nodiscard]] InputTimelineSnapshot input_timeline_snapshot() const;
     [[nodiscard]] std::vector<TransportService> transport_services() const;
     [[nodiscard]] std::string runtime_error() const;
 

@@ -145,6 +145,10 @@ PipelineSnapshot ReceiverSession::pipeline_snapshot() const {
     return device_.pipeline_snapshot();
 }
 
+InputTimelineSnapshot ReceiverSession::input_timeline_snapshot() const {
+    return device_.input_timeline_snapshot();
+}
+
 bool ReceiverSession::open_device_and_start(const DeviceDescriptor &descriptor,
                                             SourceSettings &settings,
                                             std::string &error) {

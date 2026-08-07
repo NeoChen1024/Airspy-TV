@@ -82,11 +82,11 @@ void StreamDecoder::Impl::demod_reset_timing(DemodRuntimeState &state,
     state.last_windowed_timing = 0.0;
     state.last_windowed_cir_avg = 0.0;
     state.tau_history.fill(0.0);
-    state.tau_sample_history.fill(0.0);
-    state.tau_resampler_correction_history.fill(0.0);
+    state.tau_sample_history.fill(0);
+    state.tau_interval_correction_history.fill(0.0);
     state.tau_history_head = 0;
     state.tau_history_count = 0;
-    state.timing_elapsed_samples = 0.0;
+    state.last_timing_sample_position.reset();
     if (reset_window_cir) {
         state.window_cir_offset_sum = 0.0;
     }
@@ -111,6 +111,7 @@ bool StreamDecoder::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
             static_cast<void>(symbol_postprocessor->flush());
         }
         state.postprocessor = nullptr;
+        state.postprocessor_pending_symbols = 0;
         state.pending_symbols.clear();
         state.gate_buffer.clear();
         state.in_hopeless_region = false;
@@ -171,6 +172,7 @@ bool StreamDecoder::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
             static_cast<void>(symbol_postprocessor->flush());
             state.postprocessor = nullptr;
         }
+        state.postprocessor_pending_symbols = 0;
         state.pending_symbols.clear();
         state.gate_buffer.clear();
         state.in_hopeless_region = false;

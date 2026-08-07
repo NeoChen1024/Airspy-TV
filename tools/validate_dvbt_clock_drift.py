@@ -42,6 +42,8 @@ TRACKED_RE = re.compile(rf"\btracked=({NUMBER}) Hz\b")
 SRO_RE = re.compile(rf"\bsro=({NUMBER}) ppm\b")
 SRO_COMMAND_RE = re.compile(rf"\bsro-command=({NUMBER}) ppm\b")
 SRO_APPLIED_RE = re.compile(rf"\bsro-applied=({NUMBER}) ppm\b")
+SRO_DELAY_RE = re.compile(rf"\bsro-delay=({NUMBER}) ms\b")
+SRO_LATE_RE = re.compile(r"\bsro-late=(\d+) smp\b")
 READY_RE = re.compile(r"\bsro-ready=([01])\b")
 FINAL_TS_RE = re.compile(r"\bTS=(\d+) bytes, symbols=")
 
@@ -53,6 +55,8 @@ class ClockSample:
     tracked_cfo_hz: float
     sro_command_ppm: float
     sro_applied_ppm: float
+    sro_delay_ms: float
+    sro_late_samples: int
 
 
 def run_checked(
@@ -85,6 +89,8 @@ def parse_decoder_log(text: str, sample_rate: int) -> tuple[list[ClockSample], i
             sro_match = SRO_RE.search(line)
             command_match = SRO_COMMAND_RE.search(line)
             applied_match = SRO_APPLIED_RE.search(line)
+            delay_match = SRO_DELAY_RE.search(line)
+            late_match = SRO_LATE_RE.search(line)
             ready_match = READY_RE.search(line)
             if ts_match:
                 final_ts_bytes = max(final_ts_bytes, int(ts_match.group(1)))
@@ -102,6 +108,12 @@ def parse_decoder_log(text: str, sample_rate: int) -> tuple[list[ClockSample], i
                     ),
                     sro_applied_ppm=(
                         float(applied_match.group(1)) if applied_match else 0.0
+                    ),
+                    sro_delay_ms=(
+                        float(delay_match.group(1)) if delay_match else 0.0
+                    ),
+                    sro_late_samples=(
+                        int(late_match.group(1)) if late_match else 0
                     ),
                 )
             )
@@ -230,6 +242,20 @@ def validate_scenario(
     measured_applied = statistics.median(
         sample.sro_applied_ppm for sample in tail
     )
+    scheduled_delays = [sample.sro_delay_ms for sample in tail]
+    if not scheduled_delays or min(scheduled_delays) <= 0.0:
+        raise RuntimeError(f"{scenario.name}: missing scheduled SRO delay")
+    if max(scheduled_delays) - min(scheduled_delays) > 1.0e-6:
+        raise RuntimeError(
+            f"{scenario.name}: sample-domain delay changed across the run: "
+            f"{min(scheduled_delays):.6f}..{max(scheduled_delays):.6f} ms"
+        )
+    maximum_late_samples = max(sample.sro_late_samples for sample in tail)
+    if maximum_late_samples != 0:
+        raise RuntimeError(
+            f"{scenario.name}: scheduled SRO command was late by "
+            f"{maximum_late_samples} samples"
+        )
     if abs(expected_sro) >= 0.02:
         if math.copysign(1.0, measured_applied) != math.copysign(
             1.0, expected_sro
@@ -261,6 +287,8 @@ def validate_scenario(
         f"PASS {scenario.name}: SRO={measured_sro:+.4f} ppm "
         f"(expected {expected_sro:+.4f}), CFO={measured_cfo:+.2f} Hz "
         f"(expected {expected_cfo:+.2f}){feedback_summary}, TS={ts_bytes} bytes"
+        f", delay={statistics.median(scheduled_delays):.3f} ms, "
+        f"late={maximum_late_samples} samples"
     )
     if generator.stderr:
         print(f"  generator diagnostics retained in {log_path.parent}")
