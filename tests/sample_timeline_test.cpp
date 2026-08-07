@@ -52,14 +52,16 @@ void test_resampler_timeline() {
                      .output_begin = 0,
                      .output_end = 100,
                      .input_rate_hz = 10'000'000,
-                     .applied_correction_ppm = 1.0});
+                     .applied_correction_ppm = 1.0,
+                     .applied_cfo_correction_hz = 125.0});
     timeline.append({.stream_epoch = 4,
                      .input_begin = 1'200,
                      .input_end = 1'400,
                      .output_begin = 100,
                      .output_end = 200,
                      .input_rate_hz = 10'000'000,
-                     .applied_correction_ppm = 3.0});
+                     .applied_correction_ppm = 3.0,
+                     .applied_cfo_correction_hz = 250.0});
 
     const auto middle = timeline.input_at_output(50);
     require(middle.has_value() && middle->input_sample == 1'100,
@@ -70,6 +72,9 @@ void test_resampler_timeline() {
     const auto average = timeline.average_correction(50, 150);
     require(average.has_value() && std::abs(*average - 2.0) < 1.0e-12,
             "weighted correction average");
+    const auto cfo = timeline.cfo_correction_at(125);
+    require(cfo.has_value() && *cfo == 250.0,
+            "frequency correction span lookup");
 
     timeline.discard_before(100);
     require(timeline.size() == 1, "discard completed spans");

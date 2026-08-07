@@ -35,7 +35,7 @@ pkg_check_modules(MPV REQUIRED IMPORTED_TARGET mpv)
 set(JSON_BuildTests OFF CACHE INTERNAL "Disable nlohmann/json tests")
 add_subdirectory(contrib/json EXCLUDE_FROM_ALL)
 
-add_subdirectory(contrib/liquid-resampler EXCLUDE_FROM_ALL)
+add_subdirectory(contrib/solid-resampler EXCLUDE_FROM_ALL)
 
 add_subdirectory(contrib/libfec EXCLUDE_FROM_ALL)
 
@@ -113,7 +113,7 @@ add_library(airspy-tv-dvbt STATIC
 )
 target_include_directories(airspy-tv-dvbt PUBLIC include)
 target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F airspy-tv-common
-    Threads::Threads PRIVATE liquid-resampler::liquid-resampler)
+    Threads::Threads PRIVATE solid-resampler::solid-resampler)
 
 add_executable(airspy-tv
     src/epg.cpp
@@ -174,16 +174,16 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME sample-timeline COMMAND sample-timeline-test)
 
-    add_executable(arbitrary-resampler-test
-        tests/arbitrary_resampler_test.cpp
+    add_executable(frequency-translating-resampler-test
+        tests/frequency_translating_resampler_test.cpp
     )
-    target_link_libraries(arbitrary-resampler-test PRIVATE
-        liquid-resampler::liquid-resampler)
+    target_link_libraries(frequency-translating-resampler-test PRIVATE
+        solid-resampler::solid-resampler)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(arbitrary-resampler-test PRIVATE
+        target_compile_options(frequency-translating-resampler-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
-    add_test(NAME arbitrary-resampler COMMAND arbitrary-resampler-test)
+    add_test(NAME frequency-translating-resampler COMMAND frequency-translating-resampler-test)
 
     add_executable(dvbt-inner-decoder-test
         tests/dvbt_inner_decoder_test.cpp
@@ -225,7 +225,8 @@ if(BUILD_TESTING)
         target_compile_options(dvbt-stream-decoder-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
-    foreach(STREAM_CASE clean worker-parity reset-new reset-hopeless reset-live
+    foreach(STREAM_CASE clean cfo-centering cfo-drift cfo-rebootstrap
+                        worker-parity reset-new reset-hopeless reset-live
                         reset-wait no-acq)
         add_test(NAME dvbt-stream-decoder-${STREAM_CASE}
                  COMMAND dvbt-stream-decoder-test)

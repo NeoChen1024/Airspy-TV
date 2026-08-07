@@ -1,8 +1,9 @@
-# liquid-dsp arbitrary resampler subset
+# solid-resampler
 
-This directory contains a narrow resampler implementation derived from the
-filter-design and complex/real dot-product techniques in
-[liquid-dsp](https://github.com/jgaeddert/liquid-dsp).
+The name is an engineering joke about the implementation's liquid-dsp origin.
+This directory contains a narrow frequency-translating arbitrary-rate
+resampler implementation derived from the filter-design and complex/real
+dot-product techniques in [liquid-dsp](https://github.com/jgaeddert/liquid-dsp).
 
 Upstream commit: `6bdbc8e79429c07275cc85a28688fb787ff44133`
 
@@ -18,9 +19,10 @@ The retained concepts are:
 
 Airspy-TV replaces liquid-dsp's input-driven mutable filter bank with a Q32.32
 output-driven scheduler. Output ranges are independent and run on a persistent
-worker pool. Only the common arbitrary resampler is included; liquid-dsp's
-buffers, logging, generic filters, FFT, modem, and other DSP modules are not
-vendored.
+worker pool. An optional output mixer provides phase-continuous frequency
+translation in the same output pass. Only this common resampler is included;
+liquid-dsp's buffers, logging, generic filters, FFT, modem, and other DSP
+modules are not vendored.
 
 Callers specify absolute input/output rates, passband and stopband edges, and a
 target attenuation. The implementation derives the Kaiser filter length from

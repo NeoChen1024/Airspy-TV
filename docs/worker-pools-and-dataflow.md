@@ -71,16 +71,16 @@ calculation.
 
 ## Threads and worker pools
 
-| Execution context | Responsibility | Ordering requirement |
-| --- | --- | --- |
-| Source callback/worker | Submit I/Q to spectrum, demodulator, and recorder | Must return promptly |
-| `dvbt-frontend` | Convert CS16, resample, and fill the sample ring | Serial input order |
-| Resampler pool | Process independent output ranges | Rejoined exactly before ring write |
-| `dvbt-demod` | Own acquisition, symbol position, carrier/timing loops, channel state, and TPS | Strict symbol order |
-| Symbol pool (`dvbt-sym-*`) | Reliability, MER, demap, deinterleave, and depuncture independent symbols | Results joined by sequence |
-| `dvbt-fec` | Own decoder regions, outer FEC, TS emission, and final stream-end delivery | Strict FEC/TS order |
-| Viterbi pool (`dvbt-vit-*`) | Decode overlapping mother-code windows | Results joined by sequence before outer FEC |
-| Recorder workers | Write raw I/Q or TS without blocking source/DSP workers | Preserve submitted byte order |
+| Execution context             | Responsibility                                                                 | Ordering requirement                        |
+| ----------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------- |
+| Source callback/worker        | Submit I/Q to spectrum, demodulator, and recorder                              | Must return promptly                        |
+| `dvbt-frontend`             | Convert CS16, resample, and fill the sample ring                               | Serial input order                          |
+| Resampler pool                | Process independent output ranges                                              | Rejoined exactly before ring write          |
+| `dvbt-demod`                | Own acquisition, symbol position, carrier/timing loops, channel state, and TPS | Strict symbol order                         |
+| Symbol pool (`dvbt-sym-*`)  | Reliability, MER, demap, deinterleave, and depuncture independent symbols      | Results joined by sequence                  |
+| `dvbt-fec`                  | Own decoder regions, outer FEC, TS emission, and final stream-end delivery     | Strict FEC/TS order                         |
+| Viterbi pool (`dvbt-vit-*`) | Decode overlapping mother-code windows                                         | Results joined by sequence before outer FEC |
+| Recorder workers              | Write raw I/Q or TS without blocking source/DSP workers                        | Preserve submitted byte order               |
 
 The named DVB-T threads are visible in tools such as `htop`. Pool instances
 are persistent for a compatible stream configuration; they are not recreated
@@ -218,16 +218,16 @@ contract.
 
 ## Queues and backpressure
 
-| Buffer | Policy | Current sizing |
-| --- | --- | --- |
-| StreamDecoder input | Live drop; offline block | About 0.2 s of source samples |
-| Resampled sample ring | Frontend blocks | About 0.2 s, minimum 1,048,576 complex samples |
-| Symbol/FEC-item queue | Demod blocks | About 0.2 s at current mode/bandwidth |
-| Viterbi task queue | Producer blocks | `max(2 * workers, 1024)` windows |
-| mpv TS queue | Drop oldest only at hard capacity; buffering hysteresis | 8 MiB capacity, 1 MiB low, 2 MiB resume |
-| Raw I/Q recorder | Drop/reject on recorder overload | At least 5 s from active sample rate |
-| TS recorder | Drop/reject on recorder overload | 24 MiB independent write queue |
-| Spectrum/pre-lock analyzer | Latest-data behavior | Display-oriented, not a history queue |
+| Buffer                     | Policy                                                  | Current sizing                                 |
+| -------------------------- | ------------------------------------------------------- | ---------------------------------------------- |
+| StreamDecoder input        | Live drop; offline block                                | About 0.2 s of source samples                  |
+| Resampled sample ring      | Frontend blocks                                         | About 0.2 s, minimum 1,048,576 complex samples |
+| Symbol/FEC-item queue      | Demod blocks                                            | About 0.2 s at current mode/bandwidth          |
+| Viterbi task queue         | Producer blocks                                         | `max(2 * workers, 1024)` windows             |
+| mpv TS queue               | Drop oldest only at hard capacity; buffering hysteresis | 8 MiB capacity, 1 MiB low, 2 MiB resume        |
+| Raw I/Q recorder           | Drop/reject on recorder overload                        | At least 5 s from active sample rate           |
+| TS recorder                | Drop/reject on recorder overload                        | 24 MiB independent write queue                 |
+| Spectrum/pre-lock analyzer | Latest-data behavior                                    | Display-oriented, not a history queue          |
 
 The mpv queue and TS-recorder queue serve different purposes and must not
 share watermarks. An empty playback queue is not itself a transport
@@ -293,20 +293,20 @@ DVB-T-specific diagnostics.
 
 ## Code map
 
-| Concern | Primary files |
-| --- | --- |
-| Session and demodulator lifecycle | `src/receiver_session.cpp`, `src/receiver_session.hpp`, `include/airspy_tv/demodulator.hpp` |
-| Source fan-out and common snapshots | `src/sdr.cpp`, `include/airspy_tv/sdr.hpp` |
-| StreamDecoder coordination and public stats | `src/dvbt/stream_decoder.cpp`, `include/airspy_tv/dvbt/stream_decoder.hpp` |
-| Frontend, demod session, tracking, and output helpers | `src/dvbt/stream_decoder_frontend.hpp`, `src/dvbt/stream_decoder_demod*.hpp` |
-| OFDM acquisition and resampling | `src/dvbt/ofdm_acquisition.cpp`, `include/airspy_tv/dvbt/ofdm_acquisition.hpp` |
-| TPS and inner decoding | `src/dvbt/tps_decoder.cpp`, `src/dvbt/inner_decoder.cpp`, `src/dvbt/soft_demapper.cpp` |
-| FEC queue and transport decoder | `src/dvbt/stream_decoder_fec.hpp`, `src/dvbt/transport_decoder.cpp` |
-| Viterbi pool/backend selection | `src/fec/soft_viterbi.cpp`, `include/airspy_tv/fec/soft_viterbi.hpp` |
-| Outer FEC | `src/fec/outer_fec.cpp`, `include/airspy_tv/fec/outer_fec.hpp` |
-| Signal snapshot publication/fallback | `src/dvbt/analysis_publisher.cpp`, `src/dvbt/signal_analyzer.cpp` |
-| Playback and discontinuities | `src/mpv_player.cpp`, `include/airspy_tv/mpv_player.hpp`, `include/airspy_tv/transport_stream.hpp` |
-| Raw/TS recording | `src/recorder.cpp`, `include/airspy_tv/recorder.hpp` |
+| Concern                                               | Primary files                                                                                            |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Session and demodulator lifecycle                     | `src/receiver_session.cpp`, `src/receiver_session.hpp`, `include/airspy_tv/demodulator.hpp`        |
+| Source fan-out and common snapshots                   | `src/sdr.cpp`, `include/airspy_tv/sdr.hpp`                                                           |
+| StreamDecoder coordination and public stats           | `src/dvbt/stream_decoder.cpp`, `include/airspy_tv/dvbt/stream_decoder.hpp`                           |
+| Frontend, demod session, tracking, and output helpers | `src/dvbt/stream_decoder_frontend.hpp`, `src/dvbt/stream_decoder_demod*.hpp`                         |
+| OFDM acquisition and resampling                       | `src/dvbt/ofdm_acquisition.cpp`, `include/airspy_tv/dvbt/ofdm_acquisition.hpp`                       |
+| TPS and inner decoding                                | `src/dvbt/tps_decoder.cpp`, `src/dvbt/inner_decoder.cpp`, `src/dvbt/soft_demapper.cpp`             |
+| FEC queue and transport decoder                       | `src/dvbt/stream_decoder_fec.hpp`, `src/dvbt/transport_decoder.cpp`                                  |
+| Viterbi pool/backend selection                        | `src/fec/soft_viterbi.cpp`, `include/airspy_tv/fec/soft_viterbi.hpp`                                 |
+| Outer FEC                                             | `src/fec/outer_fec.cpp`, `include/airspy_tv/fec/outer_fec.hpp`                                       |
+| Signal snapshot publication/fallback                  | `src/dvbt/analysis_publisher.cpp`, `src/dvbt/signal_analyzer.cpp`                                    |
+| Playback and discontinuities                          | `src/mpv_player.cpp`, `include/airspy_tv/mpv_player.hpp`, `include/airspy_tv/transport_stream.hpp` |
+| Raw/TS recording                                      | `src/recorder.cpp`, `include/airspy_tv/recorder.hpp`                                                 |
 
 ## Remaining architecture work
 

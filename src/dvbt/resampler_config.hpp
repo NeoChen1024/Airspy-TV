@@ -1,13 +1,13 @@
 #pragma once
 
-#include "liquid_resampler/arbitrary_resampler.hpp"
+#include "solid_resampler/frequency_translating_resampler.hpp"
 
 #include <algorithm>
 #include <cstdint>
 
 namespace airspy_tv::dvbt {
 
-[[nodiscard]] inline liquid_resampler::ResamplerConfig
+[[nodiscard]] inline solid_resampler::ResamplerConfig
 make_resampler_config(const std::uint32_t input_rate_hz,
                       const std::uint32_t channel_bandwidth_hz) {
     constexpr double active_carrier_edge_fraction = 3408.0 / 8192.0;

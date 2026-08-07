@@ -16,6 +16,10 @@ struct OfdmAcquisition {
     std::size_t fft_size{};
     std::size_t guard_size{};
     std::complex<float> phase{};
+    float fractional_cfo_phase_per_sample{};
+    float total_cfo_phase_per_sample{};
+    int carrier_offset{};
+    int pilot_phase{};
     float score{};
     TransmissionMode mode{TransmissionMode::k8};
     GuardInterval guard{GuardInterval::gi_1_4};
@@ -54,6 +58,7 @@ resample_cs16(std::span<const std::int16_t> interleaved_iq,
 // transmission modes and guard intervals.
 [[nodiscard]] OfdmAcquisition
 acquire_ofdm(std::span<const std::complex<float>> samples,
-             const ReceiverParameters &parameters);
+             const ReceiverParameters &parameters,
+             bool search_carrier_offset = true);
 
 } // namespace airspy_tv::dvbt

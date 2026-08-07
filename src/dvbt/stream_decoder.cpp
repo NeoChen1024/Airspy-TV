@@ -10,9 +10,10 @@
 #include "airspy_tv/dvbt/tps_decoder.hpp"
 #include "airspy_tv/fftw_plan.hpp"
 #include "airspy_tv/thread_name.hpp"
-#include "liquid_resampler/arbitrary_resampler.hpp"
+#include "solid_resampler/frequency_translating_resampler.hpp"
 
 #include "absolute_sample_ring.hpp"
+#include "ofdm_carrier.hpp"
 #include "resampler_config.hpp"
 
 #include <fftw3.h>
@@ -28,6 +29,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -158,6 +160,24 @@ resampler_quantum_samples(const std::uint32_t sample_rate_hz) noexcept {
                                         resampler_quantum_denominator);
 }
 
+[[nodiscard]] std::size_t
+bootstrap_input_samples(const std::uint32_t input_rate_hz,
+                        const std::uint32_t bandwidth_hz) noexcept {
+    if (input_rate_hz == 0 || bandwidth_hz == 0) {
+        return 0;
+    }
+    // Leave enough preview output beyond the acquisition window to absorb the
+    // FIR startup transient without making bootstrap depend on caller blocks.
+    constexpr std::size_t preview_margin_samples = 16'384;
+    const auto output_samples =
+        static_cast<long double>(acquisition_samples + preview_margin_samples);
+    const long double output_rate =
+        static_cast<long double>(bandwidth_hz) * 8.0L / 7.0L;
+    return static_cast<std::size_t>(
+        std::ceil(output_samples * static_cast<long double>(input_rate_hz) /
+                  output_rate));
+}
+
 [[nodiscard]] std::uint64_t
 sro_fixed_delay_samples(const std::uint32_t input_rate_hz,
                         const std::uint32_t bandwidth_hz) noexcept {
@@ -183,6 +203,10 @@ sro_fixed_delay_samples(const std::uint32_t input_rate_hz,
 // input chunk).
 constexpr std::size_t stats_window_symbols = 400;
 constexpr std::size_t analysis_interval_symbols = 32;
+constexpr float cfo_rebootstrap_phase_threshold =
+    0.75F * std::numbers::pi_v<float>;
+constexpr std::size_t cfo_rebootstrap_freeze_symbols =
+    static_cast<std::size_t>(2) * 68U;
 // MER gate window: one TPS superframe (68 symbols). Windows whose mean MER
 // falls below the constellation's decode floor are dropped and bracket a
 // fresh FEC trellis at the region edges.
@@ -194,32 +218,6 @@ constexpr std::array continual_2k{
     1140, 1146, 1206, 1269, 1323, 1377, 1491, 1683, 1704};
 constexpr std::array tps_2k{34,  50,   209,  346,  413,  569,  595,  688, 790,
                             901, 1073, 1219, 1262, 1286, 1469, 1594, 1687};
-
-[[nodiscard]] constexpr std::array<std::uint8_t, 6817> make_prbs() {
-    std::array<std::uint8_t, 6817> result{};
-    std::uint32_t state = 0x7ffU;
-    for (auto &bit : result) {
-        bit = static_cast<std::uint8_t>(state & 1U);
-        state = (state >> 1U) | ((((state >> 2U) ^ state) & 1U) << 10U);
-    }
-    return result;
-}
-constexpr auto prbs = make_prbs();
-
-[[nodiscard]] std::complex<float>
-carrier(const std::span<const std::complex<float>> fft, const std::size_t index,
-        const std::size_t maximum, const int offset) {
-    const auto bin = static_cast<std::ptrdiff_t>(index) -
-                     static_cast<std::ptrdiff_t>(maximum / 2) + offset;
-    const auto wrapped = (bin + static_cast<std::ptrdiff_t>(fft.size())) %
-                         static_cast<std::ptrdiff_t>(fft.size());
-    return fft[static_cast<std::size_t>(wrapped)];
-}
-
-struct PilotLock {
-    int phase{};
-    int offset{};
-};
 
 constexpr std::size_t timing_pilot_spacing = 12;
 constexpr std::size_t timing_filter_history_size = 7;
@@ -307,43 +305,6 @@ constexpr double timing_outlier_limit_samples = 24.0;
 // several radians at the edge of the 8K carrier grid.
 #include "timing_slope_tracker.hpp"
 
-[[nodiscard]] PilotLock
-lock_pilots(const std::span<const std::complex<float>> fft,
-            const std::size_t maximum, const int previous_offset) {
-    PilotLock best;
-    float best_score = -1.0F;
-    const int radius =
-        previous_offset == std::numeric_limits<int>::max() ? 48 : 2;
-    const int center = previous_offset == std::numeric_limits<int>::max()
-                           ? 0
-                           : previous_offset;
-    for (int offset = center - radius; offset <= center + radius; ++offset) {
-        for (int phase = 0; phase < 4; ++phase) {
-            std::complex<float> correlation{};
-            float score = 0.0F;
-            std::size_t chunk_count = 0;
-            for (auto pilot = static_cast<std::size_t>(phase) * 3U;
-                 pilot <= maximum; pilot += 12) {
-                const float value =
-                    prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
-                correlation +=
-                    value * std::conj(carrier(fft, pilot, maximum, offset));
-                if (++chunk_count == 8) {
-                    score += std::norm(correlation);
-                    correlation = {};
-                    chunk_count = 0;
-                }
-            }
-            score += std::norm(correlation);
-            if (score > best_score) {
-                best_score = score;
-                best = {phase, offset};
-            }
-        }
-    }
-    return best;
-}
-
 // Phase-only re-lock at a fixed carrier offset, used while the fade
 // indicator is marginal (0.25 < fi <= 0.5): the grid is still up but the
 // channel is degraded enough that a full offset search is noise-driven and
@@ -390,12 +351,14 @@ lock_phase_at_offset(const std::span<const std::complex<float>> fft,
                  pilot <= maximum; pilot += 12) {
                 if (previous_pilot != std::numeric_limits<std::size_t>::max()) {
                     const auto left =
-                        carrier(fft, previous_pilot, maximum, offset);
-                    const auto right = carrier(fft, pilot, maximum, offset);
-                    const float left_value =
-                        prbs[previous_pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+                        active_carrier(fft, previous_pilot, maximum, offset);
+                    const auto right =
+                        active_carrier(fft, pilot, maximum, offset);
+                    const float left_value = pilot_prbs[previous_pilot] == 0U
+                                                 ? 4.0F / 3.0F
+                                                 : -4.0F / 3.0F;
                     const float right_value =
-                        prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+                        pilot_prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
                     if (std::norm(left) > 0.0F && std::norm(right) > 0.0F) {
                         const double difference =
                             std::arg(right * std::conj(left) *
@@ -420,12 +383,13 @@ lock_phase_at_offset(const std::span<const std::complex<float>> fft,
         }
         for (auto pilot = static_cast<std::size_t>(phase) * 3U;
              pilot <= maximum; pilot += 12) {
-            const float value = prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+            const float value =
+                pilot_prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
             const auto dephase =
                 static_cast<float>(dephase_slope * static_cast<double>(pilot));
             correlation +=
                 value * std::conj(std::polar(1.0F, dephase) *
-                                  carrier(fft, pilot, maximum, offset));
+                                  active_carrier(fft, pilot, maximum, offset));
             if (++chunk_count == 8) {
                 score += std::norm(correlation);
                 correlation = {};
@@ -453,7 +417,7 @@ lock_phase_at_offset(const std::span<const std::complex<float>> fft,
 #include "fec_stage_item.hpp"
 #include "ofdm_tracking_state.hpp"
 
-struct StreamDecoder::Impl {
+struct StreamDecoder::Impl { // NOLINT(clang-analyzer-optin.performance.Padding)
     struct Block {
         std::vector<std::int16_t> samples;
         std::uint32_t rate{};
@@ -472,6 +436,16 @@ struct StreamDecoder::Impl {
         double target_ppm{};
     };
 
+    struct ScheduledCfoCommand {
+        std::uint64_t generation{};
+        std::uint64_t source_epoch{};
+        std::uint64_t command_output_sample{};
+        std::uint64_t command_input_sample{};
+        std::uint64_t effective_input_sample{};
+        std::uint64_t fixed_delay_samples{};
+        double target_hz{};
+    };
+
     // Acquisition result published by the front-end thread. `version` is
     // bumped only when the demod must act: mode/guard changes (cold re-anchor)
     // or a boundary shift beyond the alignment tolerance (the demod's grid
@@ -481,7 +455,7 @@ struct StreamDecoder::Impl {
         bool valid{false};
         std::uint64_t version{0};
         std::uint64_t start_pos{0};
-        std::complex<float> phase{};
+        int acquisition_pilot_phase{};
         float score{};
         TransmissionMode mode{TransmissionMode::k8};
         GuardInterval guard{GuardInterval::gi_1_4};
@@ -515,6 +489,7 @@ struct StreamDecoder::Impl {
     SyncState sync;
     dsp::ResamplerRateTimeline resampler_timeline;
     std::deque<ScheduledSroCommand> scheduled_sro_commands;
+    std::deque<ScheduledCfoCommand> scheduled_cfo_commands;
     // The most recent block's bandwidth, published by the front-end; the demod
     // reads it when it runs its event-driven acquisitions (the resampled rate
     // = bandwidth * 8/7 feeds the sync + realtime stats).
@@ -545,6 +520,10 @@ struct StreamDecoder::Impl {
     std::atomic<double> sro_resampler_command_ppm;
     std::atomic<double> sro_resampler_applied_ppm;
     std::atomic<bool> sro_resampler_ready;
+    std::atomic<double> cfo_resampler_command_hz;
+    std::atomic<double> cfo_resampler_applied_hz;
+    std::atomic<bool> cfo_resampler_ready;
+    std::atomic<bool> cfo_rebootstrap_requested{false};
     // Where each pipeline thread is parked, for diagnostics (see
     // WorkerState). Written by the owning thread, read lock-free by stats().
     std::atomic<int> frontend_state{static_cast<int>(WorkerState::idle)};
@@ -741,7 +720,6 @@ struct StreamDecoder::Impl {
         frontend.valid = false;
         frontend.fft_size = 0;
         frontend.guard_size = 0;
-        frontend.tracked_cfo_phase = 0.0F;
         frontend.residual_phase_ema = 0.0F;
         frontend.carrier_offset = std::numeric_limits<int>::max();
         frontend.previous_continual.clear();
@@ -813,7 +791,10 @@ struct StreamDecoder::Impl {
     static void demod_reset_stats_window(DemodRuntimeState &state);
     void demod_advance_symbol(DemodRuntimeState &state);
     [[nodiscard]] bool demod_maybe_reacquire(DemodRuntimeState &state);
-    void demod_execute_fft_and_track_cfo(DemodRuntimeState &state);
+    [[nodiscard]] bool demod_request_cfo_rebootstrap(DemodRuntimeState &state,
+                                                     const char *reason,
+                                                     float residual_phase);
+    void demod_execute_fft_and_measure_cfo(DemodRuntimeState &state);
     [[nodiscard]] std::optional<PilotLock>
     demod_lock_pilots(DemodRuntimeState &state);
     [[nodiscard]] std::vector<std::complex<float>>
@@ -941,6 +922,11 @@ void StreamDecoder::request_reset() {
         impl_->sro_resampler_command_ppm.store(0.0, std::memory_order_relaxed);
         impl_->sro_resampler_applied_ppm.store(0.0, std::memory_order_relaxed);
         impl_->sro_resampler_ready.store(false, std::memory_order_relaxed);
+        impl_->cfo_resampler_command_hz.store(0.0, std::memory_order_relaxed);
+        impl_->cfo_resampler_applied_hz.store(0.0, std::memory_order_relaxed);
+        impl_->cfo_resampler_ready.store(false, std::memory_order_relaxed);
+        impl_->cfo_rebootstrap_requested.store(false,
+                                               std::memory_order_release);
         const std::uint64_t generation =
             impl_->latest_generation.fetch_add(1) + 1;
         impl_->reset_request_generation = generation;
@@ -948,6 +934,7 @@ void StreamDecoder::request_reset() {
         impl_->queue.clear();
         impl_->fec_queue.clear();
         impl_->scheduled_sro_commands.clear();
+        impl_->scheduled_cfo_commands.clear();
         impl_->resampler_timeline.clear();
         impl_->queued_complex_samples = 0;
         impl_->sync.valid = false;
@@ -1040,6 +1027,12 @@ StreamDecoderStats StreamDecoder::stats() const {
         impl_->sro_resampler_applied_ppm.load(std::memory_order_relaxed));
     statistics.sro_resampler_ready =
         impl_->sro_resampler_ready.load(std::memory_order_relaxed);
+    statistics.cfo_resampler_command_hz = static_cast<float>(
+        impl_->cfo_resampler_command_hz.load(std::memory_order_relaxed));
+    statistics.cfo_resampler_applied_hz = static_cast<float>(
+        impl_->cfo_resampler_applied_hz.load(std::memory_order_relaxed));
+    statistics.cfo_resampler_ready =
+        impl_->cfo_resampler_ready.load(std::memory_order_relaxed);
     statistics.processing = impl_->frontend_busy || impl_->demod_busy ||
                             impl_->fec_worker_busy || !impl_->queue.empty() ||
                             !impl_->fec_queue.empty();

@@ -15,6 +15,8 @@ The production baseline now includes:
 - feedback-debiased physical timing and SRO telemetry;
 - variable-rate resampler correction as the sole long-term SRO actuator;
 - independent sample-clock and LO/CFO tracking;
+- acquisition-only frontend CFO centering with sample-stamped residual-CFO
+  feedback;
 - adaptive CIR-based FFT-window placement;
 - synthetic sample-clock and LO drift generation and validation tools.
 
@@ -238,7 +240,133 @@ cost, output-rate error, block-boundary continuity, and queue pressure. Do not
 adopt a fractional path merely because it makes the displayed `tau`
 numerically closer to zero.
 
-### 4. Second-order clock model
+### 4. Frontend CFO centering
+
+Steady-state carrier correction now lives outside the serial DVB-T demod hot
+path in the optional frequency-translating stage of the common arbitrary
+resampler. SRO and CFO remain independent estimator states, commands, and
+telemetry even though they share the frontend worker pool.
+
+The production path uses a frontend bootstrap followed by acquisition-only
+carrier centering. The frontend temporarily retains the first raw source
+samples and runs a nominal-ratio preview resampler before the production
+resampler emits anything:
+
+```text
+raw source buffer
+    -> temporary nominal preview resampler
+    -> CP acquisition and corrected acquisition FFT
+    -> fractional CFO plus integer carrier-bin offset
+    -> configure production resampler frequency translation
+    -> replay the retained raw source buffer from its beginning
+    -> centered production sample ring
+```
+
+The preview and production resamplers use the same filter and nominal ratio and
+both begin from reset phase/history. Frequency translation does not change
+sample timing, so the preview symbol position maps directly into the replayed
+production output. The production demod starts at the predicted position,
+seeds the acquisition pilot phase, fixes the carrier-bin offset at zero, and
+performs only centered-stream phase/timing validation. Re-acquisition within an
+already centered production stream disables the wide integer-bin search.
+
+This startup path must satisfy the following invariants:
+
+- no uncentered preview sample is published into the production ring;
+- the retained raw buffer is replayed, so startup centering does not discard
+  source samples or add the steady-state command horizon to startup latency;
+- CP acquisition estimates fractional CFO and an acquisition-local corrected
+  FFT plus wide pilot search determines the integer carrier-bin offset;
+- bootstrap publishes the combined initial CFO in hertz, mode, guard interval,
+  predicted symbol position, and pilot phase;
+- steady-state FFT input is already centered, so payload demodulation uses zero
+  carrier-bin offset and no per-symbol time-domain NCO rotation;
+- the production demod only performs centered-stream timing/pilot validation;
+- continual pilots measure residual CFO, and the demod schedules a future
+  frontend frequency command instead of updating a local oscillator.
+
+Direct CP acquisition at an arbitrary raw source rate is intentionally avoided:
+the useful-symbol lag is generally fractional in source samples. The temporary
+preview resampler is an acquisition tool and is reset and discarded after
+bootstrap; it is not a second continuous DSP path.
+
+The common resampler exposes frequency translation as an optional
+standard-neutral actuator. Its Q0.64 mixer phase persists across ratio and
+frequency updates, parallel output ranges are seeded from the same absolute
+output phase, and the oscillator resets only with the resampler stream state.
+Translation is fused after each FIR output, avoiding an additional memory
+pass. A zero command remains bit-identical to the unmixed path. The DVB-T
+passband-to-stopband transition is substantially wider than the acquisition
+CFO range, so the anti-alias filter does not need a pre-FIR mixer for the
+supported acquisition range.
+
+Only steady-state tracking uses delayed sample-domain command scheduling.
+Initial centering is installed before production replay. The resampler timeline
+retains the correction that generated each output span. The absolute CFO
+estimator is:
+
+```text
+estimated_cfo_hz = applied_frontend_shift_hz + measured_residual_cfo_hz
+```
+
+Steady-state commands are stamped with their measurement/output position,
+mapped back to the source timeline, and activated beyond the same bounded
+frontend horizon used for SRO control. A newer unapplied steady-state command
+supersedes an older one, while telemetry keeps the latest scheduled command
+separate from the effective sample of the command most recently applied. If a
+second-order CFO state is enabled later, extrapolate the estimate to the
+activation sample so a slow thermal drift is not corrected with a stale value.
+Do not infer CFO from SRO or assume a shared hardware reference.
+
+Normal TCXO drift is expected to remain slow enough that the residual during
+the fixed command delay is a small fraction of one subcarrier. Sudden frequency
+jumps, an implausible drift rate, loss of pilot confidence, or residual CFO
+approaching the estimator's unambiguous range are discontinuities: freeze the
+controller and return to acquisition rather than widening the tracking loop.
+
+Abrupt or out-of-range CFO now returns to the same cold frontend bootstrap.
+The demodulator only raises a rebootstrap request; the frontend owns the
+transition and performs it at a raw-input quantum boundary:
+
+1. stop publishing samples produced with the old frequency correction;
+2. advance the decoder generation and retag queued future raw blocks;
+3. preserve and prepend the unprocessed suffix of the active raw block;
+4. discard the old centered ring, resampler timeline, delayed SRO/CFO
+   commands, and queued FEC work;
+5. reset the production resampler, publish invalid sync, and emit a transport
+   discontinuity so demod/FEC state cannot concatenate across the jump;
+6. run the full preview acquisition, including wide integer-bin search, then
+   replay the retained future raw samples with the newly acquired correction.
+
+The direct trigger is a healthy continual-pilot correlation whose raw temporal
+phase reaches `0.75*pi`, before the residual estimator becomes ambiguous. A
+second trigger accumulates recovery symbols across short local re-anchors and
+returns to bootstrap after two TPS frames (136 symbols) of persistent bad lock
+or frozen recovery. Recovery evidence is cleared only after a sustained
+healthy interval, so a boundary-only re-anchor cannot indefinitely hide an
+integer-bin CFO jump.
+
+Current stats, GUI diagnostics, debug output, and JSONL records expose the
+acquisition fractional CFO and integer-bin offset, combined
+acquisition/estimated/residual CFO, commanded and applied frontend correction,
+the latest command position, the last applied command's effective and actual
+input positions, fixed delay, late scheduling, pending commands, bootstrap
+attempts, replayed input samples, retained peak samples, rebootstrap
+request/completion counts, the last trigger residual, and its source/output
+sample coordinates.
+
+Focused coverage now verifies zero-shift identity, mixer phase continuity
+across blocks, command updates and worker partitions, both frequency-shift
+signs, initial fractional plus multi-bin offsets, fragmented bootstrap input,
+raw-buffer replay through successful TS recovery, zero production carrier-bin
+offset, and a slow linear LO drift reaching the sample-stamped frontend
+actuator. Remaining work is real-capture validation, simultaneous non-zero SRO
+and CFO ramps, fades/retunes during bootstrap, and 2K coverage. Synthetic
+coverage now includes a continuous mid-stream integer-plus-fractional CFO jump,
+generation/discontinuity handling, raw-suffix replay, reacquisition of the new
+CFO, and post-jump TS recovery.
+
+### 5. Second-order clock model
 
 The current loop handles an approximately constant sample-clock offset but
 does not explicitly estimate a changing drift rate. Prototype an opt-in model
@@ -253,7 +381,7 @@ tracking. Compare it against the current loop on constant offsets, linear
 ppm/minute ramps, reversals, and long real captures before considering a new
 default.
 
-### 5. Sample-clock and LO-clock relationship
+### 6. Sample-clock and LO-clock relationship
 
 Treat SRO and CFO as independent estimator states and independent control loops
 without exception. Do not rely on a shared hardware reference and do not add
@@ -294,8 +422,11 @@ queue watermarks, and dropped blocks.
 4. Run the remaining 2K, queue-pressure, retune, and ramping/reversal matrix
    against the variable-rate resampler path.
 5. Characterize the marginal-signal FEC delta against a same-build baseline.
-6. Evaluate the second-order SRO loop behind a separate opt-in setting.
-7. Repeat the full regression matrix after each controller change.
+6. Validate frontend CFO centering on the retained real captures, 2K mode,
+   retunes/fades, simultaneous SRO/CFO ramps, and abrupt-change bootstrap.
+7. Evaluate the second-order SRO and CFO predictors behind separate opt-in
+   settings.
+8. Repeat the full regression matrix after each controller change.
 
 ## Acceptance criteria
 
@@ -307,8 +438,17 @@ Any timing-loop change must satisfy all of the following:
 - correct recovery after genuine fades and signal loss;
 - no regression on 557/581 MHz captures or synthetic SRO/CFO fixtures;
 - no unexplained bias across actuator or CIR-placement changes;
-- continuous arbitrary-resampler phase and FIR state across input block
+- continuous frequency-translating resampler phase and FIR state across input block
   boundaries;
+- continuous frontend mixer phase across input blocks, worker partitions, SRO
+  changes, and CFO command changes;
+- no preview output in the production ring and no source-sample loss across
+  bootstrap replay;
+- preview and production resampling produce the same initial symbol coordinate;
+- zero carrier-bin offset and no steady-state demod NCO after initial frontend
+  centering;
+- bounded residual CFO over the fixed command delay, with abrupt changes routed
+  to acquisition;
 - bounded output-rate error for constant, ramping, and reversing SRO;
 - scalar and enabled SIMD resampler paths remain numerically equivalent within
   the defined FIR tolerance;

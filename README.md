@@ -82,7 +82,7 @@ Required system libraries:
 - a C++20 compiler and CMake 3.25 or newer
 
 Dear ImGui, nlohmann/json, tinycolormap, and ViterbiDecoderCpp are pinned under
-`contrib/` as Git submodules. Minimized MIT-licensed arbitrary-resampler and
+`contrib/` as Git submodules. The minimized MIT-licensed solid-resampler and
 LGPL-licensed libfec Reed-Solomon subsets are vendored directly under
 `contrib/`.
 
@@ -137,12 +137,12 @@ metadata. Bare `.cs16` and `.iq` files are also supported and use the
 INT16_IQ layout produced by `airspy_rx -t 2`; specify their sample rate and
 center frequency manually.
 
-| Input | Metadata | Playback behavior |
-|---|---|---|
-| Airspy native | Device/driver supplied | Live |
-| SoapySDR | Device/driver supplied | Live |
-| Airspy TV `.json` sidecar | Sample rate, center frequency, data filename | Real time |
-| Bare `.cs16` / `.iq` | Enter sample rate and center frequency manually | Real time |
+| Input                      | Metadata                                        | Playback behavior |
+| -------------------------- | ----------------------------------------------- | ----------------- |
+| Airspy native              | Device/driver supplied                          | Live              |
+| SoapySDR                   | Device/driver supplied                          | Live              |
+| Airspy TV`.json` sidecar | Sample rate, center frequency, data filename    | Real time         |
+| Bare`.cs16` / `.iq`    | Enter sample rate and center frequency manually | Real time         |
 
 The raw I/Q recorder has a five-second queue and the full-MPTS recorder has an
 independent 24 MiB write queue. DSP queues retain approximately 200 ms of their

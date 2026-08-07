@@ -73,7 +73,6 @@ struct StreamDecoderStats { // NOLINT(clang-analyzer-optin.performance.Padding)
     float demod_ring_copy_time_ms{};
     float demod_fft_cfo_time_ms{};
     // Nested breakdown of demod_fft_cfo_time_ms.
-    float demod_nco_rotate_time_ms{};
     float demod_fft_execute_time_ms{};
     float demod_cfo_track_time_ms{};
     float demod_fft_cfo_other_time_ms{};
@@ -113,7 +112,31 @@ struct StreamDecoderStats { // NOLINT(clang-analyzer-optin.performance.Padding)
     std::uint64_t pilot_phase_discontinuities{};
     bool state_carried{};
     bool fec_skipped{};
+    float acquisition_fractional_cfo_hz{};
+    float acquisition_cfo_hz{};
+    int acquisition_carrier_bin_offset{};
+    std::uint64_t bootstrap_attempts{};
+    std::uint64_t bootstrap_replayed_input_samples{};
+    std::uint64_t bootstrap_retained_peak_samples{};
     float tracked_carrier_offset_hz{};
+    bool cfo_resampler_ready{};
+    float cfo_resampler_command_hz{};
+    float cfo_resampler_applied_hz{};
+    std::uint64_t cfo_command_output_sample{};
+    std::uint64_t cfo_command_input_sample{};
+    std::uint64_t cfo_effective_input_sample{};
+    std::uint64_t cfo_applied_effective_input_sample{};
+    std::uint64_t cfo_applied_input_sample{};
+    std::uint64_t cfo_applied_output_sample{};
+    std::uint64_t cfo_schedule_late_samples{};
+    std::uint64_t cfo_fixed_delay_samples{};
+    std::uint32_t cfo_input_sample_rate_hz{};
+    std::size_t cfo_pending_commands{};
+    std::uint64_t cfo_rebootstrap_requests{};
+    std::uint64_t cfo_rebootstrap_count{};
+    float cfo_rebootstrap_last_residual_hz{};
+    std::uint64_t cfo_rebootstrap_output_sample{};
+    std::uint64_t cfo_rebootstrap_source_sample{};
     std::size_t acquisition_start{};
     // Timing-loop telemetry for the most recently published statistics
     // window. Raw timing is the latest wrapped pilot-slope observation;
@@ -181,9 +204,10 @@ struct StreamDecoderStats { // NOLINT(clang-analyzer-optin.performance.Padding)
 // Asynchronous CS16-to-TS receiver on a continuous three-stage pipeline:
 // a front-end thread runs the streaming resampler (one persistent liquid
 // filter state, no per-chunk warmup) and an event-driven acquisition monitor;
-// a demod thread extracts a fully contiguous symbol stream (carried CFO,
-// carrier, continual-reference, and TPS superframe state — re-seeded only on
-// cold starts) through ordered symbol workers and a windowed MER gate; a
+// a demod thread extracts a fully contiguous, frontend-centered symbol stream
+// (residual CFO tracking, continual-reference, and TPS superframe state —
+// re-seeded only on cold starts) through ordered symbol workers and a windowed
+// MER gate; a
 // stateful transport worker feeds the Viterbi pool, RS decoder, and TS output.
 // The demodulator owns its GUI analysis path (SignalAnalyzer), which is fed
 // from the same input on submit().

@@ -56,12 +56,13 @@ struct DemodRuntimeState {
     std::uint64_t seen_sync_version{};
     bool have_grid{};
     std::uint64_t next_symbol_start{};
-    float nco_phase{};
     std::uint64_t symbol_count{};
     std::uint64_t analysis_symbol_count{};
     float latest_cp_snr_db{};
     float latest_deepest_notch_db{};
     std::uint64_t frozen_symbol_count{};
+    std::uint64_t cfo_recovery_symbol_count{};
+    std::uint64_t cfo_healthy_symbol_count{};
     std::uint64_t hopeless_window_count{};
     int stable_pending_offset{std::numeric_limits<int>::max()};
     int stable_pending_count{};
@@ -81,7 +82,6 @@ struct DemodRuntimeState {
     double ring_wait_time_sum_ms{};
     double ring_copy_time_sum_ms{};
     double fft_cfo_time_sum_ms{};
-    double nco_rotate_time_sum_ms{};
     double fft_execute_time_sum_ms{};
     double cfo_track_time_sum_ms{};
     double pilot_lock_time_sum_ms{};

@@ -1,7 +1,8 @@
 // State carried exclusively by the demod thread between OFDM symbols.
 // Continuous front-end tracking state owned by the demod thread and
 // carried for the life of a stream. The resampled symbol stream is
-// contiguous (no overlap rewind), so the CFO loop, carrier search,
+// contiguous (no overlap rewind), so the residual CFO loop, centered pilot
+// validation,
 // continual-carrier reference, AND TPS superframe decoder all carry
 // continuously; they are re-seeded only on cold starts (mode/guard
 // changes or resets). The TPS carry is the key weak-signal win: with the
@@ -13,7 +14,6 @@ struct OfdmTrackingState {
     GuardInterval guard{GuardInterval::gi_1_4};
     std::size_t fft_size{};
     std::size_t guard_size{};
-    float tracked_cfo_phase{0.0F};
     float residual_phase_ema{0.0F};
     int carrier_offset{std::numeric_limits<int>::max()};
     // Values captured while the tracking was last healthy; a fade never

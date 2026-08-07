@@ -1843,6 +1843,77 @@ void draw_sidebar(AppState &state) {
                     state.dvbt.decoder.resampler_requested_ratio,
                     state.dvbt.decoder.resampler_effective_ratio);
             }
+            const bool cfo_resampler_ready =
+                state.dvbt.decoder.cfo_resampler_ready;
+            const std::string cfo_text =
+                cfo_resampler_ready
+                    ? std::format("{:+.1f} / {:+.1f} Hz",
+                                  state.dvbt.decoder.acquisition_cfo_hz,
+                                  state.dvbt.decoder.cfo_resampler_applied_hz)
+                    : "acquiring";
+            draw_bipolar_metric(
+                "CFO acq / applied", cfo_text.c_str(),
+                cfo_resampler_ready
+                    ? std::clamp(
+                          0.5F + state.dvbt.decoder.residual_carrier_offset_hz /
+                                     2000.0F,
+                          0.0F, 1.0F)
+                    : 0.5F,
+                ImVec4(0.62F, 0.78F, 1.0F, 1.0F));
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                const double scheduled_delay_ms =
+                    state.dvbt.decoder.cfo_input_sample_rate_hz != 0
+                        ? 1000.0 *
+                              static_cast<double>(
+                                  state.dvbt.decoder.cfo_fixed_delay_samples) /
+                              state.dvbt.decoder.cfo_input_sample_rate_hz
+                        : 0.0;
+                ImGui::SetTooltip(
+                    "Initial CFO is acquired before production samples enter "
+                    "the ring; steady-state residual CFO is fed back to the "
+                    "same common resampler independently of SRO.\n"
+                    "Acquisition fractional %+.2f Hz, integer bins %+d.\n"
+                    "Estimated %+.2f Hz, residual %+.2f Hz, command %+.2f Hz.\n"
+                    "Bootstrap attempts %llu, replayed %llu samples, retained "
+                    "peak %llu samples.\n"
+                    "CFO rebootstrap %llu/%llu, last trigger %+.2f Hz at "
+                    "source/output %llu/%llu.\n"
+                    "Scheduled delay %.3f ms, late %llu samples, pending %zu.\n"
+                    "Latest command input %llu, target %llu. Last applied "
+                    "target %llu, actual %llu.",
+                    state.dvbt.decoder.acquisition_fractional_cfo_hz,
+                    state.dvbt.decoder.acquisition_carrier_bin_offset,
+                    state.dvbt.decoder.tracked_carrier_offset_hz,
+                    state.dvbt.decoder.residual_carrier_offset_hz,
+                    state.dvbt.decoder.cfo_resampler_command_hz,
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.bootstrap_attempts),
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.bootstrap_replayed_input_samples),
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.bootstrap_retained_peak_samples),
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.cfo_rebootstrap_count),
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.cfo_rebootstrap_requests),
+                    state.dvbt.decoder.cfo_rebootstrap_last_residual_hz,
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.cfo_rebootstrap_source_sample),
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.cfo_rebootstrap_output_sample),
+                    scheduled_delay_ms,
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.cfo_schedule_late_samples),
+                    state.dvbt.decoder.cfo_pending_commands,
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.cfo_command_input_sample),
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.cfo_effective_input_sample),
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.cfo_applied_effective_input_sample),
+                    static_cast<unsigned long long>(
+                        state.dvbt.decoder.cfo_applied_input_sample));
+            }
         }
         const auto ber_quality = [](const double ber) {
             return ber == 0.0

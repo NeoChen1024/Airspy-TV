@@ -14,7 +14,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <mutex>
+#include <numbers>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -389,6 +391,98 @@ make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F) {
     return result;
 }
 
+[[nodiscard]] std::vector<std::int16_t>
+apply_cfo_drift(const std::span<const std::int16_t> iq,
+                const double initial_cfo_hz,
+                const double cfo_drift_hz_per_second) {
+    require(iq.size() % 2U == 0U, "CFO input must contain complete I/Q pairs");
+    std::vector<std::int16_t> result(iq.size());
+    const auto sample_rate_hz = static_cast<double>(sample_rate);
+    const double phase_step =
+        2.0 * std::numbers::pi *
+        ((initial_cfo_hz / sample_rate_hz) +
+         (0.5 * cfo_drift_hz_per_second / (sample_rate_hz * sample_rate_hz)));
+    const double step_acceleration = 2.0 * std::numbers::pi *
+                                     cfo_drift_hz_per_second /
+                                     (sample_rate_hz * sample_rate_hz);
+    std::complex<double> oscillator{1.0, 0.0};
+    std::complex<double> oscillator_step = std::polar(1.0, phase_step);
+    const std::complex<double> oscillator_acceleration =
+        std::polar(1.0, step_acceleration);
+    for (std::size_t index = 0; index < iq.size() / 2U; ++index) {
+        const std::complex<double> input{
+            static_cast<double>(iq[2U * index]),
+            static_cast<double>(iq[(2U * index) + 1U])};
+        const auto shifted = input * oscillator;
+        const auto quantize = [](const double value) {
+            return static_cast<std::int16_t>(
+                std::clamp(std::lround(value), -32768L, 32767L));
+        };
+        result[2U * index] = quantize(shifted.real());
+        result[(2U * index) + 1U] = quantize(shifted.imag());
+        oscillator *= oscillator_step;
+        oscillator_step *= oscillator_acceleration;
+        if ((index & 4095U) == 4095U) {
+            const auto next_index = static_cast<double>(index + 1U);
+            const double next_time = next_index / sample_rate_hz;
+            oscillator = std::polar(1.0, 2.0 * std::numbers::pi *
+                                             ((initial_cfo_hz * next_time) +
+                                              (0.5 * cfo_drift_hz_per_second *
+                                               next_time * next_time)));
+            oscillator_step = std::polar(
+                1.0, 2.0 * std::numbers::pi *
+                         ((initial_cfo_hz / sample_rate_hz) +
+                          (cfo_drift_hz_per_second * (next_index + 0.5) /
+                           (sample_rate_hz * sample_rate_hz))));
+        }
+    }
+    return result;
+}
+
+[[nodiscard]] std::vector<std::int16_t>
+apply_cfo(const std::span<const std::int16_t> iq, const double cfo_hz) {
+    return apply_cfo_drift(iq, cfo_hz, 0.0);
+}
+
+[[nodiscard]] std::vector<std::int16_t>
+apply_cfo_step(const std::span<const std::int16_t> iq,
+               const std::size_t step_sample, const double initial_cfo_hz,
+               const double final_cfo_hz) {
+    std::vector<std::int16_t> result(iq.size());
+    double phase = 0.0;
+    for (std::size_t sample = 0; sample < iq.size() / 2U; ++sample) {
+        const double cfo_hz =
+            sample < step_sample ? initial_cfo_hz : final_cfo_hz;
+        const std::complex<double> oscillator = std::polar(1.0, phase);
+        const std::complex<double> value{
+            static_cast<double>(iq[sample * 2U]),
+            static_cast<double>(iq[(sample * 2U) + 1U])};
+        const auto shifted = value * oscillator;
+        result[sample * 2U] = static_cast<std::int16_t>(std::clamp(
+            std::lround(shifted.real()),
+            static_cast<long>(std::numeric_limits<std::int16_t>::min()),
+            static_cast<long>(std::numeric_limits<std::int16_t>::max())));
+        result[(sample * 2U) + 1U] = static_cast<std::int16_t>(std::clamp(
+            std::lround(shifted.imag()),
+            static_cast<long>(std::numeric_limits<std::int16_t>::min()),
+            static_cast<long>(std::numeric_limits<std::int16_t>::max())));
+        phase = std::remainder(phase + (2.0 * std::numbers::pi * cfo_hz /
+                                        static_cast<double>(sample_rate)),
+                               2.0 * std::numbers::pi);
+    }
+    return result;
+}
+
+[[nodiscard]] std::vector<std::int16_t>
+repeat_iq(const std::span<const std::int16_t> iq, const std::size_t count) {
+    std::vector<std::int16_t> result;
+    result.reserve(iq.size() * count);
+    for (std::size_t copy = 0; copy < count; ++copy) {
+        result.insert(result.end(), iq.begin(), iq.end());
+    }
+    return result;
+}
+
 struct DecodeResult {
     std::vector<std::uint8_t> transport;
     std::vector<TransportDiscontinuity> discontinuities;
@@ -549,6 +643,163 @@ void test_8k_clean_signal() {
             "8K finite stream did not report exactly one stream end");
 }
 
+void test_8k_frontend_cfo_centering() {
+    const auto encoded = encode_transport();
+    const auto clean_iq = make_iq(encoded.metrics);
+    constexpr std::array<std::size_t, 8> block_sizes{17,  4097,  12345, 8191,
+                                                     777, 16384, 251,   10003};
+    constexpr double subcarrier_spacing_hz =
+        static_cast<double>(sample_rate) / static_cast<double>(fft_size);
+    for (const auto [integer_bins, fractional_cfo_hz] :
+         {std::pair{5, 237.25}, std::pair{-7, -311.75}}) {
+        const double injected_cfo_hz =
+            (static_cast<double>(integer_bins) * subcarrier_spacing_hz) +
+            fractional_cfo_hz;
+        const auto shifted_iq = apply_cfo(clean_iq, injected_cfo_hz);
+        const auto serial = decode_in_blocks(shifted_iq, block_sizes, 1);
+        const auto parallel = decode_in_blocks(shifted_iq, block_sizes, 8);
+        require(has_known_run(serial.transport, encoded.transport),
+                "frontend CFO centering produced no serial TS run");
+        require(serial.transport == parallel.transport,
+                "nonzero-CFO output changed with resampler worker count");
+        require(serial.stats.carrier_bin_offset == 0 &&
+                    parallel.stats.carrier_bin_offset == 0,
+                "production demod retained an integer carrier offset");
+        require(serial.stats.cfo_resampler_ready &&
+                    parallel.stats.cfo_resampler_ready,
+                "frontend CFO actuator did not become ready");
+        require(serial.stats.bootstrap_attempts != 0 &&
+                    serial.stats.bootstrap_replayed_input_samples != 0 &&
+                    serial.stats.bootstrap_retained_peak_samples >=
+                        serial.stats.bootstrap_replayed_input_samples,
+                "frontend bootstrap replay telemetry is inconsistent");
+        require(std::abs(static_cast<double>(serial.stats.acquisition_cfo_hz) -
+                         injected_cfo_hz) < 30.0,
+                "bootstrap acquisition CFO does not match injected CFO");
+        require(serial.stats.acquisition_carrier_bin_offset == integer_bins &&
+                    std::abs(static_cast<double>(
+                                 serial.stats.acquisition_fractional_cfo_hz) -
+                             fractional_cfo_hz) < 30.0,
+                "bootstrap did not preserve integer/fractional CFO telemetry");
+        require(std::abs(
+                    static_cast<double>(serial.stats.cfo_resampler_applied_hz) -
+                    injected_cfo_hz) < 30.0,
+                "frontend resampler did not apply the acquired CFO");
+        require(std::abs(serial.stats.residual_carrier_offset_hz) < 50.0F,
+                "centered production stream retained excessive residual CFO");
+    }
+}
+
+void test_8k_frontend_cfo_drift_tracking() {
+    const auto encoded = encode_transport();
+    const auto repeated_iq = repeat_iq(make_iq(encoded.metrics), 20);
+    constexpr double subcarrier_spacing_hz =
+        static_cast<double>(sample_rate) / static_cast<double>(fft_size);
+    constexpr double initial_cfo_hz = (4.0 * subcarrier_spacing_hz) + 175.0;
+    constexpr double drift_hz_per_second = 60.0;
+    const auto shifted_iq =
+        apply_cfo_drift(repeated_iq, initial_cfo_hz, drift_hz_per_second);
+    constexpr std::array<std::size_t, 8> block_sizes{17,  4097,  12345, 8191,
+                                                     777, 16384, 251,   10003};
+    const auto result = decode_in_blocks(shifted_iq, block_sizes, 8);
+    require(has_known_run(result.transport, encoded.transport),
+            "slow CFO drift prevented TS recovery");
+    require(result.stats.cfo_fixed_delay_samples != 0,
+            "residual CFO tracker did not schedule a sample-domain command");
+    require(result.stats.cfo_input_sample_rate_hz == sample_rate,
+            "CFO scheduling telemetry lost the independent source rate");
+    require(result.stats.cfo_applied_input_sample >=
+                    result.stats.cfo_applied_effective_input_sample &&
+                result.stats.cfo_applied_effective_input_sample != 0,
+            "CFO correction did not honor its future activation sample");
+    require(result.stats.cfo_schedule_late_samples ==
+                result.stats.cfo_applied_input_sample -
+                    result.stats.cfo_applied_effective_input_sample,
+            "CFO late-scheduling telemetry is inconsistent");
+    require(std::abs(result.stats.cfo_resampler_command_hz -
+                     result.stats.acquisition_cfo_hz) > 5.0F,
+            "CFO command did not follow the injected slow drift");
+    require(std::abs(result.stats.cfo_resampler_applied_hz -
+                     result.stats.acquisition_cfo_hz) > 5.0F,
+            "scheduled CFO correction never reached the frontend resampler");
+    require(std::abs(result.stats.residual_carrier_offset_hz) < 150.0F,
+            "slow CFO drift escaped the residual tracking range");
+}
+
+void test_8k_frontend_abrupt_cfo_rebootstrap() {
+    const auto encoded = encode_transport();
+    constexpr std::size_t repetitions = 12;
+    const auto repeated_iq = repeat_iq(make_iq(encoded.metrics), repetitions);
+    constexpr double subcarrier_spacing_hz =
+        static_cast<double>(sample_rate) / static_cast<double>(fft_size);
+    constexpr double initial_cfo_hz = (4.0 * subcarrier_spacing_hz) + 175.0;
+    constexpr double final_cfo_hz = (-3.0 * subcarrier_spacing_hz) - 225.0;
+    const std::size_t step_sample = (repetitions / 2U) * symbols * symbol_size;
+    const auto shifted_iq =
+        apply_cfo_step(repeated_iq, step_sample, initial_cfo_hz, final_cfo_hz);
+    constexpr std::array<std::size_t, 8> block_sizes{17,  4097,  12345, 8191,
+                                                     777, 16384, 251,   10003};
+
+    std::vector<std::uint8_t> output;
+    std::vector<TransportDiscontinuity> discontinuities;
+    std::size_t post_rebootstrap_offset = 0;
+    std::mutex callback_mutex;
+    StreamDecoder decoder;
+    decoder.set_parameters({.channel_bandwidth_hz = channel_bandwidth,
+                            .mode = TransmissionMode::k8,
+                            .guard_interval = GuardInterval::gi_1_4,
+                            .constellation = Constellation::qpsk,
+                            .code_rate = CodeRate::rate_1_2,
+                            .worker_threads = 8});
+    decoder.set_transport_callback(
+        [&output, &callback_mutex](const std::span<const std::uint8_t> bytes) {
+            const std::scoped_lock lock(callback_mutex);
+            output.insert(output.end(), bytes.begin(), bytes.end());
+        });
+    decoder.set_discontinuity_callback(
+        [&output, &discontinuities, &post_rebootstrap_offset,
+         &callback_mutex](const TransportDiscontinuity discontinuity) {
+            const std::scoped_lock lock(callback_mutex);
+            discontinuities.push_back(discontinuity);
+            if (discontinuity == TransportDiscontinuity::retune) {
+                post_rebootstrap_offset = output.size();
+            }
+        });
+
+    submit_in_blocks(decoder, shifted_iq, block_sizes);
+    decoder.flush();
+    decoder.wait_until_idle();
+    const auto stats = decoder.stats();
+    std::span<const std::uint8_t> post_rebootstrap{output};
+    if (post_rebootstrap_offset < output.size()) {
+        post_rebootstrap = post_rebootstrap.subspan(post_rebootstrap_offset);
+    }
+
+    require(stats.cfo_rebootstrap_requests >= 1 &&
+                stats.cfo_rebootstrap_count >= 1,
+            "abrupt CFO did not return to frontend bootstrap");
+    require(stats.cfo_rebootstrap_count <= stats.cfo_rebootstrap_requests,
+            "CFO rebootstrap completion accounting is inconsistent");
+    require(std::count(discontinuities.begin(), discontinuities.end(),
+                       TransportDiscontinuity::retune) >= 1,
+            "CFO rebootstrap did not publish a transport discontinuity");
+    require(has_known_run(post_rebootstrap, encoded.transport),
+            "TS output did not recover after abrupt CFO rebootstrap");
+    require(stats.carrier_bin_offset == 0,
+            "post-rebootstrap production demod retained a carrier offset");
+    require(std::abs(static_cast<double>(stats.acquisition_cfo_hz) -
+                     final_cfo_hz) < 35.0,
+            "post-jump bootstrap did not acquire the new CFO");
+    require(std::abs(static_cast<double>(stats.cfo_resampler_applied_hz) -
+                     final_cfo_hz) < 50.0,
+            "post-jump CFO was not applied by the frontend resampler");
+    require(stats.cfo_rebootstrap_source_sample != 0 &&
+                stats.cfo_rebootstrap_output_sample != 0,
+            "CFO rebootstrap lost its sample-domain trigger coordinates");
+    require(stats.processed_input_samples == repeated_iq.size() / 2U,
+            "CFO rebootstrap lost or double-counted raw input samples");
+}
+
 void test_8k_reset_then_new_stream() {
     const auto encoded = encode_transport();
     const auto iq = make_iq(encoded.metrics);
@@ -663,6 +914,9 @@ void test_8k_non_acquirable_stream_drains() {
     const auto stats = decoder.stats();
     require(!stats.ofdm_locked,
             "zero-I/Q non-acquirable stream falsely acquired OFDM");
+    require(stats.bootstrap_attempts != 0 &&
+                stats.bootstrap_retained_peak_samples < 500'000,
+            "non-acquirable bootstrap did not retain a bounded raw window");
     require(stats.queued_blocks == 0 && stats.queued_input_samples == 0 &&
                 stats.queued_symbols == 0,
             "non-acquirable 8K stream did not drain its queues");
@@ -781,6 +1035,9 @@ int main() {
             }
         };
         run("clean", test_8k_clean_signal);
+        run("cfo-centering", test_8k_frontend_cfo_centering);
+        run("cfo-drift", test_8k_frontend_cfo_drift_tracking);
+        run("cfo-rebootstrap", test_8k_frontend_abrupt_cfo_rebootstrap);
         run("worker-parity", test_8k_worker_count_parity);
         run("reset-new", test_8k_reset_then_new_stream);
         run("reset-hopeless", test_8k_reset_after_hopeless_stream);

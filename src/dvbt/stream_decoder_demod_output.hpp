@@ -32,11 +32,14 @@ void StreamDecoder::Impl::demod_process_batch(
         }
         if (state.decoder_parameters &&
             (state.analysis_symbol_count++ % analysis_interval_symbols) == 0U) {
+            const float residual_cfo_hz = frontend.residual_phase_ema *
+                                          sync.resampled_rate /
+                                          (2.0F * std::numbers::pi_v<float> *
+                                           static_cast<float>(state.period));
             const float carrier_offset_hz =
-                frontend.tracked_cfo_phase * sync.resampled_rate /
-                (2.0F * std::numbers::pi_v<float>)+static_cast<float>(
-                    frontend.carrier_offset) *
-                sync.resampled_rate / static_cast<float>(frontend.fft_size);
+                static_cast<float>(
+                    cfo_resampler_applied_hz.load(std::memory_order_relaxed)) +
+                residual_cfo_hz;
             analysis_publisher.publish(
                 symbol.carriers, symbol.mer_db, state.latest_cp_snr_db,
                 state.latest_deepest_notch_db, carrier_offset_hz, frontend.mode,
@@ -160,6 +163,7 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
     auto &smoothed_sample_clock_ppm = state.smoothed_sample_clock_ppm;
     auto &last_windowed_timing = state.last_windowed_timing;
     auto &last_windowed_cir_avg = state.last_windowed_cir_avg;
+    const float fade_indicator = state.fade_indicator;
     constexpr std::size_t tau_history_n = DemodRuntimeState::tau_history_n;
     constexpr std::size_t tau_history_min = DemodRuntimeState::tau_history_min;
     auto &tau_history = state.tau_history;
@@ -343,6 +347,52 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             }
         }
     }
+    const double residual_cfo_hz =
+        static_cast<double>(frontend.residual_phase_ema) *
+        static_cast<double>(sync.resampled_rate) /
+        (2.0 * std::numbers::pi_v<double> * static_cast<double>(period));
+    if (window_symbols != 0 && fade_indicator > 0.5F &&
+        cfo_resampler_ready.load(std::memory_order_acquire) &&
+        std::abs(residual_cfo_hz) >= 0.05) {
+        const std::scoped_lock lock(mutex);
+        const std::uint64_t command_output_sample = ring_read_pos;
+        const auto mapped =
+            resampler_timeline.input_at_output(command_output_sample);
+        // residual_phase_ema was measured from the symbols ending this
+        // window. At a span boundary, ring_read_pos may already name the
+        // correction for future output, so look up the final consumed sample
+        // rather than the command timestamp.
+        const auto applied = resampler_timeline.cfo_correction_at(
+            output_end_sample > output_begin_sample ? output_end_sample - 1U
+                                                    : output_end_sample);
+        if (mapped.has_value() && applied.has_value()) {
+            const std::uint64_t fixed_delay = sro_fixed_delay_samples(
+                mapped->input_rate_hz, current_bandwidth);
+            const double target_hz = *applied + residual_cfo_hz;
+            // A newer residual estimate supersedes any unapplied steady-state
+            // CFO command from the same stream.
+            scheduled_cfo_commands.clear();
+            scheduled_cfo_commands.push_back({
+                .generation = state.demod_generation,
+                .source_epoch = mapped->stream_epoch,
+                .command_output_sample = command_output_sample,
+                .command_input_sample = mapped->input_sample,
+                .effective_input_sample = mapped->input_sample + fixed_delay,
+                .fixed_delay_samples = fixed_delay,
+                .target_hz = target_hz,
+            });
+            latest.cfo_command_output_sample = command_output_sample;
+            latest.cfo_command_input_sample = mapped->input_sample;
+            latest.cfo_effective_input_sample =
+                mapped->input_sample + fixed_delay;
+            latest.cfo_fixed_delay_samples = fixed_delay;
+            latest.cfo_input_sample_rate_hz = mapped->input_rate_hz;
+            latest.cfo_pending_commands = scheduled_cfo_commands.size();
+            latest.cfo_resampler_command_hz = static_cast<float>(target_hz);
+            cfo_resampler_command_hz.store(target_hz,
+                                           std::memory_order_relaxed);
+        }
+    }
     return {.wall_time_ms = window_wall,
             .symbol_count = window_symbols,
             .sample_count = window_sample_count,
@@ -405,10 +455,7 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     latest.tps_guard_interval = frontend.tps_snapshot.parameters.guard_interval;
     latest.tps_mode = frontend.tps_snapshot.parameters.mode;
     latest.tps_hierarchy = frontend.tps_snapshot.parameters.hierarchy;
-    latest.carrier_bin_offset = frontend.carrier_offset;
-    latest.tracked_carrier_offset_hz = frontend.tracked_cfo_phase *
-                                       sync.resampled_rate /
-                                       (2.0F * std::numbers::pi_v<float>);
+    latest.carrier_bin_offset = 0;
     latest.acquisition_start =
         static_cast<std::size_t>(sync.start_pos % period);
     latest.raw_timing_offset_samples = static_cast<float>(latest_raw_timing);
@@ -450,6 +497,14 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     latest.residual_carrier_offset_hz =
         frontend.residual_phase_ema * sync.resampled_rate /
         (2.0F * std::numbers::pi_v<float> * static_cast<float>(period));
+    latest.cfo_resampler_ready =
+        cfo_resampler_ready.load(std::memory_order_relaxed);
+    latest.cfo_resampler_command_hz = static_cast<float>(
+        cfo_resampler_command_hz.load(std::memory_order_relaxed));
+    latest.cfo_resampler_applied_hz = static_cast<float>(
+        cfo_resampler_applied_hz.load(std::memory_order_relaxed));
+    latest.tracked_carrier_offset_hz =
+        latest.cfo_resampler_applied_hz + latest.residual_carrier_offset_hz;
     latest.pilot_phase_discontinuities = frontend.phase_discontinuities;
     latest.ofdm_symbols = symbol_count;
     latest.processing_realtime_ratio =
@@ -467,15 +522,13 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         static_cast<float>(state.ring_copy_time_sum_ms);
     latest.demod_fft_cfo_time_ms =
         static_cast<float>(state.fft_cfo_time_sum_ms);
-    latest.demod_nco_rotate_time_ms =
-        static_cast<float>(state.nco_rotate_time_sum_ms);
     latest.demod_fft_execute_time_ms =
         static_cast<float>(state.fft_execute_time_sum_ms);
     latest.demod_cfo_track_time_ms =
         static_cast<float>(state.cfo_track_time_sum_ms);
     latest.demod_fft_cfo_other_time_ms = static_cast<float>(std::max(
-        0.0, state.fft_cfo_time_sum_ms - state.nco_rotate_time_sum_ms -
-                 state.fft_execute_time_sum_ms - state.cfo_track_time_sum_ms));
+        0.0, state.fft_cfo_time_sum_ms - state.fft_execute_time_sum_ms -
+                 state.cfo_track_time_sum_ms));
     latest.demod_pilot_lock_time_ms =
         static_cast<float>(state.pilot_lock_time_sum_ms);
     latest.demod_reacquisition_time_ms =
@@ -571,6 +624,11 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
             record.fade_indicator = latest.fade_indicator;
             record.tracked_cfo_hz = latest.tracked_carrier_offset_hz;
             record.residual_cfo_hz = latest.residual_carrier_offset_hz;
+            record.acquisition_fractional_cfo_hz =
+                latest.acquisition_fractional_cfo_hz;
+            record.acquisition_cfo_hz = latest.acquisition_cfo_hz;
+            record.acquisition_carrier_bin_offset =
+                latest.acquisition_carrier_bin_offset;
         }
         if (timing_count != 0) {
             record.raw_timing_samples = latest.raw_timing_offset_samples;
@@ -604,6 +662,28 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         record.sro_fixed_delay_samples = latest.sro_fixed_delay_samples;
         record.sro_late_samples = latest.sro_schedule_late_samples;
         record.sro_pending_commands = latest.sro_pending_commands;
+        record.cfo_resampler_ready = latest.cfo_resampler_ready;
+        record.cfo_command_hz = latest.cfo_resampler_command_hz;
+        record.cfo_applied_hz = latest.cfo_resampler_applied_hz;
+        record.cfo_command_output_sample = latest.cfo_command_output_sample;
+        record.cfo_command_input_sample = latest.cfo_command_input_sample;
+        record.cfo_effective_input_sample = latest.cfo_effective_input_sample;
+        record.cfo_applied_effective_input_sample =
+            latest.cfo_applied_effective_input_sample;
+        record.cfo_applied_input_sample = latest.cfo_applied_input_sample;
+        record.cfo_applied_output_sample = latest.cfo_applied_output_sample;
+        record.cfo_fixed_delay_samples = latest.cfo_fixed_delay_samples;
+        record.cfo_late_samples = latest.cfo_schedule_late_samples;
+        record.cfo_input_sample_rate_hz = latest.cfo_input_sample_rate_hz;
+        record.cfo_pending_commands = latest.cfo_pending_commands;
+        record.cfo_rebootstrap_requests = latest.cfo_rebootstrap_requests;
+        record.cfo_rebootstrap_count = latest.cfo_rebootstrap_count;
+        record.cfo_rebootstrap_last_residual_hz =
+            latest.cfo_rebootstrap_last_residual_hz;
+        record.cfo_rebootstrap_output_sample =
+            latest.cfo_rebootstrap_output_sample;
+        record.cfo_rebootstrap_source_sample =
+            latest.cfo_rebootstrap_source_sample;
         record.phase_discontinuities = latest.pilot_phase_discontinuities;
         record.wall_time_ms = latest.demod_window_wall_time_ms;
         record.serial_busy_time_ms = latest.demod_busy_time_ms;
@@ -622,7 +702,6 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         };
         record.wait_ms = {{"demod::ring_wait", latest.demod_ring_wait_time_ms}};
         record.nested_ms = {
-            {"demod::nco", latest.demod_nco_rotate_time_ms},
             {"demod::fft", latest.demod_fft_execute_time_ms},
             {"demod::cfo_track", latest.demod_cfo_track_time_ms},
             {"demod::fft_cfo_other", latest.demod_fft_cfo_other_time_ms},
@@ -660,7 +739,6 @@ void StreamDecoder::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
     state.ring_wait_time_sum_ms = 0.0;
     state.ring_copy_time_sum_ms = 0.0;
     state.fft_cfo_time_sum_ms = 0.0;
-    state.nco_rotate_time_sum_ms = 0.0;
     state.fft_execute_time_sum_ms = 0.0;
     state.cfo_track_time_sum_ms = 0.0;
     state.pilot_lock_time_sum_ms = 0.0;
@@ -686,10 +764,6 @@ void StreamDecoder::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
 
 void StreamDecoder::Impl::demod_advance_symbol(DemodRuntimeState &state) {
     state.next_symbol_start += state.period;
-    state.nco_phase =
-        std::remainder(state.nco_phase + frontend.tracked_cfo_phase *
-                                             static_cast<float>(state.period),
-                       2.0F * std::numbers::pi_v<float>);
 }
 
 bool StreamDecoder::Impl::demod_dispatch_payload(
@@ -737,7 +811,8 @@ bool StreamDecoder::Impl::demod_dispatch_payload(
     for (const std::size_t k :
          payload_indices[static_cast<std::size_t>(lock.phase)]) {
         payload.push_back(
-            carrier(fft_out, k, maximum, frontend.carrier_offset) * channel[k]);
+            active_carrier(fft_out, k, maximum, frontend.carrier_offset) *
+            channel[k]);
         equalizer_power.push_back(std::norm(channel[k]));
     }
     state.payload_extract_time_sum_ms +=

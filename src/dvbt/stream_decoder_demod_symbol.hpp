@@ -35,12 +35,55 @@ bool StreamDecoder::Impl::demod_maybe_reacquire(DemodRuntimeState &state) {
     return true;
 }
 
-void StreamDecoder::Impl::demod_execute_fft_and_track_cfo(
+bool StreamDecoder::Impl::demod_request_cfo_rebootstrap(
+    DemodRuntimeState &state, const char *reason, const float residual_phase) {
+    const float residual_hz =
+        residual_phase * sync.resampled_rate /
+        (2.0F * std::numbers::pi_v<float> * static_cast<float>(state.period));
+    std::uint64_t source_sample = 0;
+    {
+        const std::scoped_lock lock(mutex);
+        if (state.demod_generation !=
+            latest_generation.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        bool expected = false;
+        if (!cfo_rebootstrap_requested.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return false;
+        }
+        ++latest.cfo_rebootstrap_requests;
+        latest.cfo_rebootstrap_last_residual_hz = residual_hz;
+        latest.cfo_rebootstrap_output_sample = state.next_symbol_start;
+        if (const auto mapped =
+                resampler_timeline.input_at_output(state.next_symbol_start)) {
+            source_sample = mapped->input_sample;
+            latest.cfo_rebootstrap_source_sample = source_sample;
+        }
+    }
+    if (events_enabled()) {
+        emit_event(
+            "cfo_rebootstrap_requested", DecoderEventSeverity::warning,
+            state.demod_generation, state.next_symbol_start, state.symbol_count,
+            {{"reason", std::string(reason)},
+             {"residual_phase_rad", static_cast<double>(residual_phase)},
+             {"residual_hz", static_cast<double>(residual_hz)},
+             {"source_sample", source_sample},
+             {"fade_indicator", static_cast<double>(state.fade_indicator)},
+             {"frozen_symbols", state.frozen_symbol_count},
+             {"recovery_symbols", state.cfo_recovery_symbol_count},
+             {"hopeless_windows", state.hopeless_window_count}});
+    }
+    input_ready.notify_all();
+    ring_space.notify_all();
+    ring_data.notify_all();
+    return true;
+}
+
+void StreamDecoder::Impl::demod_execute_fft_and_measure_cfo(
     DemodRuntimeState &state) {
-    auto &fft_size = state.fft_size;
     auto &next_symbol_start = state.next_symbol_start;
-    auto &nco_phase = state.nco_phase;
-    auto &fft_in = state.fft_in;
     auto &plan = state.plan;
     auto &continual_indices = state.continual_indices;
     auto &fft_out = state.fft_out;
@@ -50,19 +93,6 @@ void StreamDecoder::Impl::demod_execute_fft_and_track_cfo(
 
     auto fft_stage_started_at = std::chrono::steady_clock::now();
     const std::uint64_t start = next_symbol_start;
-    std::complex<float> nco = std::polar(1.0F, -nco_phase);
-    const std::complex<float> nco_step =
-        std::polar(1.0F, -frontend.tracked_cfo_phase);
-    for (std::size_t i = 0; i < fft_size; ++i) {
-        fft_in[i] *= nco;
-        nco *= nco_step;
-        if ((i & 511U) == 511U) {
-            nco *= 1.0F / std::sqrt(std::norm(nco));
-        }
-    }
-    state.nco_rotate_time_sum_ms += duration_ms(fft_stage_started_at);
-
-    fft_stage_started_at = std::chrono::steady_clock::now();
     plan.execute();
     state.fft_execute_time_sum_ms += duration_ms(fft_stage_started_at);
 
@@ -71,7 +101,7 @@ void StreamDecoder::Impl::demod_execute_fft_and_track_cfo(
     current_continual.reserve(continual_indices.size());
     for (const std::size_t k : continual_indices) {
         current_continual.push_back(
-            carrier(fft_out, k, maximum, frontend.carrier_offset));
+            active_carrier(fft_out, k, maximum, frontend.carrier_offset));
     }
     float residual_phase = 0.0F;
     fade_indicator = 1.0F; // Only update the CFO loop from a
@@ -118,9 +148,10 @@ void StreamDecoder::Impl::demod_execute_fft_and_track_cfo(
                 : 0.0F;
         fade_indicator = normalized_correlation;
         if (fade_indicator > 0.25F) {
-            constexpr float loop_gain = 0.20F;
-            frontend.tracked_cfo_phase +=
-                loop_gain * residual_phase / static_cast<float>(period);
+            if (std::abs(residual_phase) >= cfo_rebootstrap_phase_threshold) {
+                static_cast<void>(demod_request_cfo_rebootstrap(
+                    state, "residual_phase_out_of_range", residual_phase));
+            }
             frontend.residual_phase_ema =
                 (0.1F * residual_phase) + (0.9F * frontend.residual_phase_ema);
         }
@@ -233,7 +264,18 @@ StreamDecoder::Impl::demod_lock_pilots(DemodRuntimeState &state) {
         // still gone just scores low and retries.
         lock = PilotLock{static_cast<int>(frontend.previous_phase),
                          frontend.carrier_offset};
-        if (++frozen_symbol_count >= 68 && frozen_symbol_count % 68 == 0 &&
+        ++frozen_symbol_count;
+        state.cfo_healthy_symbol_count = 0;
+        ++state.cfo_recovery_symbol_count;
+        if (state.cfo_recovery_symbol_count >= cfo_rebootstrap_freeze_symbols) {
+            static_cast<void>(demod_request_cfo_rebootstrap(
+                state,
+                fade_indicator > 0.25F ? "persistent_bad_lock"
+                                       : "prolonged_frozen_recovery",
+                frontend.residual_phase_ema));
+            return std::nullopt;
+        }
+        if (frozen_symbol_count >= 68 && frozen_symbol_count % 68 == 0 &&
             demod_maybe_reacquire(state)) {
             return std::nullopt;
         }
@@ -312,6 +354,14 @@ StreamDecoder::Impl::demod_lock_pilots(DemodRuntimeState &state) {
         }
         const auto was_frozen = frozen_symbol_count;
         frozen_symbol_count = 0;
+        if (fade_indicator > 0.5F && hopeless_window_count == 0) {
+            ++state.cfo_healthy_symbol_count;
+            if (state.cfo_healthy_symbol_count >= 68) {
+                state.cfo_recovery_symbol_count = 0;
+            }
+        } else {
+            state.cfo_healthy_symbol_count = 0;
+        }
         if (was_frozen > 0) {
             if (events_enabled()) {
                 emit_event(
@@ -349,7 +399,6 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
     auto &cir_confidence = state.cir_confidence;
     auto &guard_size = state.guard_size;
     auto &next_symbol_start = state.next_symbol_start;
-    auto &nco_phase = state.nco_phase;
     auto &tps_indices = state.tps_indices;
     auto &tps_values = state.tps_values;
 
@@ -357,9 +406,9 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
     std::vector<std::complex<float>> channel(maximum + 1);
     const auto &pilots = pilot_indices[static_cast<std::size_t>(lock.phase)];
     for (const std::size_t k : pilots) {
-        const float sent = prbs[k] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+        const float sent = pilot_prbs[k] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
         const auto received =
-            carrier(fft_out, k, maximum, frontend.carrier_offset);
+            active_carrier(fft_out, k, maximum, frontend.carrier_offset);
         channel[k] = std::norm(received) > minimum_power
                          ? std::complex<float>{sent, 0.0F} / received
                          : std::complex<float>{};
@@ -530,14 +579,8 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
                         next_symbol_start -= static_cast<std::uint64_t>(-delta);
                     }
                     applied_cir_offset += delta;
-                    // The window moved mid-stream: advance
-                    // the mixer phase by the skipped samples
-                    // and let the contiguous-pair gate skip
-                    // the CFO update for this boundary.
-                    nco_phase =
-                        std::remainder(nco_phase + (frontend.tracked_cfo_phase *
-                                                    static_cast<float>(delta)),
-                                       2.0F * std::numbers::pi_v<float>);
+                    // The window moved mid-stream. The contiguous-pair gate
+                    // skips the residual-CFO update for this boundary.
                 }
             }
         } else {
@@ -568,7 +611,8 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
     for (std::size_t i = 0; i < tps_indices.size(); ++i) {
         const std::size_t k = tps_indices[i];
         tps_values[i] =
-            carrier(fft_out, k, maximum, frontend.carrier_offset) * channel[k];
+            active_carrier(fft_out, k, maximum, frontend.carrier_offset) *
+            channel[k];
     }
     state.channel_tps_extract_time_sum_ms +=
         duration_ms(channel_stage_started_at);

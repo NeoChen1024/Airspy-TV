@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "liquid_resampler/arbitrary_resampler.hpp"
+#include "solid_resampler/frequency_translating_resampler.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -38,10 +38,11 @@
 #include <immintrin.h>
 #endif
 
-namespace liquid_resampler {
+namespace solid_resampler {
 namespace {
 
 constexpr std::uint64_t q32_one = std::uint64_t{1} << 32U;
+constexpr long double q64_turn = 18446744073709551616.0L;
 constexpr std::size_t minimum_parallel_outputs = 4096;
 constexpr std::size_t filter_tap_alignment = 16;
 constexpr std::size_t minimum_filter_taps = 16;
@@ -68,8 +69,7 @@ constexpr std::size_t maximum_filter_taps = 4096;
     return (value + alignment - 1U) / alignment * alignment;
 }
 
-[[nodiscard]] std::size_t estimate_filter_taps(
-    const ResamplerConfig &config) {
+[[nodiscard]] std::size_t estimate_filter_taps(const ResamplerConfig &config) {
     const double transition =
         (config.stopband_edge_hz - config.passband_edge_hz) /
         config.input_rate_hz;
@@ -82,10 +82,10 @@ constexpr std::size_t maximum_filter_taps = 4096;
         throw std::length_error(
             "arbitrary resampler transition requires too many filter taps");
     }
-    const auto raw_taps = static_cast<std::size_t>(std::ceil(estimated_order)) +
-                          1U;
-    const std::size_t aligned_taps = round_up(
-        std::max(raw_taps, minimum_filter_taps), filter_tap_alignment);
+    const auto raw_taps =
+        static_cast<std::size_t>(std::ceil(estimated_order)) + 1U;
+    const std::size_t aligned_taps =
+        round_up(std::max(raw_taps, minimum_filter_taps), filter_tap_alignment);
     if (aligned_taps > maximum_filter_taps - filter_tap_alignment) {
         throw std::length_error(
             "arbitrary resampler transition requires too many filter taps");
@@ -133,7 +133,8 @@ design_polyphase_bank(const unsigned int semi_length,
         const double radius =
             2.0 * centered / static_cast<double>(prototype_count - 1U);
         const double window =
-            std::cyl_bessel_i(0.0, beta * std::sqrt(std::max(0.0, 1.0 - radius * radius))) /
+            std::cyl_bessel_i(
+                0.0, beta * std::sqrt(std::max(0.0, 1.0 - radius * radius))) /
             denominator;
         const double coefficient =
             normalized_sinc(2.0 * prototype_cutoff * centered) * window;
@@ -187,9 +188,8 @@ dot_product_sse41(const std::complex<float> *const input,
     const std::size_t vector_count = scalar_count & ~std::size_t{3};
     __m128 sum = _mm_setzero_ps();
     for (std::size_t index = 0; index < vector_count; index += 4U) {
-        sum = _mm_add_ps(
-            sum, _mm_mul_ps(_mm_loadu_ps(values + index),
-                            _mm_loadu_ps(coefficients + index)));
+        sum = _mm_add_ps(sum, _mm_mul_ps(_mm_loadu_ps(values + index),
+                                         _mm_loadu_ps(coefficients + index)));
     }
     alignas(16) float lanes[4];
     _mm_store_ps(lanes, sum);
@@ -212,7 +212,7 @@ dot_product_avx2(const std::complex<float> *const input,
     __m256 sum = _mm256_setzero_ps();
     for (std::size_t index = 0; index < vector_count; index += 8U) {
         sum = _mm256_fmadd_ps(_mm256_loadu_ps(values + index),
-                             _mm256_loadu_ps(coefficients + index), sum);
+                              _mm256_loadu_ps(coefficients + index), sum);
     }
     alignas(32) float lanes[8];
     _mm256_store_ps(lanes, sum);
@@ -268,7 +268,8 @@ dot_product_neon(const std::complex<float> *const input,
     return dot_product_portable;
 }
 
-void set_thread_name(const std::string &prefix, const std::size_t index) noexcept {
+void set_thread_name(const std::string &prefix,
+                     const std::size_t index) noexcept {
 #if defined(__linux__)
     std::string name = prefix + std::to_string(index);
     name.resize(std::min<std::size_t>(name.size(), 15U));
@@ -323,7 +324,7 @@ class OutputBuffer {
 
 } // namespace
 
-struct ArbitraryResampler::Impl {
+struct FrequencyTranslatingResampler::Impl {
     explicit Impl(const std::size_t requested_workers, std::string name)
         : workers_requested(std::max<std::size_t>(requested_workers, 1U)),
           worker_name(std::move(name)), dot_product(select_dot_product()) {
@@ -344,8 +345,7 @@ struct ArbitraryResampler::Impl {
     ~Impl() { stop_and_join(); }
 
     void configure(const ResamplerConfig &next) {
-        if (!(next.input_rate_hz > 0.0) ||
-            !std::isfinite(next.input_rate_hz) ||
+        if (!(next.input_rate_hz > 0.0) || !std::isfinite(next.input_rate_hz) ||
             !(next.output_rate_hz > 0.0) ||
             !std::isfinite(next.output_rate_hz) ||
             !(next.passband_edge_hz > 0.0) ||
@@ -357,9 +357,9 @@ struct ArbitraryResampler::Impl {
             next.stopband_attenuation_db > 160.0F ||
             !std::isfinite(next.stopband_attenuation_db) ||
             !is_power_of_two(next.polyphase_filters) ||
-            next.polyphase_filters < 2U ||
-            next.polyphase_filters > 65536U) {
-            throw std::invalid_argument("invalid arbitrary resampler configuration");
+            next.polyphase_filters < 2U || next.polyphase_filters > 65536U) {
+            throw std::invalid_argument(
+                "invalid arbitrary resampler configuration");
         }
         if (configured_ && next.input_rate_hz == config.input_rate_hz &&
             next.output_rate_hz == config.output_rate_hz &&
@@ -377,8 +377,7 @@ struct ArbitraryResampler::Impl {
             next.input_rate_hz);
         coefficients = design_polyphase_bank(
             static_cast<unsigned int>(next_tap_count / 2U),
-            next.polyphase_filters, cutoff,
-            next.stopband_attenuation_db);
+            next.polyphase_filters, cutoff, next.stopband_attenuation_db);
         config = next;
         tap_count = next_tap_count;
         phase_bits = log2_power_of_two(config.polyphase_filters);
@@ -386,13 +385,17 @@ struct ArbitraryResampler::Impl {
         boundary.resize(2U * (tap_count - 1U));
         configured_ = true;
         set_ratio(ratio);
+        set_frequency_shift(0.0);
         reset();
     }
 
     void reset() noexcept {
         phase_q32 = 0;
+        frequency_phase_q64 = 0;
         slew_step_credit = 0.0L;
         applied_step_q32.store(0U, std::memory_order_relaxed);
+        applied_frequency_step_q64.store(0, std::memory_order_relaxed);
+        applied_frequency_shift_hz.store(0.0, std::memory_order_relaxed);
         if (configured_) {
             std::ranges::fill(history, std::complex<float>{});
         }
@@ -401,7 +404,8 @@ struct ArbitraryResampler::Impl {
 
     void set_ratio(const double output_per_input) {
         if (!(output_per_input > 0.0) || !std::isfinite(output_per_input)) {
-            throw std::invalid_argument("resampling ratio must be finite and positive");
+            throw std::invalid_argument(
+                "resampling ratio must be finite and positive");
         }
         const long double step =
             static_cast<long double>(q32_one) / output_per_input;
@@ -421,6 +425,38 @@ struct ArbitraryResampler::Impl {
         }
         max_slew_rate_ppm_per_second.store(ppm_per_second,
                                            std::memory_order_relaxed);
+    }
+
+    void set_frequency_shift(const double frequency_hz) {
+        if (!configured_) {
+            if (frequency_hz == 0.0) {
+                requested_frequency_shift_hz.store(0.0,
+                                                   std::memory_order_relaxed);
+                target_frequency_step_q64.store(0, std::memory_order_release);
+                return;
+            }
+            throw std::logic_error(
+                "frequency shift requires a configured resampler");
+        }
+        if (!std::isfinite(frequency_hz) ||
+            std::abs(frequency_hz) >= 0.5 * config.output_rate_hz) {
+            throw std::invalid_argument(
+                "frequency shift must be finite and inside output Nyquist");
+        }
+        const long double normalized =
+            static_cast<long double>(frequency_hz) /
+            static_cast<long double>(config.output_rate_hz);
+        const long double rounded = std::round(normalized * q64_turn);
+        if (rounded < static_cast<long double>(
+                          std::numeric_limits<std::int64_t>::min()) ||
+            rounded > static_cast<long double>(
+                          std::numeric_limits<std::int64_t>::max())) {
+            throw std::out_of_range("frequency shift exceeds Q0.64 range");
+        }
+        requested_frequency_shift_hz.store(frequency_hz,
+                                           std::memory_order_relaxed);
+        target_frequency_step_q64.store(static_cast<std::int64_t>(rounded),
+                                        std::memory_order_release);
     }
 
     [[nodiscard]] std::uint64_t
@@ -471,13 +507,24 @@ struct ArbitraryResampler::Impl {
 
         const std::uint64_t step = next_applied_step(input.size());
         applied_step_q32.store(step, std::memory_order_relaxed);
+        const std::int64_t frequency_step =
+            target_frequency_step_q64.load(std::memory_order_acquire);
+        applied_frequency_step_q64.store(frequency_step,
+                                         std::memory_order_relaxed);
+        const double frequency_shift = static_cast<double>(
+            static_cast<long double>(frequency_step) *
+            static_cast<long double>(config.output_rate_hz) / q64_turn);
+        applied_frequency_shift_hz.store(frequency_shift,
+                                         std::memory_order_relaxed);
         const std::uint64_t phase_at_block_start = phase_q32;
+        const std::uint64_t frequency_phase_at_block_start =
+            frequency_phase_q64;
         if (input.size() > std::numeric_limits<std::uint32_t>::max()) {
             throw std::length_error(
                 "arbitrary resampler input exceeds Q32.32 block range");
         }
-        const std::uint64_t limit =
-            static_cast<std::uint64_t>(input.size()) << 32U;
+        const std::uint64_t limit = static_cast<std::uint64_t>(input.size())
+                                    << 32U;
         std::size_t output_count = 0;
         if (phase_q32 < limit) {
             const std::uint64_t distance = limit - phase_q32;
@@ -485,7 +532,8 @@ struct ArbitraryResampler::Impl {
             const std::uint64_t remainder = distance % step;
             const std::uint64_t count = quotient + (remainder != 0U ? 1U : 0U);
             if (count > std::numeric_limits<std::size_t>::max()) {
-                throw std::length_error("arbitrary resampler output is too large");
+                throw std::length_error(
+                    "arbitrary resampler output is too large");
             }
             output_count = static_cast<std::size_t>(count);
             phase_q32 = remainder == 0U ? 0U : step - remainder;
@@ -497,7 +545,8 @@ struct ArbitraryResampler::Impl {
         std::copy(history.begin(), history.end(), boundary.begin());
         const std::size_t prefix = std::min(history.size(), input.size());
         std::copy_n(input.begin(), prefix,
-                    boundary.begin() + static_cast<std::ptrdiff_t>(history.size()));
+                    boundary.begin() +
+                        static_cast<std::ptrdiff_t>(history.size()));
         if (prefix < history.size()) {
             std::fill(boundary.begin() +
                           static_cast<std::ptrdiff_t>(history.size() + prefix),
@@ -509,6 +558,8 @@ struct ArbitraryResampler::Impl {
         task_output_count = output_count;
         task_phase_q32 = phase_at_block_start;
         task_step_q32 = step;
+        task_frequency_phase_q64 = frequency_phase_at_block_start;
+        task_frequency_step_q64 = frequency_step;
 
         const std::size_t active =
             output_count < minimum_parallel_outputs
@@ -529,17 +580,38 @@ struct ArbitraryResampler::Impl {
         }
 
         update_history(input);
+        frequency_phase_q64 +=
+            static_cast<std::uint64_t>(frequency_step) * output_count;
         return output.view();
     }
 
     void process_range(const std::size_t begin,
                        const std::size_t end) const noexcept {
         const std::size_t phase_stride = tap_count * 2U;
+        const bool translate = task_frequency_step_q64 != 0;
+        std::complex<float> oscillator{1.0F, 0.0F};
+        std::complex<float> oscillator_step{1.0F, 0.0F};
+        const auto phase_radians = [](const std::uint64_t word) {
+            return static_cast<float>(2.0L * std::numbers::pi_v<long double> *
+                                      static_cast<long double>(word) /
+                                      q64_turn);
+        };
+        if (translate) {
+            const std::uint64_t phase =
+                task_frequency_phase_q64 +
+                static_cast<std::uint64_t>(task_frequency_step_q64) * begin;
+            oscillator = std::polar(1.0F, phase_radians(phase));
+            oscillator_step = std::polar(
+                1.0F, static_cast<float>(
+                          2.0L * std::numbers::pi_v<long double> *
+                          static_cast<long double>(task_frequency_step_q64) /
+                          q64_turn));
+        }
         for (std::size_t output_index = begin; output_index < end;
              ++output_index) {
             const std::uint64_t position =
-                task_phase_q32 + static_cast<std::uint64_t>(output_index) *
-                                     task_step_q32;
+                task_phase_q32 +
+                static_cast<std::uint64_t>(output_index) * task_step_q32;
             const auto source = static_cast<std::size_t>(position >> 32U);
             const auto fraction = static_cast<std::uint32_t>(position);
             const std::size_t phase =
@@ -550,9 +622,20 @@ struct ArbitraryResampler::Impl {
             } else {
                 window = task_input + source - history.size();
             }
+            const auto filtered = dot_product(
+                window, coefficients.data() + phase * phase_stride, tap_count);
             task_output[output_index] =
-                dot_product(window, coefficients.data() + phase * phase_stride,
-                            tap_count);
+                translate ? filtered * oscillator : filtered;
+            if (translate) {
+                oscillator *= oscillator_step;
+                if (((output_index - begin) & 511U) == 511U) {
+                    const std::uint64_t next_phase =
+                        task_frequency_phase_q64 +
+                        static_cast<std::uint64_t>(task_frequency_step_q64) *
+                            (output_index + 1U);
+                    oscillator = std::polar(1.0F, phase_radians(next_phase));
+                }
+            }
         }
     }
 
@@ -627,9 +710,14 @@ struct ArbitraryResampler::Impl {
     OutputBuffer output;
     std::atomic<double> requested_ratio_{};
     std::atomic<double> max_slew_rate_ppm_per_second{};
+    std::atomic<double> requested_frequency_shift_hz{};
+    std::atomic<double> applied_frequency_shift_hz{};
     std::atomic<std::uint64_t> target_step_q32{};
     std::atomic<std::uint64_t> applied_step_q32{};
+    std::atomic<std::int64_t> target_frequency_step_q64{};
+    std::atomic<std::int64_t> applied_frequency_step_q64{};
     std::uint64_t phase_q32{};
+    std::uint64_t frequency_phase_q64{};
     long double slew_step_credit{};
 
     std::vector<std::thread> workers;
@@ -646,68 +734,86 @@ struct ArbitraryResampler::Impl {
     std::size_t task_output_count{};
     std::uint64_t task_phase_q32{};
     std::uint64_t task_step_q32{};
+    std::uint64_t task_frequency_phase_q64{};
+    std::int64_t task_frequency_step_q64{};
 };
 
-ArbitraryResampler::ArbitraryResampler(const std::size_t worker_count,
-                                       std::string worker_name)
+FrequencyTranslatingResampler::FrequencyTranslatingResampler(
+    const std::size_t worker_count, std::string worker_name)
     : impl_(std::make_unique<Impl>(worker_count, std::move(worker_name))) {}
 
-ArbitraryResampler::~ArbitraryResampler() noexcept = default;
+FrequencyTranslatingResampler::~FrequencyTranslatingResampler() noexcept =
+    default;
 
-void ArbitraryResampler::configure(const ResamplerConfig &config) {
+void FrequencyTranslatingResampler::configure(const ResamplerConfig &config) {
     impl_->configure(config);
 }
 
-void ArbitraryResampler::reset() noexcept { impl_->reset(); }
+void FrequencyTranslatingResampler::reset() noexcept { impl_->reset(); }
 
-void ArbitraryResampler::set_ratio(const double output_per_input) {
+void FrequencyTranslatingResampler::set_ratio(const double output_per_input) {
     impl_->set_ratio(output_per_input);
 }
 
-void ArbitraryResampler::set_max_slew_rate(const double ppm_per_second) {
+void FrequencyTranslatingResampler::set_max_slew_rate(
+    const double ppm_per_second) {
     impl_->set_max_slew_rate(ppm_per_second);
 }
 
-std::span<const std::complex<float>> ArbitraryResampler::process(
+void FrequencyTranslatingResampler::set_frequency_shift(
+    const double frequency_hz) {
+    impl_->set_frequency_shift(frequency_hz);
+}
+
+std::span<const std::complex<float>> FrequencyTranslatingResampler::process(
     const std::span<const std::complex<float>> input) {
     return impl_->process(input);
 }
 
-bool ArbitraryResampler::configured() const noexcept {
+bool FrequencyTranslatingResampler::configured() const noexcept {
     return impl_->configured_;
 }
 
-std::size_t ArbitraryResampler::worker_count() const noexcept {
+std::size_t FrequencyTranslatingResampler::worker_count() const noexcept {
     return impl_->workers_requested;
 }
 
-double ArbitraryResampler::nominal_ratio() const noexcept {
+double FrequencyTranslatingResampler::nominal_ratio() const noexcept {
     return impl_->configured_
                ? impl_->config.output_rate_hz / impl_->config.input_rate_hz
                : 0.0;
 }
 
-double ArbitraryResampler::requested_ratio() const noexcept {
+double FrequencyTranslatingResampler::requested_ratio() const noexcept {
     return impl_->requested_ratio_.load(std::memory_order_relaxed);
 }
 
-double ArbitraryResampler::effective_ratio() const noexcept {
+double FrequencyTranslatingResampler::effective_ratio() const noexcept {
     const std::uint64_t applied =
         impl_->applied_step_q32.load(std::memory_order_relaxed);
     const std::uint64_t step =
-        applied != 0U
-            ? applied
-            : impl_->target_step_q32.load(std::memory_order_relaxed);
-    return step == 0U ? 0.0
-                      : static_cast<double>(q32_one) /
-                            static_cast<double>(step);
+        applied != 0U ? applied
+                      : impl_->target_step_q32.load(std::memory_order_relaxed);
+    return step == 0U
+               ? 0.0
+               : static_cast<double>(q32_one) / static_cast<double>(step);
 }
 
-double ArbitraryResampler::max_slew_rate() const noexcept {
+double FrequencyTranslatingResampler::max_slew_rate() const noexcept {
     return impl_->max_slew_rate_ppm_per_second.load(std::memory_order_relaxed);
 }
 
-std::uint64_t ArbitraryResampler::phase_step_q32() const noexcept {
+double
+FrequencyTranslatingResampler::requested_frequency_shift() const noexcept {
+    return impl_->requested_frequency_shift_hz.load(std::memory_order_relaxed);
+}
+
+double
+FrequencyTranslatingResampler::effective_frequency_shift() const noexcept {
+    return impl_->applied_frequency_shift_hz.load(std::memory_order_relaxed);
+}
+
+std::uint64_t FrequencyTranslatingResampler::phase_step_q32() const noexcept {
     const std::uint64_t applied =
         impl_->applied_step_q32.load(std::memory_order_relaxed);
     return applied != 0U
@@ -715,8 +821,8 @@ std::uint64_t ArbitraryResampler::phase_step_q32() const noexcept {
                : impl_->target_step_q32.load(std::memory_order_relaxed);
 }
 
-std::size_t ArbitraryResampler::filter_taps() const noexcept {
+std::size_t FrequencyTranslatingResampler::filter_taps() const noexcept {
     return impl_->tap_count;
 }
 
-} // namespace liquid_resampler
+} // namespace solid_resampler

@@ -404,10 +404,26 @@ class StreamingResampler {
         resampler_.set_ratio(resampler_.nominal_ratio() / scale);
     }
 
+    void set_cfo_correction_hz(const double correction_hz) {
+        if (!std::isfinite(correction_hz)) {
+            throw std::invalid_argument("invalid CFO resampler correction");
+        }
+        // A positive measured CFO requires a negative complex translation.
+        resampler_.set_frequency_shift(-correction_hz);
+    }
+
     [[nodiscard]] double applied_sro_correction_ppm() const noexcept {
         const double ratio = resampler_.effective_ratio();
         return ratio > 0.0 ? (resampler_.nominal_ratio() / ratio - 1.0) * 1.0e6
                            : 0.0;
+    }
+
+    [[nodiscard]] double applied_cfo_correction_hz() const noexcept {
+        return -resampler_.effective_frequency_shift();
+    }
+
+    [[nodiscard]] double requested_cfo_correction_hz() const noexcept {
+        return -resampler_.requested_frequency_shift();
     }
 
     [[nodiscard]] double requested_ratio() const noexcept {
@@ -428,7 +444,7 @@ class StreamingResampler {
 
   private:
     static constexpr double sro_slew_rate_ppm_per_second = 0.5;
-    liquid_resampler::ArbitraryResampler resampler_;
+    solid_resampler::FrequencyTranslatingResampler resampler_;
     std::uint32_t rate_{};
     std::uint32_t bandwidth_{};
 };

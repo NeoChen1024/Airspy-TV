@@ -1,4 +1,4 @@
-#include "liquid_resampler/arbitrary_resampler.hpp"
+#include "solid_resampler/frequency_translating_resampler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,8 +18,8 @@
 
 namespace {
 
-using liquid_resampler::ArbitraryResampler;
-using liquid_resampler::ResamplerConfig;
+using solid_resampler::FrequencyTranslatingResampler;
+using solid_resampler::ResamplerConfig;
 
 [[nodiscard]] constexpr ResamplerConfig
 make_test_config(const double input_rate_hz, const double output_rate_hz) {
@@ -66,14 +66,14 @@ make_input(const std::size_t count) {
 }
 
 [[nodiscard]] std::vector<std::complex<float>>
-copy_output(ArbitraryResampler &resampler,
+copy_output(FrequencyTranslatingResampler &resampler,
             const std::span<const std::complex<float>> input) {
     const auto output = resampler.process(input);
     return {output.begin(), output.end()};
 }
 
 void append_output(std::vector<std::complex<float>> &destination,
-                   ArbitraryResampler &resampler,
+                   FrequencyTranslatingResampler &resampler,
                    const std::span<const std::complex<float>> input) {
     const auto output = resampler.process(input);
     destination.insert(destination.end(), output.begin(), output.end());
@@ -84,12 +84,12 @@ void test_streaming_boundaries_and_workers() {
         make_test_config(10'000'000.0, 64'000'000.0 / 7.0);
     const auto input = make_input(250'003);
 
-    ArbitraryResampler reference{1};
+    FrequencyTranslatingResampler reference{1};
     reference.configure(config);
     const auto expected = copy_output(reference, input);
     require(!expected.empty(), "single-block resampler output");
 
-    ArbitraryResampler chunked{1};
+    FrequencyTranslatingResampler chunked{1};
     chunked.configure(config);
     std::vector<std::complex<float>> chunked_output;
     // Fixed seeds make chunk-boundary regressions reproducible.
@@ -107,7 +107,7 @@ void test_streaming_boundaries_and_workers() {
             "arbitrary input block boundaries must be bit-identical");
 
     for (const std::size_t workers : {2U, 4U, 8U}) {
-        ArbitraryResampler parallel{workers};
+        FrequencyTranslatingResampler parallel{workers};
         parallel.configure(config);
         const auto actual = copy_output(parallel, input);
         require(actual == expected,
@@ -119,11 +119,11 @@ void test_sparse_output_boundaries() {
     constexpr ResamplerConfig config =
         make_test_config(8'000'000.0, 1'000'000.0);
     const auto input = make_input(4097);
-    ArbitraryResampler reference{1};
+    FrequencyTranslatingResampler reference{1};
     reference.configure(config);
     const auto expected = copy_output(reference, input);
 
-    ArbitraryResampler sample_by_sample{1};
+    FrequencyTranslatingResampler sample_by_sample{1};
     sample_by_sample.configure(config);
     std::vector<std::complex<float>> actual;
     for (const auto &sample : input) {
@@ -137,7 +137,7 @@ void test_reset_and_ratio_telemetry() {
     constexpr ResamplerConfig config =
         make_test_config(10'000'000.0, 64'000'000.0 / 7.0);
     const auto input = make_input(32'003);
-    ArbitraryResampler resampler{2};
+    FrequencyTranslatingResampler resampler{2};
     require(!resampler.configured(), "new resampler must be unconfigured");
     resampler.configure(config);
     require(resampler.configured(), "configured resampler state");
@@ -164,7 +164,7 @@ void test_rate_change_continuity_and_counts() {
     constexpr ResamplerConfig config =
         make_test_config(1'000'000.0, 1'000'000.0);
     std::vector<std::complex<float>> constant(20'000, {1.0F, -0.25F});
-    ArbitraryResampler resampler{2};
+    FrequencyTranslatingResampler resampler{2};
     resampler.configure(config);
 
     const auto before =
@@ -198,7 +198,7 @@ void test_bounded_ratio_slew() {
     constexpr ResamplerConfig config =
         make_test_config(1'000'000.0, 1'000'000.0);
     const auto input = make_input(250'000);
-    ArbitraryResampler resampler{1};
+    FrequencyTranslatingResampler resampler{1};
     resampler.configure(config);
     resampler.set_max_slew_rate(2.0);
     require(resampler.max_slew_rate() == 2.0, "configured slew telemetry");
@@ -226,7 +226,116 @@ void test_bounded_ratio_slew() {
             "reset must clear pending slew state");
 }
 
-[[nodiscard]] double measure_tone_gain(ArbitraryResampler &resampler,
+[[nodiscard]] float
+maximum_error(const std::span<const std::complex<float>> left,
+              const std::span<const std::complex<float>> right) {
+    require(left.size() == right.size(), "frequency-shift output size");
+    float result = 0.0F;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        result = std::max(result, std::abs(left[index] - right[index]));
+    }
+    return result;
+}
+
+void test_frequency_translation() {
+    constexpr ResamplerConfig config = make_test_config(1'000'000.0, 800'000.0);
+    constexpr double input_tone_hz = 137'500.0;
+    constexpr double shift_hz = -82'250.0;
+    constexpr double expected_tone_hz = input_tone_hz + shift_hz;
+    std::vector<std::complex<float>> input(50'003);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        const double phase = 2.0 * std::numbers::pi * input_tone_hz *
+                             static_cast<double>(index) / config.input_rate_hz;
+        input[index] = {static_cast<float>(std::cos(phase)),
+                        static_cast<float>(std::sin(phase))};
+    }
+
+    FrequencyTranslatingResampler reference{1};
+    reference.configure(config);
+    reference.set_frequency_shift(shift_hz);
+    const auto expected = copy_output(reference, input);
+    require(reference.requested_frequency_shift() == shift_hz,
+            "requested frequency-shift telemetry");
+    require(std::abs(reference.effective_frequency_shift() - shift_hz) < 1.0e-6,
+            "effective Q0.64 frequency-shift telemetry");
+
+    const std::size_t skip = 2U * reference.filter_taps();
+    std::complex<double> phase_step_sum{};
+    for (std::size_t index = skip + 1U; index < expected.size(); ++index) {
+        phase_step_sum +=
+            static_cast<std::complex<double>>(expected[index]) *
+            std::conj(static_cast<std::complex<double>>(expected[index - 1U]));
+    }
+    const double measured_hz = std::arg(phase_step_sum) *
+                               config.output_rate_hz / (2.0 * std::numbers::pi);
+    require(std::abs(measured_hz - expected_tone_hz) < 0.1,
+            "translated output tone frequency");
+
+    FrequencyTranslatingResampler chunked{1};
+    chunked.configure(config);
+    chunked.set_frequency_shift(shift_hz);
+    std::vector<std::complex<float>> chunked_output;
+    for (std::size_t offset = 0; offset < input.size();) {
+        const std::size_t count =
+            std::min<std::size_t>(4093, input.size() - offset);
+        append_output(chunked_output, chunked,
+                      std::span{input}.subspan(offset, count));
+        offset += count;
+    }
+    const float chunked_error = maximum_error(chunked_output, expected);
+    if (chunked_error >= 2.0e-4F) {
+        throw std::runtime_error(
+            "mixer phase continuity across input blocks: " +
+            std::to_string(chunked_error));
+    }
+
+    FrequencyTranslatingResampler parallel{4};
+    parallel.configure(config);
+    parallel.set_frequency_shift(shift_hz);
+    const auto parallel_output = copy_output(parallel, input);
+    const float parallel_error = maximum_error(parallel_output, expected);
+    if (parallel_error >= 2.0e-4F) {
+        throw std::runtime_error("parallel mixer phase seeding: " +
+                                 std::to_string(parallel_error));
+    }
+
+    FrequencyTranslatingResampler zero_shift{4};
+    zero_shift.configure(config);
+    const auto unshifted = copy_output(zero_shift, input);
+    zero_shift.reset();
+    zero_shift.set_frequency_shift(0.0);
+    const auto explicit_zero = copy_output(zero_shift, input);
+    require(explicit_zero == unshifted,
+            "zero frequency shift must preserve bit-identical output");
+
+    constexpr ResamplerConfig unity_config =
+        make_test_config(1'000'000.0, 1'000'000.0);
+    constexpr double first_shift_hz = 73'125.0;
+    constexpr double second_shift_hz = -41'875.0;
+    constexpr std::size_t command_boundary = 12'000;
+    std::vector<std::complex<float>> constant(24'000, {1.0F, 0.0F});
+    FrequencyTranslatingResampler changing{4};
+    changing.configure(unity_config);
+    changing.set_frequency_shift(first_shift_hz);
+    const auto first =
+        copy_output(changing, std::span{constant}.first(command_boundary));
+    changing.set_frequency_shift(second_shift_hz);
+    const auto second =
+        copy_output(changing, std::span{constant}.subspan(command_boundary));
+    require(first.size() == command_boundary &&
+                second.size() == constant.size() - command_boundary,
+            "unity-ratio frequency-command output count");
+    const double boundary_phase = 2.0 * std::numbers::pi * first_shift_hz *
+                                  static_cast<double>(command_boundary) /
+                                  unity_config.output_rate_hz;
+    const std::complex<float> expected_boundary{
+        static_cast<float>(std::cos(boundary_phase)),
+        static_cast<float>(std::sin(boundary_phase))};
+    require(std::abs(second.front() - expected_boundary) < 2.0e-3F,
+            "frequency command update reset the mixer phase");
+}
+
+[[nodiscard]] double measure_tone_gain(FrequencyTranslatingResampler &resampler,
                                        const ResamplerConfig &config,
                                        const double frequency_hz) {
     constexpr std::size_t input_count = 32'768;
@@ -256,7 +365,7 @@ void test_dvbt_stopband_attenuation() {
 
     for (std::size_t index = 0; index < bandwidths.size(); ++index) {
         const auto config = make_dvbt_config(bandwidths[index]);
-        ArbitraryResampler resampler{1};
+        FrequencyTranslatingResampler resampler{1};
         resampler.configure(config);
         require(resampler.filter_taps() == expected_taps[index],
                 "DVB-T 80 dB filter tap estimate");
@@ -297,12 +406,13 @@ int main() {
         test_reset_and_ratio_telemetry();
         test_rate_change_continuity_and_counts();
         test_bounded_ratio_slew();
+        test_frequency_translation();
         test_dvbt_stopband_attenuation();
-        std::cout << "Arbitrary resampler tests passed\n";
+        std::cout << "Frequency-translating resampler tests passed\n";
         return 0;
     } catch (const std::exception &error) {
-        std::cerr << "Arbitrary resampler test failed: " << error.what()
-                  << '\n';
+        std::cerr << "Frequency-translating resampler test failed: "
+                  << error.what() << '\n';
         return 1;
     }
 }

@@ -45,38 +45,52 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
             ? 0.0F
             : 100.0F * static_cast<float>(stats.ring_used_samples) /
                   static_cast<float>(stats.ring_capacity_samples);
-    std::cerr << "[diag] fe=" << worker_state_name(stats.frontend_state)
-              << " dm=" << worker_state_name(stats.demod_state)
-              << " fec=" << worker_state_name(stats.fec_state) << " iq="
-              << static_cast<int>(std::clamp(iq_percent, 0.0F, 100.0F))
-              << "% ring="
-              << static_cast<int>(std::clamp(ring_percent, 0.0F, 100.0F))
-              << "% fecq=" << stats.queued_symbols
-              << " ofdm=" << stats.ofdm_locked << " tps=" << stats.tps_locked
-              << " tps-ever=" << stats.tps_ever_locked
-              << " car=" << stats.carrier_bin_offset
-              << " acq=" << stats.acquisition_score
-              << " fi=" << stats.fade_indicator << " mer=" << stats.mer_db
-              << "dB"
-              << " tau=" << stats.timing_offset_samples
-              << " rawtau=" << stats.raw_timing_offset_samples
-              << " phys=" << stats.physical_timing_offset_samples
-              << " sro=" << stats.sample_clock_offset_ppm << "ppm"
-              << " srocmd=" << stats.sro_resampler_command_ppm << "ppm"
-              << " sroapply=" << stats.sro_resampler_applied_ppm << "ppm"
-              << " srodelay=" << stats.sro_fixed_delay_samples << "smp"
-              << " srolate=" << stats.sro_schedule_late_samples << "smp"
-              << " sropending=" << stats.sro_pending_commands
-              << " tconf=" << stats.timing_confidence
-              << " cir=" << stats.cir_offset_samples
-              << " circonf=" << stats.cir_confidence
-              << " tmeas=" << stats.timing_measurements
-              << " taccept=" << stats.timing_accepted_measurements
-              << " trej=" << stats.timing_rejected_measurements
-              << " sroready=" << (stats.sro_resampler_ready ? 1 : 0)
-              << " fec-skip=" << stats.fec_skipped
-              << " drop=" << stats.dropped_blocks << " dm-busy="
-              << static_cast<int>(stats.demod_busy_fraction * 100.0F) << "%";
+    std::cerr
+        << "[diag] fe=" << worker_state_name(stats.frontend_state)
+        << " dm=" << worker_state_name(stats.demod_state)
+        << " fec=" << worker_state_name(stats.fec_state)
+        << " iq=" << static_cast<int>(std::clamp(iq_percent, 0.0F, 100.0F))
+        << "% ring=" << static_cast<int>(std::clamp(ring_percent, 0.0F, 100.0F))
+        << "% fecq=" << stats.queued_symbols << " ofdm=" << stats.ofdm_locked
+        << " tps=" << stats.tps_locked << " tps-ever=" << stats.tps_ever_locked
+        << " car=" << stats.carrier_bin_offset
+        << " acq=" << stats.acquisition_score << " fi=" << stats.fade_indicator
+        << " mer=" << stats.mer_db << "dB"
+        << " tau=" << stats.timing_offset_samples
+        << " rawtau=" << stats.raw_timing_offset_samples
+        << " phys=" << stats.physical_timing_offset_samples
+        << " sro=" << stats.sample_clock_offset_ppm << "ppm"
+        << " srocmd=" << stats.sro_resampler_command_ppm << "ppm"
+        << " sroapply=" << stats.sro_resampler_applied_ppm << "ppm"
+        << " srodelay=" << stats.sro_fixed_delay_samples << "smp"
+        << " srolate=" << stats.sro_schedule_late_samples << "smp"
+        << " sropending=" << stats.sro_pending_commands
+        << " cfoacq=" << stats.acquisition_cfo_hz << "Hz"
+        << " cfofrac=" << stats.acquisition_fractional_cfo_hz << "Hz"
+        << " cfobins=" << stats.acquisition_carrier_bin_offset
+        << " cfo=" << stats.tracked_carrier_offset_hz << "Hz"
+        << " cfores=" << stats.residual_carrier_offset_hz << "Hz"
+        << " cfocmd=" << stats.cfo_resampler_command_hz << "Hz"
+        << " cfoapply=" << stats.cfo_resampler_applied_hz << "Hz"
+        << " cfo-bootstrap=" << stats.bootstrap_attempts << '/'
+        << stats.bootstrap_replayed_input_samples << "smp"
+        << " cfodelay=" << stats.cfo_fixed_delay_samples << "smp"
+        << " cfolate=" << stats.cfo_schedule_late_samples << "smp"
+        << " cfoeffective=" << stats.cfo_applied_effective_input_sample << "smp"
+        << " cfopending=" << stats.cfo_pending_commands
+        << " cforeboot=" << stats.cfo_rebootstrap_count << '/'
+        << stats.cfo_rebootstrap_requests
+        << " last=" << stats.cfo_rebootstrap_last_residual_hz << "Hz"
+        << " tconf=" << stats.timing_confidence
+        << " cir=" << stats.cir_offset_samples
+        << " circonf=" << stats.cir_confidence
+        << " tmeas=" << stats.timing_measurements
+        << " taccept=" << stats.timing_accepted_measurements
+        << " trej=" << stats.timing_rejected_measurements
+        << " sroready=" << (stats.sro_resampler_ready ? 1 : 0)
+        << " fec-skip=" << stats.fec_skipped << " drop=" << stats.dropped_blocks
+        << " dm-busy=" << static_cast<int>(stats.demod_busy_fraction * 100.0F)
+        << "%";
     if (stats.processing_realtime_ratio > 0.0F) {
         std::cerr << " rt=" << (1.0F / stats.processing_realtime_ratio) << "x";
     }
@@ -147,10 +161,8 @@ void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
                        ? 100.0F * time_ms / stats.demod_fft_cfo_time_ms
                        : 0.0F;
         };
-        std::cerr << "[diag] fft+cfo-ms NCO=" << stats.demod_nco_rotate_time_ms
-                  << '(' << fft_share(stats.demod_nco_rotate_time_ms)
-                  << "%) FFT=" << stats.demod_fft_execute_time_ms << '('
-                  << fft_share(stats.demod_fft_execute_time_ms)
+        std::cerr << "[diag] fft+cfo-ms FFT=" << stats.demod_fft_execute_time_ms
+                  << '(' << fft_share(stats.demod_fft_execute_time_ms)
                   << "%) CFO-track=" << stats.demod_cfo_track_time_ms << '('
                   << fft_share(stats.demod_cfo_track_time_ms)
                   << "%) other=" << stats.demod_fft_cfo_other_time_ms << '('

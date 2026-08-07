@@ -4,6 +4,8 @@
 
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 
+#include "ofdm_carrier.hpp"
+
 #include <fftw3.h>
 
 #include <algorithm>
@@ -35,24 +37,6 @@ constexpr float analysis_rate_hz =
     1000.0F / static_cast<float>(analysis_interval.count());
 constexpr float minimum_power = 1.0e-12F;
 
-struct PilotLock {
-    int phase{};
-    int carrier_offset{};
-};
-
-[[nodiscard]] std::array<std::uint8_t, 6817> pilot_prbs() noexcept {
-    std::array<std::uint8_t, 6817> result{};
-    std::uint32_t state = (1U << 11U) - 1U;
-    for (auto &value : result) {
-        value = static_cast<std::uint8_t>(state & 1U);
-        const std::uint32_t next = ((state >> 2U) ^ state) & 1U;
-        state = (state >> 1U) | (next << 10U);
-    }
-    return result;
-}
-
-const auto prbs = pilot_prbs();
-
 [[nodiscard]] std::vector<std::complex<float>>
 transform_symbol(const std::span<const std::complex<float>> samples,
                  const OfdmAcquisition &acquisition) {
@@ -83,53 +67,6 @@ transform_symbol(const std::span<const std::complex<float>> samples,
     return output;
 }
 
-[[nodiscard]] std::complex<float>
-active_carrier(const std::span<const std::complex<float>> fft,
-               const std::size_t carrier, const std::size_t carrier_max,
-               const int carrier_offset = 0) {
-    const auto signed_bin = static_cast<std::ptrdiff_t>(carrier) -
-                            static_cast<std::ptrdiff_t>(carrier_max / 2) +
-                            static_cast<std::ptrdiff_t>(carrier_offset);
-    const auto wrapped =
-        (signed_bin + static_cast<std::ptrdiff_t>(fft.size())) %
-        static_cast<std::ptrdiff_t>(fft.size());
-    return fft[static_cast<std::size_t>(wrapped)];
-}
-
-[[nodiscard]] PilotLock
-scattered_pilot_lock(const std::span<const std::complex<float>> fft,
-                     const std::size_t carrier_max) {
-    float best_score = -1.0F;
-    PilotLock best;
-    for (int carrier_offset = -48; carrier_offset <= 48; ++carrier_offset) {
-        for (int phase = 0; phase < 4; ++phase) {
-            const auto first_pilot = static_cast<std::size_t>(phase) * 3;
-            float score = 0.0F;
-            std::complex<float> correlation{};
-            std::size_t chunk_count = 0;
-            for (std::size_t pilot = first_pilot, count = 0;
-                 pilot <= carrier_max && count < 192; pilot += 12, ++count) {
-                const float transmitted =
-                    prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
-                correlation += transmitted *
-                               std::conj(active_carrier(fft, pilot, carrier_max,
-                                                        carrier_offset));
-                if (++chunk_count == 8) {
-                    score += std::norm(correlation);
-                    correlation = {};
-                    chunk_count = 0;
-                }
-            }
-            score += std::norm(correlation);
-            if (score > best_score) {
-                best_score = score;
-                best = {phase, carrier_offset};
-            }
-        }
-    }
-    return best;
-}
-
 [[nodiscard]] std::vector<std::complex<float>>
 estimate_channel(const std::span<const std::complex<float>> fft,
                  const std::size_t carrier_max, const PilotLock lock) {
@@ -138,10 +75,9 @@ estimate_channel(const std::span<const std::complex<float>> fft,
     for (auto pilot = static_cast<std::size_t>(lock.phase) * 3;
          pilot <= carrier_max; pilot += 12) {
         const float transmitted =
-            prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+            pilot_prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
         channel[pilot] =
-            active_carrier(fft, pilot, carrier_max, lock.carrier_offset) /
-            transmitted;
+            active_carrier(fft, pilot, carrier_max, lock.offset) / transmitted;
         pilots.push_back(pilot);
     }
     if (pilots.empty()) {
@@ -219,7 +155,8 @@ analyze(const std::span<const std::int16_t> scalars,
     }
     const std::size_t carrier_max =
         acquisition.mode == TransmissionMode::k8 ? 6816 : 1704;
-    const PilotLock pilot_lock = scattered_pilot_lock(fft, carrier_max);
+    const PilotLock pilot_lock =
+        lock_pilots(fft, carrier_max, std::numeric_limits<int>::max(), 192);
     const auto channel = estimate_channel(fft, carrier_max, pilot_lock);
 
     std::vector<float> channel_db;
@@ -240,9 +177,9 @@ analyze(const std::span<const std::int16_t> scalars,
             continue;
         }
         if (std::norm(channel[carrier]) > minimum_power) {
-            equalized.push_back(active_carrier(fft, carrier, carrier_max,
-                                               pilot_lock.carrier_offset) /
-                                channel[carrier]);
+            equalized.push_back(
+                active_carrier(fft, carrier, carrier_max, pilot_lock.offset) /
+                channel[carrier]);
         }
     }
     if (equalized.empty() || channel_db.empty()) {

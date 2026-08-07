@@ -9,16 +9,20 @@ void StreamDecoder::Impl::demod_cold_seed(DemodRuntimeState &state) {
     // into an out-of-range PilotLock.
     state.lock_hold = 0;
     state.frozen_symbol_count = 0;
+    state.cfo_recovery_symbol_count = 0;
+    state.cfo_healthy_symbol_count = 0;
     state.hopeless_window_count = 0;
     state.stable_pending_offset = std::numeric_limits<int>::max();
     state.stable_pending_count = 0;
     state.tps_mismatch_symbols = 0;
-    frontend.tracked_cfo_phase =
-        std::arg(sync.phase) / static_cast<float>(state.fft_size);
     frontend.residual_phase_ema = 0.0F;
-    frontend.carrier_offset = std::numeric_limits<int>::max();
+    frontend.carrier_offset = 0;
     frontend.previous_continual.clear();
-    frontend.previous_phase = -1;
+    // The bootstrap acquisition FFT already established the scattered-pilot
+    // phase at carrier offset zero. Seed the previous phase so the first
+    // production symbol validates the predicted next phase instead of
+    // entering any wide carrier-search path.
+    frontend.previous_phase = (sync.acquisition_pilot_phase + 3) % 4;
     frontend.tps_decoder.reset();
     frontend.tps_snapshot = {};
     frontend.just_seeded = true;
@@ -177,8 +181,6 @@ bool StreamDecoder::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
         state.gate_buffer.clear();
         state.in_hopeless_region = false;
         state.next_symbol_start = anchored_start();
-        state.nco_phase = frontend.tracked_cfo_phase *
-                          static_cast<float>(state.next_symbol_start);
         state.last_reanchor_carried = false;
         state.applied_cir_offset =
             static_cast<int>(std::lround(frontend.cir_offset));
@@ -205,13 +207,6 @@ bool StreamDecoder::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
     while (new_next < ring_read_pos) {
         new_next += state.period;
     }
-    state.nco_phase = std::remainder(
-        state.nco_phase +
-            frontend.tracked_cfo_phase *
-                static_cast<float>(
-                    static_cast<std::int64_t>(new_next) -
-                    static_cast<std::int64_t>(state.next_symbol_start)),
-        2.0F * std::numbers::pi_v<float>);
     state.next_symbol_start = new_next;
     state.applied_cir_offset =
         static_cast<int>(std::lround(frontend.cir_offset));
@@ -277,7 +272,7 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
 
     const auto acquisition_started_at = std::chrono::steady_clock::now();
     const OfdmAcquisition acquisition =
-        acquire_ofdm(std::span(window), acquisition_parameters);
+        acquire_ofdm(std::span(window), acquisition_parameters, false);
     const float acquisition_elapsed_ms = duration_ms(acquisition_started_at);
     if (state.demod_busy_active) {
         state.reacquisition_time_sum_ms +=
@@ -307,7 +302,7 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
         stable_guard = acquisition.guard;
         sync.valid = true;
         sync.start_pos = base + acquisition.start;
-        sync.phase = acquisition.phase;
+        sync.acquisition_pilot_phase = acquisition.pilot_phase;
         sync.score = acquisition.score;
         sync.mode = acquisition.mode;
         sync.guard = acquisition.guard;

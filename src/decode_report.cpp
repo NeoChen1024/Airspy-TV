@@ -150,6 +150,10 @@ worker_state_name_json(const dvbt::WorkerState state) {
         {"complex_samples", record.input_complex_samples},
         {"discontinuity_before", record.discontinuity_before},
         {"abandoned", record.abandoned},
+        {"bootstrap",
+         {{"attempts", record.bootstrap_attempts},
+          {"replayed_input_samples", record.bootstrap_replayed_input_samples},
+          {"retained_peak_samples", record.bootstrap_retained_peak_samples}}},
     };
     result["resampler"] = {
         {"resampled_begin_sample", record.resampled_begin_sample},
@@ -166,6 +170,27 @@ worker_state_name_json(const dvbt::WorkerState state) {
         {"fixed_delay_samples", record.fixed_delay_samples},
         {"late_samples", record.late_samples},
         {"pending_commands", record.pending_commands},
+        {"frequency",
+         {{"commanded_cfo_hz", json_finite_or_null(record.commanded_cfo_hz)},
+          {"applied_cfo_hz", json_finite_or_null(record.applied_cfo_hz)},
+          {"command_output_sample", record.cfo_command_output_sample},
+          {"command_input_sample", record.cfo_command_input_sample},
+          {"effective_input_sample", record.cfo_effective_input_sample},
+          {"applied_effective_input_sample",
+           record.cfo_applied_effective_input_sample},
+          {"applied_input_sample", record.cfo_applied_input_sample},
+          {"applied_output_sample", record.cfo_applied_output_sample},
+          {"fixed_delay_samples", record.cfo_fixed_delay_samples},
+          {"late_samples", record.cfo_late_samples},
+          {"input_sample_rate_hz", record.cfo_input_sample_rate_hz},
+          {"pending_commands", record.cfo_pending_commands},
+          {"rebootstrap",
+           {{"requests", record.cfo_rebootstrap_requests},
+            {"completed", record.cfo_rebootstrap_count},
+            {"last_residual_hz",
+             json_finite_or_null(record.cfo_rebootstrap_last_residual_hz)},
+            {"output_sample", record.cfo_rebootstrap_output_sample},
+            {"source_sample", record.cfo_rebootstrap_source_sample}}}}},
     };
     result["timing_ms"] = {{"serial_wall", timing_map(record.serial_wall_ms)}};
     return result;
@@ -201,6 +226,10 @@ worker_state_name_json(const dvbt::WorkerState state) {
     };
     result["acquisition"] = {
         {"carrier_bin_offset", record.carrier_bin_offset},
+        {"initial_carrier_bin_offset", record.acquisition_carrier_bin_offset},
+        {"fractional_cfo_hz",
+         optional_number(record.acquisition_fractional_cfo_hz)},
+        {"cfo_hz", optional_number(record.acquisition_cfo_hz)},
         {"score", json_finite_or_null(record.acquisition_score)},
         {"start", record.acquisition_start},
     };
@@ -209,6 +238,29 @@ worker_state_name_json(const dvbt::WorkerState state) {
         {"fade_indicator", optional_number(record.fade_indicator)},
         {"tracked_cfo_hz", optional_number(record.tracked_cfo_hz)},
         {"residual_cfo_hz", optional_number(record.residual_cfo_hz)},
+    };
+    result["frequency_tracking"] = {
+        {"resampler_ready", record.cfo_resampler_ready},
+        {"commanded_cfo_hz", json_finite_or_null(record.cfo_command_hz)},
+        {"applied_cfo_hz", json_finite_or_null(record.cfo_applied_hz)},
+        {"command_output_sample", record.cfo_command_output_sample},
+        {"command_input_sample", record.cfo_command_input_sample},
+        {"effective_input_sample", record.cfo_effective_input_sample},
+        {"applied_effective_input_sample",
+         record.cfo_applied_effective_input_sample},
+        {"applied_input_sample", record.cfo_applied_input_sample},
+        {"applied_output_sample", record.cfo_applied_output_sample},
+        {"fixed_delay_samples", record.cfo_fixed_delay_samples},
+        {"late_samples", record.cfo_late_samples},
+        {"input_sample_rate_hz", record.cfo_input_sample_rate_hz},
+        {"pending_commands", record.cfo_pending_commands},
+        {"rebootstrap",
+         {{"requests", record.cfo_rebootstrap_requests},
+          {"completed", record.cfo_rebootstrap_count},
+          {"last_residual_hz",
+           optional_number(record.cfo_rebootstrap_last_residual_hz)},
+          {"output_sample", record.cfo_rebootstrap_output_sample},
+          {"source_sample", record.cfo_rebootstrap_source_sample}}},
     };
     result["clock_tracking"] = {
         {"raw_timing_samples", optional_number(record.raw_timing_samples)},
@@ -506,6 +558,14 @@ struct DecodeReport::Impl {
         if (record.tracked_cfo_hz) {
             cfo.add(*record.tracked_cfo_hz);
         }
+        if (record.acquisition_cfo_hz) {
+            acquisition_cfo.add(*record.acquisition_cfo_hz);
+        }
+        if (record.residual_cfo_hz) {
+            residual_cfo.add(*record.residual_cfo_hz);
+        }
+        cfo_command.add(record.cfo_command_hz);
+        cfo_applied.add(record.cfo_applied_hz);
         if (record.physical_timing_samples) {
             timing.add(*record.physical_timing_samples);
         }
@@ -657,6 +717,9 @@ struct DecodeReport::Impl {
               {"overlap_packets", stats.ts_overlap_packets},
               {"overlap_join_failures", stats.ts_overlap_join_failures},
               {"fec_sessions", stats.fec_sessions},
+              {"bootstrap_attempts", stats.bootstrap_attempts},
+              {"cfo_rebootstrap_requests", stats.cfo_rebootstrap_requests},
+              {"cfo_rebootstrap_count", stats.cfo_rebootstrap_count},
               {"pre_viterbi_error_bits", fec.pre_viterbi_error_bits},
               {"pre_viterbi_compared_bits", fec.pre_viterbi_compared_bits},
               {"post_viterbi_error_bits", fec.post_viterbi_error_bits},
@@ -671,7 +734,11 @@ struct DecodeReport::Impl {
             {"measurements",
              {{"mer_db", mer.value()},
               {"sro_ppm", sro.value()},
+              {"acquisition_cfo_hz", acquisition_cfo.value()},
               {"tracked_cfo_hz", cfo.value()},
+              {"residual_cfo_hz", residual_cfo.value()},
+              {"commanded_cfo_hz", cfo_command.value()},
+              {"applied_cfo_hz", cfo_applied.value()},
               {"physical_timing_samples", timing.value()}}},
             {"timing_ms", timing_summary},
             {"events", event_summary},
@@ -683,7 +750,31 @@ struct DecodeReport::Impl {
               {"estimated_sro_ppm",
                json_finite_or_null(stats.sample_clock_offset_ppm)},
               {"applied_sro_ppm",
-               json_finite_or_null(stats.sro_resampler_applied_ppm)}}},
+               json_finite_or_null(stats.sro_resampler_applied_ppm)},
+              {"acquisition_cfo_hz",
+               json_finite_or_null(stats.acquisition_cfo_hz)},
+              {"acquisition_fractional_cfo_hz",
+               json_finite_or_null(stats.acquisition_fractional_cfo_hz)},
+              {"acquisition_carrier_bin_offset",
+               stats.acquisition_carrier_bin_offset},
+              {"estimated_cfo_hz",
+               json_finite_or_null(stats.tracked_carrier_offset_hz)},
+              {"residual_cfo_hz",
+               json_finite_or_null(stats.residual_carrier_offset_hz)},
+              {"commanded_cfo_hz",
+               json_finite_or_null(stats.cfo_resampler_command_hz)},
+              {"applied_cfo_hz",
+               json_finite_or_null(stats.cfo_resampler_applied_hz)},
+              {"cfo_rebootstrap_last_residual_hz",
+               json_finite_or_null(stats.cfo_rebootstrap_last_residual_hz)},
+              {"cfo_rebootstrap_output_sample",
+               stats.cfo_rebootstrap_output_sample},
+              {"cfo_rebootstrap_source_sample",
+               stats.cfo_rebootstrap_source_sample},
+              {"bootstrap_replayed_input_samples",
+               stats.bootstrap_replayed_input_samples},
+              {"bootstrap_retained_peak_samples",
+               stats.bootstrap_retained_peak_samples}}},
             {"exit_code", exit_code},
             {"error", error.empty() ? json(nullptr) : json(error)},
         };
@@ -707,7 +798,11 @@ struct DecodeReport::Impl {
     std::uint64_t tps_locked_windows{};
     Aggregate mer;
     Aggregate sro;
+    Aggregate acquisition_cfo;
     Aggregate cfo;
+    Aggregate residual_cfo;
+    Aggregate cfo_command;
+    Aggregate cfo_applied;
     Aggregate timing;
     std::map<std::string, Aggregate, std::less<>> timing_aggregates;
     std::map<std::string, std::uint64_t, std::less<>> event_counts;
@@ -757,11 +852,12 @@ void format_debug_telemetry(std::ostream &stream,
             if constexpr (std::is_same_v<Value, dvbt::FrontendBlockTelemetry>) {
                 stream << std::format(
                     "[frontend_block] seq={} source={}..{} resampled={}..{} "
-                    "ratio={:.9f} sro={:+.4f}ppm total={:.3f}ms\n",
+                    "ratio={:.9f} sro={:+.4f}ppm cfo={:+.2f}Hz "
+                    "total={:.3f}ms\n",
                     value.envelope.sequence, value.source_begin_sample,
                     value.source_end_sample, value.resampled_begin_sample,
                     value.resampled_end_sample, value.effective_ratio,
-                    value.applied_sro_ppm,
+                    value.applied_sro_ppm, value.applied_cfo_hz,
                     value.serial_wall_ms.at("frontend::total"));
             } else if constexpr (std::is_same_v<Value,
                                                 dvbt::DemodWindowTelemetry>) {
@@ -796,6 +892,21 @@ void format_debug_telemetry(std::ostream &stream,
                         value.cir_confidence.value_or(0.0),
                         value.timing_drift_ready);
                 }
+                stream << std::format(
+                    "  clock::frequency acquisition={:+.2f}Hz "
+                    "fractional={:+.2f}Hz bins={} "
+                    "estimated={:+.2f}Hz residual={:+.2f}Hz "
+                    "resampler={:+.2f}/{:+.2f}Hz delay={} late={} "
+                    "pending={} rebootstrap={}/{} last={:+.2f}Hz\n",
+                    value.acquisition_cfo_hz.value_or(0.0),
+                    value.acquisition_fractional_cfo_hz.value_or(0.0),
+                    value.acquisition_carrier_bin_offset,
+                    value.tracked_cfo_hz.value_or(0.0),
+                    value.residual_cfo_hz.value_or(0.0), value.cfo_command_hz,
+                    value.cfo_applied_hz, value.cfo_fixed_delay_samples,
+                    value.cfo_late_samples, value.cfo_pending_commands,
+                    value.cfo_rebootstrap_count, value.cfo_rebootstrap_requests,
+                    value.cfo_rebootstrap_last_residual_hz.value_or(0.0));
                 for (const auto &[name, timing] : value.serial_busy_ms) {
                     stream << std::format("  {}={:.3f}ms\n", name, timing);
                 }

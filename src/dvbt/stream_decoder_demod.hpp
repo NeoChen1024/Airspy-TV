@@ -38,6 +38,22 @@ void StreamDecoder::Impl::run_demod() {
                     }
                 }
                 fire_pending_discontinuity();
+                if (cfo_rebootstrap_requested.load(std::memory_order_acquire)) {
+                    std::unique_lock lock(mutex);
+                    demod_state.store(
+                        static_cast<int>(WorkerState::waiting_sync));
+                    ring_data.wait(lock, [this, &seen_sync_version] {
+                        return stopping || sync.version != seen_sync_version ||
+                               !cfo_rebootstrap_requested.load(
+                                   std::memory_order_acquire);
+                    });
+                    if (stopping) {
+                        demod_state.store(
+                            static_cast<int>(WorkerState::exited));
+                        return;
+                    }
+                    continue;
+                }
                 if (have_grid && decoder_parameters &&
                     postprocessor == nullptr && !demod_start_decoder(runtime)) {
                     return;
@@ -57,7 +73,7 @@ void StreamDecoder::Impl::run_demod() {
                     return;
                 }
                 auto stage_started_at = std::chrono::steady_clock::now();
-                demod_execute_fft_and_track_cfo(runtime);
+                demod_execute_fft_and_measure_cfo(runtime);
                 runtime.fft_cfo_time_sum_ms += duration_ms(stage_started_at);
 
                 stage_started_at = std::chrono::steady_clock::now();

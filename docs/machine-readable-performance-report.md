@@ -304,8 +304,7 @@ time:
       "demod::ring_wait": 1.72
     },
     "nested": {
-      "demod::nco": 7.72,
-      "demod::fft": 8.30,
+      "demod::fft": 16.02,
       "demod::cfo_track": 0.91,
       "demod::channel::timing": 12.45,
       "demod::channel::interpolate": 4.83
@@ -328,8 +327,9 @@ The complete first-version metric set is:
   `demod::payload_extract`, `demod::symbol_submit`,
   `demod::postprocess_wait`, `demod::output`, and `demod::other`;
 - demod outside busy: `demod::ring_wait`;
-- FFT/CFO nested: `demod::nco`, `demod::fft`, `demod::cfo_track`, and
-  `demod::fft_cfo_other`;
+- FFT/CFO nested: `demod::fft`, `demod::cfo_track`, and
+  `demod::fft_cfo_other`; carrier translation is performed by the frontend
+  resampler and therefore has no separate demod NCO bucket;
 - channel nested: `demod::channel::pilots`, `demod::channel::notch`,
   `demod::channel::timing`, `demod::channel::cir`,
   `demod::channel::interpolate`, `demod::channel::tps_extract`, and
@@ -342,6 +342,17 @@ The complete first-version metric set is:
 Each record also carries its applicable total wall time, sample/symbol count,
 and interval endpoints. Percentages are derived values and should not be
 stored in detailed records when the numerator and denominator are available.
+
+Frontend records also carry the common resampler's independent SRO and CFO
+actuator state. Demod-window records separate acquisition CFO, estimated
+absolute CFO, residual CFO, latest scheduled command coordinates, and the
+effective/actual source positions of the most recently applied command. This
+distinction is required when a newer command is still pending behind the fixed
+sample-domain horizon. Frequency-tracking records also expose abrupt-CFO
+rebootstrap request/completion counts, the last trigger residual, and its
+source/output sample coordinates. The corresponding
+`cfo_rebootstrap_requested` event records the trigger reason and recovery
+state.
 
 ## Detailed values
 

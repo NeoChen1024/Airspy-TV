@@ -16,6 +16,7 @@ struct ResamplerRateSpan {
     std::uint64_t output_end{};
     std::uint32_t input_rate_hz{};
     double applied_correction_ppm{};
+    double applied_cfo_correction_hz{};
 };
 
 struct MappedInputPosition {
@@ -93,6 +94,18 @@ class ResamplerRateTimeline {
         }
         return static_cast<double>(weighted_sum /
                                    static_cast<long double>(covered));
+    }
+
+    [[nodiscard]] std::optional<double>
+    cfo_correction_at(const std::uint64_t output_sample) const noexcept {
+        const auto item = std::find_if(
+            spans_.rbegin(), spans_.rend(), [output_sample](const auto &span) {
+                return output_sample >= span.output_begin &&
+                       output_sample < span.output_end;
+            });
+        return item == spans_.rend()
+                   ? std::nullopt
+                   : std::optional<double>{item->applied_cfo_correction_hz};
     }
 
     void discard_before(const std::uint64_t output_sample) {

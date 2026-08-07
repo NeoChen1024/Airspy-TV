@@ -1,8 +1,12 @@
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 #include "airspy_tv/dsp/vector_ops.hpp"
-#include "liquid_resampler/arbitrary_resampler.hpp"
+#include "airspy_tv/fftw_plan.hpp"
+#include "solid_resampler/frequency_translating_resampler.hpp"
 
+#include "ofdm_carrier.hpp"
 #include "resampler_config.hpp"
+
+#include <fftw3.h>
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <numbers>
 #include <span>
 #include <vector>
 
@@ -43,7 +48,7 @@ struct Cs16Resampler::Impl {
         return {output.begin(), output.end()};
     }
 
-    liquid_resampler::ArbitraryResampler resampler;
+    solid_resampler::FrequencyTranslatingResampler resampler;
 };
 
 Cs16Resampler::Cs16Resampler(const std::size_t worker_count)
@@ -73,7 +78,8 @@ resample_cs16(const std::span<const std::int16_t> interleaved_iq,
 }
 
 OfdmAcquisition acquire_ofdm(const std::span<const std::complex<float>> samples,
-                             const ReceiverParameters &parameters) {
+                             const ReceiverParameters &parameters,
+                             const bool search_carrier_offset) {
     OfdmAcquisition best;
     float best_periodic_score = 0.0F;
     for (const auto mode : {TransmissionMode::k8, TransmissionMode::k2}) {
@@ -163,10 +169,58 @@ OfdmAcquisition acquire_ofdm(const std::span<const std::complex<float>> samples,
             }
             best_periodic_score = candidate_score;
             best = {
-                selected,         fft_size, guard,         selected_correlation,
-                scores[selected], mode,     guard_interval};
+                .start = selected,
+                .fft_size = fft_size,
+                .guard_size = guard,
+                .phase = selected_correlation,
+                .score = scores[selected],
+                .mode = mode,
+                .guard = guard_interval,
+            };
         }
     }
+    if (best.score <= 0.0F || best.fft_size == 0U ||
+        best.start + best.guard_size + best.fft_size > samples.size()) {
+        return best;
+    }
+
+    best.fractional_cfo_phase_per_sample =
+        std::arg(best.phase) / static_cast<float>(best.fft_size);
+    std::vector<std::complex<float>> fft_input(best.fft_size);
+    std::vector<std::complex<float>> fft_output(best.fft_size);
+    const std::size_t data_start = best.start + best.guard_size;
+    std::complex<float> nco =
+        std::polar(1.0F, -best.fractional_cfo_phase_per_sample *
+                             static_cast<float>(data_start));
+    const std::complex<float> nco_step =
+        std::polar(1.0F, -best.fractional_cfo_phase_per_sample);
+    for (std::size_t index = 0; index < best.fft_size; ++index) {
+        fft_input[index] = samples[data_start + index] * nco;
+        nco *= nco_step;
+        if ((index & 511U) == 511U) {
+            const float power = std::norm(nco);
+            if (power > 0.0F) {
+                nco *= 1.0F / std::sqrt(power);
+            }
+        }
+    }
+    static_assert(sizeof(std::complex<float>) == sizeof(fftwf_complex));
+    auto plan =
+        FftwfPlan::dft_1d(static_cast<int>(best.fft_size),
+                          reinterpret_cast<fftwf_complex *>(fft_input.data()),
+                          reinterpret_cast<fftwf_complex *>(fft_output.data()),
+                          FFTW_FORWARD, FFTW_ESTIMATE);
+    plan.execute();
+    const std::size_t maximum = best.fft_size == 8192U ? 6816U : 1704U;
+    const PilotLock lock = search_carrier_offset
+                               ? lock_pilots(fft_output, maximum)
+                               : lock_pilots_at_offset(fft_output, maximum, 0);
+    best.carrier_offset = lock.offset;
+    best.pilot_phase = lock.phase;
+    best.total_cfo_phase_per_sample = best.fractional_cfo_phase_per_sample +
+                                      (2.0F * std::numbers::pi_v<float> *
+                                       static_cast<float>(best.carrier_offset) /
+                                       static_cast<float>(best.fft_size));
     return best;
 }
 
