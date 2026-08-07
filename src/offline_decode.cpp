@@ -11,8 +11,8 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <format>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -32,29 +32,28 @@ using airspy_tv::dvbt::StreamDecoderStats;
     if (capacity == 0) {
         return 0;
     }
-    return static_cast<int>(std::clamp(
-        100.0 * static_cast<double>(used) / static_cast<double>(capacity),
-        0.0, 100.0));
+    return static_cast<int>(std::clamp(100.0 * static_cast<double>(used) /
+                                           static_cast<double>(capacity),
+                                       0.0, 100.0));
 }
 
 void print_progress(const StreamDecoderStats &stats,
                     const std::uint64_t submitted_samples,
                     const std::uint32_t sample_rate_hz,
                     const double wall_seconds) {
-    const double input_seconds =
-        sample_rate_hz == 0
-            ? 0.0
-            : static_cast<double>(submitted_samples) /
-                  static_cast<double>(sample_rate_hz);
-    const double speed = wall_seconds > 0.0 ? input_seconds / wall_seconds : 0.0;
-    const int iq = percent(stats.queued_input_samples,
-                           stats.input_queue_capacity_samples);
+    const double input_seconds = sample_rate_hz == 0
+                                     ? 0.0
+                                     : static_cast<double>(submitted_samples) /
+                                           static_cast<double>(sample_rate_hz);
+    const double speed =
+        wall_seconds > 0.0 ? input_seconds / wall_seconds : 0.0;
+    const int iq =
+        percent(stats.queued_input_samples, stats.input_queue_capacity_samples);
     const int demod = static_cast<int>(
         std::clamp(100.0F * stats.demod_busy_fraction, 0.0F, 100.0F));
     const int fec = percent(stats.queued_symbols, stats.symbol_queue_capacity);
-    std::cerr << std::fixed << std::setprecision(1)
-              << "wall=" << wall_seconds << "s input=" << input_seconds
-              << "s speed=" << speed << "x MER=";
+    std::cerr << std::fixed << std::setprecision(1) << "wall=" << wall_seconds
+              << "s input=" << input_seconds << "s speed=" << speed << "x MER=";
     if (stats.ofdm_locked) {
         std::cerr << stats.mer_db << "dB";
     } else {
@@ -63,11 +62,10 @@ void print_progress(const StreamDecoderStats &stats,
     std::cerr << " OFDM=" << (stats.ofdm_locked ? "lock" : "search")
               << " TPS=" << (stats.tps_locked ? "lock" : "search")
               << " TS=" << std::setprecision(1)
-              << static_cast<double>(stats.transport_bytes) /
-                     (1024.0 * 1024.0)
+              << static_cast<double>(stats.transport_bytes) / (1024.0 * 1024.0)
               << "MiB TEI=" << stats.cumulative_transport.tei_packets
-              << std::format(" IQ={:3d}% Demod={:3d}% FEC={:3d}%", iq,
-                             demod, fec)
+              << std::format(" IQ={:3d}% Demod={:3d}% FEC={:3d}%", iq, demod,
+                             fec)
               << '\n';
 }
 
@@ -122,15 +120,14 @@ int offline_decode_cli(
     std::unique_ptr<DecodeReport> report;
     if (report_directory.has_value()) {
         try {
-            report = std::make_unique<DecodeReport>(
-                DecodeReportConfig{
-                    .directory = *report_directory,
-                    .source = stdin_source ? "stdin" : source.string(),
-                    .destination = stdout_destination ? "stdout"
-                                                      : destination.string(),
-                    .sample_rate_hz = info.sample_rate_hz,
-                    .decoder = parameters,
-                });
+            report = std::make_unique<DecodeReport>(DecodeReportConfig{
+                .directory = *report_directory,
+                .source = stdin_source ? "stdin" : source.string(),
+                .destination =
+                    stdout_destination ? "stdout" : destination.string(),
+                .sample_rate_hz = info.sample_rate_hz,
+                .decoder = parameters,
+            });
         } catch (const std::exception &exception) {
             std::cerr << "Unable to initialize performance report: "
                       << exception.what() << '\n';
@@ -141,8 +138,8 @@ int offline_decode_cli(
     std::unique_ptr<std::ifstream> input_file;
     std::istream *input = &std::cin;
     if (!stdin_source) {
-        input_file = std::make_unique<std::ifstream>(info.data_path,
-                                                     std::ios::binary);
+        input_file =
+            std::make_unique<std::ifstream>(info.data_path, std::ios::binary);
         input = input_file.get();
     }
     std::unique_ptr<std::ofstream> output_file;
@@ -235,15 +232,15 @@ int offline_decode_cli(
 
     while (*input && !output_failed.load(std::memory_order_relaxed) &&
            !report_failed) {
-        input->read(reinterpret_cast<char *>(block.data()),
-                    static_cast<std::streamsize>(block.size() *
-                                                 sizeof(block.front())));
+        input->read(
+            reinterpret_cast<char *>(block.data()),
+            static_cast<std::streamsize>(block.size() * sizeof(block.front())));
         const std::streamsize bytes_read = input->gcount();
         if (bytes_read <= 0) {
             break;
         }
-        if ((bytes_read % static_cast<std::streamsize>(
-                              sizeof(std::int16_t) * 2)) != 0) {
+        if ((bytes_read %
+             static_cast<std::streamsize>(sizeof(std::int16_t) * 2)) != 0) {
             input_failed = true;
             error = "I/Q input ended with an incomplete CS16 sample";
             break;
@@ -273,10 +270,10 @@ int offline_decode_cli(
     periodic(true);
 
     const auto stats = decoder.stats();
-    const double wall_seconds = std::chrono::duration<double>(
-                                    std::chrono::steady_clock::now() -
-                                    started_at)
-                                    .count();
+    const double wall_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      started_at)
+            .count();
     int exit_code = 0;
     std::string status = "completed";
     if (report_failed) {
@@ -310,8 +307,8 @@ int offline_decode_cli(
     }
     if (report) {
         try {
-            report->finalize(status, exit_code, error, stats,
-                             submitted_samples, wall_seconds);
+            report->finalize(status, exit_code, error, stats, submitted_samples,
+                             wall_seconds);
         } catch (const std::exception &exception) {
             std::cerr << "Unable to finalize performance report: "
                       << exception.what() << '\n';

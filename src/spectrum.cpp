@@ -269,10 +269,7 @@ struct SpectrumAnalyzer::Impl {
             }
             next.bins_dbfs[output_index] = smoothed_bins_dbfs[output_index];
         }
-        update_channel_metrics(
-            next,
-            shifted_power,
-            channel_bandwidth);
+        update_channel_metrics(next, shifted_power, channel_bandwidth);
         const float snr_alpha =
             snr_smoothing ? std::min(static_cast<float>(std::max(
                                          snr_smoothing_speed.load(), 1)) /

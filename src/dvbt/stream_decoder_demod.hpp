@@ -108,16 +108,14 @@ void StreamDecoder::Impl::run_demod() {
                 finish_symbol_attempt();
                 if (window_symbol_count >= stats_window_symbols) {
                     demod_publish_stats_window(runtime);
-                    static_cast<void>(
-                        enqueue_fec({.kind = FecItem::Kind::stats,
-                                     .generation = demod_generation,
-                                     .parameters = {},
-                                     .mother_metrics = {},
-                                     .symbol_index = 0,
-                                     .demod_window_sequence =
-                                         runtime.window_sequence,
-                                     .source_epoch =
-                                         runtime.window_source_epoch}));
+                    static_cast<void>(enqueue_fec(
+                        {.kind = FecItem::Kind::stats,
+                         .generation = demod_generation,
+                         .parameters = {},
+                         .mother_metrics = {},
+                         .symbol_index = 0,
+                         .demod_window_sequence = runtime.window_sequence,
+                         .source_epoch = runtime.window_source_epoch}));
                     demod_reset_stats_window(runtime);
                 }
                 if (!payload_dispatched) {

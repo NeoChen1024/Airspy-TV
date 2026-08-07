@@ -78,7 +78,12 @@ class Demodulator {
         std::function<void(std::span<const std::uint8_t>)>;
     using DiscontinuityCallback = std::function<void(TransportDiscontinuity)>;
 
+    Demodulator() = default;
     virtual ~Demodulator() = default;
+    Demodulator(const Demodulator &) = delete;
+    Demodulator &operator=(const Demodulator &) = delete;
+    Demodulator(Demodulator &&) = delete;
+    Demodulator &operator=(Demodulator &&) = delete;
 
     // Publish a discontinuity and return immediately. Source callbacks use
     // this path so dropped-sample recovery never waits for decoder workers.

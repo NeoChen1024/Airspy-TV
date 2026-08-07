@@ -18,7 +18,7 @@ class FftwfPlan {
     static FftwfPlan dft_1d(const int size, fftwf_complex *input,
                             fftwf_complex *output, const int sign,
                             const unsigned flags) {
-        std::scoped_lock lock(planner_mutex());
+        std::scoped_lock const lock(planner_mutex());
         fftwf_plan plan = fftwf_plan_dft_1d(size, input, output, sign, flags);
         if (plan == nullptr) {
             throw std::bad_alloc();
@@ -48,7 +48,7 @@ class FftwfPlan {
         if (plan_ == nullptr) {
             return;
         }
-        std::scoped_lock lock(planner_mutex());
+        std::scoped_lock const lock(planner_mutex());
         fftwf_destroy_plan(std::exchange(plan_, nullptr));
     }
 

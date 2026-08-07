@@ -7,10 +7,10 @@
 #include "airspy_tv/iq_file.hpp"
 #include "airspy_tv/mpv_player.hpp"
 #include "byte_rate_tracker.hpp"
-#include "pipeline_load_monitor.hpp"
-#include "receiver_session.hpp"
 #include "decode_report.hpp"
 #include "offline_decode.hpp"
+#include "pipeline_load_monitor.hpp"
+#include "receiver_session.hpp"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_dialog.h>
@@ -58,7 +58,6 @@ using airspy_tv::EnumerationResult;
 using airspy_tv::EpgEvent;
 using airspy_tv::EpgModel;
 using airspy_tv::EpgSnapshot;
-using airspy_tv::IqFileInfo;
 using airspy_tv::MpvPlayer;
 using airspy_tv::PipelineLoadMonitor;
 using airspy_tv::PipelineLoadSample;
@@ -86,7 +85,7 @@ using airspy_tv::dvbt::WorkerState;
 // Decoder diagnostics helpers (defined in the anonymous namespace below):
 // forward declarations so the GUI panels and the periodic dump can use them
 // before the definitions.
-[[nodiscard]] const char *worker_state_name(const WorkerState state);
+[[nodiscard]] const char *worker_state_name(WorkerState state);
 void dump_decoder_diagnostics(const StreamDecoderStats &stats);
 
 #include "main_gui.hpp"
@@ -112,7 +111,7 @@ int main(const int argc, char **argv) {
     bool bias_tee = false;
     ReceiverParameters dvbt_parameters;
 
-    int opt;
+    int opt = 0;
     while ((opt = getopt_long(argc, argv, "hd", cli_options, nullptr)) != -1) {
         switch (opt) {
         case 'h':
@@ -293,8 +292,8 @@ int main(const int argc, char **argv) {
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
     AppState state;
-    state.session.set_dvbt_telemetry_enabled(
-        airspy_tv::is_debug_enabled(), std::chrono::steady_clock::now());
+    state.session.set_dvbt_telemetry_enabled(airspy_tv::is_debug_enabled(),
+                                             std::chrono::steady_clock::now());
     state.session.set_dvbt_parameters(state.dvbt.parameters);
     state.window = window;
     std::string player_error;

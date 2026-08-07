@@ -54,6 +54,8 @@ void require(const bool condition, const std::string_view message) {
 
 [[nodiscard]] std::vector<std::complex<float>>
 make_input(const std::size_t count) {
+    // Fixed seeds make numerical regression failures reproducible.
+    // NOLINTNEXTLINE(bugprone-random-generator-seed)
     std::mt19937 generator{0x52534d50U};
     std::uniform_real_distribution<float> distribution{-1.0F, 1.0F};
     std::vector<std::complex<float>> input(count);
@@ -90,6 +92,8 @@ void test_streaming_boundaries_and_workers() {
     ArbitraryResampler chunked{1};
     chunked.configure(config);
     std::vector<std::complex<float>> chunked_output;
+    // Fixed seeds make chunk-boundary regressions reproducible.
+    // NOLINTNEXTLINE(bugprone-random-generator-seed)
     std::mt19937 generator{0x424c4f43U};
     std::uniform_int_distribution<std::size_t> chunk_size{1, 8191};
     for (std::size_t offset = 0; offset < input.size();) {
@@ -149,8 +153,8 @@ void test_reset_and_ratio_telemetry() {
     (void)resampler.process(std::span{input}.first(4096));
     require(resampler.requested_ratio() == requested,
             "requested ratio telemetry");
-    const double q32_tolerance = 0.6 / static_cast<double>(std::uint64_t{1}
-                                                           << 32U);
+    const double q32_tolerance =
+        0.6 / static_cast<double>(std::uint64_t{1} << 32U);
     require(std::abs(resampler.effective_ratio() - requested) < q32_tolerance,
             "effective Q32.32 ratio precision");
     require(resampler.phase_step_q32() != 0U, "Q32.32 phase step telemetry");
@@ -163,18 +167,20 @@ void test_rate_change_continuity_and_counts() {
     ArbitraryResampler resampler{2};
     resampler.configure(config);
 
-    const auto before = copy_output(resampler, std::span{constant}.first(10'000));
+    const auto before =
+        copy_output(resampler, std::span{constant}.first(10'000));
     require(before.size() == 10'000U, "unity-ratio output count");
     resampler.set_ratio(0.8);
-    const auto after = copy_output(resampler, std::span{constant}.subspan(10'000));
+    const auto after =
+        copy_output(resampler, std::span{constant}.subspan(10'000));
     require(after.size() == 8'000U, "reduced-ratio output count");
 
     const auto close_to_constant = [](const std::complex<float> sample) {
         return std::abs(sample - std::complex<float>{1.0F, -0.25F}) < 2.0e-3F;
     };
-    require(std::ranges::all_of(std::span{before}.subspan(64),
-                                close_to_constant),
-            "resampler must preserve steady-state gain");
+    require(
+        std::ranges::all_of(std::span{before}.subspan(64), close_to_constant),
+        "resampler must preserve steady-state gain");
     require(std::ranges::all_of(after, close_to_constant),
             "ratio update must preserve FIR history and continuity");
 
@@ -201,7 +207,7 @@ void test_bounded_ratio_slew() {
     resampler.set_ratio(1.0 / (1.0 + 20.0e-6));
     (void)resampler.process(input);
     const double first_correction_ppm =
-        (1.0 / resampler.effective_ratio() - 1.0) * 1.0e6;
+        ((1.0 / resampler.effective_ratio()) - 1.0) * 1.0e6;
     require(first_correction_ppm > 0.45 && first_correction_ppm < 0.55,
             "slew must be limited by elapsed input duration");
 
@@ -209,7 +215,7 @@ void test_bounded_ratio_slew() {
         (void)resampler.process(input);
     }
     const double final_correction_ppm =
-        (1.0 / resampler.effective_ratio() - 1.0) * 1.0e6;
+        ((1.0 / resampler.effective_ratio()) - 1.0) * 1.0e6;
     require(std::abs(final_correction_ppm - 20.0) < 0.01,
             "bounded slew must converge to the requested ratio");
 
@@ -227,15 +233,14 @@ void test_bounded_ratio_slew() {
     std::vector<std::complex<float>> input(input_count);
     for (std::size_t index = 0; index < input.size(); ++index) {
         const double phase = 2.0 * std::numbers::pi * frequency_hz *
-                             static_cast<double>(index) /
-                             config.input_rate_hz;
+                             static_cast<double>(index) / config.input_rate_hz;
         input[index] = {static_cast<float>(std::cos(phase)),
                         static_cast<float>(std::sin(phase))};
     }
     resampler.reset();
     const auto output = resampler.process(input);
-    const std::size_t skip = std::min(2U * resampler.filter_taps(),
-                                      output.size());
+    const std::size_t skip =
+        std::min(2U * resampler.filter_taps(), output.size());
     double power = 0.0;
     for (const auto sample : output.subspan(skip)) {
         power += std::norm(sample);
@@ -268,9 +273,9 @@ void test_dvbt_stopband_attenuation() {
         for (std::size_t step = 0; step <= sweep_intervals; ++step) {
             const double frequency_hz =
                 config.stopband_edge_hz +
-                (0.5 * config.input_rate_hz - config.stopband_edge_hz) *
-                    static_cast<double>(step) /
-                    static_cast<double>(sweep_intervals);
+                (((0.5 * config.input_rate_hz) - config.stopband_edge_hz) *
+                 static_cast<double>(step) /
+                 static_cast<double>(sweep_intervals));
             worst_stopband_gain =
                 std::max(worst_stopband_gain,
                          measure_tone_gain(resampler, config, frequency_hz));
@@ -278,8 +283,7 @@ void test_dvbt_stopband_attenuation() {
         if (worst_stopband_gain > maximum_stopband_gain) {
             throw std::runtime_error(
                 "DVB-T stopband missed 80 dB target: " +
-                std::to_string(20.0 * std::log10(worst_stopband_gain)) +
-                " dB");
+                std::to_string(20.0 * std::log10(worst_stopband_gain)) + " dB");
         }
     }
 }

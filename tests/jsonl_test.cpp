@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -29,7 +30,7 @@ template <typename Function>
 JsonlError expect_jsonl_error(Function &&function,
                               const std::string_view message) {
     try {
-        function();
+        std::forward<Function>(function)();
     } catch (const JsonlError &error) {
         return error;
     }
@@ -52,12 +53,16 @@ void test_round_trip_and_record_numbers() {
     JsonlReader reader(input);
     const auto first = reader.read();
     const auto second = reader.read();
-    require(first.has_value() && first->line_number == 1,
-            "first line number is wrong");
+    if (!first.has_value()) {
+        throw std::runtime_error("first record is missing");
+    }
+    if (!second.has_value()) {
+        throw std::runtime_error("second record is missing");
+    }
+    require(first->line_number == 1, "first line number is wrong");
     require(first->value.at("record_type") == "first",
             "first value changed during round trip");
-    require(second.has_value() && second->line_number == 2,
-            "second line number is wrong");
+    require(second->line_number == 2, "second line number is wrong");
     require(second->value.at("message") == "line one\nline two",
             "escaped newline changed during round trip");
     require(!reader.read().has_value(), "reader did not stop at clean EOF");

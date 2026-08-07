@@ -1811,17 +1811,17 @@ void draw_sidebar(AppState &state) {
                 "SRO cmd / applied", actuator_text.c_str(),
                 sro_resampler_ready
                     ? std::clamp(
-                          0.5F +
-                              state.dvbt.decoder.sro_resampler_applied_ppm /
-                                  10.0F,
+                          0.5F + state.dvbt.decoder.sro_resampler_applied_ppm /
+                                     10.0F,
                           0.0F, 1.0F)
                     : 0.5F,
                 ImVec4(0.52F, 0.82F, 1.0F, 1.0F));
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
                 const double scheduled_delay_ms =
                     state.dvbt.decoder.sro_input_sample_rate_hz != 0
-                        ? 1000.0 * static_cast<double>(
-                                       state.dvbt.decoder.sro_fixed_delay_samples) /
+                        ? 1000.0 *
+                              static_cast<double>(
+                                  state.dvbt.decoder.sro_fixed_delay_samples) /
                               state.dvbt.decoder.sro_input_sample_rate_hz
                         : 0.0;
                 ImGui::SetTooltip(

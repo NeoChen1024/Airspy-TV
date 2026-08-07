@@ -23,9 +23,8 @@ convert_cs16_to_cf32(const std::span<const std::int16_t> interleaved_iq,
     }
 }
 
-inline void magnitude_squared(
-    const std::span<const std::complex<float>> input,
-    const std::span<float> output) {
+inline void magnitude_squared(const std::span<const std::complex<float>> input,
+                              const std::span<float> output) {
     if (input.size() != output.size()) {
         throw std::invalid_argument("magnitude output size mismatch");
     }
@@ -36,10 +35,9 @@ inline void magnitude_squared(
     }
 }
 
-inline void multiply_real(
-    const std::span<const std::complex<float>> input,
-    const std::span<const float> factors,
-    const std::span<std::complex<float>> output) {
+inline void multiply_real(const std::span<const std::complex<float>> input,
+                          const std::span<const float> factors,
+                          const std::span<std::complex<float>> output) {
     if (input.size() != factors.size() || input.size() != output.size()) {
         throw std::invalid_argument("real-vector multiply size mismatch");
     }
@@ -50,7 +48,7 @@ inline void multiply_real(
 
 [[nodiscard]] inline float sum(const std::span<const float> input) noexcept {
     std::size_t index = 0;
-    float lanes[8]{};
+    std::array<float, 8> lanes{};
     for (; input.size() - index >= 8; index += 8) {
         lanes[0] += input[index];
         lanes[1] += input[index + 1];

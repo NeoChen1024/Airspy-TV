@@ -403,8 +403,7 @@ void MpvPlayer::submit(const std::span<const std::uint8_t> transport_stream) {
     impl_->data_ready.notify_all();
 }
 
-void MpvPlayer::on_discontinuity(
-    const TransportDiscontinuity discontinuity) {
+void MpvPlayer::on_discontinuity(const TransportDiscontinuity discontinuity) {
     switch (discontinuity) {
     case TransportDiscontinuity::fec_region_reset:
         // A gated region was dropped and the FEC re-seeded: the demuxer sees
@@ -534,8 +533,8 @@ PlaybackTelemetry MpvPlayer::telemetry() const {
         result.playback_time_s = value;
     }
     value = 0.0;
-    if (mpv_get_property(impl_->handle, "avsync", MPV_FORMAT_DOUBLE,
-                         &value) >= 0) {
+    if (mpv_get_property(impl_->handle, "avsync", MPV_FORMAT_DOUBLE, &value) >=
+        0) {
         // mpv reports the A/V difference in seconds; positive = audio ahead.
         result.avsync_ms = value * 1e3;
     }
@@ -545,13 +544,12 @@ PlaybackTelemetry MpvPlayer::telemetry() const {
         result.dropped_frames = count;
     }
     count = 0;
-    if (mpv_get_property(impl_->handle, "vo-drop-frame-count",
-                         MPV_FORMAT_INT64, &count) >= 0) {
+    if (mpv_get_property(impl_->handle, "vo-drop-frame-count", MPV_FORMAT_INT64,
+                         &count) >= 0) {
         result.vo_dropped_frames = count;
     }
     int flag = 0;
-    if (mpv_get_property(impl_->handle, "pause", MPV_FORMAT_FLAG, &flag) >=
-        0) {
+    if (mpv_get_property(impl_->handle, "pause", MPV_FORMAT_FLAG, &flag) >= 0) {
         result.paused = flag != 0;
     }
     return result;

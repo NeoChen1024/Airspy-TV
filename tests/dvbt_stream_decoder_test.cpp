@@ -86,7 +86,8 @@ void require(const bool condition, const std::string_view message) {
         const std::uint16_t feedback =
             ((shift_register >> 13U) ^ (shift_register >> 14U)) & 1U;
         shift_register = static_cast<std::uint16_t>(
-            ((shift_register << 1U) | feedback) & 0x7FFFU);
+            ((static_cast<unsigned int>(shift_register) << 1U) | feedback) &
+            0x7FFFU);
         result = static_cast<std::uint8_t>((result << 1U) | feedback);
     }
     return result;
@@ -104,7 +105,7 @@ make_transport_stream(const std::size_t count) {
             0x10U | static_cast<std::uint8_t>(packet & 0x0FU));
         for (std::size_t byte = 4; byte < ts_packet_size; ++byte) {
             stream[offset + byte] = static_cast<std::uint8_t>(
-                (packet * 29U + byte * 17U + 3U) & 0xFFU);
+                ((packet * 29U) + (byte * 17U) + 3U) & 0xFFU);
         }
     }
     return stream;
@@ -119,7 +120,7 @@ energy_scramble(const std::span<const std::uint8_t> transport_stream) {
          group += 8 * ts_packet_size) {
         std::uint16_t shift_register = 0x00A9;
         for (std::size_t packet = 0; packet < 8; ++packet) {
-            const std::size_t offset = group + packet * ts_packet_size;
+            const std::size_t offset = group + (packet * ts_packet_size);
             output[offset] = packet == 0 ? 0xB8 : 0x47;
             for (std::size_t byte = 1; byte < ts_packet_size; ++byte) {
                 output[offset + byte] = transport_stream[offset + byte] ^
@@ -174,11 +175,14 @@ convolutional_encode(const std::span<const std::uint8_t> input) {
     for (const std::uint8_t value : input) {
         for (int bit = 7; bit >= 0; --bit) {
             shift_register = static_cast<std::uint8_t>(
-                ((shift_register << 1U) | ((value >> bit) & 1U)) & 0x7FU);
+                ((static_cast<unsigned int>(shift_register) << 1U) |
+                 ((value >> static_cast<unsigned int>(bit)) & 1U)) &
+                0x7FU);
             for (const std::uint8_t polynomial : polynomials) {
                 output.push_back(static_cast<std::uint8_t>(
-                    std::popcount(static_cast<unsigned int>(shift_register &
-                                                            polynomial)) &
+                    static_cast<unsigned int>(
+                        std::popcount(static_cast<unsigned int>(shift_register &
+                                                                polynomial))) &
                     1U));
             }
         }
@@ -209,13 +213,13 @@ bit_interleave(const std::span<const float> input) {
                  ++output_bit) {
                 const std::size_t half = bits_per_carrier / 2;
                 const std::size_t source_bit =
-                    (output_bit / half) + 2 * (output_bit % half);
+                    (output_bit / half) + (2 * (output_bit % half));
                 const std::size_t source_position =
                     (position + block_carriers - offsets[source_bit]) %
                     block_carriers;
-                output[block + source_position * bits_per_carrier +
+                output[block + (source_position * bits_per_carrier) +
                        source_bit] =
-                    input[block + position * bits_per_carrier + output_bit];
+                    input[block + (position * bits_per_carrier) + output_bit];
             }
         }
     }
@@ -296,9 +300,9 @@ make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F) {
     const MaxLogDemapper demapper{Constellation::qpsk};
     const SymbolDeinterleaver symbol_permutation{TransmissionMode::k8};
     const auto points = demapper.constellation_points();
-    fftwf_complex *frequency = static_cast<fftwf_complex *>(
+    auto *frequency = static_cast<fftwf_complex *>(
         fftwf_malloc(sizeof(fftwf_complex) * fft_size));
-    fftwf_complex *time = static_cast<fftwf_complex *>(
+    auto *time = static_cast<fftwf_complex *>(
         fftwf_malloc(sizeof(fftwf_complex) * fft_size));
     require(frequency != nullptr && time != nullptr, "allocate OFDM FFT");
     fftwf_plan plan = fftwf_plan_dft_1d(static_cast<int>(fft_size), frequency,
@@ -309,7 +313,7 @@ make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F) {
     result.reserve(symbols * symbol_size * 2);
     for (std::size_t symbol = 0; symbol < symbols; ++symbol) {
         std::fill(reinterpret_cast<float *>(frequency),
-                  reinterpret_cast<float *>(frequency) + 2 * fft_size, 0.0F);
+                  reinterpret_cast<float *>(frequency) + (2 * fft_size), 0.0F);
         const std::size_t phase = symbol % 4;
         const auto payload = payload_indices(phase);
         const auto symbol_metrics =
@@ -332,7 +336,7 @@ make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F) {
                 std::size_t label = 0;
                 for (std::size_t bit = 0; bit < bits_per_carrier; ++bit) {
                     label = (label << 1U) |
-                            (transmitted[payload_position * bits_per_carrier +
+                            (transmitted[(payload_position * bits_per_carrier) +
                                          bit] > 0.0F
                                  ? 1U
                                  : 0U);
@@ -360,7 +364,7 @@ make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F) {
             // arbitrary equal-score symbol at the end of an ideal capture.
             if (symbol != 0) {
                 const float noise =
-                    0.002F * std::sin(static_cast<float>(index) * 0.071F +
+                    0.002F * std::sin((static_cast<float>(index) * 0.071F) +
                                       static_cast<float>(symbol));
                 real += noise;
                 imag += 0.8F * noise;

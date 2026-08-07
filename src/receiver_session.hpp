@@ -53,12 +53,11 @@ class ReceiverSession {
     void set_dvbt_parameters(const dvbt::ReceiverParameters &parameters);
     void set_display_smoothing(bool fft_enabled, int fft_speed,
                                bool signal_enabled, int signal_speed);
-    void set_dvbt_telemetry_enabled(
-        bool enabled,
-        dvbt::TelemetryClock::time_point started_at =
-            dvbt::TelemetryClock::now());
-    [[nodiscard]] std::vector<dvbt::TelemetryRecord>
-    drain_dvbt_telemetry();
+    void
+    set_dvbt_telemetry_enabled(bool enabled,
+                               dvbt::TelemetryClock::time_point started_at =
+                                   dvbt::TelemetryClock::now());
+    [[nodiscard]] std::vector<dvbt::TelemetryRecord> drain_dvbt_telemetry();
     [[nodiscard]] DvbTSessionSnapshot dvbt_snapshot() const;
     [[nodiscard]] SignalSnapshot signal_snapshot() const;
     [[nodiscard]] PipelineSnapshot pipeline_snapshot() const;
@@ -86,7 +85,7 @@ class ReceiverSession {
     void set_discontinuity_callback(DiscontinuityCallback callback);
 
   private:
-    [[nodiscard]] std::unique_ptr<Demodulator>
+    [[nodiscard]] static std::unique_ptr<Demodulator>
     make_demodulator(ReceiveStandard standard, std::string &error);
     void install_demodulator(std::unique_ptr<Demodulator> demodulator,
                              ReceiveStandard standard);

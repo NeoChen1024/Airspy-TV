@@ -61,6 +61,8 @@ class TransportStreamRecorder {
     TransportStreamRecorder(const TransportStreamRecorder &) = delete;
     TransportStreamRecorder &
     operator=(const TransportStreamRecorder &) = delete;
+    TransportStreamRecorder(TransportStreamRecorder &&) = delete;
+    TransportStreamRecorder &operator=(TransportStreamRecorder &&) = delete;
 
     bool start(const std::filesystem::path &path, std::string &error);
     void submit(std::span<const std::uint8_t> transport_stream);

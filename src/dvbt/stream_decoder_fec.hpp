@@ -21,57 +21,57 @@ void StreamDecoder::Impl::run_fec() {
     float decoder_transport_time_ms = 0.0F;
     TransportDecoderStats completed_sessions;
     TransportDecoderStats previous_marker;
-    const auto publish_fec_window =
-        [this, &decoder, &fec_work_ms, &window_transport_bytes,
-         &decoder_transport_time_ms, &fec_session, &completed_sessions,
-         &previous_marker](const FecItem &item) {
-            if (!decoder) {
-                return;
-            }
-            const float total_transport_time_ms =
-                decoder->timing().transport_time_ms;
-            const float window_transport_time_ms = std::max(
-                0.0F, total_transport_time_ms - decoder_transport_time_ms);
-            decoder_transport_time_ms = total_transport_time_ms;
-            const TransportDecoderStats current = decoder->stats();
-            const TransportDecoderStats delta =
-                transport_counter_delta(current, previous_marker);
-            previous_marker = current;
-            TransportDecoderStats cumulative = completed_sessions;
-            add_transport_counters(cumulative, current);
-            const std::scoped_lock guard(mutex);
-            if (item.generation != latest_generation) {
-                return;
-            }
-            latest.fec_work_time_ms = fec_work_ms;
-            latest.transport_bytes += window_transport_bytes;
-            latest.transport = current;
-            latest.cumulative_transport = cumulative;
-            latest.fec_sessions = fec_session;
-            latest.transport_work_time_ms = window_transport_time_ms;
-            if (telemetry_enabled && item.demod_window_sequence != 0) {
-                FecWindowTelemetry record;
-                record.envelope = {
-                    .sequence = ++fec_telemetry_sequence,
-                    .decoder_generation = item.generation,
-                    .source_epoch = item.source_epoch,
-                    .wall_elapsed_ms = telemetry_elapsed_ms(),
-                };
-                record.demod_window_sequence =
-                    item.demod_window_sequence;
-                record.fec_session = fec_session;
-                record.output_bytes_delta = window_transport_bytes;
-                record.output_bytes_cumulative = latest.transport_bytes;
-                record.session = current;
-                record.delta = delta;
-                record.cumulative = cumulative;
-                record.fec_total_ms = fec_work_ms;
-                record.transport_nested_ms = window_transport_time_ms;
-                telemetry_queue.emplace_back(std::move(record));
-            }
-            fec_work_ms = 0.0F;
-            window_transport_bytes = 0;
-        };
+    const auto publish_fec_window = [this, &decoder, &fec_work_ms,
+                                     &window_transport_bytes,
+                                     &decoder_transport_time_ms, &fec_session,
+                                     &completed_sessions,
+                                     &previous_marker](const FecItem &item) {
+        if (!decoder) {
+            return;
+        }
+        const float total_transport_time_ms =
+            decoder->timing().transport_time_ms;
+        const float window_transport_time_ms =
+            std::max(0.0F, total_transport_time_ms - decoder_transport_time_ms);
+        decoder_transport_time_ms = total_transport_time_ms;
+        const TransportDecoderStats current = decoder->stats();
+        const TransportDecoderStats delta =
+            transport_counter_delta(current, previous_marker);
+        previous_marker = current;
+        TransportDecoderStats cumulative = completed_sessions;
+        add_transport_counters(cumulative, current);
+        const std::scoped_lock guard(mutex);
+        if (item.generation != latest_generation) {
+            return;
+        }
+        latest.fec_work_time_ms = fec_work_ms;
+        latest.transport_bytes += window_transport_bytes;
+        latest.transport = current;
+        latest.cumulative_transport = cumulative;
+        latest.fec_sessions = fec_session;
+        latest.transport_work_time_ms = window_transport_time_ms;
+        if (telemetry_enabled && item.demod_window_sequence != 0) {
+            FecWindowTelemetry record;
+            record.envelope = {
+                .sequence = ++fec_telemetry_sequence,
+                .decoder_generation = item.generation,
+                .source_epoch = item.source_epoch,
+                .wall_elapsed_ms = telemetry_elapsed_ms(),
+            };
+            record.demod_window_sequence = item.demod_window_sequence;
+            record.fec_session = fec_session;
+            record.output_bytes_delta = window_transport_bytes;
+            record.output_bytes_cumulative = latest.transport_bytes;
+            record.session = current;
+            record.delta = delta;
+            record.cumulative = cumulative;
+            record.fec_total_ms = fec_work_ms;
+            record.transport_nested_ms = window_transport_time_ms;
+            telemetry_queue.emplace_back(std::move(record));
+        }
+        fec_work_ms = 0.0F;
+        window_transport_bytes = 0;
+    };
     while (true) {
         FecItem item;
         {
@@ -123,16 +123,17 @@ void StreamDecoder::Impl::run_fec() {
                     decoder = std::make_unique<Decoder>(item.parameters);
                     decoder->set_diagnostic_handler(
                         {.enabled = [this] { return events_enabled(); },
-                         .emit = [this, &diagnostic_context,
-                                  &fec_session](DiagnosticEvent event) {
-                             emit_diagnostic_event(
-                                 std::move(event),
-                                 diagnostic_context.generation,
-                                 diagnostic_context.source_epoch,
-                                 diagnostic_context.demod_window_sequence,
-                                 fec_session,
-                                 diagnostic_context.tps_symbol_index);
-                         }});
+                         .emit =
+                             [this, &diagnostic_context,
+                              &fec_session](DiagnosticEvent event) {
+                                 emit_diagnostic_event(
+                                     std::move(event),
+                                     diagnostic_context.generation,
+                                     diagnostic_context.source_epoch,
+                                     diagnostic_context.demod_window_sequence,
+                                     fec_session,
+                                     diagnostic_context.tps_symbol_index);
+                             }});
                 } else {
                     // A new generation (retune/source reset) or a gated
                     // region ended. Keep the Viterbi threads and reset

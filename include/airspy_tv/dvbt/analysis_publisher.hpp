@@ -27,7 +27,7 @@ class AnalysisPublisher {
   private:
     mutable std::mutex mutex_;
     SignalAnalysisSnapshot latest_;
-    std::chrono::steady_clock::time_point last_publish_{};
+    std::chrono::steady_clock::time_point last_publish_;
     bool smoothing_enabled_{true};
     int smoothing_speed_{20};
 };

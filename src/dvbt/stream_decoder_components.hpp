@@ -302,7 +302,8 @@ class SymbolPostprocessorPool {
     }
 
     [[nodiscard]]
-    std::vector<PostprocessedSymbol> take_ready_locked(const std::size_t count) {
+    std::vector<PostprocessedSymbol>
+    take_ready_locked(const std::size_t count) {
         std::vector<PostprocessedSymbol> output;
         output.reserve(count);
         for (std::size_t offset = 0; offset < count; ++offset) {

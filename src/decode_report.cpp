@@ -6,8 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
-#include <fstream>
 #include <format>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <optional>
@@ -19,12 +19,12 @@
 namespace airspy_tv {
 namespace {
 
-using nlohmann::json;
 using dvbt::CodeRate;
 using dvbt::Constellation;
 using dvbt::GuardInterval;
 using dvbt::TransmissionMode;
 using dvbt::TransportDecoderStats;
+using nlohmann::json;
 
 [[nodiscard]] const char *mode_name(const TransmissionMode value) noexcept {
     return value == TransmissionMode::k8 ? "8k" : "2k";
@@ -72,7 +72,8 @@ using dvbt::TransportDecoderStats;
     return "unknown";
 }
 
-[[nodiscard]] const char *worker_state_name_json(const dvbt::WorkerState state) {
+[[nodiscard]] const char *
+worker_state_name_json(const dvbt::WorkerState state) {
     switch (state) {
     case dvbt::WorkerState::idle:
         return "idle";
@@ -156,8 +157,7 @@ using dvbt::TransportDecoderStats;
         {"complex_samples", record.resampled_complex_samples},
         {"requested_ratio", json_finite_or_null(record.requested_ratio)},
         {"effective_ratio", json_finite_or_null(record.effective_ratio)},
-        {"commanded_sro_ppm",
-         json_finite_or_null(record.commanded_sro_ppm)},
+        {"commanded_sro_ppm", json_finite_or_null(record.commanded_sro_ppm)},
         {"applied_sro_ppm", json_finite_or_null(record.applied_sro_ppm)},
         {"command_output_sample", record.command_output_sample},
         {"command_input_sample", record.command_input_sample},
@@ -246,13 +246,11 @@ using dvbt::TransportDecoderStats;
     result["phase_discontinuities"] = record.phase_discontinuities;
     result["timing_ms"] = {
         {"wall", json_finite_or_null(record.wall_time_ms)},
-        {"serial_busy_total",
-         json_finite_or_null(record.serial_busy_time_ms)},
+        {"serial_busy_total", json_finite_or_null(record.serial_busy_time_ms)},
         {"serial_busy", timing_map(record.serial_busy_ms)},
         {"wait", timing_map(record.wait_ms)},
         {"nested", timing_map(record.nested_ms)},
-        {"aggregate_worker_work",
-         timing_map(record.aggregate_worker_work_ms)},
+        {"aggregate_worker_work", timing_map(record.aggregate_worker_work_ms)},
     };
     return result;
 }
@@ -277,10 +275,9 @@ using dvbt::TransportDecoderStats;
     return result;
 }
 
-[[nodiscard]] const char *event_severity_name(
-    const dvbt::DecoderEventSeverity severity) {
-    return severity == dvbt::DecoderEventSeverity::warning ? "warning"
-                                                            : "info";
+[[nodiscard]] const char *
+event_severity_name(const dvbt::DecoderEventSeverity severity) {
+    return severity == dvbt::DecoderEventSeverity::warning ? "warning" : "info";
 }
 
 [[nodiscard]] json event_value(const dvbt::DecoderEventValue &value) {
@@ -407,15 +404,13 @@ struct DecodeReport::Impl {
               {"sample_rate_hz", config.sample_rate_hz}}},
             {"destination", {{"descriptor", config.destination}}},
             {"decoder",
-             {{"channel_bandwidth_hz",
-               config.decoder.channel_bandwidth_hz},
+             {{"channel_bandwidth_hz", config.decoder.channel_bandwidth_hz},
               {"transmission_mode",
                optional_parameter(config.decoder.mode, mode_name)},
               {"guard_interval",
                optional_parameter(config.decoder.guard_interval, guard_name)},
-              {"constellation",
-               optional_parameter(config.decoder.constellation,
-                                  constellation_name)},
+              {"constellation", optional_parameter(config.decoder.constellation,
+                                                   constellation_name)},
               {"code_rate",
                optional_parameter(config.decoder.code_rate, code_rate_name)},
               {"worker_threads", config.decoder.worker_threads}}},
@@ -449,13 +444,14 @@ struct DecodeReport::Impl {
         write_summary("running", 0, "", {}, 0, 0.0);
     }
 
-    void open_stream(std::ofstream &stream, std::unique_ptr<JsonlWriter> &writer,
-                     const char *name) {
+    void open_stream(std::ofstream &stream,
+                     std::unique_ptr<JsonlWriter> &writer,
+                     const char *name) const {
         stream.open(config.directory / name,
                     std::ios::binary | std::ios::trunc);
         if (!stream) {
-            throw std::runtime_error(std::string("Unable to create report stream: ") +
-                                     name);
+            throw std::runtime_error(
+                std::string("Unable to create report stream: ") + name);
         }
         writer = std::make_unique<JsonlWriter>(stream);
     }
@@ -469,8 +465,8 @@ struct DecodeReport::Impl {
             std::visit(
                 [this, &frontend, &demod, &fec, &events](const auto &value) {
                     using Value = std::decay_t<decltype(value)>;
-                    if constexpr (std::is_same_v<Value,
-                                                 dvbt::FrontendBlockTelemetry>) {
+                    if constexpr (std::is_same_v<
+                                      Value, dvbt::FrontendBlockTelemetry>) {
                         for (const auto &[name, duration_ms] :
                              value.serial_wall_ms) {
                             timing_aggregates[name].add(duration_ms);
@@ -482,10 +478,8 @@ struct DecodeReport::Impl {
                         aggregate(value);
                         demod.push_back(to_json_record(value));
                     } else if constexpr (std::is_same_v<
-                                             Value,
-                                             dvbt::FecWindowTelemetry>) {
-                        timing_aggregates["fec::total"].add(
-                            value.fec_total_ms);
+                                             Value, dvbt::FecWindowTelemetry>) {
+                        timing_aggregates["fec::total"].add(value.fec_total_ms);
                         timing_aggregates["fec::transport"].add(
                             value.transport_nested_ms);
                         fec.push_back(to_json_record(value));
@@ -515,9 +509,9 @@ struct DecodeReport::Impl {
         if (record.physical_timing_samples) {
             timing.add(*record.physical_timing_samples);
         }
-        for (const auto *map : {&record.serial_busy_ms, &record.wait_ms,
-                                &record.nested_ms,
-                                &record.aggregate_worker_work_ms}) {
+        for (const auto *map :
+             {&record.serial_busy_ms, &record.wait_ms, &record.nested_ms,
+              &record.aggregate_worker_work_ms}) {
             for (const auto &[name, value] : *map) {
                 timing_aggregates[name].add(value);
             }
@@ -536,11 +530,10 @@ struct DecodeReport::Impl {
                         const double wall_elapsed_seconds) {
         const auto fraction = [](const std::uint64_t used,
                                  const std::uint64_t capacity) {
-            return capacity == 0
-                       ? 0.0
-                       : std::clamp(static_cast<double>(used) /
-                                        static_cast<double>(capacity),
-                                    0.0, 1.0);
+            return capacity == 0 ? 0.0
+                                 : std::clamp(static_cast<double>(used) /
+                                                  static_cast<double>(capacity),
+                                              0.0, 1.0);
         };
         json record = {{"schema_version", 0},
                        {"record_type", "pipeline_sample"},
@@ -563,23 +556,20 @@ struct DecodeReport::Impl {
         record["quality"] = {
             {"ofdm_locked", stats.ofdm_locked},
             {"tps_locked", stats.tps_locked},
-            {"mer_db", stats.ofdm_locked
-                           ? json_finite_or_null(stats.mer_db)
-                           : json(nullptr)},
+            {"mer_db", stats.ofdm_locked ? json_finite_or_null(stats.mer_db)
+                                         : json(nullptr)},
         };
         record["queues"] = {
             {"input",
              {{"used", stats.queued_input_samples},
               {"capacity", stats.input_queue_capacity_samples},
-              {"fraction",
-               fraction(stats.queued_input_samples,
-                        stats.input_queue_capacity_samples)}}},
+              {"fraction", fraction(stats.queued_input_samples,
+                                    stats.input_queue_capacity_samples)}}},
             {"resampled_ring",
              {{"used", stats.ring_used_samples},
               {"capacity", stats.ring_capacity_samples},
-              {"fraction",
-               fraction(stats.ring_used_samples,
-                        stats.ring_capacity_samples)}}},
+              {"fraction", fraction(stats.ring_used_samples,
+                                    stats.ring_capacity_samples)}}},
             {"fec",
              {{"used", stats.queued_symbols},
               {"capacity", stats.symbol_queue_capacity},
@@ -605,7 +595,7 @@ struct DecodeReport::Impl {
         pipeline_writer->write(record);
     }
 
-    void flush() {
+    void flush() const {
         frontend_writer->flush();
         pipeline_writer->flush();
         demod_writer->flush();
@@ -645,8 +635,9 @@ struct DecodeReport::Impl {
              {{"wall_seconds", wall_elapsed_seconds},
               {"signal_seconds", signal_seconds},
               {"average_realtime_speed",
-               wall_elapsed_seconds > 0.0 ? signal_seconds / wall_elapsed_seconds
-                                          : 0.0}}},
+               wall_elapsed_seconds > 0.0
+                   ? signal_seconds / wall_elapsed_seconds
+                   : 0.0}}},
             {"samples",
              {{"submitted", submitted_samples},
               {"processed", stats.processed_input_samples}}},
@@ -656,10 +647,9 @@ struct DecodeReport::Impl {
               {"emitted_partial_bytes", stats.transport_bytes % 188},
               {"decoded_packets", fec.ts_packets},
               {"tei_packets", fec.tei_packets},
-              {"usable_packets",
-               fec.ts_packets >= fec.tei_packets
-                   ? fec.ts_packets - fec.tei_packets
-                   : 0}}},
+              {"usable_packets", fec.ts_packets >= fec.tei_packets
+                                     ? fec.ts_packets - fec.tei_packets
+                                     : 0}}},
             {"counters",
              {{"dropped_blocks", stats.dropped_blocks},
               {"ofdm_symbols", stats.ofdm_symbols},
@@ -734,18 +724,18 @@ void DecodeReport::consume(
 }
 
 void DecodeReport::write_pipeline(const dvbt::StreamDecoderStats &stats,
-                                       const std::uint64_t submitted_samples,
-                                       const double wall_elapsed_seconds) {
+                                  const std::uint64_t submitted_samples,
+                                  const double wall_elapsed_seconds) {
     impl_->write_pipeline(stats, submitted_samples, wall_elapsed_seconds);
 }
 
 void DecodeReport::flush() { impl_->flush(); }
 
-void DecodeReport::finalize(
-    const std::string_view status, const int exit_code,
-    const std::string_view error, const dvbt::StreamDecoderStats &stats,
-    const std::uint64_t submitted_samples,
-    const double wall_elapsed_seconds) {
+void DecodeReport::finalize(const std::string_view status, const int exit_code,
+                            const std::string_view error,
+                            const dvbt::StreamDecoderStats &stats,
+                            const std::uint64_t submitted_samples,
+                            const double wall_elapsed_seconds) {
     std::exception_ptr flush_error;
     try {
         impl_->flush();
@@ -764,8 +754,7 @@ void format_debug_telemetry(std::ostream &stream,
     std::visit(
         [&stream](const auto &value) {
             using Value = std::decay_t<decltype(value)>;
-            if constexpr (std::is_same_v<Value,
-                                         dvbt::FrontendBlockTelemetry>) {
+            if constexpr (std::is_same_v<Value, dvbt::FrontendBlockTelemetry>) {
                 stream << std::format(
                     "[frontend_block] seq={} source={}..{} resampled={}..{} "
                     "ratio={:.9f} sro={:+.4f}ppm total={:.3f}ms\n",
@@ -774,10 +763,11 @@ void format_debug_telemetry(std::ostream &stream,
                     value.resampled_end_sample, value.effective_ratio,
                     value.applied_sro_ppm,
                     value.serial_wall_ms.at("frontend::total"));
-            } else if constexpr (std::is_same_v<
-                                     Value, dvbt::DemodWindowTelemetry>) {
+            } else if constexpr (std::is_same_v<Value,
+                                                dvbt::DemodWindowTelemetry>) {
                 stream << std::format(
-                    "[demod_window] seq={} symbols={} MER={} CFO={}Hz SRO={}ppm "
+                    "[demod_window] seq={} symbols={} MER={} CFO={}Hz "
+                    "SRO={}ppm "
                     "wall={:.3f}ms busy={:.3f}ms\n",
                     value.demod_window_sequence, value.symbol_count,
                     value.mer_db ? std::format("{:.2f}", *value.mer_db) : "--",
@@ -813,10 +803,11 @@ void format_debug_telemetry(std::ostream &stream,
                     stream << std::format("  {}={:.3f}ms (nested)\n", name,
                                           timing);
                 }
-            } else if constexpr (std::is_same_v<
-                                     Value, dvbt::FecWindowTelemetry>) {
+            } else if constexpr (std::is_same_v<Value,
+                                                dvbt::FecWindowTelemetry>) {
                 stream << std::format(
-                    "[fec_window] seq={} demod={} session={} bytes=+{} total={} "
+                    "[fec_window] seq={} demod={} session={} bytes=+{} "
+                    "total={} "
                     "RS=+{}/{} TEI=+{} fec={:.3f}ms transport={:.3f}ms\n",
                     value.envelope.sequence, value.demod_window_sequence,
                     value.fec_session, value.output_bytes_delta,

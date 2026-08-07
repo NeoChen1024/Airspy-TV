@@ -7,7 +7,7 @@
 #include "viterbi/x86/viterbi_decoder_avx_u16.h"
 #elif defined(AIRSPY_TV_USE_SIMD_VITERBI) && defined(__SSE4_1__)
 #include "viterbi/x86/viterbi_decoder_sse_u16.h"
-#elif defined(AIRSPY_TV_USE_SIMD_VITERBI) && defined(__aarch64__) &&             \
+#elif defined(AIRSPY_TV_USE_SIMD_VITERBI) && defined(__aarch64__) &&           \
     defined(__ARM_NEON)
 #include "viterbi/arm/viterbi_decoder_neon_u16.h"
 #endif
@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -91,12 +92,14 @@ struct SoftViterbi::Impl {
 
     Impl(const Impl &) = delete;
     Impl &operator=(const Impl &) = delete;
+    Impl(Impl &&) = delete;
+    Impl &operator=(Impl &&) = delete;
 
     void reset() {
         static_cast<void>(flush());
         metrics_.clear();
         metric_offset_ = 0;
-        std::scoped_lock lock(mutex_);
+        std::scoped_lock const lock(mutex_);
         completed_.clear();
         next_sequence_ = 0;
         next_result_ = 0;
@@ -113,7 +116,8 @@ struct SoftViterbi::Impl {
         for (std::size_t index = 0; index < llrs.size(); ++index) {
             const float soft =
                 std::clamp(127.5F + (llrs[index] * 8.0F), 0.0F, 255.0F);
-            metrics_[old_size + index] = static_cast<std::uint8_t>(soft + 0.5F);
+            metrics_[old_size + index] =
+                static_cast<std::uint8_t>(std::lround(soft));
         }
 
         return dispatch_ready_windows();
@@ -202,7 +206,7 @@ struct SoftViterbi::Impl {
 #elif defined(AIRSPY_TV_USE_SIMD_VITERBI) && defined(__SSE4_1__)
     using DecoderType =
         ViterbiDecoder_SSE_u16<constraint_length, convolutional_rate>;
-#elif defined(AIRSPY_TV_USE_SIMD_VITERBI) && defined(__aarch64__) &&             \
+#elif defined(AIRSPY_TV_USE_SIMD_VITERBI) && defined(__aarch64__) &&           \
     defined(__ARM_NEON)
     using DecoderType =
         ViterbiDecoder_NEON_u16<constraint_length, convolutional_rate>;
@@ -212,8 +216,7 @@ struct SoftViterbi::Impl {
                               std::uint16_t, std::int16_t>;
 #endif
     using BranchTable =
-        ViterbiBranchTable<constraint_length, convolutional_rate,
-                           std::int16_t>;
+        ViterbiBranchTable<constraint_length, convolutional_rate, std::int16_t>;
 
     // DVB-T generator polynomials (171, 133 octal) in Phil Karn's reversed
     // convention. The branch table is read-only once built, so all workers
@@ -228,22 +231,20 @@ struct SoftViterbi::Impl {
     // max errors keeps the u16 accumulator far from saturation between
     // renormalisations (mirrors the upstream SOFT16 example).
     static ViterbiDecoder_Config<std::uint16_t> decoder_config() {
-        constexpr std::uint16_t max_error =
+        constexpr auto max_error =
             static_cast<std::uint16_t>(254U * convolutional_rate);
-        constexpr std::uint16_t error_margin =
+        constexpr auto error_margin =
             static_cast<std::uint16_t>(max_error * 5U);
         return {max_error, 0U, error_margin,
                 static_cast<std::uint16_t>(65'535U - error_margin)};
     }
 
-    static DecoderHandle *create_decoder() {
-        auto *decoder =
-            new DecoderHandle(shared_branch_table(), decoder_config());
+    static std::unique_ptr<DecoderHandle> create_decoder() {
+        auto decoder = std::make_unique<DecoderHandle>(shared_branch_table(),
+                                                       decoder_config());
         decoder->set_traceback_length(viterbi_window_bits);
         return decoder;
     }
-
-    static void destroy_decoder(DecoderHandle *decoder) { delete decoder; }
 
     static Result decode(DecoderHandle *decoder, const Task &task) {
         // ViterbiDecoderCpp consumes signed soft decisions in [-127, +127];
@@ -281,10 +282,9 @@ struct SoftViterbi::Impl {
     // path against the received mother-code metrics. The traceback margins
     // establish encoder state and are not counted. Metric 128 is the neutral
     // value inserted for punctures.
-    static Result
-    extract_output(const std::array<std::uint8_t, viterbi_window_bits / 8>
-                       &decoded,
-                   const Task &task) {
+    static Result extract_output(
+        const std::array<std::uint8_t, viterbi_window_bits / 8> &decoded,
+        const Task &task) {
         constexpr std::size_t margin_bytes = viterbi_margin_bits / 8;
         constexpr std::size_t output_bytes = viterbi_output_bits / 8;
         Result result;
@@ -294,10 +294,12 @@ struct SoftViterbi::Impl {
         constexpr std::array<std::uint8_t, 2> polynomials{0117, 0155};
         std::uint8_t shift_register = 0;
         for (std::size_t bit = 0; bit < viterbi_window_bits; ++bit) {
-            const std::uint8_t decoded_bit = static_cast<std::uint8_t>(
+            const auto decoded_bit = static_cast<std::uint8_t>(
                 (decoded[bit / 8] >> (7U - (bit % 8))) & 1U);
             shift_register = static_cast<std::uint8_t>(
-                ((shift_register << 1U) | decoded_bit) & 0x7FU);
+                ((static_cast<unsigned int>(shift_register) << 1U) |
+                 decoded_bit) &
+                0x7FU);
             if (bit < viterbi_margin_bits ||
                 bit >= viterbi_margin_bits + viterbi_output_bits) {
                 continue;
@@ -309,9 +311,10 @@ struct SoftViterbi::Impl {
                 if (metric == 128U) {
                     continue;
                 }
-                const std::uint8_t encoded_bit = static_cast<std::uint8_t>(
-                    std::popcount(static_cast<unsigned int>(
-                        shift_register & polynomials[branch])) &
+                const auto encoded_bit = static_cast<std::uint8_t>(
+                    static_cast<unsigned int>(
+                        std::popcount(static_cast<unsigned int>(
+                            shift_register & polynomials[branch]))) &
                     1U);
                 result.hard_decision_errors += static_cast<std::uint64_t>(
                     (metric > 127U) != (encoded_bit != 0U));
@@ -322,7 +325,7 @@ struct SoftViterbi::Impl {
     }
 
     void run_worker() noexcept {
-        DecoderHandle *decoder = nullptr;
+        std::unique_ptr<DecoderHandle> decoder;
         try {
             decoder = create_decoder();
         } catch (...) {
@@ -356,7 +359,7 @@ struct SoftViterbi::Impl {
             }
             queue_space_.notify_one();
             try {
-                auto output = decode(decoder, task);
+                auto output = decode(decoder.get(), task);
                 const std::scoped_lock lock(mutex_);
                 completed_.emplace(task.sequence, std::move(output));
                 --outstanding_;
@@ -370,7 +373,6 @@ struct SoftViterbi::Impl {
             all_finished_.notify_all();
             queue_space_.notify_all();
         }
-        destroy_decoder(decoder);
     }
 
     void rethrow_worker_error() const {
@@ -380,7 +382,7 @@ struct SoftViterbi::Impl {
     }
 
     [[nodiscard]] std::vector<std::uint8_t> take_ready() {
-        std::scoped_lock lock(mutex_);
+        std::scoped_lock const lock(mutex_);
         rethrow_worker_error();
         return take_ready_locked();
     }

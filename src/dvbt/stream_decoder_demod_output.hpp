@@ -64,13 +64,12 @@ void StreamDecoder::Impl::demod_process_batch(
         state.hopeless_window_count =
             hopeless ? state.hopeless_window_count + 1 : 0;
         if (hopeless && events_enabled()) {
-            emit_event(
-                "hopeless_gate_window", DecoderEventSeverity::warning,
-                state.demod_generation, state.next_symbol_start,
-                state.symbol_count,
-                {{"mer_db", window_mer},
-                 {"fec_floor_db", static_cast<double>(floor)},
-                 {"consecutive_windows", state.hopeless_window_count}});
+            emit_event("hopeless_gate_window", DecoderEventSeverity::warning,
+                       state.demod_generation, state.next_symbol_start,
+                       state.symbol_count,
+                       {{"mer_db", window_mer},
+                        {"fec_floor_db", static_cast<double>(floor)},
+                        {"consecutive_windows", state.hopeless_window_count}});
         }
         if (hopeless && !state.in_hopeless_region) {
             state.in_hopeless_region = true;
@@ -82,14 +81,14 @@ void StreamDecoder::Impl::demod_process_batch(
                     source_epoch = mapped->stream_epoch;
                 }
             }
-            static_cast<void>(enqueue_fec({.kind = FecItem::Kind::end,
-                                           .generation = state.demod_generation,
-                                           .parameters = {},
-                                           .mother_metrics = {},
-                                           .symbol_index = 0,
-                                           .demod_window_sequence =
-                                               state.window_sequence + 1,
-                                           .source_epoch = source_epoch}));
+            static_cast<void>(
+                enqueue_fec({.kind = FecItem::Kind::end,
+                             .generation = state.demod_generation,
+                             .parameters = {},
+                             .mother_metrics = {},
+                             .symbol_index = 0,
+                             .demod_window_sequence = state.window_sequence + 1,
+                             .source_epoch = source_epoch}));
         } else if (!hopeless && state.in_hopeless_region) {
             state.in_hopeless_region = false;
             static_cast<void>(
@@ -191,8 +190,7 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             ? static_cast<double>(applied_cir_offset)
             : window_cir_offset_sum / static_cast<double>(window_symbols);
     double observed_drift = 0.0;
-    const std::uint64_t output_begin_sample =
-        state.window_output_begin_sample;
+    const std::uint64_t output_begin_sample = state.window_output_begin_sample;
     const std::uint64_t output_end_sample = state.next_symbol_start;
     const std::uint64_t timing_sample_position =
         output_begin_sample + (output_end_sample - output_begin_sample) / 2;
@@ -254,8 +252,7 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             }
             resampler_timeline.discard_before(timing_sample_position);
         }
-        tau_interval_correction_history[tau_history_head] =
-            interval_correction;
+        tau_interval_correction_history[tau_history_head] = interval_correction;
         state.last_timing_sample_position = timing_sample_position;
         tau_history_head = (tau_history_head + 1) % tau_history_n;
         if (tau_history_count < tau_history_n) {
@@ -292,8 +289,7 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                 // Add back the correction that actually produced the output
                 // samples between these timing measurements. This remains
                 // correct when queue occupancy changes the wall-clock delay.
-                diffs[i] = residual_sro +
-                           tau_interval_correction_history[idx1];
+                diffs[i] = residual_sro + tau_interval_correction_history[idx1];
             }
             std::sort(diffs.begin(),
                       diffs.begin() + static_cast<std::ptrdiff_t>(diffs_count));
@@ -312,10 +308,10 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             smoothed_sample_clock_ppm, -drift_limit_ppm, drift_limit_ppm);
         smoothed_timing_drift =
             smoothed_sample_clock_ppm * window_sample_count / 1.0e6;
-        const double confidence =
-            window_symbols == 0 ? 0.0
-                                : static_cast<double>(timing_count) /
-                                      static_cast<double>(window_symbols);
+        const double confidence = window_symbols == 0
+                                      ? 0.0
+                                      : static_cast<double>(timing_count) /
+                                            static_cast<double>(window_symbols);
         if (tau_history_count >= tau_history_min && confidence >= 0.75) {
             const std::scoped_lock lock(mutex);
             const std::uint64_t command_output_sample = ring_read_pos;
@@ -329,7 +325,8 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                     .source_epoch = mapped->stream_epoch,
                     .command_output_sample = command_output_sample,
                     .command_input_sample = mapped->input_sample,
-                    .effective_input_sample = mapped->input_sample + fixed_delay,
+                    .effective_input_sample =
+                        mapped->input_sample + fixed_delay,
                     .fixed_delay_samples = fixed_delay,
                     .target_ppm = smoothed_sample_clock_ppm,
                 });
@@ -559,11 +556,10 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
                 ? state.decoder_parameters->constellation
                 : state.selected_parameters.constellation.value_or(
                       latest.tps_constellation);
-        record.code_rate =
-            state.decoder_parameters.has_value()
-                ? state.decoder_parameters->code_rate
-                : state.selected_parameters.code_rate.value_or(
-                      latest.tps_code_rate);
+        record.code_rate = state.decoder_parameters.has_value()
+                               ? state.decoder_parameters->code_rate
+                               : state.selected_parameters.code_rate.value_or(
+                                     latest.tps_code_rate);
         record.hierarchy = latest.tps_hierarchy;
         record.fft_size = latest.fft_size;
         record.guard_size = latest.guard_size;
@@ -624,8 +620,7 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
             {"demod::output", latest.demod_output_time_ms},
             {"demod::other", latest.demod_other_time_ms},
         };
-        record.wait_ms = {{"demod::ring_wait",
-                           latest.demod_ring_wait_time_ms}};
+        record.wait_ms = {{"demod::ring_wait", latest.demod_ring_wait_time_ms}};
         record.nested_ms = {
             {"demod::nco", latest.demod_nco_rotate_time_ms},
             {"demod::fft", latest.demod_fft_execute_time_ms},
@@ -644,8 +639,7 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         record.aggregate_worker_work_ms = {
             {"symbol::preprocess", latest.symbol_preprocess_work_time_ms},
             {"symbol::demap", latest.symbol_demap_work_time_ms},
-            {"symbol::deinterleave",
-             latest.symbol_deinterleave_work_time_ms},
+            {"symbol::deinterleave", latest.symbol_deinterleave_work_time_ms},
             {"symbol::depuncture", latest.symbol_depuncture_work_time_ms},
         };
         telemetry_queue.emplace_back(std::move(record));
@@ -705,8 +699,7 @@ bool StreamDecoder::Impl::demod_dispatch_payload(
     auto &fft_out = state.fft_out;
     auto &maximum = state.maximum;
     auto &postprocessor = state.postprocessor;
-    auto &postprocessor_pending_symbols =
-        state.postprocessor_pending_symbols;
+    auto &postprocessor_pending_symbols = state.postprocessor_pending_symbols;
     auto &pending_symbols = state.pending_symbols;
 
     const auto submit_postprocessor =
@@ -849,15 +842,14 @@ void StreamDecoder::Impl::demod_finish_stream(DemodRuntimeState &state) {
         demod_reset_stats_window(state);
     }
     if (postprocessor != nullptr) {
-        static_cast<void>(enqueue_fec({.kind = FecItem::Kind::stream_end,
-                                       .generation = demod_generation,
-                                       .parameters = {},
-                                       .mother_metrics = {},
-                                       .symbol_index = 0,
-                                       .demod_window_sequence =
-                                           state.window_sequence,
-                                       .source_epoch =
-                                           state.window_source_epoch}));
+        static_cast<void>(
+            enqueue_fec({.kind = FecItem::Kind::stream_end,
+                         .generation = demod_generation,
+                         .parameters = {},
+                         .mother_metrics = {},
+                         .symbol_index = 0,
+                         .demod_window_sequence = state.window_sequence,
+                         .source_epoch = state.window_source_epoch}));
         // A flushed stream that is then resumed starts a fresh
         // region so the replay's first symbols do not continue a
         // flushed trellis.

@@ -23,7 +23,7 @@ constexpr std::int64_t mjd_unix_epoch = 40587; // MJD of 1970-01-01
     const std::uint32_t hours = digit((value >> 16U) & 0xFFU);
     const std::uint32_t minutes = digit((value >> 8U) & 0xFFU);
     const std::uint32_t seconds = digit(value & 0xFFU);
-    return (hours * 60U + minutes) * 60U + seconds;
+    return (((hours * 60U) + minutes) * 60U) + seconds;
 }
 
 [[nodiscard]] std::uint64_t mjd_to_unix(const std::uint32_t mjd) noexcept {
@@ -70,7 +70,7 @@ struct EpgModel::Impl {
     mutable std::mutex mutex;
     std::map<std::uint16_t, std::vector<EpgEvent>> events;
     std::optional<std::uint64_t> utc_time;
-    std::chrono::steady_clock::time_point utc_time_received{};
+    std::chrono::steady_clock::time_point utc_time_received;
     si::SectionFeed feed{[this](const std::span<const std::uint8_t> section) {
         dispatch(section);
     }};
@@ -114,7 +114,7 @@ struct EpgModel::Impl {
                 (static_cast<unsigned int>(section[offset + 7]) << 16U) |
                 (static_cast<unsigned int>(section[offset + 8]) << 8U) |
                 section[offset + 9]);
-            const std::uint8_t running_status =
+            const auto running_status =
                 static_cast<std::uint8_t>((section[offset + 10] >> 5U) & 0x07U);
             const std::size_t descriptors_length =
                 ((static_cast<std::size_t>(section[offset + 10]) & 0x0FU)

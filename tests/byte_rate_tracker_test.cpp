@@ -26,7 +26,7 @@ void require_near(const double actual, const double expected,
 void test_windowed_rate_and_idle_reset() {
     ByteRateTracker tracker;
     const ByteRateTracker::Clock::time_point start{};
-    constexpr std::uint64_t mib = 1024U * 1024U;
+    constexpr std::uint64_t mib = std::uint64_t{1024} * 1024U;
 
     require_near(tracker.update(true, 0, start), 0.0,
                  "first active sample should establish a baseline");
@@ -43,7 +43,7 @@ void test_windowed_rate_and_idle_reset() {
 void test_counter_restart_rebaselines() {
     ByteRateTracker tracker;
     const ByteRateTracker::Clock::time_point start{};
-    constexpr std::uint64_t mib = 1024U * 1024U;
+    constexpr std::uint64_t mib = std::uint64_t{1024} * 1024U;
 
     static_cast<void>(tracker.update(true, 4 * mib, start));
     require_near(tracker.update(true, mib, start + 1s), 0.0,

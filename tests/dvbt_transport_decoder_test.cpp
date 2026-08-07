@@ -44,8 +44,10 @@ std::uint8_t clock_prbs(std::uint16_t &shift_register) {
         const std::uint16_t feedback =
             ((shift_register >> 13) ^ (shift_register >> 14)) & 1U;
         shift_register = static_cast<std::uint16_t>(
-            ((shift_register << 1) | feedback) & 0x7FFFU);
-        result = static_cast<std::uint8_t>((result << 1) | feedback);
+            ((static_cast<unsigned int>(shift_register) << 1U) | feedback) &
+            0x7FFFU);
+        result = static_cast<std::uint8_t>(
+            (static_cast<unsigned int>(result) << 1U) | feedback);
     }
     return result;
 }
@@ -115,12 +117,15 @@ convolutional_encode(const std::span<const std::uint8_t> input) {
     for (const std::uint8_t byte : input) {
         for (int bit = 7; bit >= 0; --bit) {
             shift_register = static_cast<std::uint8_t>(
-                ((shift_register << 1) | ((byte >> bit) & 1U)) & 0x7FU);
+                ((static_cast<unsigned int>(shift_register) << 1U) |
+                 ((byte >> static_cast<unsigned int>(bit)) & 1U)) &
+                0x7FU);
             for (const std::uint8_t polynomial : polynomials) {
                 output.push_back(static_cast<std::uint8_t>(
-                    std::popcount(static_cast<unsigned int>(shift_register &
-                                                            polynomial)) &
-                    1));
+                    static_cast<unsigned int>(
+                        std::popcount(static_cast<unsigned int>(shift_register &
+                                                                polynomial))) &
+                    1U));
             }
         }
     }
@@ -163,6 +168,9 @@ std::vector<float> make_metrics(const std::span<const std::uint8_t> bits,
 
 std::vector<float> bit_interleave(const std::span<const float> input,
                                   const std::size_t bits_per_carrier) {
+    if (bits_per_carrier < 2 || (bits_per_carrier % 2) != 0) {
+        throw std::invalid_argument("invalid bits per carrier");
+    }
     constexpr std::array<std::size_t, 6> offsets{0, 63, 105, 42, 21, 84};
     constexpr std::size_t block_carriers = 126;
     const std::size_t block_metrics = block_carriers * bits_per_carrier;
@@ -217,8 +225,8 @@ std::vector<std::uint8_t> make_transport_stream() {
         stream[offset + 3] = static_cast<std::uint8_t>(
             0x10U | static_cast<std::uint8_t>(packet & 0x0FU));
         for (std::size_t byte = 4; byte < ts_packet_size; ++byte) {
-            stream[offset + byte] =
-                static_cast<std::uint8_t>((packet * 29U + byte * 17U) & 0xFFU);
+            stream[offset + byte] = static_cast<std::uint8_t>(
+                ((packet * 29U) + (byte * 17U)) & 0xFFU);
         }
     }
     return stream;
@@ -253,7 +261,8 @@ void test_transport_decoder(const CodeRate rate,
             std::to_string(failed_stats.outer_deinterleaver_phase) +
             ", RS=" + std::to_string(failed_stats.rs_packets) + ", failures=" +
             std::to_string(failed_stats.rs_uncorrectable_packets) +
-            ", energy=" + std::to_string(failed_stats.energy_synchronized));
+            ", energy=" +
+            std::string(failed_stats.energy_synchronized ? "1" : "0"));
     }
     require(recovered.size() % ts_packet_size == 0, "TS packet alignment");
     require(
@@ -303,7 +312,7 @@ void test_prepared_soft_transport() {
     for (std::size_t index = 0; index < mother.size(); ++index) {
         const float value =
             std::clamp(127.5F + (mother[index] * 8.0F), 0.0F, 255.0F);
-        soft[index] = static_cast<std::uint8_t>(value + 0.5F);
+        soft[index] = static_cast<std::uint8_t>(std::lround(value));
     }
 
     TransportDecoder float_decoder{rate, 4};

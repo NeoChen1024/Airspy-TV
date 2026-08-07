@@ -158,7 +158,9 @@ class EnergyDescrambler {
             const std::uint16_t feedback =
                 ((shift_register_ >> 13) ^ (shift_register_ >> 14)) & 1U;
             shift_register_ = static_cast<std::uint16_t>(
-                ((shift_register_ << 1) | feedback) & 0x7FFFU);
+                ((static_cast<unsigned int>(shift_register_) << 1U) |
+                 feedback) &
+                0x7FFFU);
             result = static_cast<std::uint8_t>((result << 1) | feedback);
         }
         return result;
@@ -212,12 +214,12 @@ find_rs_alignment(const std::span<const std::uint8_t> bytes,
                         ? 0xB8
                         : 0x47;
                 std::array<std::uint8_t, ts_packet_size> decoded{};
-                rs_successes +=
+                rs_successes += static_cast<std::size_t>(
                     reed_solomon.decode(
                         bytes.subspan(start + (packet * rs_packet_size),
                                       rs_packet_size),
                         decoded) &&
-                    decoded.front() == expected;
+                    decoded.front() == expected);
             }
             if (rs_successes > best.rs_successes ||
                 (rs_successes == best.rs_successes &&
@@ -256,7 +258,7 @@ struct OuterFec::Impl {
 
     void emit_diagnostic(std::string name,
                          const DiagnosticEventSeverity severity,
-                         DiagnosticEventFields fields) {
+                         DiagnosticEventFields fields) const {
         diagnostic_handler.emit({.name = std::move(name),
                                  .severity = severity,
                                  .fields = std::move(fields)});
@@ -335,10 +337,10 @@ struct OuterFec::Impl {
                     fields.emplace(prefix + "rs_successes",
                                    static_cast<std::uint64_t>(
                                        candidate_evidence.rs_successes));
-                    fields.emplace(prefix + "start",
-                                   static_cast<std::uint64_t>(
-                                       available ? candidate_evidence.start
-                                                 : 0));
+                    fields.emplace(
+                        prefix + "start",
+                        static_cast<std::uint64_t>(
+                            available ? candidate_evidence.start : 0));
                     fields.emplace(prefix + "energy_phase",
                                    static_cast<std::uint64_t>(
                                        candidate_evidence.energy_phase));
@@ -387,7 +389,8 @@ struct OuterFec::Impl {
                         emit_diagnostic(
                             "outer_fec_alignment_pending",
                             DiagnosticEventSeverity::info,
-                            {{"phase", static_cast<std::uint64_t>(selected_phase)},
+                            {{"phase",
+                              static_cast<std::uint64_t>(selected_phase)},
                              {"sync_distance",
                               static_cast<std::uint64_t>(
                                   selected_evidence.sync_distance)},
@@ -414,17 +417,15 @@ struct OuterFec::Impl {
                         "outer_fec_alignment_locked",
                         DiagnosticEventSeverity::info,
                         {{"phase", static_cast<std::uint64_t>(selected_phase)},
-                         {"start", static_cast<std::uint64_t>(
-                                       selected_evidence.start)},
+                         {"start",
+                          static_cast<std::uint64_t>(selected_evidence.start)},
                          {"sync_distance",
                           static_cast<std::uint64_t>(
                               selected_evidence.sync_distance)},
-                         {"rs_successes",
-                          static_cast<std::uint64_t>(
-                              selected_evidence.rs_successes)},
-                         {"energy_phase",
-                          static_cast<std::uint64_t>(
-                              selected_evidence.energy_phase)},
+                         {"rs_successes", static_cast<std::uint64_t>(
+                                              selected_evidence.rs_successes)},
+                         {"energy_phase", static_cast<std::uint64_t>(
+                                              selected_evidence.energy_phase)},
                          {"candidate_bytes",
                           static_cast<std::uint64_t>(
                               outer_candidates[selected_phase].size())},
@@ -433,16 +434,15 @@ struct OuterFec::Impl {
             } else {
                 pending_alignment_phase = outer_interleaver_branches;
                 if (diagnostics_enabled()) {
-                    emit_diagnostic(
-                        "outer_fec_alignment_missed",
-                        DiagnosticEventSeverity::info,
-                        {{"search_count", alignment_search_count},
-                         {"best_sync_distance",
-                          static_cast<std::uint64_t>(
-                              statistics.outer_sync_distance)},
-                         {"best_rs_evidence",
-                          static_cast<std::uint64_t>(
-                              statistics.outer_rs_evidence)}});
+                    emit_diagnostic("outer_fec_alignment_missed",
+                                    DiagnosticEventSeverity::info,
+                                    {{"search_count", alignment_search_count},
+                                     {"best_sync_distance",
+                                      static_cast<std::uint64_t>(
+                                          statistics.outer_sync_distance)},
+                                     {"best_rs_evidence",
+                                      static_cast<std::uint64_t>(
+                                          statistics.outer_rs_evidence)}});
                 }
             }
             if (!statistics.rs_synchronized) {
@@ -472,8 +472,8 @@ struct OuterFec::Impl {
                     "outer_fec_rs_attempt", DiagnosticEventSeverity::info,
                     {{"packet", statistics.rs_packets},
                      {"valid", valid},
-                     {"received_sync_byte", static_cast<std::uint64_t>(
-                                                received_randomized.front())},
+                     {"received_sync_byte",
+                      static_cast<std::uint64_t>(received_randomized.front())},
                      {"buffered_bytes",
                       static_cast<std::uint64_t>(rs_bytes.size())},
                      {"energy_synchronized",
@@ -502,13 +502,13 @@ struct OuterFec::Impl {
                     emit_diagnostic(
                         "outer_fec_rs_failure_streak",
                         DiagnosticEventSeverity::warning,
-                        {{"streak", static_cast<std::uint64_t>(
-                                        uncorrectable_since_sync)},
+                        {{"streak",
+                          static_cast<std::uint64_t>(uncorrectable_since_sync)},
                          {"uncorrectable_packets",
                           statistics.rs_uncorrectable_packets},
                          {"rs_packets", statistics.rs_packets},
-                         {"phase", static_cast<std::uint64_t>(
-                                       selected_outer_phase)},
+                         {"phase",
+                          static_cast<std::uint64_t>(selected_outer_phase)},
                          {"buffered_bytes",
                           static_cast<std::uint64_t>(rs_bytes.size())},
                          {"energy_synchronized",
@@ -525,9 +525,8 @@ struct OuterFec::Impl {
                     uncorrectable_since_sync = 0;
                     selected_outer_phase = outer_interleaver_branches;
                     rs_bytes.clear();
-                    for (std::size_t phase = 0; phase < outer_candidates.size();
-                         ++phase) {
-                        outer_candidates[phase].clear();
+                    for (auto &outer_candidate : outer_candidates) {
+                        outer_candidate.clear();
                     }
                     energy_descrambler.reset();
                     alignment_search_bytes = 0;
@@ -540,8 +539,7 @@ struct OuterFec::Impl {
                     statistics.outer_rs_evidence = 0;
                     if (diagnostics_enabled()) {
                         emit_diagnostic(
-                            "outer_fec_reset",
-                            DiagnosticEventSeverity::warning,
+                            "outer_fec_reset", DiagnosticEventSeverity::warning,
                             {{"reason", std::string{"rs_failure_streak"}},
                              {"threshold", static_cast<std::uint64_t>(
                                                uncorrectable_reset_threshold)},
@@ -563,12 +561,12 @@ struct OuterFec::Impl {
             if (uncorrectable_since_sync >= 8 && diagnostics_enabled()) {
                 emit_diagnostic(
                     "outer_fec_rs_recovered", DiagnosticEventSeverity::info,
-                    {{"previous_streak", static_cast<std::uint64_t>(
-                                             uncorrectable_since_sync)},
+                    {{"previous_streak",
+                      static_cast<std::uint64_t>(uncorrectable_since_sync)},
                      {"uncorrectable_packets",
                       statistics.rs_uncorrectable_packets},
-                     {"phase", static_cast<std::uint64_t>(
-                                   selected_outer_phase)}});
+                     {"phase",
+                      static_cast<std::uint64_t>(selected_outer_phase)}});
             }
             uncorrectable_since_sync = 0;
             std::array<std::uint8_t, ts_packet_size> packet{};
@@ -603,7 +601,8 @@ struct OuterFec::Impl {
     // searches are throttled so a noisy interval cannot monopolize the FEC
     // worker.  This is many times longer than one RS alignment window, while
     // the candidate buffers continue to retain the newest window.
-    static constexpr std::size_t alignment_search_interval = 32 * 32 * 204;
+    static constexpr std::size_t alignment_search_interval =
+        std::size_t{32} * 32U * 204U;
     std::size_t alignment_search_bytes{};
     std::uint64_t alignment_search_count{};
     std::size_t pending_alignment_phase{outer_interleaver_branches};

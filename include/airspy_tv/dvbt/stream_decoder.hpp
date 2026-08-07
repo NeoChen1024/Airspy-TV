@@ -7,11 +7,11 @@
 #include "airspy_tv/dvbt/transport_decoder.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <complex>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <chrono>
 #include <memory>
 #include <span>
 #include <string>
@@ -34,7 +34,9 @@ enum class WorkerState : int {
     exited,              // thread returned (only expected on stop)
 };
 
-struct StreamDecoderStats {
+// Public snapshot fields remain grouped by subsystem for consumers; byte-level
+// packing is not worth making the API harder to inspect.
+struct StreamDecoderStats { // NOLINT(clang-analyzer-optin.performance.Padding)
     std::uint64_t decoder_generation{};
     std::uint64_t source_epoch{};
     bool failed{};
@@ -209,7 +211,7 @@ class StreamDecoder : public Demodulator {
                            std::span<const float>, std::size_t)>;
 
     StreamDecoder();
-    ~StreamDecoder() noexcept;
+    ~StreamDecoder() noexcept override;
     StreamDecoder(const StreamDecoder &) = delete;
     StreamDecoder &operator=(const StreamDecoder &) = delete;
     StreamDecoder(StreamDecoder &&) = delete;
@@ -223,11 +225,10 @@ class StreamDecoder : public Demodulator {
                 InputSampleStamp stamp = {}) override;
     // Decoder-paced file input: wait for queue capacity instead of dropping an
     // input block. Live SDR callbacks should continue to use submit().
-    void
-    submit_blocking(std::span<const std::int16_t> interleaved_iq,
-                    std::uint32_t sample_rate_hz,
-                    std::uint32_t channel_bandwidth_hz = 6'000'000,
-                    InputSampleStamp stamp = {}) override;
+    void submit_blocking(std::span<const std::int16_t> interleaved_iq,
+                         std::uint32_t sample_rate_hz,
+                         std::uint32_t channel_bandwidth_hz = 6'000'000,
+                         InputSampleStamp stamp = {}) override;
     // Process any final partial chunk, then wait until all queued input has
     // completed. This is intended for finite, decoder-paced file input.
     void flush() override;
@@ -248,9 +249,9 @@ class StreamDecoder : public Demodulator {
     [[nodiscard]] StreamDecoderStats stats() const;
     // Detailed records are opt-in. Workers only append typed values; callers
     // drain and serialize them outside the real-time pipeline.
-    void set_telemetry_enabled(bool enabled,
-                               TelemetryClock::time_point run_started_at =
-                                   TelemetryClock::now());
+    void set_telemetry_enabled(
+        bool enabled,
+        TelemetryClock::time_point run_started_at = TelemetryClock::now());
     [[nodiscard]] std::vector<TelemetryRecord> drain_telemetry();
 
   private:

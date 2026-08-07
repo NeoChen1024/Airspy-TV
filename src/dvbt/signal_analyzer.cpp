@@ -297,14 +297,14 @@ struct SignalAnalyzer::Impl {
     std::uint32_t sample_rate{};
     std::uint32_t bandwidth{};
     ReceiverParameters parameters;
-    std::chrono::steady_clock::time_point next_analysis{};
+    std::chrono::steady_clock::time_point next_analysis;
     mutable std::mutex pending_mutex;
     std::condition_variable ready;
     bool pending{};
     bool stopping{};
     std::atomic<bool> snr_smoothing{true};
     std::atomic<int> snr_smoothing_speed{20};
-    std::atomic<bool> tracking_reset_requested{};
+    std::atomic<bool> tracking_reset_requested;
     mutable std::mutex snapshot_mutex;
     SignalAnalysisSnapshot latest;
     std::array<std::size_t, 8> configuration_votes{};
@@ -401,14 +401,14 @@ struct SignalAnalyzer::Impl {
                 missed_count = 0;
                 const std::size_t mode_index =
                     next.mode == TransmissionMode::k8 ? 4 : 0;
-                const std::size_t guard_index =
+                const auto guard_index =
                     static_cast<std::size_t>(next.guard_interval);
                 ++configuration_votes[mode_index + guard_index];
                 ++configuration_vote_count;
-                const auto winner =
+                auto *const winner =
                     std::ranges::max_element(configuration_votes);
                 const std::size_t winner_votes = *winner;
-                const std::size_t winner_index = static_cast<std::size_t>(
+                const auto winner_index = static_cast<std::size_t>(
                     std::distance(configuration_votes.begin(), winner));
                 if (configuration_vote_count >= 3 && winner_votes == 3) {
                     stable_mode = winner_index >= 4 ? TransmissionMode::k8

@@ -48,7 +48,7 @@ class Cs16Resampler {
 [[nodiscard]] std::vector<std::complex<float>>
 resample_cs16(std::span<const std::int16_t> interleaved_iq,
               std::uint32_t sample_rate_hz, std::uint32_t channel_bandwidth_hz,
-              std::size_t worker_count = 1);
+              std::size_t requested_workers = 1);
 
 // Searches CP periodicity across all allowed (or explicitly selected) DVB-T
 // transmission modes and guard intervals.

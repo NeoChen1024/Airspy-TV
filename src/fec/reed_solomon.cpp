@@ -10,8 +10,7 @@
 namespace airspy_tv::fec {
 
 DvbReedSolomon::DvbReedSolomon()
-    : codec_(init_rs_char(8, 0x11D, 0, 1,
-                          static_cast<int>(parity_size), 51)) {
+    : codec_(init_rs_char(8, 0x11D, 0, 1, static_cast<int>(parity_size), 51)) {
     if (codec_ == nullptr) {
         throw std::runtime_error("failed to create DVB Reed-Solomon codec");
     }
@@ -28,10 +27,9 @@ void DvbReedSolomon::encode(const std::span<const std::uint8_t> payload,
     encode_rs_char(codec_, codeword.data(), codeword.data() + payload_size);
 }
 
-bool DvbReedSolomon::decode(
-    const std::span<const std::uint8_t> codeword,
-    const std::span<std::uint8_t> payload,
-    std::uint64_t *const corrected_payload_bits) const {
+bool DvbReedSolomon::decode(const std::span<const std::uint8_t> codeword,
+                            const std::span<std::uint8_t> payload,
+                            std::uint64_t *const corrected_payload_bits) const {
     if (codeword.size() != codeword_size || payload.size() != payload_size) {
         throw std::invalid_argument("DVB RS block size mismatch");
     }

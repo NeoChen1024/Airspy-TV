@@ -58,7 +58,8 @@ namespace {
 
 } // namespace
 
-JsonlError::JsonlError(std::string message, const std::size_t line_number)
+JsonlError::JsonlError(const std::string &message,
+                       const std::size_t line_number)
     : std::runtime_error(with_line(message, line_number)),
       line_number_(line_number) {}
 
@@ -120,7 +121,8 @@ void JsonlWriter::write_batch(const std::span<const nlohmann::json> values) {
     std::string serialized_batch;
     for (std::size_t index = 0; index < values.size(); ++index) {
         const std::size_t record_number = records_written_ + index + 1;
-        std::string serialized = serialize_record(values[index], record_number);
+        std::string const serialized =
+            serialize_record(values[index], record_number);
         if (serialized.size() == std::numeric_limits<std::size_t>::max() ||
             serialized_batch.size() > std::numeric_limits<std::size_t>::max() -
                                           serialized.size() - 1) {

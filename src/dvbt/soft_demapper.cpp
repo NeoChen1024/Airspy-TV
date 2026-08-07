@@ -91,8 +91,8 @@ MaxLogDemapper::MaxLogDemapper(const Constellation constellation)
       bits_per_symbol_(dvbt::bits_per_symbol(constellation)),
       axis_gain_(normalization(constellation)),
       half_inverse_axis_gain_(0.5F / axis_gain_),
-      maximum_axis_index_(
-          static_cast<int>((std::size_t{1} << (bits_per_symbol_ / 2 - 1)) - 1)),
+      maximum_axis_index_(static_cast<int>(
+          (std::size_t{1} << ((bits_per_symbol_ / 2) - 1)) - 1)),
       points_(make_constellation(constellation)) {
     for (std::size_t bit = 0; bit < bits_per_symbol_; ++bit) {
         const std::size_t mask = std::size_t{1} << (bits_per_symbol_ - bit - 1);

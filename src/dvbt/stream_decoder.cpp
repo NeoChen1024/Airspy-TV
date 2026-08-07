@@ -50,7 +50,6 @@ constexpr float minimum_power = 1.0e-12F;
 constexpr std::size_t acquisition_samples = 350'000;
 constexpr std::size_t buffer_duration_denominator = 5;
 constexpr std::size_t initial_symbol_queue_capacity = 256;
-constexpr std::size_t ts_packet_size = 188;
 
 void add_transport_counters(TransportDecoderStats &destination,
                             const TransportDecoderStats &source) noexcept {
@@ -58,14 +57,12 @@ void add_transport_counters(TransportDecoderStats &destination,
     destination.pre_viterbi_error_bits += source.pre_viterbi_error_bits;
     destination.pre_viterbi_compared_bits += source.pre_viterbi_compared_bits;
     destination.post_viterbi_error_bits += source.post_viterbi_error_bits;
-    destination.post_viterbi_compared_bits +=
-        source.post_viterbi_compared_bits;
+    destination.post_viterbi_compared_bits += source.post_viterbi_compared_bits;
     destination.rs_packets += source.rs_packets;
     destination.rs_uncorrectable_packets += source.rs_uncorrectable_packets;
     destination.tei_packets += source.tei_packets;
     destination.ts_packets += source.ts_packets;
-    destination.outer_deinterleaver_phase =
-        source.outer_deinterleaver_phase;
+    destination.outer_deinterleaver_phase = source.outer_deinterleaver_phase;
     destination.outer_sync_distance = source.outer_sync_distance;
     destination.outer_rs_evidence = source.outer_rs_evidence;
     destination.rs_synchronized = source.rs_synchronized;
@@ -107,8 +104,8 @@ transport_counter_delta(const TransportDecoderStats &current,
     return "unknown";
 }
 
-[[nodiscard]] const char *event_constellation_name(
-    const Constellation constellation) {
+[[nodiscard]] const char *
+event_constellation_name(const Constellation constellation) {
     switch (constellation) {
     case Constellation::qpsk:
         return "qpsk";
@@ -156,19 +153,17 @@ ring_capacity_for(const std::uint32_t sample_rate_hz) noexcept {
 
 [[nodiscard]] std::size_t
 resampler_quantum_samples(const std::uint32_t sample_rate_hz) noexcept {
-    return std::max<std::size_t>(
-        1, (static_cast<std::size_t>(sample_rate_hz) +
-            resampler_quantum_denominator - 1) /
-               resampler_quantum_denominator);
+    return std::max<std::size_t>(1, (static_cast<std::size_t>(sample_rate_hz) +
+                                     resampler_quantum_denominator - 1) /
+                                        resampler_quantum_denominator);
 }
 
 [[nodiscard]] std::uint64_t
 sro_fixed_delay_samples(const std::uint32_t input_rate_hz,
                         const std::uint32_t bandwidth_hz) noexcept {
-    const std::uint64_t minimum =
-        (static_cast<std::uint64_t>(input_rate_hz) +
-         minimum_sro_delay_denominator - 1) /
-        minimum_sro_delay_denominator;
+    const std::uint64_t minimum = (static_cast<std::uint64_t>(input_rate_hz) +
+                                   minimum_sro_delay_denominator - 1) /
+                                  minimum_sro_delay_denominator;
     if (bandwidth_hz == 0) {
         return minimum;
     }
@@ -179,8 +174,8 @@ sro_fixed_delay_samples(const std::uint32_t input_rate_hz,
         static_cast<long double>(input_rate_hz) / output_rate;
     const long double bounded_lead =
         std::ceil(ring_input_equivalent) +
-        2.0L * static_cast<long double>(
-                   resampler_quantum_samples(input_rate_hz));
+        (2.0L *
+         static_cast<long double>(resampler_quantum_samples(input_rate_hz)));
     return std::max(minimum, static_cast<std::uint64_t>(bounded_lead));
 }
 // Demod statistics window: 400 OFDM symbols (~0.6 s at 8K/guard-1/4), the
@@ -327,7 +322,7 @@ lock_pilots(const std::span<const std::complex<float>> fft,
             std::complex<float> correlation{};
             float score = 0.0F;
             std::size_t chunk_count = 0;
-            for (std::size_t pilot = static_cast<std::size_t>(phase * 3);
+            for (auto pilot = static_cast<std::size_t>(phase) * 3U;
                  pilot <= maximum; pilot += 12) {
                 const float value =
                     prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
@@ -391,7 +386,7 @@ lock_phase_at_offset(const std::span<const std::complex<float>> fft,
             std::size_t ramp_count = 0;
             std::size_t previous_pilot =
                 std::numeric_limits<std::size_t>::max();
-            for (std::size_t pilot = static_cast<std::size_t>(phase * 3);
+            for (auto pilot = static_cast<std::size_t>(phase) * 3U;
                  pilot <= maximum; pilot += 12) {
                 if (previous_pilot != std::numeric_limits<std::size_t>::max()) {
                     const auto left =
@@ -423,10 +418,10 @@ lock_phase_at_offset(const std::span<const std::complex<float>> fft,
                           static_cast<double>(ramp_count * timing_pilot_spacing)
                     : 0.0;
         }
-        for (std::size_t pilot = static_cast<std::size_t>(phase * 3);
+        for (auto pilot = static_cast<std::size_t>(phase) * 3U;
              pilot <= maximum; pilot += 12) {
             const float value = prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
-            const float dephase =
+            const auto dephase =
                 static_cast<float>(dephase_slope * static_cast<double>(pilot));
             correlation +=
                 value * std::conj(std::polar(1.0F, dephase) *
@@ -538,18 +533,18 @@ struct StreamDecoder::Impl {
     std::optional<GuardInterval> stable_guard;
     OfdmTrackingState frontend;
     StreamDecoderStats latest;
-    std::atomic_bool telemetry_enabled{};
+    std::atomic_bool telemetry_enabled;
     TelemetryClock::time_point telemetry_started_at{TelemetryClock::now()};
     std::deque<TelemetryRecord> telemetry_queue;
     std::uint64_t frontend_telemetry_sequence{};
     std::uint64_t fec_telemetry_sequence{};
     std::uint64_t event_telemetry_sequence{};
-    std::atomic<bool> cancel_requested{};
+    std::atomic<bool> cancel_requested;
     // The demod estimates source SRO; the front-end owns and applies the
     // common resampler. These atomics are the only cross-thread control path.
-    std::atomic<double> sro_resampler_command_ppm{};
-    std::atomic<double> sro_resampler_applied_ppm{};
-    std::atomic<bool> sro_resampler_ready{};
+    std::atomic<double> sro_resampler_command_ppm;
+    std::atomic<double> sro_resampler_applied_ppm;
+    std::atomic<bool> sro_resampler_ready;
     // Where each pipeline thread is parked, for diagnostics (see
     // WorkerState). Written by the owning thread, read lock-free by stats().
     std::atomic<int> frontend_state{static_cast<int>(WorkerState::idle)};
@@ -577,7 +572,7 @@ struct StreamDecoder::Impl {
     // retry back-off, the end-of-stream wait, or the drain.
     bool acquisition_pending{};
     bool fec_worker_busy{};
-    std::atomic<std::uint64_t> latest_generation{};
+    std::atomic<std::uint64_t> latest_generation;
     std::exception_ptr terminal_exception;
     std::string terminal_error;
     std::unique_ptr<SymbolPostprocessorPool> symbol_postprocessor;
@@ -632,12 +627,13 @@ struct StreamDecoder::Impl {
         telemetry_queue.emplace_back(std::move(record));
     }
 
-    void emit_diagnostic_event(
-        DiagnosticEvent diagnostic, const std::uint64_t generation,
-        const std::uint64_t source_epoch,
-        const std::uint64_t demod_window_sequence,
-        const std::uint64_t fec_session,
-        const std::optional<std::uint64_t> tps_symbol_index) {
+    void
+    emit_diagnostic_event(DiagnosticEvent diagnostic,
+                          const std::uint64_t generation,
+                          const std::uint64_t source_epoch,
+                          const std::uint64_t demod_window_sequence,
+                          const std::uint64_t fec_session,
+                          const std::optional<std::uint64_t> tps_symbol_index) {
         if (!telemetry_enabled.load(std::memory_order_relaxed)) {
             return;
         }
@@ -680,6 +676,10 @@ struct StreamDecoder::Impl {
               set_current_thread_name("dvbt-fec");
               run_guarded("fec", [this] { run_fec(); });
           }) {}
+    Impl(const Impl &) = delete;
+    Impl &operator=(const Impl &) = delete;
+    Impl(Impl &&) = delete;
+    Impl &operator=(Impl &&) = delete;
     ~Impl() {
         cancel_requested = true;
         {

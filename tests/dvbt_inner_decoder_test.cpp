@@ -75,6 +75,8 @@ void test_constellations() {
 }
 
 void test_separable_max_log_matches_exhaustive_reference() {
+    // Fixed seeds make numerical regression failures reproducible.
+    // NOLINTNEXTLINE(bugprone-random-generator-seed)
     std::mt19937 generator{0x44564254U};
     std::uniform_real_distribution<float> sample_distribution{-2.0F, 2.0F};
     std::uniform_real_distribution<float> reliability_distribution{0.0F, 20.0F};
@@ -136,6 +138,8 @@ void test_separable_max_log_matches_exhaustive_reference() {
 }
 
 void test_shared_ofdm_acquisition() {
+    // Fixed seeds make acquisition regressions reproducible.
+    // NOLINTNEXTLINE(bugprone-random-generator-seed)
     std::mt19937 generator{0x4f46444dU};
     std::uniform_real_distribution<float> sample_distribution{-1.0F, 1.0F};
     for (const auto mode : {TransmissionMode::k2, TransmissionMode::k8}) {
@@ -256,12 +260,14 @@ void test_depuncturer() {
     const std::array transmitted_per_period{2U, 3U, 4U, 6U, 8U};
     const std::array mother_period{2U, 4U, 6U, 10U, 14U};
     for (std::size_t index = 0; index < rates.size(); ++index) {
-        std::vector<float> input(transmitted_per_period[index] * 3);
+        std::vector<float> input(transmitted_per_period[index] *
+                                 std::size_t{3});
         std::iota(input.begin(), input.end(), 1.0F);
         std::vector<float> output(
             airspy_tv::dvbt::depunctured_size(input.size(), rates[index]));
         airspy_tv::dvbt::depuncture(input, rates[index], output);
-        require(output.size() == mother_period[index] * 3, "depunctured size");
+        require(output.size() == mother_period[index] * std::size_t{3},
+                "depunctured size");
         require(std::ranges::count(output, 0.0F) ==
                     static_cast<std::ptrdiff_t>(output.size() - input.size()),
                 "neutral punctured metrics");
@@ -275,7 +281,9 @@ void test_depuncturer() {
 }
 
 void test_partitioned_resampler() {
-    constexpr std::size_t complex_samples = 35 * 257;
+    constexpr std::size_t complex_samples = std::size_t{35} * 257U;
+    // Fixed seeds make worker-partition regressions reproducible.
+    // NOLINTNEXTLINE(bugprone-random-generator-seed)
     std::mt19937 generator{0x5253504CU};
     std::uniform_int_distribution<int> sample_distribution{-32768, 32767};
     std::vector<std::int16_t> input(complex_samples * 2);

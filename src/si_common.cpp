@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <string>
+#include <utility>
 
 namespace airspy_tv::si {
 namespace {
@@ -51,19 +52,21 @@ std::string iconv_text(const char *codeset,
         return {};
     }
     iconv_t cd = iconv_open("UTF-8", codeset);
+    // POSIX specifies (iconv_t)-1 as iconv_open()'s failure sentinel.
+    // NOLINTNEXTLINE(performance-no-int-to-ptr)
     if (cd == reinterpret_cast<iconv_t>(-1)) {
         return {};
     }
-    std::string output(bytes.size() * 3U + 16U, '\0');
-    auto *input = const_cast<char *>(
-        reinterpret_cast<const char *>(bytes.data()));
+    std::string output((bytes.size() * 3U) + 16U, '\0');
+    auto *input =
+        const_cast<char *>(reinterpret_cast<const char *>(bytes.data()));
     std::size_t input_left = bytes.size();
     char *cursor = output.data();
     std::size_t output_left = output.size();
     const std::size_t result =
         iconv(cd, &input, &input_left, &cursor, &output_left);
     iconv_close(cd);
-    if (result == static_cast<std::size_t>(-1)) {
+    if (std::cmp_equal(result, -1)) {
         return {}; // EILSEQ/E2BIG: fall back to passthrough.
     }
     output.resize(static_cast<std::size_t>(cursor - output.data()));
@@ -126,8 +129,7 @@ std::string dvb_text(std::span<const std::uint8_t> bytes) {
                 "ISO-8859-9",  "ISO-8859-10", "ISO-8859-11", "ISO-8859-12",
                 "ISO-8859-13", "ISO-8859-14", "ISO-8859-15", "ISO-8859-16",
                 "ISO-8859-2",  "ISO-8859-3",  "ISO-8859-4"};
-            if (const auto text =
-                    iconv_text(codesets[encoding - 1U], payload);
+            if (const auto text = iconv_text(codesets[encoding - 1U], payload);
                 !text.empty()) {
                 return text;
             }

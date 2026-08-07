@@ -16,7 +16,7 @@ namespace airspy_tv {
 
 class JsonlError : public std::runtime_error {
   public:
-    JsonlError(std::string message, std::size_t line_number = 0);
+    JsonlError(const std::string &message, std::size_t line_number = 0);
 
     [[nodiscard]] std::size_t line_number() const noexcept;
 

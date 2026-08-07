@@ -33,8 +33,8 @@ class ByteRateTracker {
         }
 
         const std::uint64_t written = bytes - sampled_bytes_;
-        mib_per_second_ = static_cast<double>(written) /
-                          (bytes_per_mib * elapsed_seconds);
+        mib_per_second_ =
+            static_cast<double>(written) / (bytes_per_mib * elapsed_seconds);
         sampled_at_ = now;
         sampled_bytes_ = bytes;
         return mib_per_second_;

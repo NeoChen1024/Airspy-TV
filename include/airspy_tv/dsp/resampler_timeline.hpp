@@ -55,17 +55,17 @@ class ResamplerRateTimeline {
             return MappedInputPosition{span.stream_epoch, span.input_end,
                                        span.input_rate_hz};
         }
-        const long double output_offset =
+        const auto output_offset =
             static_cast<long double>(output_sample - span.output_begin);
-        const long double input_count =
+        const auto input_count =
             static_cast<long double>(span.input_end - span.input_begin);
-        const long double output_count =
+        const auto output_count =
             static_cast<long double>(span.output_end - span.output_begin);
         const auto input_offset = static_cast<std::uint64_t>(
             std::floor(output_offset * input_count / output_count));
-        return MappedInputPosition{
-            span.stream_epoch, span.input_begin + input_offset,
-            span.input_rate_hz};
+        return MappedInputPosition{span.stream_epoch,
+                                   span.input_begin + input_offset,
+                                   span.input_rate_hz};
     }
 
     [[nodiscard]] std::optional<double>
@@ -77,14 +77,15 @@ class ResamplerRateTimeline {
         long double weighted_sum = 0.0L;
         std::uint64_t covered = 0;
         for (const auto &span : spans_) {
-            const std::uint64_t begin = std::max(output_begin, span.output_begin);
+            const std::uint64_t begin =
+                std::max(output_begin, span.output_begin);
             const std::uint64_t end = std::min(output_end, span.output_end);
             if (end <= begin) {
                 continue;
             }
             const std::uint64_t count = end - begin;
-            weighted_sum += static_cast<long double>(count) *
-                            span.applied_correction_ppm;
+            weighted_sum +=
+                static_cast<long double>(count) * span.applied_correction_ppm;
             covered += count;
         }
         if (covered != output_end - output_begin) {
@@ -95,31 +96,28 @@ class ResamplerRateTimeline {
     }
 
     void discard_before(const std::uint64_t output_sample) {
-        while (!spans_.empty() &&
-               spans_.front().output_end <= output_sample) {
+        while (!spans_.empty() && spans_.front().output_end <= output_sample) {
             spans_.pop_front();
         }
     }
 
     void truncate_after(const std::uint64_t output_sample) {
-        while (!spans_.empty() &&
-               spans_.back().output_begin >= output_sample) {
+        while (!spans_.empty() && spans_.back().output_begin >= output_sample) {
             spans_.pop_back();
         }
         if (spans_.empty() || spans_.back().output_end <= output_sample) {
             return;
         }
         auto &span = spans_.back();
-        const long double retained_output =
+        const auto retained_output =
             static_cast<long double>(output_sample - span.output_begin);
-        const long double total_output =
+        const auto total_output =
             static_cast<long double>(span.output_end - span.output_begin);
-        const long double total_input =
+        const auto total_input =
             static_cast<long double>(span.input_end - span.input_begin);
-        span.input_end = span.input_begin + static_cast<std::uint64_t>(
-                                               std::ceil(retained_output *
-                                                         total_input /
-                                                         total_output));
+        span.input_end = span.input_begin +
+                         static_cast<std::uint64_t>(std::ceil(
+                             retained_output * total_input / total_output));
         span.output_end = output_sample;
     }
 

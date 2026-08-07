@@ -187,8 +187,7 @@ void StreamDecoder::Impl::run_frontend() {
                         }
                         break;
                     }
-                    latest.sro_pending_commands =
-                        scheduled_sro_commands.size();
+                    latest.sro_pending_commands = scheduled_sro_commands.size();
                 }
                 if (command_to_apply.has_value()) {
                     resampler->set_sro_correction_ppm(
@@ -263,11 +262,12 @@ void StreamDecoder::Impl::run_frontend() {
                         break;
                     }
                     const std::size_t used = ring_write_pos - ring_read_pos;
-                    const std::size_t chunk = std::min(
-                        ring.size() - used, resampled.size() - pushed);
+                    const std::size_t chunk =
+                        std::min(ring.size() - used, resampled.size() - pushed);
                     const auto ring_copy_started_at =
                         std::chrono::steady_clock::now();
-                    const std::size_t write_index = ring_write_pos % ring.size();
+                    const std::size_t write_index =
+                        ring_write_pos % ring.size();
                     const std::size_t first =
                         std::min(chunk, ring.size() - write_index);
                     std::copy_n(resampled.data() + pushed, first,
@@ -325,9 +325,9 @@ void StreamDecoder::Impl::run_frontend() {
                         record.resampled_begin_sample =
                             have_resampled_span ? resampled_begin_sample
                                                 : ring_write_pos;
-                        record.resampled_end_sample =
-                            have_resampled_span ? resampled_end_sample
-                                                : ring_write_pos;
+                        record.resampled_end_sample = have_resampled_span
+                                                          ? resampled_end_sample
+                                                          : ring_write_pos;
                         record.input_complex_samples = complex_count;
                         record.resampled_complex_samples =
                             record.resampled_end_sample -
@@ -351,10 +351,8 @@ void StreamDecoder::Impl::run_frontend() {
                             latest.sro_applied_input_sample;
                         record.fixed_delay_samples =
                             latest.sro_fixed_delay_samples;
-                        record.late_samples =
-                            latest.sro_schedule_late_samples;
-                        record.pending_commands =
-                            scheduled_sro_commands.size();
+                        record.late_samples = latest.sro_schedule_late_samples;
+                        record.pending_commands = scheduled_sro_commands.size();
                         record.serial_wall_ms = {
                             {"frontend::total", total_time_ms},
                             {"frontend::convert", convert_time_ms},

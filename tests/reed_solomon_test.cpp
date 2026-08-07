@@ -26,7 +26,7 @@ make_payload() {
     std::array<std::uint8_t, DvbReedSolomon::payload_size> payload{};
     for (std::size_t index = 0; index < payload.size(); ++index) {
         payload[index] =
-            static_cast<std::uint8_t>((index * 73U + 19U) & 0xFFU);
+            static_cast<std::uint8_t>(((index * 73U) + 19U) & 0xFFU);
     }
     return payload;
 }
@@ -43,10 +43,9 @@ void test_correction_limit() {
         auto damaged = encoded;
         std::uint64_t expected_payload_bits = 0;
         for (std::size_t error = 0; error < error_count; ++error) {
-            const std::size_t position = (error * 23U + error_count * 7U) %
-                                         damaged.size();
-            const std::uint8_t mask =
-                static_cast<std::uint8_t>(0x41U + error);
+            const std::size_t position =
+                ((error * 23U) + (error_count * 7U)) % damaged.size();
+            const auto mask = static_cast<std::uint8_t>(0x41U + error);
             damaged[position] ^= mask;
             if (position < payload.size()) {
                 expected_payload_bits += static_cast<std::uint64_t>(
@@ -70,8 +69,7 @@ void test_uncorrectable_codeword() {
     std::array<std::uint8_t, DvbReedSolomon::codeword_size> damaged{};
     codec.encode(payload, damaged);
     for (std::size_t error = 0; error < 9; ++error) {
-        damaged[error * 23U] ^=
-            static_cast<std::uint8_t>(0x81U + error);
+        damaged[error * 23U] ^= static_cast<std::uint8_t>(0x81U + error);
     }
 
     std::array<std::uint8_t, DvbReedSolomon::payload_size> decoded{};

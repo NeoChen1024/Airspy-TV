@@ -24,8 +24,8 @@ void require(const bool condition, const std::string_view message) {
 }
 
 void test_conversion() {
-    constexpr std::array<std::int16_t, 8> input{
-        -32768, 32767, -16384, 16384, -1, 1, 0, 8192};
+    constexpr std::array<std::int16_t, 8> input{-32768, 32767, -16384, 16384,
+                                                -1,     1,     0,      8192};
     std::array<std::complex<float>, 4> output{};
     convert_cs16_to_cf32(input, output);
     constexpr float scale = 1.0F / 32768.0F;
@@ -34,14 +34,16 @@ void test_conversion() {
                     static_cast<float>(input[index * 2]) * scale,
                 "CS16 real conversion mismatch");
         require(output[index].imag() ==
-                    static_cast<float>(input[index * 2 + 1]) * scale,
+                    static_cast<float>(input[(index * 2) + 1]) * scale,
                 "CS16 imaginary conversion mismatch");
     }
 }
 
 void test_spectrum_operations() {
     constexpr std::array<std::complex<float>, 4> input{
-        std::complex<float>{3.0F, 4.0F}, {1.0F, -2.0F}, {-2.0F, -2.0F},
+        std::complex<float>{3.0F, 4.0F},
+        {1.0F, -2.0F},
+        {-2.0F, -2.0F},
         {0.5F, 0.25F}};
     constexpr std::array<float, 4> factors{0.0F, 0.25F, 0.5F, 2.0F};
     std::array<float, 4> power{};
@@ -49,8 +51,7 @@ void test_spectrum_operations() {
     magnitude_squared(input, power);
     multiply_real(input, factors, multiplied);
 
-    constexpr std::array<float, 4> expected_power{25.0F, 5.0F, 8.0F,
-                                                   0.3125F};
+    constexpr std::array<float, 4> expected_power{25.0F, 5.0F, 8.0F, 0.3125F};
     for (std::size_t index = 0; index < input.size(); ++index) {
         require(power[index] == expected_power[index],
                 "magnitude squared mismatch");

@@ -126,17 +126,17 @@ std::vector<std::uint8_t> short_event(const std::string &name,
 
 std::vector<std::uint8_t> content_descriptor(const std::uint8_t level) {
     // tag, length=2, nibble_1<<4|nibble_2, user_byte.
-    return {0x54U, 0x02U, static_cast<std::uint8_t>((level << 4U) | 0x00U),
+    return {0x54U, 0x02U,
+            static_cast<std::uint8_t>((static_cast<unsigned int>(level) << 4U) |
+                                      0x00U),
             0x00U};
 }
 
-std::vector<std::uint8_t> make_eit_pf(const std::uint16_t service_id,
-                                      const std::uint64_t start_unix,
-                                      const std::uint32_t duration_seconds,
-                                      const std::string &name,
-                                      const std::string &text,
-                                      const std::uint8_t genre,
-                                      const std::uint8_t running_status) {
+std::vector<std::uint8_t>
+make_eit_pf(const std::uint16_t service_id, const std::uint64_t start_unix,
+            const std::uint32_t duration_seconds, const std::string &name,
+            const std::string &text, const std::uint8_t genre,
+            const std::uint8_t running_status) {
     std::vector<std::uint8_t> event;
     event.push_back(0x00U); // event_id hi
     event.push_back(0x01U); // event_id lo
@@ -158,7 +158,8 @@ std::vector<std::uint8_t> make_eit_pf(const std::uint16_t service_id,
     const auto genre_desc = content_descriptor(genre);
     const std::size_t descriptors_length = name_desc.size() + genre_desc.size();
     event.push_back(static_cast<std::uint8_t>(
-        (running_status << 5U) | ((descriptors_length >> 8U) & 0x0FU)));
+        (static_cast<std::size_t>(running_status) << 5U) |
+        ((descriptors_length >> 8U) & 0x0FU)));
     event.push_back(static_cast<std::uint8_t>(descriptors_length & 0xFFU));
     event.insert(event.end(), name_desc.begin(), name_desc.end());
     event.insert(event.end(), genre_desc.begin(), genre_desc.end());
@@ -167,9 +168,20 @@ std::vector<std::uint8_t> make_eit_pf(const std::uint16_t service_id,
     // extension), version/current, section/last_section, transport_stream_id,
     // original_network_id, segment_last_section_number, last_table_id.
     std::vector<std::uint8_t> section{
-        0x4EU, 0x00U, 0x00U, static_cast<std::uint8_t>(service_id >> 8U),
-        static_cast<std::uint8_t>(service_id & 0xFFU), 0xC1U, 0x00U, 0x01U,
-        0x00U, 0x01U, 0x00U, 0x01U, 0xF0U, 0x4EU};
+        0x4EU,
+        0x00U,
+        0x00U,
+        static_cast<std::uint8_t>(service_id >> 8U),
+        static_cast<std::uint8_t>(service_id & 0xFFU),
+        0xC1U,
+        0x00U,
+        0x01U,
+        0x00U,
+        0x01U,
+        0x00U,
+        0x01U,
+        0xF0U,
+        0x4EU};
     section.insert(section.end(), event.begin(), event.end());
     const std::size_t section_length = section.size() - 3 + 4; // incl. CRC
     section[1] = static_cast<std::uint8_t>((section_length >> 8U) & 0x0FU);
@@ -195,8 +207,8 @@ void test_encodings() {
     const std::vector<std::uint8_t> latin{0x0BU, 0xA4U};
     expect(dvb_text(latin) == "\xE2\x82\xAC", "ISO-8859-15 decodes");
     // UTF-8 passthrough (0x15 marker stripped)
-    const std::vector<std::uint8_t> utf8{
-        0x15U, 0xE4U, 0xB8U, 0xADU, 0xE6U, 0x96U, 0x87U};
+    const std::vector<std::uint8_t> utf8{0x15U, 0xE4U, 0xB8U, 0xADU,
+                                         0xE6U, 0x96U, 0x87U};
     expect(dvb_text(utf8) == "\xE4\xB8\xAD\xE6\x96\x87",
            "UTF-8 marker stripped and bytes preserved");
     // Taiwan quirk: 0x14-labeled UTF-16BE
@@ -210,9 +222,7 @@ void test_encodings() {
            "invalid Big5 falls back to passthrough");
 }
 
-} // namespace
-
-int main() {
+void run_tests() {
     test_encodings();
 
     // TDT: a fixed wall-clock time is captured and reported.
@@ -222,8 +232,11 @@ int main() {
     const EpgSnapshot clock_snapshot = clock_model.snapshot(1);
     expect(clock_snapshot.utc_now.has_value(),
            "TDT should set the broadcast clock");
-    expect(*clock_snapshot.utc_now >= tdt_unix &&
-               *clock_snapshot.utc_now <= tdt_unix + 60U,
+    if (!clock_snapshot.utc_now.has_value()) {
+        throw std::runtime_error("TDT broadcast clock is unavailable");
+    }
+    const auto utc_now = *clock_snapshot.utc_now;
+    expect(utc_now >= tdt_unix && utc_now <= tdt_unix + 60U,
            "TDT clock should match the encoded time");
 
     // Two services, each with its own EIT p/f section; the service id comes
@@ -232,9 +245,9 @@ int main() {
     constexpr std::uint64_t start_unix = 1'777'000'000U;
     const std::vector<std::uint8_t> eit_one = with_crc(make_eit_pf(
         0x0100U, start_unix, 1800U, "News Hour", "Headlines", 0x02U, 0x04U));
-    const std::vector<std::uint8_t> eit_two = with_crc(make_eit_pf(
-        0x0101U, start_unix + 1800U, 3600U, "Sports Live", "Match coverage",
-        0x04U, 0x01U));
+    const std::vector<std::uint8_t> eit_two =
+        with_crc(make_eit_pf(0x0101U, start_unix + 1800U, 3600U, "Sports Live",
+                             "Match coverage", 0x04U, 0x01U));
     // Deliver in reverse order to prove the service id is read from the
     // section and not inferred from arrival order.
     model.consume(packets(0x0012, eit_two));
@@ -264,7 +277,17 @@ int main() {
     corrupt_model.consume(packets(0x0014, bad));
     expect(!corrupt_model.snapshot(1).utc_now.has_value(),
            "bad CRC section is ignored");
+}
 
+} // namespace
+
+int main() {
+    try {
+        run_tests();
+    } catch (const std::exception &exception) {
+        std::cerr << "epg-model test failed: " << exception.what() << '\n';
+        return EXIT_FAILURE;
+    }
     std::cout << "epg-model: all checks passed\n";
-    return 0;
+    return EXIT_SUCCESS;
 }

@@ -35,10 +35,8 @@ class DecodeReport {
                         double wall_elapsed_seconds);
     void flush();
     void finalize(std::string_view status, int exit_code,
-                  std::string_view error,
-                  const dvbt::StreamDecoderStats &stats,
-                  std::uint64_t submitted_samples,
-                  double wall_elapsed_seconds);
+                  std::string_view error, const dvbt::StreamDecoderStats &stats,
+                  std::uint64_t submitted_samples, double wall_elapsed_seconds);
 
   private:
     struct Impl;

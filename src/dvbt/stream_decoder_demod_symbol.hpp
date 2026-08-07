@@ -4,8 +4,7 @@ bool StreamDecoder::Impl::demod_maybe_reacquire(DemodRuntimeState &state) {
     if (events_enabled()) {
         emit_event(
             "reanchor_triggered", DecoderEventSeverity::warning,
-            state.demod_generation, state.next_symbol_start,
-            state.symbol_count,
+            state.demod_generation, state.next_symbol_start, state.symbol_count,
             {{"fade_indicator", static_cast<double>(state.fade_indicator)},
              {"carrier_bin_offset",
               static_cast<std::int64_t>(frontend.carrier_offset)}});
@@ -16,8 +15,7 @@ bool StreamDecoder::Impl::demod_maybe_reacquire(DemodRuntimeState &state) {
             "reanchor_result",
             reanchor_score < 0.20F ? DecoderEventSeverity::warning
                                    : DecoderEventSeverity::info,
-            state.demod_generation, state.next_symbol_start,
-            state.symbol_count,
+            state.demod_generation, state.next_symbol_start, state.symbol_count,
             {{"score", static_cast<double>(reanchor_score)},
              {"stable_carrier_bin_offset",
               static_cast<std::int64_t>(frontend.stable_carrier_offset)}});
@@ -211,8 +209,7 @@ StreamDecoder::Impl::demod_lock_pilots(DemodRuntimeState &state) {
                         {{"fade_indicator",
                           static_cast<double>(fade_indicator)},
                          {"carrier_bin_offset",
-                          static_cast<std::int64_t>(
-                              frontend.carrier_offset)}});
+                          static_cast<std::int64_t>(frontend.carrier_offset)}});
                 }
             }
         }
@@ -399,8 +396,7 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
                         "timing_branch_change", DecoderEventSeverity::warning,
                         state.demod_generation, state.next_symbol_start,
                         symbol_count,
-                        {{"previous_filtered_samples",
-                          *previous_filtered_tau},
+                        {{"previous_filtered_samples", *previous_filtered_tau},
                          {"accepted_samples", *accepted_tau},
                          {"raw_samples", *measured_tau}});
                 }
@@ -412,13 +408,13 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
             ++timing_rejected_count;
             const auto filtered_tau = timing_tracker.filtered();
             if (events_enabled()) {
-                emit_event(
-                    "timing_measurement_rejected",
-                    DecoderEventSeverity::warning, state.demod_generation,
-                    state.next_symbol_start, symbol_count,
-                    {{"raw_samples", *measured_tau},
-                     {"filtered_samples",
-                      filtered_tau.value_or(*measured_tau)}});
+                emit_event("timing_measurement_rejected",
+                           DecoderEventSeverity::warning,
+                           state.demod_generation, state.next_symbol_start,
+                           symbol_count,
+                           {{"raw_samples", *measured_tau},
+                            {"filtered_samples",
+                             filtered_tau.value_or(*measured_tau)}});
             }
         }
     }
@@ -618,20 +614,19 @@ DemodFlow StreamDecoder::Impl::demod_process_tps(DemodRuntimeState &state) {
     if (!decoder_parameters && matching_tps &&
         frontend.tps_snapshot.parameters.hierarchy == 0U) {
         if (events_enabled()) {
-            emit_event(
-                "tps_lock", DecoderEventSeverity::info,
-                state.demod_generation, state.next_symbol_start, symbol_count,
-                {{"transmission_mode",
-                  std::string(event_mode_name(frontend.mode))},
-                 {"guard_interval",
-                  std::string(event_guard_name(frontend.guard))},
-                 {"constellation",
-                  std::string(event_constellation_name(
-                      frontend.tps_snapshot.parameters.constellation))},
-                 {"code_rate",
-                  std::string(event_code_rate_name(
-                      frontend.tps_snapshot.parameters
-                          .high_priority_code_rate))}});
+            emit_event("tps_lock", DecoderEventSeverity::info,
+                       state.demod_generation, state.next_symbol_start,
+                       symbol_count,
+                       {{"transmission_mode",
+                         std::string(event_mode_name(frontend.mode))},
+                        {"guard_interval",
+                         std::string(event_guard_name(frontend.guard))},
+                        {"constellation",
+                         std::string(event_constellation_name(
+                             frontend.tps_snapshot.parameters.constellation))},
+                        {"code_rate", std::string(event_code_rate_name(
+                                          frontend.tps_snapshot.parameters
+                                              .high_priority_code_rate))}});
         }
         decoder_parameters = DecoderParameters{
             frontend.mode,

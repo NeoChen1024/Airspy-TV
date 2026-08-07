@@ -240,9 +240,8 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
                 if (!cancel && events_enabled()) {
                     emit_event(
                         "acquisition_wait_timeout",
-                        DecoderEventSeverity::warning,
-                        state.demod_generation, state.next_symbol_start,
-                        state.symbol_count,
+                        DecoderEventSeverity::warning, state.demod_generation,
+                        state.next_symbol_start, state.symbol_count,
                         {{"available_resampled_samples", now_available}});
                 }
                 return 0.0F;
@@ -321,16 +320,15 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
         static_cast<void>(demod_handle_sync_change(state));
     }
     if (events_enabled()) {
-        emit_event(
-            "acquisition_succeeded", DecoderEventSeverity::info,
-            acquisition_generation, base + acquisition.start,
-            state.symbol_count,
-            {{"score", static_cast<double>(acquisition.score)},
-             {"window_start", acquisition.start},
-             {"transmission_mode",
-              std::string(event_mode_name(acquisition.mode))},
-             {"guard_interval",
-              std::string(event_guard_name(acquisition.guard))}});
+        emit_event("acquisition_succeeded", DecoderEventSeverity::info,
+                   acquisition_generation, base + acquisition.start,
+                   state.symbol_count,
+                   {{"score", static_cast<double>(acquisition.score)},
+                    {"window_start", acquisition.start},
+                    {"transmission_mode",
+                     std::string(event_mode_name(acquisition.mode))},
+                    {"guard_interval",
+                     std::string(event_guard_name(acquisition.guard))}});
     }
     return acquisition.score;
 }

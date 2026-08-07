@@ -63,7 +63,7 @@ std::string argument_value(const std::map<std::string, std::string> &arguments,
 [[nodiscard]] std::uint64_t corrected_frequency(const std::uint64_t nominal_hz,
                                                 const double ppm) noexcept {
     const long double factor =
-        1.0L + static_cast<long double>(ppm) / 1'000'000.0L;
+        1.0L + (static_cast<long double>(ppm) / 1'000'000.0L);
     const long double corrected = static_cast<long double>(nominal_hz) * factor;
     return corrected <= 0.0L
                ? 0
@@ -177,6 +177,8 @@ struct SdrDevice::Impl {
         }
         analyzer.reset();
         if (demodulator) {
+            // Reset decoder state; smart-pointer ownership is unchanged.
+            // NOLINTNEXTLINE(readability-ambiguous-smartptr-reset-call)
             demodulator->reset();
         }
     }
@@ -231,6 +233,8 @@ struct SdrDevice::Impl {
         // the UI is already tearing down after a window-close request.
         analyzer.reset();
         if (demodulator) {
+            // Reset decoder state; smart-pointer ownership is unchanged.
+            // NOLINTNEXTLINE(readability-ambiguous-smartptr-reset-call)
             demodulator->reset();
         }
         if (current.backend == SdrBackend::AirspyNative && airspy != nullptr &&
@@ -630,6 +634,8 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
         impl_->analyzer.reset();
         impl_->input_timeline.mark_discontinuity();
         if (impl_->demodulator) {
+            // Reset decoder state; smart-pointer ownership is unchanged.
+            // NOLINTNEXTLINE(readability-ambiguous-smartptr-reset-call)
             impl_->demodulator->reset();
         }
         impl_->transport_model.reset();
@@ -650,6 +656,8 @@ bool SdrDevice::set_center_frequency(const std::uint64_t frequency_hz,
         impl_->analyzer.reset();
         impl_->input_timeline.mark_discontinuity();
         if (impl_->demodulator) {
+            // Reset decoder state; smart-pointer ownership is unchanged.
+            // NOLINTNEXTLINE(readability-ambiguous-smartptr-reset-call)
             impl_->demodulator->reset();
         }
         impl_->transport_model.reset();
