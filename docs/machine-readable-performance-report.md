@@ -2,9 +2,10 @@
 
 ## Status and goals
 
-This document specifies the proposed long-run report format for offline I/Q
-decoding. It is a design for the next implementation phase, not a description
-of an existing CLI feature.
+This document specifies the implemented long-run report format for offline I/Q
+decoding. The first pre-alpha implementation landed on August 7, 2026. All
+report-owned schema versions remain `0` while field names and stream contents
+are still allowed to evolve.
 
 The report must support performance comparisons and clock/FEC failure analysis
 without parsing the verbose `--debug` output. A report is a directory containing
@@ -19,6 +20,7 @@ REPORT_DIR/
   pipeline.jsonl
   dvbt-demod.jsonl
   dvbt-fec.jsonl
+  events.jsonl
 ```
 
 Each JSONL file contains exactly one record schema. Different subsystems or
@@ -29,9 +31,10 @@ the common frontend or pipeline schemas.
 Human-readable debug timing remains available during the transition, but its
 format is allowed to change. It must become a renderer of the same typed
 telemetry records used by JSONL and the summary aggregator, rather than retain
-a second flat timing schema or independent field mapping. Important decoder
-events may remain on their existing debug path until structured event records
-are introduced.
+a second flat timing schema or independent field mapping. Decoder events use
+the same typed queue and are routed to one homogeneous `decoder_event` stream;
+`--debug` renders those records instead of receiving direct worker-thread
+`fprintf` output.
 
 ## Existing JSON support
 
@@ -162,8 +165,8 @@ different intervals:
 - FEC timing is complete only when the corresponding marker reaches the FEC
   worker.
 
-The decoder should therefore expose an opt-in, drainable queue of typed DVB-T
-telemetry records. Each owning stage appends its completed record under the
+The decoder exposes an opt-in, drainable queue of typed DVB-T telemetry
+records. Each owning stage appends its completed record under the
 existing coordinator mutex. The CLI drains records after submissions and after
 `flush()`, then performs JSON conversion and file I/O on the CLI thread.
 Normal GUI and non-report users leave collection disabled, so they incur no
@@ -215,11 +218,55 @@ The first report version uses these homogeneous streams:
 | `pipeline.jsonl` | `pipeline_sample` | once per wall-clock second | Queue occupancy, worker states, latest locks/quality, and cumulative progress |
 | `dvbt-demod.jsonl` | `demod_window` | one stats window completes | Lock, RF/OFDM quality, CFO/SRO/timing state, and demod/symbol timing |
 | `dvbt-fec.jsonl` | `fec_window` | a numbered stats marker reaches FEC | FEC timing, session identity, output deltas, BER, RS, TEI, and sync state |
+| `events.jsonl` | `decoder_event` | a diagnostic state transition occurs | Acquisition, lock, fade, phase, timing-rejection, and FEC-gating events |
 
 Lifecycle and configuration belong in `manifest.json` and `stats.json`, not as
-different `run_start`/`run_end` schemas mixed into a telemetry stream. A future
-`events.jsonl` may be added only after it has one stable event-envelope schema;
-existing human-readable event diagnostics remain outside the first version.
+different `run_start`/`run_end` schemas mixed into a telemetry stream.
+
+Every event record has the same envelope: `event`, `severity`, nullable source,
+resampled-sample and OFDM-symbol positions, and a `fields` object containing
+event-specific typed values. Event names and enum-valued fields use stable
+lowercase strings. Different events do not introduce different top-level
+schemas. The initial event names are:
+
+- `acquisition_succeeded` and `acquisition_wait_timeout`;
+- `reanchor_triggered` and `reanchor_result`;
+- `fade_enter`, `fade_exit`, and `bad_lock_enter`;
+- `pilot_phase_jump`;
+- `timing_branch_change` and `timing_measurement_rejected`;
+- `tps_lock` and `hopeless_gate_window`;
+- `outer_fec_alignment_search`, `outer_fec_alignment_pending`,
+  `outer_fec_alignment_locked`, and `outer_fec_alignment_missed`;
+- `outer_fec_rs_attempt`, `outer_fec_rs_failure_streak`,
+  `outer_fec_rs_recovered`, and `outer_fec_reset`.
+
+Common FEC components publish mode-independent typed diagnostic events through
+an optional handler. The DVB-T FEC worker adds its current `fec_session`,
+`demod_window_sequence`, source epoch, and TPS symbol index before placing the
+event on the receiver telemetry queue. The enabled predicate is checked before
+event fields are constructed, so an inactive report/debug path does not add
+map allocation to the normal FEC hot path.
+
+Periodic timing-loop state is not an event. It remains part of each
+`demod_window` record and the shared `--debug` demod-window formatter.
+
+### Diagnostic-output boundary
+
+Decoder algorithm diagnostics and state transitions must use typed telemetry;
+leaf DSP/FEC components must not read the process-global debug flag or format
+their own `stderr` records. This keeps `events.jsonl`, event counts, and
+`--debug` as different consumers of one representation.
+
+The following output deliberately remains outside that event stream:
+
+- command-line errors, warnings, and once-per-second offline progress;
+- the GUI's periodic `[diag]` snapshot, which describes current queue/thread
+  state rather than a decoder transition;
+- the demod worker's last-resort synchronous exception message immediately
+  before the exception is propagated to the coordinator.
+
+The process-global debug flag therefore only selects human-readable rendering
+and the GUI snapshot. It is not an input to common decoding components.
 
 FEC stats markers need the associated demod-window sequence. FEC decoder
 creation/reset also needs a monotonically increasing `fec_session` identifier.
@@ -356,25 +403,28 @@ maximum; p50/p95 can be calculated exactly from the relevant homogeneous JSONL
 stream by regression tools without growing decoder memory during an indefinite
 run.
 
-## Implementation order
+## Implementation status
 
-1. Add stdin/stdout stream ownership, explicit sample-rate tracking, and the
-   steady-clock one-second progress line without changing decoder telemetry.
-2. Add a report-directory writer with immutable `manifest.json`, homogeneous
-   JSONL stream routing, `pipeline_sample`, atomic `stats.json`, explicit
-   finite-number conversion, and unit tests for valid JSON/JSONL and failure
-   status.
-3. Add the opt-in typed telemetry queue, exact frontend/demod sample spans, FEC
-   window IDs/sessions, and monotonic run-wide transport/FEC counters.
-4. Serialize all stage records, compute bounded summary aggregates, and replace
-   the current debug timing field dump with a human formatter over those same
-   records and timing maps.
-5. Validate a short stdin/stdout pipeline and compare TS output byte-for-byte
-   with file input/output. Then run the long 545 MHz capture and confirm that
-   report mode does not change TS output, dropped-block count, or throughput.
-6. Remove the old flat debug timing formatter after byte-for-byte decoder
-   validation. Keep rare human-readable event diagnostics until equivalent
-   structured event records exist.
+Implemented:
+
+- stdin/stdout stream ownership, explicit stdin sample-rate validation, and a
+  steady-clock one-second progress line;
+- report-directory creation/refusal rules, immutable manifest, homogeneous
+  JSONL routing, periodic flushing, and atomic running/final `stats.json`;
+- opt-in frontend/demod/FEC typed telemetry with source and resampled sample
+  spans, demod-window IDs, FEC sessions, and exact run-wide counters;
+- bounded summary aggregation and one canonical timing representation shared
+  by JSONL output and the human-readable `--debug` renderer;
+- homogeneous structured decoder events shared by `events.jsonl`, summary
+  event counts, and the `--debug` event renderer;
+- short real-capture validation of stdin/stdout, JSON validity, failure and
+  no-transport statuses, and byte-identical TS output compared with file I/O.
+
+Remaining validation and follow-up:
+
+- run the complete 545 MHz capture and compare report-disabled/report-enabled
+  TS output, dropped-block count, and throughput;
+- add standalone schema-validation tooling once the version-0 fields settle.
 
 Tests must cover a non-empty report-directory refusal, output/report write
 failure, no-transport exit status, final partial input, and JSON validity for

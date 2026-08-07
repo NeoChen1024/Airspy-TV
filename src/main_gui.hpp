@@ -2238,6 +2238,11 @@ void draw_application(AppState &state) {
     const auto dvbt_snapshot = state.session.dvbt_snapshot();
     state.dvbt.signal = dvbt_snapshot.signal;
     state.dvbt.decoder = dvbt_snapshot.decoder;
+    if (airspy_tv::is_debug_enabled()) {
+        for (const auto &record : state.session.drain_dvbt_telemetry()) {
+            airspy_tv::format_debug_telemetry(std::cerr, record);
+        }
+    }
     float queue_pressure = 0.0F;
     for (std::size_t index = 0; index < state.pipeline.stage_count; ++index) {
         const auto &stage = state.pipeline.stages[index];
@@ -2256,7 +2261,8 @@ void draw_application(AppState &state) {
     {
         static auto last_diag = std::chrono::steady_clock::now();
         const auto now = std::chrono::steady_clock::now();
-        if (now - last_diag >= std::chrono::seconds(10)) {
+        if (airspy_tv::is_debug_enabled() &&
+            now - last_diag >= std::chrono::seconds(10)) {
             last_diag = now;
             dump_decoder_diagnostics(state.dvbt.decoder);
         }

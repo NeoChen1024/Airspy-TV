@@ -1,16 +1,15 @@
 #include "airspy_tv/fec/outer_fec.hpp"
-#include "airspy_tv/debug.hpp"
 #include "airspy_tv/fec/reed_solomon.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <deque>
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace airspy_tv::fec {
@@ -251,6 +250,18 @@ struct OuterFec::Impl {
         pending_alignment_phase = outer_interleaver_branches;
     }
 
+    [[nodiscard]] bool diagnostics_enabled() const {
+        return diagnostic_handler.is_enabled();
+    }
+
+    void emit_diagnostic(std::string name,
+                         const DiagnosticEventSeverity severity,
+                         DiagnosticEventFields fields) {
+        diagnostic_handler.emit({.name = std::move(name),
+                                 .severity = severity,
+                                 .fields = std::move(fields)});
+    }
+
     [[nodiscard]] std::vector<std::uint8_t>
     process(const std::span<const std::uint8_t> decoded) {
         constexpr std::size_t maximum_search = 32 * rs_packet_size;
@@ -306,22 +317,35 @@ struct OuterFec::Impl {
                 evidence[phase] =
                     find_rs_alignment(outer_candidates[phase], reed_solomon);
             }
-            if (airspy_tv::is_debug_enabled()) {
-                std::fprintf(
-                    stderr, "[fec] align-search #%llu",
-                    static_cast<unsigned long long>(alignment_search_count));
+            if (diagnostics_enabled()) {
+                DiagnosticEventFields fields{
+                    {"search_count", alignment_search_count}};
                 for (std::size_t phase = 0; phase < outer_candidates.size();
                      ++phase) {
                     const auto &candidate_evidence = evidence[phase];
-                    std::fprintf(stderr, " p%zu=%u/%zu@%zu", phase,
-                                 candidate_evidence.sync_distance,
-                                 candidate_evidence.rs_successes,
-                                 candidate_evidence.start ==
-                                         std::numeric_limits<std::size_t>::max()
-                                     ? 0
-                                     : candidate_evidence.start);
+                    const std::string prefix =
+                        "phase_" + std::to_string(phase) + '_';
+                    const bool available =
+                        candidate_evidence.start !=
+                        std::numeric_limits<std::size_t>::max();
+                    fields.emplace(prefix + "available", available);
+                    fields.emplace(prefix + "sync_distance",
+                                   static_cast<std::uint64_t>(
+                                       candidate_evidence.sync_distance));
+                    fields.emplace(prefix + "rs_successes",
+                                   static_cast<std::uint64_t>(
+                                       candidate_evidence.rs_successes));
+                    fields.emplace(prefix + "start",
+                                   static_cast<std::uint64_t>(
+                                       available ? candidate_evidence.start
+                                                 : 0));
+                    fields.emplace(prefix + "energy_phase",
+                                   static_cast<std::uint64_t>(
+                                       candidate_evidence.energy_phase));
                 }
-                std::fputc('\n', stderr);
+                emit_diagnostic("outer_fec_alignment_search",
+                                DiagnosticEventSeverity::info,
+                                std::move(fields));
             }
             std::size_t selected_phase = outer_interleaver_branches;
             AlignmentEvidence selected_evidence;
@@ -359,12 +383,17 @@ struct OuterFec::Impl {
                 if (pending_alignment_phase != selected_phase) {
                     pending_alignment_phase = selected_phase;
                     statistics.rs_synchronized = false;
-                    if (airspy_tv::is_debug_enabled()) {
-                        std::fprintf(
-                            stderr,
-                            "[fec] align-pending phase=%zu sync=%u rs=%zu\n",
-                            selected_phase, selected_evidence.sync_distance,
-                            selected_evidence.rs_successes);
+                    if (diagnostics_enabled()) {
+                        emit_diagnostic(
+                            "outer_fec_alignment_pending",
+                            DiagnosticEventSeverity::info,
+                            {{"phase", static_cast<std::uint64_t>(selected_phase)},
+                             {"sync_distance",
+                              static_cast<std::uint64_t>(
+                                  selected_evidence.sync_distance)},
+                             {"rs_successes",
+                              static_cast<std::uint64_t>(
+                                  selected_evidence.rs_successes)}});
                     }
                     return {};
                 }
@@ -380,23 +409,40 @@ struct OuterFec::Impl {
                 energy_descrambler.start_at_energy_phase(
                     selected_evidence.energy_phase);
                 statistics.rs_synchronized = true;
-                if (airspy_tv::is_debug_enabled()) {
-                    std::fprintf(
-                        stderr,
-                        "[fec] align-lock phase=%zu start=%zu sync=%u "
-                        "rs=%zu energy=%zu candidate=%zu confirmed=2\n",
-                        selected_phase, selected_evidence.start,
-                        selected_evidence.sync_distance,
-                        selected_evidence.rs_successes,
-                        selected_evidence.energy_phase,
-                        outer_candidates[selected_phase].size());
+                if (diagnostics_enabled()) {
+                    emit_diagnostic(
+                        "outer_fec_alignment_locked",
+                        DiagnosticEventSeverity::info,
+                        {{"phase", static_cast<std::uint64_t>(selected_phase)},
+                         {"start", static_cast<std::uint64_t>(
+                                       selected_evidence.start)},
+                         {"sync_distance",
+                          static_cast<std::uint64_t>(
+                              selected_evidence.sync_distance)},
+                         {"rs_successes",
+                          static_cast<std::uint64_t>(
+                              selected_evidence.rs_successes)},
+                         {"energy_phase",
+                          static_cast<std::uint64_t>(
+                              selected_evidence.energy_phase)},
+                         {"candidate_bytes",
+                          static_cast<std::uint64_t>(
+                              outer_candidates[selected_phase].size())},
+                         {"confirmation_count", std::uint64_t{2}}});
                 }
             } else {
                 pending_alignment_phase = outer_interleaver_branches;
-                if (airspy_tv::is_debug_enabled()) {
-                    std::fprintf(stderr, "[fec] align-miss searches=%llu\n",
-                                 static_cast<unsigned long long>(
-                                     alignment_search_count));
+                if (diagnostics_enabled()) {
+                    emit_diagnostic(
+                        "outer_fec_alignment_missed",
+                        DiagnosticEventSeverity::info,
+                        {{"search_count", alignment_search_count},
+                         {"best_sync_distance",
+                          static_cast<std::uint64_t>(
+                              statistics.outer_sync_distance)},
+                         {"best_rs_evidence",
+                          static_cast<std::uint64_t>(
+                              statistics.outer_rs_evidence)}});
                 }
             }
             if (!statistics.rs_synchronized) {
@@ -421,14 +467,17 @@ struct OuterFec::Impl {
                 randomized, &corrected_payload_bits);
             rs_bytes.erase(rs_bytes.begin(), rs_bytes.begin() + rs_packet_size);
             ++statistics.rs_packets;
-            if (airspy_tv::is_debug_enabled() && statistics.rs_packets <= 4) {
-                std::fprintf(
-                    stderr,
-                    "[fec] rs-attempt #%llu valid=%d sync=0x%02x "
-                    "rsbuf=%zu energy=%d\n",
-                    static_cast<unsigned long long>(statistics.rs_packets),
-                    valid ? 1 : 0, received_randomized.front(), rs_bytes.size(),
-                    energy_descrambler.synchronized() ? 1 : 0);
+            if (statistics.rs_packets <= 4 && diagnostics_enabled()) {
+                emit_diagnostic(
+                    "outer_fec_rs_attempt", DiagnosticEventSeverity::info,
+                    {{"packet", statistics.rs_packets},
+                     {"valid", valid},
+                     {"received_sync_byte", static_cast<std::uint64_t>(
+                                                received_randomized.front())},
+                     {"buffered_bytes",
+                      static_cast<std::uint64_t>(rs_bytes.size())},
+                     {"energy_synchronized",
+                      energy_descrambler.synchronized()}});
             }
             // Count every codeword once it has been selected by a valid outer
             // phase. The old accounting only advanced after a successful RS
@@ -442,24 +491,28 @@ struct OuterFec::Impl {
                 ++statistics.rs_uncorrectable_packets;
                 statistics.corrected_payload_bits += ts_packet_size * 8;
                 ++uncorrectable_since_sync;
-                if (airspy_tv::is_debug_enabled() &&
-                    (uncorrectable_since_sync == 1 ||
-                     uncorrectable_since_sync == 8 ||
-                     uncorrectable_since_sync == 32 ||
-                     uncorrectable_since_sync == 128 ||
-                     uncorrectable_since_sync == 256 ||
-                     uncorrectable_since_sync ==
-                         uncorrectable_reset_threshold)) {
-                    std::fprintf(
-                        stderr,
-                        "[fec] rs-fail streak=%zu total=%llu packets=%llu "
-                        "phase=%zu rsbuf=%zu energy=%d\n",
-                        uncorrectable_since_sync,
-                        static_cast<unsigned long long>(
-                            statistics.rs_uncorrectable_packets),
-                        static_cast<unsigned long long>(statistics.rs_packets),
-                        selected_outer_phase, rs_bytes.size(),
-                        energy_descrambler.synchronized() ? 1 : 0);
+                const bool failure_milestone =
+                    uncorrectable_since_sync == 1 ||
+                    uncorrectable_since_sync == 8 ||
+                    uncorrectable_since_sync == 32 ||
+                    uncorrectable_since_sync == 128 ||
+                    uncorrectable_since_sync == 256 ||
+                    uncorrectable_since_sync == uncorrectable_reset_threshold;
+                if (failure_milestone && diagnostics_enabled()) {
+                    emit_diagnostic(
+                        "outer_fec_rs_failure_streak",
+                        DiagnosticEventSeverity::warning,
+                        {{"streak", static_cast<std::uint64_t>(
+                                        uncorrectable_since_sync)},
+                         {"uncorrectable_packets",
+                          statistics.rs_uncorrectable_packets},
+                         {"rs_packets", statistics.rs_packets},
+                         {"phase", static_cast<std::uint64_t>(
+                                       selected_outer_phase)},
+                         {"buffered_bytes",
+                          static_cast<std::uint64_t>(rs_bytes.size())},
+                         {"energy_synchronized",
+                          energy_descrambler.synchronized()}});
                 }
                 if (uncorrectable_since_sync >= uncorrectable_reset_threshold) {
                     // A long run of consecutive RS failures means the
@@ -485,14 +538,15 @@ struct OuterFec::Impl {
                     statistics.outer_deinterleaver_phase = -1;
                     statistics.outer_sync_distance = 0;
                     statistics.outer_rs_evidence = 0;
-                    if (airspy_tv::is_debug_enabled()) {
-                        std::fprintf(
-                            stderr,
-                            "[fec] outer-reset reason=rs-failure-streak "
-                            "threshold=%zu total=%llu\n",
-                            uncorrectable_reset_threshold,
-                            static_cast<unsigned long long>(
-                                statistics.rs_uncorrectable_packets));
+                    if (diagnostics_enabled()) {
+                        emit_diagnostic(
+                            "outer_fec_reset",
+                            DiagnosticEventSeverity::warning,
+                            {{"reason", std::string{"rs_failure_streak"}},
+                             {"threshold", static_cast<std::uint64_t>(
+                                               uncorrectable_reset_threshold)},
+                             {"uncorrectable_packets",
+                              statistics.rs_uncorrectable_packets}});
                     }
                     break;
                 }
@@ -506,15 +560,15 @@ struct OuterFec::Impl {
                 }
                 continue;
             }
-            if (airspy_tv::is_debug_enabled() &&
-                uncorrectable_since_sync >= 8) {
-                std::fprintf(stderr,
-                             "[fec] rs-recover previous-streak=%zu total=%llu "
-                             "phase=%zu\n",
-                             uncorrectable_since_sync,
-                             static_cast<unsigned long long>(
-                                 statistics.rs_uncorrectable_packets),
-                             selected_outer_phase);
+            if (uncorrectable_since_sync >= 8 && diagnostics_enabled()) {
+                emit_diagnostic(
+                    "outer_fec_rs_recovered", DiagnosticEventSeverity::info,
+                    {{"previous_streak", static_cast<std::uint64_t>(
+                                             uncorrectable_since_sync)},
+                     {"uncorrectable_packets",
+                      statistics.rs_uncorrectable_packets},
+                     {"phase", static_cast<std::uint64_t>(
+                                   selected_outer_phase)}});
             }
             uncorrectable_since_sync = 0;
             std::array<std::uint8_t, ts_packet_size> packet{};
@@ -554,6 +608,7 @@ struct OuterFec::Impl {
     std::uint64_t alignment_search_count{};
     std::size_t pending_alignment_phase{outer_interleaver_branches};
     bool alignment_search_done{};
+    DiagnosticEventHandler diagnostic_handler;
 };
 
 OuterFec::OuterFec() : impl_(std::make_unique<Impl>()) {}
@@ -562,6 +617,10 @@ OuterFec::OuterFec(OuterFec &&) noexcept = default;
 OuterFec &OuterFec::operator=(OuterFec &&) noexcept = default;
 
 void OuterFec::reset() { impl_->reset(); }
+
+void OuterFec::set_diagnostic_handler(DiagnosticEventHandler handler) {
+    impl_->diagnostic_handler = std::move(handler);
+}
 
 std::vector<std::uint8_t>
 OuterFec::process(const std::span<const std::uint8_t> hard_bytes) {

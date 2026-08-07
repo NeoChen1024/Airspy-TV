@@ -6,6 +6,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace airspy_tv::dvbt {
@@ -109,6 +110,10 @@ Decoder &Decoder::operator=(Decoder &&) noexcept = default;
 void Decoder::reset() {
     impl_->transport_decoder.reset();
     impl_->timing = {};
+}
+
+void Decoder::set_diagnostic_handler(DiagnosticEventHandler handler) {
+    impl_->transport_decoder.set_diagnostic_handler(std::move(handler));
 }
 
 std::vector<std::uint8_t> Decoder::process_symbol(

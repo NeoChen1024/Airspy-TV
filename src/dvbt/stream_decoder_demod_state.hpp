@@ -15,6 +15,10 @@ struct DemodWindowMetrics {
     std::uint64_t output_begin_sample{};
     std::uint64_t output_midpoint_sample{};
     std::uint64_t output_end_sample{};
+    std::uint64_t source_epoch{};
+    std::uint64_t source_begin_sample{};
+    std::uint64_t source_end_sample{};
+    std::uint32_t source_sample_rate_hz{};
 };
 
 struct DemodRuntimeState {
@@ -66,6 +70,8 @@ struct DemodRuntimeState {
 
     // Per-statistics-window accumulators.
     std::uint64_t window_symbol_count{};
+    std::uint64_t window_sequence{};
+    std::uint64_t window_source_epoch{};
     std::uint64_t window_output_begin_sample{};
     double mer_sum{};
     float preprocess_time_sum{};

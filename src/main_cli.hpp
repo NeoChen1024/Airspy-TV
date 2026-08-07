@@ -10,6 +10,7 @@ enum CliOption : int {
     opt_inspect_iq,
     opt_decode_iq,
     opt_ts_output,
+    opt_report_dir,
     opt_sample_rate,
     opt_mode,
     opt_dvbt_mode,
@@ -33,6 +34,7 @@ constexpr option cli_options[] = {
     {"inspect-iq", required_argument, nullptr, opt_inspect_iq},
     {"decode-iq", required_argument, nullptr, opt_decode_iq},
     {"ts-output", required_argument, nullptr, opt_ts_output},
+    {"report-dir", required_argument, nullptr, opt_report_dir},
     {"sample-rate", required_argument, nullptr, opt_sample_rate},
     // Broadcast standard selection: DVB-T is the only implemented value
     // today; DVB-C / DVB-T2 / DTMB / ATSC are reserved for the roadmap.
@@ -77,12 +79,14 @@ void print_cli_usage() {
            "(needs --sample-rate)\n"
         << "\n"
         << "I/Q to MPEG-TS decoding (offline):\n"
-        << "      --decode-iq PATH          Raw I/Q input file (.cs16 / "
+        << "      --decode-iq PATH|-        Raw I/Q input file (.cs16 / "
            "raw INT16_IQ; a .json\n"
         << "                                 sidecar is honoured when "
            "present)\n"
-        << "      --ts-output PATH          MPEG-TS output file (required "
+        << "      --ts-output PATH|-        MPEG-TS output file (required "
            "with --decode-iq)\n"
+        << "      --report-dir DIR         Write machine-readable decode "
+           "report\n"
         << "      --sample-rate HZ          Raw I/Q sample rate (default "
            "10000000)\n"
         << "      --decoder-threads N       Worker budget 0..256 "

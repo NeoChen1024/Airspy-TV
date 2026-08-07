@@ -32,9 +32,6 @@
 }
 
 void dump_decoder_diagnostics(const StreamDecoderStats &stats) {
-    if (!airspy_tv::is_debug_enabled()) {
-        return;
-    }
     if (stats.failed) {
         std::cerr << "[diag] ERROR " << stats.error << '\n';
     }

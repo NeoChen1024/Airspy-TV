@@ -7,4 +7,6 @@ struct FecItem {
     DecoderParameters parameters{};
     std::vector<std::uint8_t> mother_metrics;
     std::size_t symbol_index{};
+    std::uint64_t demod_window_sequence{};
+    std::uint64_t source_epoch{};
 };

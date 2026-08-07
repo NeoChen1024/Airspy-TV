@@ -1,6 +1,5 @@
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 
-#include "airspy_tv/debug.hpp"
 #include "airspy_tv/dsp/resampler_timeline.hpp"
 #include "airspy_tv/dsp/vector_ops.hpp"
 #include "airspy_tv/dvbt/analysis_publisher.hpp"
@@ -52,6 +51,90 @@ constexpr std::size_t acquisition_samples = 350'000;
 constexpr std::size_t buffer_duration_denominator = 5;
 constexpr std::size_t initial_symbol_queue_capacity = 256;
 constexpr std::size_t ts_packet_size = 188;
+
+void add_transport_counters(TransportDecoderStats &destination,
+                            const TransportDecoderStats &source) noexcept {
+    destination.viterbi_bits += source.viterbi_bits;
+    destination.pre_viterbi_error_bits += source.pre_viterbi_error_bits;
+    destination.pre_viterbi_compared_bits += source.pre_viterbi_compared_bits;
+    destination.post_viterbi_error_bits += source.post_viterbi_error_bits;
+    destination.post_viterbi_compared_bits +=
+        source.post_viterbi_compared_bits;
+    destination.rs_packets += source.rs_packets;
+    destination.rs_uncorrectable_packets += source.rs_uncorrectable_packets;
+    destination.tei_packets += source.tei_packets;
+    destination.ts_packets += source.ts_packets;
+    destination.outer_deinterleaver_phase =
+        source.outer_deinterleaver_phase;
+    destination.outer_sync_distance = source.outer_sync_distance;
+    destination.outer_rs_evidence = source.outer_rs_evidence;
+    destination.rs_synchronized = source.rs_synchronized;
+    destination.energy_synchronized = source.energy_synchronized;
+    destination.viterbi_workers = source.viterbi_workers;
+}
+
+[[nodiscard]] TransportDecoderStats
+transport_counter_delta(const TransportDecoderStats &current,
+                        const TransportDecoderStats &previous) noexcept {
+    TransportDecoderStats result = current;
+    result.viterbi_bits -= previous.viterbi_bits;
+    result.pre_viterbi_error_bits -= previous.pre_viterbi_error_bits;
+    result.pre_viterbi_compared_bits -= previous.pre_viterbi_compared_bits;
+    result.post_viterbi_error_bits -= previous.post_viterbi_error_bits;
+    result.post_viterbi_compared_bits -= previous.post_viterbi_compared_bits;
+    result.rs_packets -= previous.rs_packets;
+    result.rs_uncorrectable_packets -= previous.rs_uncorrectable_packets;
+    result.tei_packets -= previous.tei_packets;
+    result.ts_packets -= previous.ts_packets;
+    return result;
+}
+
+[[nodiscard]] const char *event_mode_name(const TransmissionMode mode) {
+    return mode == TransmissionMode::k8 ? "8k" : "2k";
+}
+
+[[nodiscard]] const char *event_guard_name(const GuardInterval guard) {
+    switch (guard) {
+    case GuardInterval::gi_1_32:
+        return "1/32";
+    case GuardInterval::gi_1_16:
+        return "1/16";
+    case GuardInterval::gi_1_8:
+        return "1/8";
+    case GuardInterval::gi_1_4:
+        return "1/4";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] const char *event_constellation_name(
+    const Constellation constellation) {
+    switch (constellation) {
+    case Constellation::qpsk:
+        return "qpsk";
+    case Constellation::qam16:
+        return "qam16";
+    case Constellation::qam64:
+        return "qam64";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] const char *event_code_rate_name(const CodeRate rate) {
+    switch (rate) {
+    case CodeRate::rate_1_2:
+        return "1/2";
+    case CodeRate::rate_2_3:
+        return "2/3";
+    case CodeRate::rate_3_4:
+        return "3/4";
+    case CodeRate::rate_5_6:
+        return "5/6";
+    case CodeRate::rate_7_8:
+        return "7/8";
+    }
+    return "unknown";
+}
 
 // Resampled-sample ring shared by the front-end thread (producer) and the
 // demod thread (consumer). The ring is sized at run time from the input rate
@@ -455,6 +538,12 @@ struct StreamDecoder::Impl {
     std::optional<GuardInterval> stable_guard;
     OfdmTrackingState frontend;
     StreamDecoderStats latest;
+    std::atomic_bool telemetry_enabled{};
+    TelemetryClock::time_point telemetry_started_at{TelemetryClock::now()};
+    std::deque<TelemetryRecord> telemetry_queue;
+    std::uint64_t frontend_telemetry_sequence{};
+    std::uint64_t fec_telemetry_sequence{};
+    std::uint64_t event_telemetry_sequence{};
     std::atomic<bool> cancel_requested{};
     // The demod estimates source SRO; the front-end owns and applies the
     // common resampler. These atomics are the only cross-thread control path.
@@ -495,6 +584,88 @@ struct StreamDecoder::Impl {
     std::thread frontend_thread;
     std::thread demod_thread;
     std::thread fec_thread;
+
+    [[nodiscard]] double telemetry_elapsed_ms() const noexcept {
+        return std::chrono::duration<double, std::milli>(TelemetryClock::now() -
+                                                         telemetry_started_at)
+            .count();
+    }
+
+    [[nodiscard]] bool events_enabled() const noexcept {
+        return telemetry_enabled.load(std::memory_order_relaxed);
+    }
+
+    void emit_event(std::string event, DecoderEventSeverity severity,
+                    std::uint64_t generation,
+                    std::optional<std::uint64_t> resampled_sample,
+                    std::optional<std::uint64_t> ofdm_symbol,
+                    DecoderEventFields fields) {
+        if (!telemetry_enabled.load(std::memory_order_relaxed)) {
+            return;
+        }
+        const std::scoped_lock lock(mutex);
+        if (!telemetry_enabled.load(std::memory_order_relaxed)) {
+            return;
+        }
+        std::uint64_t source_epoch = 0;
+        std::optional<std::uint64_t> source_sample;
+        if (resampled_sample.has_value()) {
+            if (const auto mapped =
+                    resampler_timeline.input_at_output(*resampled_sample)) {
+                source_epoch = mapped->stream_epoch;
+                source_sample = mapped->input_sample;
+            }
+        }
+        DecoderEventTelemetry record;
+        record.envelope = {
+            .sequence = ++event_telemetry_sequence,
+            .decoder_generation = generation,
+            .source_epoch = source_epoch,
+            .wall_elapsed_ms = telemetry_elapsed_ms(),
+        };
+        record.event = std::move(event);
+        record.severity = severity;
+        record.source_sample = source_sample;
+        record.resampled_sample = resampled_sample;
+        record.ofdm_symbol = ofdm_symbol;
+        record.fields = std::move(fields);
+        telemetry_queue.emplace_back(std::move(record));
+    }
+
+    void emit_diagnostic_event(
+        DiagnosticEvent diagnostic, const std::uint64_t generation,
+        const std::uint64_t source_epoch,
+        const std::uint64_t demod_window_sequence,
+        const std::uint64_t fec_session,
+        const std::optional<std::uint64_t> tps_symbol_index) {
+        if (!telemetry_enabled.load(std::memory_order_relaxed)) {
+            return;
+        }
+        diagnostic.fields.emplace("fec_session", fec_session);
+        if (demod_window_sequence != 0) {
+            diagnostic.fields.emplace("demod_window_sequence",
+                                      demod_window_sequence);
+        }
+        if (tps_symbol_index.has_value()) {
+            diagnostic.fields.emplace("tps_symbol_index", *tps_symbol_index);
+        }
+        const std::scoped_lock lock(mutex);
+        if (!telemetry_enabled.load(std::memory_order_relaxed) ||
+            generation != latest_generation.load(std::memory_order_relaxed)) {
+            return;
+        }
+        DecoderEventTelemetry record;
+        record.envelope = {
+            .sequence = ++event_telemetry_sequence,
+            .decoder_generation = generation,
+            .source_epoch = source_epoch,
+            .wall_elapsed_ms = telemetry_elapsed_ms(),
+        };
+        record.event = std::move(diagnostic.name);
+        record.severity = diagnostic.severity;
+        record.fields = std::move(diagnostic.fields);
+        telemetry_queue.emplace_back(std::move(record));
+    }
 
     Impl()
         : ring(ring_minimum_samples), frontend_thread([this] {
@@ -846,6 +1017,7 @@ void StreamDecoder::set_equalized_callback(EqualizedCallback callback) {
 StreamDecoderStats StreamDecoder::stats() const {
     const std::scoped_lock lock(impl_->mutex);
     auto statistics = impl_->latest;
+    statistics.decoder_generation = impl_->latest_generation.load();
     statistics.failed = impl_->terminal_exception != nullptr;
     statistics.error = impl_->terminal_error;
     statistics.queued_blocks = impl_->queue.size();
@@ -872,6 +1044,28 @@ StreamDecoderStats StreamDecoder::stats() const {
                             impl_->fec_worker_busy || !impl_->queue.empty() ||
                             !impl_->fec_queue.empty();
     return statistics;
+}
+
+void StreamDecoder::set_telemetry_enabled(
+    const bool enabled, const TelemetryClock::time_point run_started_at) {
+    const std::scoped_lock lock(impl_->mutex);
+    impl_->telemetry_enabled.store(enabled, std::memory_order_relaxed);
+    impl_->telemetry_started_at = run_started_at;
+    impl_->telemetry_queue.clear();
+    impl_->frontend_telemetry_sequence = 0;
+    impl_->fec_telemetry_sequence = 0;
+    impl_->event_telemetry_sequence = 0;
+}
+
+std::vector<TelemetryRecord> StreamDecoder::drain_telemetry() {
+    const std::scoped_lock lock(impl_->mutex);
+    std::vector<TelemetryRecord> result;
+    result.reserve(impl_->telemetry_queue.size());
+    while (!impl_->telemetry_queue.empty()) {
+        result.push_back(std::move(impl_->telemetry_queue.front()));
+        impl_->telemetry_queue.pop_front();
+    }
+    return result;
 }
 
 SignalSnapshot StreamDecoder::signal_snapshot() const {

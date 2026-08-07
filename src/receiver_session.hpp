@@ -7,6 +7,7 @@
 #include <functional>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace airspy_tv {
 
@@ -52,6 +53,12 @@ class ReceiverSession {
     void set_dvbt_parameters(const dvbt::ReceiverParameters &parameters);
     void set_display_smoothing(bool fft_enabled, int fft_speed,
                                bool signal_enabled, int signal_speed);
+    void set_dvbt_telemetry_enabled(
+        bool enabled,
+        dvbt::TelemetryClock::time_point started_at =
+            dvbt::TelemetryClock::now());
+    [[nodiscard]] std::vector<dvbt::TelemetryRecord>
+    drain_dvbt_telemetry();
     [[nodiscard]] DvbTSessionSnapshot dvbt_snapshot() const;
     [[nodiscard]] SignalSnapshot signal_snapshot() const;
     [[nodiscard]] PipelineSnapshot pipeline_snapshot() const;
@@ -89,6 +96,9 @@ class ReceiverSession {
     ReceiveStandard standard_{ReceiveStandard::DvbT};
     dvbt::ReceiverParameters dvbt_parameters_;
     dvbt::StreamDecoder *dvbt_{};
+    bool dvbt_telemetry_enabled_{};
+    dvbt::TelemetryClock::time_point dvbt_telemetry_started_at_{
+        dvbt::TelemetryClock::now()};
     DiscontinuityCallback discontinuity_callback_;
 };
 

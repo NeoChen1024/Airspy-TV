@@ -1,5 +1,6 @@
 #pragma once
 
+#include "airspy_tv/diagnostic_event.hpp"
 #include "airspy_tv/dvbt/inner_decoder.hpp"
 #include "airspy_tv/dvbt/soft_demapper.hpp"
 #include "airspy_tv/dvbt/transport_decoder.hpp"
@@ -44,6 +45,7 @@ class Decoder {
     Decoder &operator=(Decoder &&) noexcept;
 
     void reset();
+    void set_diagnostic_handler(DiagnosticEventHandler handler);
     [[nodiscard]] std::vector<std::uint8_t>
     process_symbol(std::span<const std::complex<float>> equalized_carriers,
                    std::span<const float> reliability,

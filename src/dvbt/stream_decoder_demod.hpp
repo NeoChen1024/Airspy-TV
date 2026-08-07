@@ -113,7 +113,11 @@ void StreamDecoder::Impl::run_demod() {
                                      .generation = demod_generation,
                                      .parameters = {},
                                      .mother_metrics = {},
-                                     .symbol_index = 0}));
+                                     .symbol_index = 0,
+                                     .demod_window_sequence =
+                                         runtime.window_sequence,
+                                     .source_epoch =
+                                         runtime.window_source_epoch}));
                     demod_reset_stats_window(runtime);
                 }
                 if (!payload_dispatched) {

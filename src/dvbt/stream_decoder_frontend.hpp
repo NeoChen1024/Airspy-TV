@@ -155,6 +155,9 @@ void StreamDecoder::Impl::run_frontend() {
             double applied_sro = resampler->applied_sro_correction_ppm();
             std::size_t input_offset = 0;
             bool abandoned = false;
+            bool have_resampled_span = false;
+            std::uint64_t resampled_begin_sample = 0;
+            std::uint64_t resampled_end_sample = 0;
             const std::size_t maximum_quantum =
                 resampler_quantum_samples(block.rate);
             while (input_offset < complex_count && !abandoned) {
@@ -212,6 +215,11 @@ void StreamDecoder::Impl::run_frontend() {
                 {
                     const std::scoped_lock lock(mutex);
                     output_begin = ring_write_pos;
+                    if (!have_resampled_span) {
+                        resampled_begin_sample = output_begin;
+                        have_resampled_span = true;
+                    }
+                    resampled_end_sample = output_begin + resampled.size();
                     resampler_timeline.append({
                         .stream_epoch = block.stamp.stream_epoch,
                         .input_begin = input_begin,
@@ -280,9 +288,12 @@ void StreamDecoder::Impl::run_frontend() {
             {
                 const std::scoped_lock lock(mutex);
                 if (block.generation == latest_generation) {
-                    latest.processed_input_samples += complex_count;
-                    latest.last_frontend_block_wall_time_ms =
+                    const float total_time_ms =
                         duration_ms(frontend_block_started_at);
+                    latest.processed_input_samples += complex_count;
+                    latest.decoder_generation = block.generation;
+                    latest.source_epoch = block.stamp.stream_epoch;
+                    latest.last_frontend_block_wall_time_ms = total_time_ms;
                     latest.last_frontend_convert_time_ms = convert_time_ms;
                     latest.last_frontend_resample_time_ms = resample_time_ms;
                     latest.last_frontend_ring_copy_time_ms = ring_copy_time_ms;
@@ -294,6 +305,68 @@ void StreamDecoder::Impl::run_frontend() {
                     latest.resampler_effective_ratio =
                         resampler->effective_ratio();
                     current_bandwidth = block.bandwidth;
+                    if (telemetry_enabled) {
+                        const double accounted =
+                            static_cast<double>(convert_time_ms) +
+                            static_cast<double>(resample_time_ms) +
+                            static_cast<double>(ring_copy_time_ms) +
+                            static_cast<double>(ring_wait_time_ms);
+                        FrontendBlockTelemetry record;
+                        record.envelope = {
+                            .sequence = ++frontend_telemetry_sequence,
+                            .decoder_generation = block.generation,
+                            .source_epoch = block.stamp.stream_epoch,
+                            .wall_elapsed_ms = telemetry_elapsed_ms(),
+                        };
+                        record.input_sample_rate_hz = block.rate;
+                        record.channel_bandwidth_hz = block.bandwidth;
+                        record.source_begin_sample = block.stamp.begin_sample;
+                        record.source_end_sample = block.stamp.end_sample();
+                        record.resampled_begin_sample =
+                            have_resampled_span ? resampled_begin_sample
+                                                : ring_write_pos;
+                        record.resampled_end_sample =
+                            have_resampled_span ? resampled_end_sample
+                                                : ring_write_pos;
+                        record.input_complex_samples = complex_count;
+                        record.resampled_complex_samples =
+                            record.resampled_end_sample -
+                            record.resampled_begin_sample;
+                        record.discontinuity_before =
+                            block.stamp.discontinuity_before;
+                        record.abandoned = abandoned;
+                        record.requested_ratio = resampler->requested_ratio();
+                        record.effective_ratio = resampler->effective_ratio();
+                        record.commanded_sro_ppm =
+                            sro_resampler_command_ppm.load(
+                                std::memory_order_relaxed);
+                        record.applied_sro_ppm = applied_sro;
+                        record.command_output_sample =
+                            latest.sro_command_output_sample;
+                        record.command_input_sample =
+                            latest.sro_command_input_sample;
+                        record.effective_input_sample =
+                            latest.sro_effective_input_sample;
+                        record.applied_input_sample =
+                            latest.sro_applied_input_sample;
+                        record.fixed_delay_samples =
+                            latest.sro_fixed_delay_samples;
+                        record.late_samples =
+                            latest.sro_schedule_late_samples;
+                        record.pending_commands =
+                            scheduled_sro_commands.size();
+                        record.serial_wall_ms = {
+                            {"frontend::total", total_time_ms},
+                            {"frontend::convert", convert_time_ms},
+                            {"frontend::resample", resample_time_ms},
+                            {"frontend::ring_copy", ring_copy_time_ms},
+                            {"frontend::ring_wait", ring_wait_time_ms},
+                            {"frontend::other",
+                             std::max(0.0, static_cast<double>(total_time_ms) -
+                                               accounted)},
+                        };
+                        telemetry_queue.emplace_back(std::move(record));
+                    }
                 }
             }
         }

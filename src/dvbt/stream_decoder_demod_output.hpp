@@ -63,22 +63,33 @@ void StreamDecoder::Impl::demod_process_batch(
         const bool hopeless = static_cast<float>(window_mer) < floor;
         state.hopeless_window_count =
             hopeless ? state.hopeless_window_count + 1 : 0;
-        if (airspy_tv::is_debug_enabled() && hopeless) {
-            std::fprintf(
-                stderr,
-                "[evt] hopeless mer=%.2f floor=%.2f "
-                "count=%llu sym=%llu\n",
-                static_cast<float>(window_mer), floor,
-                static_cast<unsigned long long>(state.hopeless_window_count),
-                static_cast<unsigned long long>(state.symbol_count));
+        if (hopeless && events_enabled()) {
+            emit_event(
+                "hopeless_gate_window", DecoderEventSeverity::warning,
+                state.demod_generation, state.next_symbol_start,
+                state.symbol_count,
+                {{"mer_db", window_mer},
+                 {"fec_floor_db", static_cast<double>(floor)},
+                 {"consecutive_windows", state.hopeless_window_count}});
         }
         if (hopeless && !state.in_hopeless_region) {
             state.in_hopeless_region = true;
+            std::uint64_t source_epoch = state.window_source_epoch;
+            {
+                const std::scoped_lock guard(mutex);
+                if (const auto mapped = resampler_timeline.input_at_output(
+                        state.next_symbol_start)) {
+                    source_epoch = mapped->stream_epoch;
+                }
+            }
             static_cast<void>(enqueue_fec({.kind = FecItem::Kind::end,
                                            .generation = state.demod_generation,
                                            .parameters = {},
                                            .mother_metrics = {},
-                                           .symbol_index = 0}));
+                                           .symbol_index = 0,
+                                           .demod_window_sequence =
+                                               state.window_sequence + 1,
+                                           .source_epoch = source_epoch}));
         } else if (!hopeless && state.in_hopeless_region) {
             state.in_hopeless_region = false;
             static_cast<void>(
@@ -96,7 +107,9 @@ void StreamDecoder::Impl::demod_process_batch(
                      .parameters = {},
                      .mother_metrics =
                          std::move(state.gate_buffer[i].mother_metrics),
-                     .symbol_index = state.gate_buffer[i].symbol_index}));
+                     .symbol_index = state.gate_buffer[i].symbol_index,
+                     .demod_window_sequence = state.window_sequence + 1,
+                     .source_epoch = state.window_source_epoch}));
             }
         }
         state.gate_buffer.erase(
@@ -156,8 +169,6 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
         state.tau_interval_correction_history;
     auto &tau_history_head = state.tau_history_head;
     auto &tau_history_count = state.tau_history_count;
-    auto &latest_raw_timing = state.latest_raw_timing;
-    auto &cir_confidence = state.cir_confidence;
 
     const float window_wall = duration_ms(window_started_at);
     const std::uint64_t window_symbols = window_symbol_count;
@@ -185,6 +196,24 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
     const std::uint64_t output_end_sample = state.next_symbol_start;
     const std::uint64_t timing_sample_position =
         output_begin_sample + (output_end_sample - output_begin_sample) / 2;
+    std::uint64_t source_epoch = 0;
+    std::uint64_t source_begin_sample = 0;
+    std::uint64_t source_end_sample = 0;
+    std::uint32_t source_sample_rate_hz = 0;
+    {
+        const std::scoped_lock lock(mutex);
+        const auto mapped_begin =
+            resampler_timeline.input_at_output(output_begin_sample);
+        const auto mapped_end =
+            resampler_timeline.input_at_output(output_end_sample);
+        if (mapped_begin.has_value() && mapped_end.has_value() &&
+            mapped_begin->stream_epoch == mapped_end->stream_epoch) {
+            source_epoch = mapped_begin->stream_epoch;
+            source_begin_sample = mapped_begin->input_sample;
+            source_end_sample = mapped_end->input_sample;
+            source_sample_rate_hz = mapped_begin->input_rate_hz;
+        }
+    }
     double smoothed_timing_drift =
         smoothed_sample_clock_ppm * window_sample_count / 1.0e6;
     if (timing_count != 0) {
@@ -316,25 +345,6 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                 sro_resampler_ready.store(true, std::memory_order_relaxed);
             }
         }
-        if (airspy_tv::is_debug_enabled() && timing_count != 0 &&
-            window_symbols >= stats_window_symbols) {
-            std::fprintf(
-                stderr,
-                "[evt] tloop raw=%.2f tau=%.2f "
-                "phys=%.2f drift=%.3f smooth=%.3f sro=%+.4fppm "
-                "resamp=%+.4f/%+.4fppm conf=%.3f "
-                "cir=%.2f/%.3f ready=%d\n",
-                latest_raw_timing, static_cast<double>(timing_offset),
-                static_cast<double>(timing_offset) + window_cir_avg,
-                observed_drift, smoothed_timing_drift,
-                smoothed_sample_clock_ppm,
-                sro_resampler_command_ppm.load(std::memory_order_relaxed),
-                sro_resampler_applied_ppm.load(std::memory_order_relaxed),
-                static_cast<double>(timing_count) /
-                    static_cast<double>(window_symbols),
-                window_cir_avg, cir_confidence,
-                tau_history_count >= tau_history_min);
-        }
     }
     return {.wall_time_ms = window_wall,
             .symbol_count = window_symbols,
@@ -346,7 +356,11 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             .smoothed_timing_drift = smoothed_timing_drift,
             .output_begin_sample = output_begin_sample,
             .output_midpoint_sample = timing_sample_position,
-            .output_end_sample = output_end_sample};
+            .output_end_sample = output_end_sample,
+            .source_epoch = source_epoch,
+            .source_begin_sample = source_begin_sample,
+            .source_end_sample = source_end_sample,
+            .source_sample_rate_hz = source_sample_rate_hz};
 }
 
 void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
@@ -381,6 +395,7 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     const double window_cir_avg = metrics.cir_offset;
     const double observed_drift = metrics.observed_drift;
     const double smoothed_timing_drift = metrics.smoothed_timing_drift;
+    state.window_source_epoch = metrics.source_epoch;
     const std::scoped_lock lock(mutex);
     latest.ofdm_locked = true;
     latest.fft_size = static_cast<std::uint32_t>(fft_size);
@@ -516,6 +531,125 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     latest.state_carried = last_reanchor_carried;
     latest.fec_skipped = in_hopeless_region;
     ++latest.processed_chunks;
+    ++state.window_sequence;
+    if (telemetry_enabled) {
+        DemodWindowTelemetry record;
+        record.envelope = {.sequence = state.window_sequence,
+                           .decoder_generation = state.demod_generation,
+                           .source_epoch = metrics.source_epoch,
+                           .wall_elapsed_ms = telemetry_elapsed_ms()};
+        record.demod_window_sequence = state.window_sequence;
+        record.source_begin_sample = metrics.source_begin_sample;
+        record.source_end_sample = metrics.source_end_sample;
+        record.resampled_begin_sample = metrics.output_begin_sample;
+        record.resampled_midpoint_sample = metrics.output_midpoint_sample;
+        record.resampled_end_sample = metrics.output_end_sample;
+        record.source_sample_rate_hz = metrics.source_sample_rate_hz;
+        record.symbol_count = window_symbols;
+        record.signal_duration_seconds = input_seconds;
+        record.ofdm_locked = latest.ofdm_locked;
+        record.tps_locked = latest.tps_locked;
+        record.tps_ever_locked = latest.tps_ever_locked;
+        record.state_carried = latest.state_carried;
+        record.fec_skipped = latest.fec_skipped;
+        record.transmission_mode = frontend.mode;
+        record.guard_interval = frontend.guard;
+        record.constellation =
+            state.decoder_parameters.has_value()
+                ? state.decoder_parameters->constellation
+                : state.selected_parameters.constellation.value_or(
+                      latest.tps_constellation);
+        record.code_rate =
+            state.decoder_parameters.has_value()
+                ? state.decoder_parameters->code_rate
+                : state.selected_parameters.code_rate.value_or(
+                      latest.tps_code_rate);
+        record.hierarchy = latest.tps_hierarchy;
+        record.fft_size = latest.fft_size;
+        record.guard_size = latest.guard_size;
+        record.carrier_bin_offset = latest.carrier_bin_offset;
+        record.acquisition_score = latest.acquisition_score;
+        record.acquisition_start = latest.acquisition_start;
+        if (window_symbols != 0) {
+            record.mer_db = latest.mer_db;
+            record.fade_indicator = latest.fade_indicator;
+            record.tracked_cfo_hz = latest.tracked_carrier_offset_hz;
+            record.residual_cfo_hz = latest.residual_carrier_offset_hz;
+        }
+        if (timing_count != 0) {
+            record.raw_timing_samples = latest.raw_timing_offset_samples;
+            record.filtered_timing_samples = latest.timing_offset_samples;
+            record.physical_timing_samples =
+                latest.physical_timing_offset_samples;
+            record.observed_timing_drift_samples =
+                latest.observed_timing_drift_samples;
+            record.smoothed_timing_drift_samples =
+                latest.smoothed_timing_drift_samples;
+            record.estimated_sro_ppm = latest.sample_clock_offset_ppm;
+            record.timing_confidence = latest.timing_confidence;
+            record.cir_offset_samples = latest.cir_offset_samples;
+            record.cir_confidence = latest.cir_confidence;
+        }
+        record.timing_measurements = latest.timing_measurements;
+        record.timing_accepted_measurements =
+            latest.timing_accepted_measurements;
+        record.timing_rejected_measurements =
+            latest.timing_rejected_measurements;
+        record.timing_drift_ready = latest.timing_drift_ready;
+        record.sro_resampler_ready = latest.sro_resampler_ready;
+        record.sro_command_ppm = latest.sro_resampler_command_ppm;
+        record.sro_applied_ppm = latest.sro_resampler_applied_ppm;
+        record.requested_resample_ratio = latest.resampler_requested_ratio;
+        record.effective_resample_ratio = latest.resampler_effective_ratio;
+        record.sro_command_output_sample = latest.sro_command_output_sample;
+        record.sro_command_input_sample = latest.sro_command_input_sample;
+        record.sro_effective_input_sample = latest.sro_effective_input_sample;
+        record.sro_applied_input_sample = latest.sro_applied_input_sample;
+        record.sro_fixed_delay_samples = latest.sro_fixed_delay_samples;
+        record.sro_late_samples = latest.sro_schedule_late_samples;
+        record.sro_pending_commands = latest.sro_pending_commands;
+        record.phase_discontinuities = latest.pilot_phase_discontinuities;
+        record.wall_time_ms = latest.demod_window_wall_time_ms;
+        record.serial_busy_time_ms = latest.demod_busy_time_ms;
+        record.serial_busy_ms = {
+            {"demod::ring_copy", latest.demod_ring_copy_time_ms},
+            {"demod::fft_cfo", latest.demod_fft_cfo_time_ms},
+            {"demod::pilot_lock", latest.demod_pilot_lock_time_ms},
+            {"demod::reacquisition", latest.demod_reacquisition_time_ms},
+            {"demod::channel", latest.demod_channel_estimate_time_ms},
+            {"demod::tps", latest.demod_tps_time_ms},
+            {"demod::payload_extract", latest.demod_payload_extract_time_ms},
+            {"demod::symbol_submit", latest.demod_symbol_submit_time_ms},
+            {"demod::postprocess_wait", latest.demod_postprocess_wait_time_ms},
+            {"demod::output", latest.demod_output_time_ms},
+            {"demod::other", latest.demod_other_time_ms},
+        };
+        record.wait_ms = {{"demod::ring_wait",
+                           latest.demod_ring_wait_time_ms}};
+        record.nested_ms = {
+            {"demod::nco", latest.demod_nco_rotate_time_ms},
+            {"demod::fft", latest.demod_fft_execute_time_ms},
+            {"demod::cfo_track", latest.demod_cfo_track_time_ms},
+            {"demod::fft_cfo_other", latest.demod_fft_cfo_other_time_ms},
+            {"demod::channel::pilots", latest.demod_channel_pilot_time_ms},
+            {"demod::channel::notch", latest.demod_channel_notch_time_ms},
+            {"demod::channel::timing", latest.demod_channel_timing_time_ms},
+            {"demod::channel::cir", latest.demod_channel_cir_time_ms},
+            {"demod::channel::interpolate",
+             latest.demod_channel_interpolate_time_ms},
+            {"demod::channel::tps_extract",
+             latest.demod_channel_tps_extract_time_ms},
+            {"demod::channel::other", latest.demod_channel_other_time_ms},
+        };
+        record.aggregate_worker_work_ms = {
+            {"symbol::preprocess", latest.symbol_preprocess_work_time_ms},
+            {"symbol::demap", latest.symbol_demap_work_time_ms},
+            {"symbol::deinterleave",
+             latest.symbol_deinterleave_work_time_ms},
+            {"symbol::depuncture", latest.symbol_depuncture_work_time_ms},
+        };
+        telemetry_queue.emplace_back(std::move(record));
+    }
     acquisition_time_ms = 0.0F;
 }
 
@@ -701,17 +835,29 @@ void StreamDecoder::Impl::demod_finish_stream(DemodRuntimeState &state) {
                      .generation = demod_generation,
                      .parameters = {},
                      .mother_metrics = std::move(symbol.mother_metrics),
-                     .symbol_index = symbol.symbol_index}));
+                     .symbol_index = symbol.symbol_index,
+                     .demod_window_sequence = state.window_sequence + 1,
+                     .source_epoch = state.window_source_epoch}));
             }
         }
         gate_buffer.clear();
+    }
+    // Publish the final partial window before the stream-end marker so the
+    // FEC flush can carry the same correlation ID and include its tail bytes.
+    if (window_symbol_count != 0 || mer_sum != 0.0) {
+        demod_publish_stats_window(state);
+        demod_reset_stats_window(state);
     }
     if (postprocessor != nullptr) {
         static_cast<void>(enqueue_fec({.kind = FecItem::Kind::stream_end,
                                        .generation = demod_generation,
                                        .parameters = {},
                                        .mother_metrics = {},
-                                       .symbol_index = 0}));
+                                       .symbol_index = 0,
+                                       .demod_window_sequence =
+                                           state.window_sequence,
+                                       .source_epoch =
+                                           state.window_source_epoch}));
         // A flushed stream that is then resumed starts a fresh
         // region so the replay's first symbols do not continue a
         // flushed trellis.
@@ -722,11 +868,6 @@ void StreamDecoder::Impl::demod_finish_stream(DemodRuntimeState &state) {
                                            .mother_metrics = {},
                                            .symbol_index = 0}));
         }
-    }
-    // Publish a final partial-window stats snapshot.
-    if (window_symbol_count != 0 || mer_sum != 0.0) {
-        demod_publish_stats_window(state);
-        demod_reset_stats_window(state);
     }
     {
         const std::scoped_lock lock(mutex);

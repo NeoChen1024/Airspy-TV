@@ -237,10 +237,13 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
                 now_available = ring_write_pos - ring_read_pos;
             }
             if (cancel || duration_ms(wait_started) > 1000.0F) {
-                if (airspy_tv::is_debug_enabled() && !cancel) {
-                    std::fprintf(
-                        stderr, "[evt] acq wait-timeout avail=%llu\n",
-                        static_cast<unsigned long long>(now_available));
+                if (!cancel && events_enabled()) {
+                    emit_event(
+                        "acquisition_wait_timeout",
+                        DecoderEventSeverity::warning,
+                        state.demod_generation, state.next_symbol_start,
+                        state.symbol_count,
+                        {{"available_resampled_samples", now_available}});
                 }
                 return 0.0F;
             }
@@ -314,16 +317,20 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
         sync.bandwidth = bandwidth;
         sync.resampled_rate = resampled_rate;
         latest.acquisition_score = acquisition.score;
-        if (airspy_tv::is_debug_enabled()) {
-            std::fprintf(stderr,
-                         "[evt] acq ok score=%.3f start=%llu mode=%d g=%d\n",
-                         acquisition.score,
-                         static_cast<unsigned long long>(acquisition.start),
-                         static_cast<int>(acquisition.mode),
-                         static_cast<int>(acquisition.guard));
-        }
         ++sync.version;
         static_cast<void>(demod_handle_sync_change(state));
+    }
+    if (events_enabled()) {
+        emit_event(
+            "acquisition_succeeded", DecoderEventSeverity::info,
+            acquisition_generation, base + acquisition.start,
+            state.symbol_count,
+            {{"score", static_cast<double>(acquisition.score)},
+             {"window_start", acquisition.start},
+             {"transmission_mode",
+              std::string(event_mode_name(acquisition.mode))},
+             {"guard_interval",
+              std::string(event_guard_name(acquisition.guard))}});
     }
     return acquisition.score;
 }

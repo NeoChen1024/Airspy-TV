@@ -1,5 +1,6 @@
 #pragma once
 
+#include "airspy_tv/diagnostic_event.hpp"
 #include "airspy_tv/dvbt/inner_decoder.hpp"
 #include "airspy_tv/fec/soft_viterbi.hpp"
 
@@ -50,6 +51,7 @@ class TransportDecoder {
     TransportDecoder &operator=(TransportDecoder &&) noexcept;
 
     void reset();
+    void set_diagnostic_handler(DiagnosticEventHandler handler);
     [[nodiscard]] std::vector<std::uint8_t>
     process(std::span<const float> punctured_llrs);
     [[nodiscard]] std::vector<std::uint8_t>

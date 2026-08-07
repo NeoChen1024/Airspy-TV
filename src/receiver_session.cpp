@@ -73,6 +73,10 @@ ReceiverSession::make_demodulator(const ReceiveStandard standard,
 void ReceiverSession::install_demodulator(
     std::unique_ptr<Demodulator> demodulator, const ReceiveStandard standard) {
     dvbt_ = dynamic_cast<dvbt::StreamDecoder *>(demodulator.get());
+    if (dvbt_ != nullptr) {
+        dvbt_->set_telemetry_enabled(dvbt_telemetry_enabled_,
+                                     dvbt_telemetry_started_at_);
+    }
     if (demodulator) {
         demodulator->set_discontinuity_callback(discontinuity_callback_);
     }
@@ -128,6 +132,20 @@ void ReceiverSession::set_display_smoothing(const bool fft_enabled,
     device_.set_display_smoothing(fft_enabled, fft_speed, signal_enabled,
                                   signal_speed);
     device_.set_demodulator_signal_smoothing(signal_enabled, signal_speed);
+}
+
+void ReceiverSession::set_dvbt_telemetry_enabled(
+    const bool enabled, const dvbt::TelemetryClock::time_point started_at) {
+    dvbt_telemetry_enabled_ = enabled;
+    dvbt_telemetry_started_at_ = started_at;
+    if (dvbt_ != nullptr) {
+        dvbt_->set_telemetry_enabled(enabled, started_at);
+    }
+}
+
+std::vector<dvbt::TelemetryRecord> ReceiverSession::drain_dvbt_telemetry() {
+    return dvbt_ != nullptr ? dvbt_->drain_telemetry()
+                            : std::vector<dvbt::TelemetryRecord>{};
 }
 
 DvbTSessionSnapshot ReceiverSession::dvbt_snapshot() const {

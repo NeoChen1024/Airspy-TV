@@ -3,6 +3,7 @@
 #include "airspy_tv/demodulator.hpp"
 #include "airspy_tv/dvbt/receiver_parameters.hpp"
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
+#include "airspy_tv/dvbt/telemetry.hpp"
 #include "airspy_tv/dvbt/transport_decoder.hpp"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <chrono>
 #include <memory>
 #include <span>
 #include <string>
@@ -33,6 +35,8 @@ enum class WorkerState : int {
 };
 
 struct StreamDecoderStats {
+    std::uint64_t decoder_generation{};
+    std::uint64_t source_epoch{};
     bool failed{};
     std::string error;
     bool ofdm_locked{};
@@ -168,6 +172,8 @@ struct StreamDecoderStats {
     bool processing{};
     bool fec_processing{};
     TransportDecoderStats transport{};
+    TransportDecoderStats cumulative_transport{};
+    std::uint64_t fec_sessions{};
 };
 
 // Asynchronous CS16-to-TS receiver on a continuous three-stage pipeline:
@@ -240,6 +246,12 @@ class StreamDecoder : public Demodulator {
     [[nodiscard]] SignalAnalysisSnapshot analysis_snapshot() const;
     void set_signal_smoothing(bool enabled, int speed) override;
     [[nodiscard]] StreamDecoderStats stats() const;
+    // Detailed records are opt-in. Workers only append typed values; callers
+    // drain and serialize them outside the real-time pipeline.
+    void set_telemetry_enabled(bool enabled,
+                               TelemetryClock::time_point run_started_at =
+                                   TelemetryClock::now());
+    [[nodiscard]] std::vector<TelemetryRecord> drain_telemetry();
 
   private:
     struct Impl;

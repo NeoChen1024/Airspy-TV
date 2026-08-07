@@ -9,6 +9,8 @@
 #include "byte_rate_tracker.hpp"
 #include "pipeline_load_monitor.hpp"
 #include "receiver_session.hpp"
+#include "decode_report.hpp"
+#include "offline_decode.hpp"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_dialog.h>
@@ -98,8 +100,10 @@ int main(const int argc, char **argv) {
     std::optional<std::filesystem::path> inspect_iq_path;
     std::optional<std::filesystem::path> decode_iq_path;
     std::optional<std::filesystem::path> ts_output_path;
+    std::optional<std::filesystem::path> report_directory;
     std::optional<std::filesystem::path> record_path;
     std::uint32_t sample_rate_hz = 10'000'000;
+    bool sample_rate_supplied = false;
     std::uint64_t center_frequency_hz = 545'000'000;
     double frequency_correction_ppm = 0.0;
     int duration_ms = 1000;
@@ -128,12 +132,16 @@ int main(const int argc, char **argv) {
         case opt_ts_output:
             ts_output_path = optarg;
             break;
+        case opt_report_dir:
+            report_directory = optarg;
+            break;
         case opt_sample_rate:
             sample_rate_hz =
                 static_cast<std::uint32_t>(parse_u64(optarg, "sample rate"));
             if (sample_rate_hz == 0) {
                 cli_usage_error("sample rate must be non-zero");
             }
+            sample_rate_supplied = true;
             break;
         case opt_mode:
             // Validated here; DVB-T is the only implemented standard today,
@@ -205,6 +213,9 @@ int main(const int argc, char **argv) {
         cli_usage_error("--decode-iq, --record-first and --inspect-iq are "
                         "mutually exclusive");
     }
+    if (report_directory.has_value() && !decode_iq_path.has_value()) {
+        cli_usage_error("--report-dir is only valid with --decode-iq");
+    }
 
     if (inspect_iq_path.has_value()) {
         return inspect_iq_cli(*inspect_iq_path, sample_rate_hz,
@@ -214,8 +225,13 @@ int main(const int argc, char **argv) {
         if (!ts_output_path.has_value()) {
             cli_usage_error("--decode-iq requires --ts-output");
         }
-        return decode_iq_cli(*decode_iq_path, *ts_output_path, sample_rate_hz,
-                             dvbt_parameters);
+        if (*decode_iq_path == std::filesystem::path("-") &&
+            !sample_rate_supplied) {
+            cli_usage_error("--decode-iq - requires an explicit --sample-rate");
+        }
+        return offline_decode_cli(*decode_iq_path, *ts_output_path,
+                                  sample_rate_hz, dvbt_parameters,
+                                  report_directory);
     }
     if (record_path.has_value()) {
         SourceSettings settings;
@@ -277,6 +293,8 @@ int main(const int argc, char **argv) {
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
     AppState state;
+    state.session.set_dvbt_telemetry_enabled(
+        airspy_tv::is_debug_enabled(), std::chrono::steady_clock::now());
     state.session.set_dvbt_parameters(state.dvbt.parameters);
     state.window = window;
     std::string player_error;

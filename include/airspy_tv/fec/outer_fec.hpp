@@ -1,5 +1,7 @@
 #pragma once
 
+#include "airspy_tv/diagnostic_event.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -43,6 +45,7 @@ class OuterFec {
     OuterFec &operator=(OuterFec &&) noexcept;
 
     void reset();
+    void set_diagnostic_handler(DiagnosticEventHandler handler);
     [[nodiscard]] std::vector<std::uint8_t>
     process(std::span<const std::uint8_t> hard_bytes);
     [[nodiscard]] OuterFecStats stats() const;

@@ -106,6 +106,10 @@ TransportDecoder::operator=(TransportDecoder &&) noexcept = default;
 
 void TransportDecoder::reset() { impl_->reset(); }
 
+void TransportDecoder::set_diagnostic_handler(DiagnosticEventHandler handler) {
+    impl_->outer.set_diagnostic_handler(std::move(handler));
+}
+
 std::vector<std::uint8_t>
 TransportDecoder::process(const std::span<const float> punctured_llrs) {
     return impl_->process(punctured_llrs);
