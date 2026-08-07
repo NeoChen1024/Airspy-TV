@@ -381,7 +381,102 @@ tracking. Compare it against the current loop on constant offsets, linear
 ppm/minute ramps, reversals, and long real captures before considering a new
 default.
 
-### 6. Sample-clock and LO-clock relationship
+### 6. Controller alternatives and offline parameter tuning
+
+Do not assume that replacing the current loops with a generic PID controller
+is automatically an improvement. The existing paths are already
+estimator-plus-actuator servos:
+
+- SRO uses a robust first-difference estimate of timing phase, adds back the
+  correction that generated each interval, smooths the resulting source-clock
+  estimate, and commands the variable-rate resampler;
+- CFO converts continual-pilot phase advance into residual frequency and
+  updates the absolute frontend translation as `applied + residual`, which is
+  already similar to an incremental integral controller;
+- adaptive CIR placement is a discrete channel-delay state machine and should
+  not be folded into either continuous controller.
+
+The approximate SRO plant is:
+
+```text
+d(tau)/dt = source_sro - applied_sro + measurement_noise
+tau = channel_group_delay_bias + accumulated_clock_error
+```
+
+Consequently, a PID driven by absolute `tau` with a zero setpoint would chase
+static multipath group delay. Any phase-error controller must instead use an
+acquisition/reference coordinate, or explicitly estimate channel bias as a
+separate state. The approximate CFO observation is already a frequency error:
+
+```text
+residual_cfo = source_cfo - applied_cfo + measurement_noise
+```
+
+The fixed sample-domain command horizon removes queue-occupancy-dependent
+delay, but it remains a substantial control delay. The SRO actuator also has a
+0.5 ppm/second slew limit. Candidate controllers must therefore include output
+limits, slew-aware anti-windup, confidence/fade gating, and bumpless reset on
+stream epoch changes, retunes, and frontend rebootstrap.
+
+Implement controller experiments behind replaceable, independently selectable
+SRO and CFO interfaces. Each update should receive the measurement sample
+position, measured phase/rate error, correction that generated the measured
+interval, confidence, and stream epoch, and should return an optional
+sample-stamped absolute actuator command. Keep the current implementation as
+the required baseline. Add a shadow mode that records alternative commands
+without applying them before enabling any candidate in the production path.
+
+Candidate SRO implementations are:
+
+- the current robust source-SRO disturbance estimator;
+- a reference-based PI loop with the current robust derivative estimate as a
+  feed-forward term, not an unfiltered PID derivative;
+- an alpha-beta or alpha-beta-gamma observer with timing phase, SRO, and
+  optional slow SRO-drift states;
+- a small confidence-adaptive Kalman model only if the simpler observers leave
+  measurable residual drift.
+
+Candidate CFO implementations are:
+
+- the current residual-EMA incremental correction;
+- a delayed PI loop operating on residual CFO;
+- an alpha-beta observer with independent CFO and CFO-drift states.
+
+Avoid a raw derivative term on either loop. Pilot phase, timing slope,
+multipath changes, and ambiguity-branch outliers make numerical derivatives
+noisy. A drift-rate state with bounded process noise is preferable when a
+second-order model is required.
+
+Evolutionary or other gradient-free optimization is reasonable for offline
+parameter tuning because lock loss, rebootstrap, FEC cliffs, confidence gates,
+and command replacement make the objective discontinuous. For a small
+continuous parameter vector, evaluate CMA-ES or differential evolution before
+a generic genetic algorithm. Use NSGA-II only when retaining a Pareto frontier
+between recovery, residual error, and command activity is useful. Do not run
+evolutionary tuning in a live receiver.
+
+Candidate optimization parameters include controller gains, observer process
+noise/bandwidth, EMA factors, history lengths, update cadence, residual
+deadbands, confidence thresholds, command slew limits, and recovery
+thresholds. Use a hierarchical objective:
+
+1. reject any run with permanent lock loss, phase discontinuity, dropped
+   samples, command divergence, or failed reacquisition;
+2. maximize recovered non-TEI TS packets and minimize RS-uncorrectable packets,
+   dropout duration, and reacquisition time;
+3. minimize residual SRO/CFO RMS and high percentiles, timing-ambiguity risk,
+   overshoot, settling time, and unnecessary command activity;
+4. use MER and CPU cost as secondary metrics rather than sole objectives.
+
+Tune on deterministic synthetic fixtures spanning independent SRO/CFO offsets,
+ramps, reversals, jumps, fades, multipath changes, and queue pressure. Divide
+real recordings into tuning, validation, and untouched holdout sets; include
+the full 545 MHz capture only as one member of that matrix. Optimize aggregate
+worst-case or high-percentile behavior rather than only the mean, and require a
+same-build comparison against the current controller before accepting any
+optimized parameter set.
+
+### 7. Sample-clock and LO-clock relationship
 
 Treat SRO and CFO as independent estimator states and independent control loops
 without exception. Do not rely on a shared hardware reference and do not add
@@ -407,6 +502,7 @@ Each new algorithm should cover at least:
 | Sample clock       | zero, positive/negative offset, linear ramp, reversal              |
 | LO clock           | zero, positive/negative offset, linear ramp                        |
 | Clock relationship | independent, correlated, conflicting                               |
+| Controller         | baseline, reference PI, alpha-beta/gamma, delayed PI                |
 | Channel            | clean synthetic, static multipath, moving CIR, fade, real captures |
 | Input path         | deterministic offline replay; live SDR where practical             |
 
@@ -424,9 +520,14 @@ queue watermarks, and dropped blocks.
 5. Characterize the marginal-signal FEC delta against a same-build baseline.
 6. Validate frontend CFO centering on the retained real captures, 2K mode,
    retunes/fades, simultaneous SRO/CFO ramps, and abrupt-change bootstrap.
-7. Evaluate the second-order SRO and CFO predictors behind separate opt-in
-   settings.
-8. Repeat the full regression matrix after each controller change.
+7. Introduce independent SRO/CFO controller interfaces and shadow-command
+   telemetry while retaining the current implementation as the default.
+8. Evaluate the second-order observers and reference/delayed PI alternatives
+   behind separate opt-in settings.
+9. Run offline gradient-free parameter optimization only after each candidate
+   is stable with manually conservative parameters.
+10. Repeat the full regression matrix and untouched holdout captures after
+    each controller or parameter change.
 
 ## Acceptance criteria
 
@@ -438,6 +539,10 @@ Any timing-loop change must satisfy all of the following:
 - correct recovery after genuine fades and signal loss;
 - no regression on 557/581 MHz captures or synthetic SRO/CFO fixtures;
 - no unexplained bias across actuator or CIR-placement changes;
+- no controller attempt to force static channel group delay to a zero timing
+  setpoint;
+- no integral windup or command jump across confidence loss, stream reset,
+  retune, or frontend rebootstrap;
 - continuous frequency-translating resampler phase and FIR state across input block
   boundaries;
 - continuous frontend mixer phase across input blocks, worker partitions, SRO
@@ -453,4 +558,6 @@ Any timing-loop change must satisfy all of the following:
 - scalar and enabled SIMD resampler paths remain numerically equivalent within
   the defined FIR tolerance;
 - no regression in the native decoder tests;
+- no regression on optimizer holdout fixtures or real captures not used for
+  parameter selection;
 - no unacceptable increase in CPU load, queue depth, latency, or dropped input.

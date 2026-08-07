@@ -100,6 +100,7 @@ struct AppState {
     std::string status{"Ready"};
     std::string recording_path{"capture.cs16"};
     std::string ts_recording_path{"capture.ts"};
+    ByteRateTracker iq_write_rate;
     ByteRateTracker ts_write_rate;
     std::size_t selected_colormap{};
     float display_floor_dbfs{default_display_floor_dbfs};
@@ -681,6 +682,20 @@ std::string format_recording_duration(const std::uint64_t milliseconds) {
     const std::uint64_t seconds = total_seconds % 60;
     const std::uint64_t tenths = (milliseconds % 1000) / 100;
     return std::format("{:02}:{:02}:{:02}.{}", hours, minutes, seconds, tenths);
+}
+
+template <typename Stats>
+void draw_recorder_write_stats(ByteRateTracker &rate_tracker,
+                               const Stats &stats) {
+    const double write_mib_per_second =
+        rate_tracker.update(stats.active, stats.bytes_written);
+    ImGui::Text("Duration: %s",
+                format_recording_duration(stats.elapsed_milliseconds).c_str());
+    ImGui::Text("Written: %.2f MiB",
+                static_cast<double>(stats.bytes_written) / (1024.0 * 1024.0));
+    ImGui::Text("Write rate: %.2f MiB/s", write_mib_per_second);
+    ImGui::Text("Queue drops: %llu",
+                static_cast<unsigned long long>(stats.dropped_blocks));
 }
 
 bool file_dialog_is_open(const std::shared_ptr<FileDialogState> &dialog);
@@ -1278,12 +1293,7 @@ void draw_recorder_panel(AppState &state) {
     }
 
     const auto stats = state.session.recording_stats();
-    ImGui::Text("Duration: %s",
-                format_recording_duration(stats.elapsed_milliseconds).c_str());
-    ImGui::Text("Written: %.2f MiB",
-                static_cast<double>(stats.bytes_written) / (1024.0 * 1024.0));
-    ImGui::Text("Queue drops: %llu",
-                static_cast<unsigned long long>(stats.dropped_blocks));
+    draw_recorder_write_stats(state.iq_write_rate, stats);
     ImGui::Text("Source drops: %llu",
                 static_cast<unsigned long long>(stats.source_dropped_samples));
     ImGui::PopID();
@@ -1429,8 +1439,6 @@ void draw_ts_recorder_panel(AppState &state) {
     const bool dialog_open = file_dialog_is_open(state.ts_file_dialog);
     const bool ts_source_available = state.session.is_streaming();
     const auto ts_stats = state.session.ts_recording_stats();
-    const double ts_write_mib_per_second =
-        state.ts_write_rate.update(ts_stats.active, ts_stats.bytes_written);
 
     draw_disabled_wrapped("Decoded DVB-T transport stream (MPEG-TS)");
     ImGui::TextUnformatted("Output file");
@@ -1464,15 +1472,7 @@ void draw_ts_recorder_panel(AppState &state) {
         state.status = "MPEG-TS recording stopped";
     }
 
-    ImGui::Text(
-        "Duration: %s",
-        format_recording_duration(ts_stats.elapsed_milliseconds).c_str());
-    ImGui::Text("Written: %.2f MiB",
-                static_cast<double>(ts_stats.bytes_written) /
-                    (1024.0 * 1024.0));
-    ImGui::Text("Write rate: %.2f MiB/s", ts_write_mib_per_second);
-    ImGui::Text("Queue drops: %llu",
-                static_cast<unsigned long long>(ts_stats.dropped_blocks));
+    draw_recorder_write_stats(state.ts_write_rate, ts_stats);
     ImGui::PopID();
 }
 
@@ -1772,41 +1772,26 @@ void draw_sidebar(AppState &state) {
             const bool timing_valid =
                 state.dvbt.decoder.ofdm_locked &&
                 state.dvbt.decoder.timing_confidence > 0.0F;
-            const std::string timing_text =
-                !timing_valid ? "-- smp / -- ppm"
-                : state.dvbt.decoder.timing_drift_ready
-                    ? std::format("{:.1f} smp / {:+.3f} ppm",
-                                  state.dvbt.decoder.timing_offset_samples,
-                                  state.dvbt.decoder.sample_clock_offset_ppm)
-                    : std::format("{:.1f} smp / -- ppm",
-                                  state.dvbt.decoder.timing_offset_samples);
-            draw_bipolar_metric(
-                "Timing / SRO", timing_text.c_str(),
-                timing_valid && state.dvbt.decoder.timing_drift_ready
-                    ? std::clamp(
-                          0.5F + state.dvbt.decoder.sample_clock_offset_ppm /
-                                     10.0F,
-                          0.0F, 1.0F)
-                    : 0.5F,
-                ImVec4(0.95F, 0.72F, 0.30F, 1.0F));
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-                ImGui::SetTooltip(
-                    "Filtered pilot-slope timing and feedback-debiased "
-                    "sample-clock offset.");
-            }
-            const std::string confidence_text = std::format(
-                "{:.1f}%%", state.dvbt.decoder.timing_confidence * 100.0F);
-            draw_metric("Timing conf", confidence_text.c_str(),
-                        state.dvbt.decoder.timing_confidence,
-                        ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
             const bool sro_resampler_ready =
                 state.dvbt.decoder.sro_resampler_ready;
             const std::string actuator_text =
                 sro_resampler_ready
-                    ? std::format("{:+.3f} / {:+.3f} ppm",
-                                  state.dvbt.decoder.sro_resampler_command_ppm,
-                                  state.dvbt.decoder.sro_resampler_applied_ppm)
-                    : "warming up";
+                    ? std::format(
+                          "{:+.3f} / {:+.3f} ppm / {}",
+                          state.dvbt.decoder.sro_resampler_command_ppm,
+                          state.dvbt.decoder.sro_resampler_applied_ppm,
+                          timing_valid
+                              ? std::format(
+                                    "{:.1f} smp",
+                                    state.dvbt.decoder.timing_offset_samples)
+                              : "-- smp")
+                    : std::format(
+                          "-- / -- ppm / {}",
+                          timing_valid
+                              ? std::format(
+                                    "{:.1f} smp",
+                                    state.dvbt.decoder.timing_offset_samples)
+                              : "-- smp");
             draw_bipolar_metric(
                 "SRO cmd / applied", actuator_text.c_str(),
                 sro_resampler_ready
@@ -1825,11 +1810,15 @@ void draw_sidebar(AppState &state) {
                               state.dvbt.decoder.sro_input_sample_rate_hz
                         : 0.0;
                 ImGui::SetTooltip(
-                    "DVB-T timing-loop command and correction currently "
-                    "applied by the common variable-rate resampler.\n"
-                    "Scheduled delay %.3f ms, late %llu samples, pending %zu.\n"
+                    "DVB-T timing-loop command, correction currently applied "
+                    "by the common variable-rate resampler, and filtered "
+                    "pilot-slope timing offset. The bar uses applied ppm "
+                    "only.\n"
+                    "Measured SRO %+.4f ppm, scheduled delay %.3f ms, late "
+                    "%llu samples, pending %zu.\n"
                     "Command input %llu, target %llu, applied %llu.\n"
                     "Requested ratio %.12f, effective ratio %.12f.",
+                    state.dvbt.decoder.sample_clock_offset_ppm,
                     scheduled_delay_ms,
                     static_cast<unsigned long long>(
                         state.dvbt.decoder.sro_schedule_late_samples),
@@ -1843,23 +1832,31 @@ void draw_sidebar(AppState &state) {
                     state.dvbt.decoder.resampler_requested_ratio,
                     state.dvbt.decoder.resampler_effective_ratio);
             }
+            const std::string confidence_text = std::format(
+                "{:.1f}%%", state.dvbt.decoder.timing_confidence * 100.0F);
+            draw_metric("Timing conf", confidence_text.c_str(),
+                        state.dvbt.decoder.timing_confidence,
+                        ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
             const bool cfo_resampler_ready =
                 state.dvbt.decoder.cfo_resampler_ready;
             const std::string cfo_text =
                 cfo_resampler_ready
-                    ? std::format("{:+.1f} / {:+.1f} Hz",
+                    ? std::format("{:+.1f} / {:+.1f} / {:+.2f} Hz",
                                   state.dvbt.decoder.acquisition_cfo_hz,
-                                  state.dvbt.decoder.cfo_resampler_applied_hz)
+                                  state.dvbt.decoder.cfo_resampler_applied_hz,
+                                  state.dvbt.decoder.residual_carrier_offset_hz)
                     : "acquiring";
-            draw_bipolar_metric(
-                "CFO acq / applied", cfo_text.c_str(),
-                cfo_resampler_ready
+            const float cfo_position =
+                cfo_resampler_ready &&
+                        state.signal.carrier_offset_limit_hz > 0.0F
                     ? std::clamp(
-                          0.5F + state.dvbt.decoder.residual_carrier_offset_hz /
-                                     2000.0F,
+                          0.5F +
+                              state.dvbt.decoder.cfo_resampler_applied_hz /
+                                  (2.0F * state.signal.carrier_offset_limit_hz),
                           0.0F, 1.0F)
-                    : 0.5F,
-                ImVec4(0.62F, 0.78F, 1.0F, 1.0F));
+                    : 0.5F;
+            draw_bipolar_metric("CFO acq / applied", cfo_text.c_str(),
+                                cfo_position, ImVec4(0.62F, 0.78F, 1.0F, 1.0F));
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
                 const double scheduled_delay_ms =
                     state.dvbt.decoder.cfo_input_sample_rate_hz != 0
@@ -1871,7 +1868,9 @@ void draw_sidebar(AppState &state) {
                 ImGui::SetTooltip(
                     "Initial CFO is acquired before production samples enter "
                     "the ring; steady-state residual CFO is fed back to the "
-                    "same common resampler independently of SRO.\n"
+                    "same common resampler independently of SRO. The third "
+                    "displayed value is residual CFO; the bar uses applied "
+                    "CFO only.\n"
                     "Acquisition fractional %+.2f Hz, integer bins %+d.\n"
                     "Estimated %+.2f Hz, residual %+.2f Hz, command %+.2f Hz.\n"
                     "Bootstrap attempts %llu, replayed %llu samples, retained "
