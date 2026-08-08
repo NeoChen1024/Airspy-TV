@@ -17,7 +17,8 @@ def main() -> int:
     counts = validate_report_directory(args.report_dir.resolve())
     print(
         f"valid validation report: {counts['stages']} stages, "
-        f"{counts['ctest']} CTest cases, {counts['fixtures']} fixtures"
+        f"{counts['ctest']} CTest cases, {counts['fixtures']} fixtures, "
+        f"{counts['real_signals']} real signals"
     )
     return 0
 

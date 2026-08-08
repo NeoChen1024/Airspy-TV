@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import importlib.util
 from itertools import combinations, product
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -19,6 +20,8 @@ import sys
 import time
 from typing import Any, Iterable
 
+from real_signal_corpus import discover_real_signal_corpus
+from real_signal_validation import run_real_signal_matrix
 from validation_report import (
     CommandResult,
     ValidationReport,
@@ -117,6 +120,19 @@ def positive_integer(value: str) -> int:
     return parsed
 
 
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def bandwidth_hz(value: str) -> int:
+    if value not in BANDWIDTHS:
+        raise argparse.ArgumentTypeError("must be one of 5M, 6M, 7M, or 8M")
+    return int(value[:-1]) * 1_000_000
+
+
 def parse_args() -> argparse.Namespace:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
@@ -140,14 +156,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-jobs", type=positive_integer)
     parser.add_argument("--ctest-jobs", type=positive_integer)
     parser.add_argument("--fixture-jobs", type=positive_integer)
+    parser.add_argument("--real-jobs", type=positive_integer)
     parser.add_argument("--decoder-threads", type=int, default=0)
     parser.add_argument("--skip-configure", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-ctest", action="store_true")
     parser.add_argument("--skip-fixtures", action="store_true")
+    parser.add_argument("--real-signals-dir", type=Path)
+    parser.add_argument("--real-sample-rate", type=positive_integer, default=10_000_000)
+    parser.add_argument(
+        "--real-channel-bandwidth", type=bandwidth_hz, default=6_000_000
+    )
+    parser.add_argument(
+        "--real-profile", choices=PROFILE_NAMES, default="portable-release"
+    )
+    parser.add_argument("--real-long-threshold", type=positive_float, default=600.0)
+    parser.add_argument("--include-long-real-signals", action="store_true")
+    parser.add_argument("--list-real-signals", action="store_true")
     args = parser.parse_args()
     if not 0 <= args.decoder_threads <= 256:
         parser.error("decoder threads must be between 0 and 256")
+    if args.list_real_signals and args.real_signals_dir is None:
+        parser.error("--list-real-signals requires --real-signals-dir")
+    if (
+        args.real_signals_dir is not None
+        and not args.list_real_signals
+        and args.real_profile not in args.profiles
+    ):
+        parser.error("--real-profile must also be selected by --profiles")
     return args
 
 
@@ -478,7 +514,10 @@ def run_fixture_matrix(
 
 
 def initial_summary(
-    profiles: list[str], specs: dict[str, ProfileSpec], configuration: dict[str, Any]
+    profiles: list[str],
+    specs: dict[str, ProfileSpec],
+    configuration: dict[str, Any],
+    real_signal_count: int,
 ) -> dict[str, Any]:
     planned_fixtures = (
         0
@@ -502,6 +541,15 @@ def initial_summary(
                 "passed": 0,
                 "failed": 0,
             },
+            "real_signals": {
+                "planned": real_signal_count,
+                "completed": 0,
+                "failed": 0,
+                "decode_completed": 0,
+                "no_transport": 0,
+                "regressed": 0,
+                "not_evaluated": 0,
+            },
         },
         "profiles": {
             profile: {
@@ -519,6 +567,19 @@ def initial_summary(
                     "failed": 0,
                     "duration_seconds": specs[profile].duration,
                     "timeout_seconds": specs[profile].timeout,
+                },
+                "real_signals": {
+                    "planned": (
+                        real_signal_count
+                        if profile == configuration["real_profile"]
+                        else 0
+                    ),
+                    "completed": 0,
+                    "failed": 0,
+                    "decode_completed": 0,
+                    "no_transport": 0,
+                    "regressed": 0,
+                    "not_evaluated": 0,
                 },
                 "binary": None,
             }
@@ -598,6 +659,36 @@ def print_cases(profiles: Iterable[str], specs: dict[str, ProfileSpec]) -> None:
             print(f"  {case.slug}")
 
 
+def empty_real_signal_inventory(configuration: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 0,
+        "record_type": "real_signal_corpus",
+        "root": None,
+        "configuration": {
+            "fallback_sample_rate_hz": configuration["real_sample_rate_hz"],
+            "channel_bandwidth_hz": configuration["real_channel_bandwidth_hz"],
+            "include_long_recordings": configuration["include_long_real_signals"],
+            "long_recording_threshold_seconds": configuration[
+                "real_long_threshold_seconds"
+            ],
+            "recognized_iq_extension": ".cs16",
+            "recognized_metadata_extension": ".json",
+            "ignored_file_policy": "ignore every other regular file",
+        },
+        "totals": {
+            "recordings": 0,
+            "selected": 0,
+            "excluded_long": 0,
+            "file_size_bytes": 0,
+            "signal_seconds": 0.0,
+            "selected_signal_seconds": 0.0,
+            "ignored_files": 0,
+        },
+        "recordings": [],
+        "ignored_files": [],
+    }
+
+
 def main() -> int:
     args = parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -607,6 +698,24 @@ def main() -> int:
     specs = profile_specs(args.smoke)
     if args.list_cases:
         print_cases(args.profiles, specs)
+        return 0
+    real_corpus = (
+        discover_real_signal_corpus(
+            args.real_signals_dir,
+            fallback_sample_rate_hz=args.real_sample_rate,
+            channel_bandwidth_hz=args.real_channel_bandwidth,
+            include_long_recordings=args.include_long_real_signals,
+            long_recording_threshold_seconds=args.real_long_threshold,
+        )
+        if args.real_signals_dir is not None
+        else None
+    )
+    if args.list_real_signals:
+        if real_corpus is None:
+            raise RuntimeError("real-signal corpus was not discovered")
+        print(
+            json.dumps(real_corpus.to_json(), indent=2, sort_keys=True, allow_nan=False)
+        )
         return 0
     preflight(args)
 
@@ -623,17 +732,27 @@ def main() -> int:
     default_ctest_jobs = min(cpu_count, 8)
     ctest_jobs = args.ctest_jobs or args.jobs
     fixture_jobs = args.fixture_jobs or args.jobs or 1
+    real_jobs = args.real_jobs or args.jobs or 1
     configuration = {
         "profiles": args.profiles,
         "smoke": args.smoke,
         "build_jobs": build_jobs,
         "ctest_jobs": ctest_jobs,
         "fixture_jobs": fixture_jobs,
+        "real_jobs": real_jobs,
         "decoder_threads": args.decoder_threads,
         "skip_configure": args.skip_configure,
         "skip_build": args.skip_build,
         "skip_ctest": args.skip_ctest,
         "skip_fixtures": args.skip_fixtures,
+        "real_signals_dir": (
+            str(real_corpus.root) if real_corpus is not None else None
+        ),
+        "real_sample_rate_hz": args.real_sample_rate,
+        "real_channel_bandwidth_hz": args.real_channel_bandwidth,
+        "real_profile": args.real_profile,
+        "real_long_threshold_seconds": args.real_long_threshold,
+        "include_long_real_signals": args.include_long_real_signals,
         "runtime_environment": {
             profile: {
                 key: value
@@ -643,8 +762,16 @@ def main() -> int:
             for profile in args.profiles
         },
     }
-    summary = initial_summary(args.profiles, specs, configuration)
+    real_signal_count = (
+        len(real_corpus.selected_cases) if real_corpus is not None else 0
+    )
+    summary = initial_summary(args.profiles, specs, configuration, real_signal_count)
     report = ValidationReport(results_dir, root, args.profiles, configuration)
+    report.write_real_signal_corpus(
+        real_corpus.to_json()
+        if real_corpus is not None
+        else empty_real_signal_inventory(configuration)
+    )
     report.write_summary(summary)
 
     failed = False
@@ -717,9 +844,23 @@ def main() -> int:
                     args.decoder_threads,
                 )
                 failed = failed or fixture_failures != 0
+            if real_corpus is not None and profile == args.real_profile:
+                real_failures = run_real_signal_matrix(
+                    root,
+                    report,
+                    summary,
+                    real_corpus,
+                    profile,
+                    real_jobs,
+                    args.decoder_threads,
+                    sanitizer_environment(profile),
+                )
+                failed = failed or real_failures != 0
             profile_failed = (
                 profile_summary["ctest"]["failed"] != 0
                 or profile_summary["fixtures"]["failed"] != 0
+                or profile_summary["real_signals"]["failed"] != 0
+                or profile_summary["real_signals"]["regressed"] != 0
             )
             profile_summary["status"] = "failed" if profile_failed else "completed"
             report.write_summary(summary)
@@ -749,7 +890,8 @@ def main() -> int:
     print(
         f"validation {summary['status']}: {results_dir / 'summary.json'} "
         f"({report_counts['stages']} stages, {report_counts['ctest']} CTest cases, "
-        f"{report_counts['fixtures']} fixtures)"
+        f"{report_counts['fixtures']} fixtures, "
+        f"{report_counts['real_signals']} real signals)"
     )
     if caught is not None:
         raise caught

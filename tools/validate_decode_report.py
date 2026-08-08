@@ -148,18 +148,23 @@ def require_samples(
         )
 
 
-def validate_decode_report(
-    report_dir: Path,
-    *,
-    expected_samples: int | None = None,
-    expected_packets: int | None = None,
-    expected_sample_rate: int | None = None,
-    expected_bandwidth_hz: int | None = None,
-    expected_transmission_mode: str | None = None,
-    expected_guard_interval: str | None = None,
-    expected_constellation: str | None = None,
-    expected_code_rate: str | None = None,
-) -> dict[str, Any]:
+def require_real_samples(
+    value: dict[str, Any], location: str, expected_samples: int
+) -> None:
+    samples = field(value, "samples")
+    submitted = field(samples, "submitted")
+    processed = field(samples, "processed")
+    require(
+        submitted == expected_samples,
+        f"{location} reports {submitted} samples, expected {expected_samples}",
+    )
+    require(
+        isinstance(processed, int) and 0 <= processed <= submitted,
+        f"{location} processed sample count is out of range",
+    )
+
+
+def load_decode_report(report_dir: Path) -> dict[str, Any]:
     report_dir = report_dir.resolve()
     manifest = load_json(report_dir / "manifest.json")
     require(field(manifest, "report_format_version") == 0, "unsupported report version")
@@ -217,12 +222,130 @@ def validate_decode_report(
         "decoder_event",
     }
     require(set(streams) == expected_types, "manifest stream inventory is incomplete")
-    for record_type in expected_types - {"decoder_event"}:
-        require(streams[record_type], f"{record_type} stream is empty")
-
     stats = load_json(report_dir / "stats.json")
     require(field(stats, "schema_version") == 0, "stats schema version is not 0")
     require(field(stats, "mode") == "dvbt", "stats mode is not dvbt")
+    sessions = streams["source_session"]
+    require(len(sessions) == 1, "source-sessions.jsonl must contain exactly one record")
+    return {
+        "manifest": manifest,
+        "streams": streams,
+        "stats": stats,
+        "source_session": sessions[0],
+    }
+
+
+def validate_real_decode_report(
+    report_dir: Path,
+    *,
+    expected_samples: int,
+    expected_sample_rate: int,
+    expected_bandwidth_hz: int,
+) -> dict[str, Any]:
+    result = load_decode_report(report_dir)
+    stats = result["stats"]
+    session = result["source_session"]
+    status = field(stats, "status")
+    require(status in {"completed", "no_transport"}, "real decode did not complete")
+    require(field(stats, "error") is None, "real decode report contains an error")
+    require(field(session, "status") == status, "source and run status disagree")
+    require(field(session, "error") is None, "source session contains an error")
+    expected_exit_code = 0 if status == "completed" else 2
+    require(
+        field(stats, "exit_code") == expected_exit_code, "decode exit code disagrees"
+    )
+
+    source_counts = field(stats, "source_sessions")
+    require(field(source_counts, "total") == 1, "source session total is not one")
+    require(field(source_counts, "failed") == 0, "stats contains a failed source")
+    require(
+        field(source_counts, status) == 1,
+        f"stats source session does not report {status}",
+    )
+    require_real_samples(stats, "stats", expected_samples)
+    require_real_samples(session, "source session", expected_samples)
+    require(
+        field(stats, "samples") == field(session, "samples"),
+        "run and source sample summaries disagree",
+    )
+    require(
+        field(session, "source", "sample_rate_hz") == expected_sample_rate,
+        "source session sample rate is incorrect",
+    )
+    require(
+        field(session, "decoder", "channel_bandwidth_hz") == expected_bandwidth_hz,
+        "source session channel bandwidth is incorrect",
+    )
+    require(
+        field(stats, "transport") == field(session, "transport"),
+        "run and source transport summaries disagree",
+    )
+    require(
+        field(stats, "counters") == field(session, "counters"),
+        "run and source counters disagree",
+    )
+    transport = field(stats, "transport")
+    for name in (
+        "decoded_packets",
+        "emitted_packets",
+        "usable_packets",
+        "tei_packets",
+        "emitted_partial_bytes",
+        "bytes",
+    ):
+        value = field(transport, name)
+        require(
+            isinstance(value, int) and value >= 0,
+            f"transport.{name} is not a non-negative integer",
+        )
+    require(
+        field(transport, "bytes") == field(transport, "emitted_packets") * 188,
+        "transport byte and packet counts disagree",
+    )
+    require(
+        field(transport, "emitted_partial_bytes") == 0,
+        "transport contains a partial packet",
+    )
+    if status == "no_transport":
+        require(
+            field(transport, "emitted_packets") == 0,
+            "no-transport decode emitted packets",
+        )
+    result["stream_records"] = {
+        record_type: len(records)
+        for record_type, records in result.pop("streams").items()
+    }
+    return result
+
+
+def validate_decode_report(
+    report_dir: Path,
+    *,
+    expected_samples: int | None = None,
+    expected_packets: int | None = None,
+    expected_sample_rate: int | None = None,
+    expected_bandwidth_hz: int | None = None,
+    expected_transmission_mode: str | None = None,
+    expected_guard_interval: str | None = None,
+    expected_constellation: str | None = None,
+    expected_code_rate: str | None = None,
+) -> dict[str, Any]:
+    loaded = load_decode_report(report_dir)
+    manifest = loaded["manifest"]
+    streams = loaded["streams"]
+    expected_types = {
+        "source_session",
+        "frontend_block",
+        "pipeline_sample",
+        "demod_window",
+        "fec_window",
+        "decoder_event",
+    }
+    require(set(streams) == expected_types, "manifest stream inventory is incomplete")
+    for record_type in expected_types - {"decoder_event"}:
+        require(streams[record_type], f"{record_type} stream is empty")
+
+    stats = loaded["stats"]
     require(field(stats, "status") == "completed", "decode did not complete")
     require(field(stats, "exit_code") == 0, "decode exit code is not zero")
     require(field(stats, "error") is None, "decode report contains an error")
@@ -242,9 +365,7 @@ def validate_decode_report(
     require(field(windows, "ofdm_locked") > 0, "stats contains no OFDM lock")
     require(field(windows, "tps_locked") > 0, "stats contains no TPS lock")
 
-    sessions = streams["source_session"]
-    require(len(sessions) == 1, "source-sessions.jsonl must contain exactly one record")
-    session = sessions[0]
+    session = loaded["source_session"]
     require(field(session, "status") == "completed", "source session did not complete")
     require(field(session, "error") is None, "source session contains an error")
     require_samples(session, "source session", expected_samples)

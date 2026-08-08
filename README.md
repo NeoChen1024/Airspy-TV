@@ -139,7 +139,8 @@ DVB-T matrix under portable and ASan builds and a deterministic all-pairs set
 under TSan. It also validates exact recovered TS identity and every JSON/JSONL
 decode report. Each run emits a versioned machine-readable manifest, bounded
 summary and environment description, homogeneous stage/CTest/fixture JSONL
-streams, native JUnit, full stage logs, and complete failure artifacts. See
+streams, optional real-signal corpus benchmarks, native JUnit, full stage logs,
+and complete failure artifacts. See
 [scripts/README.md](scripts/README.md) for the report schemas, reproducible venv
 bootstrap, smoke mode, and independently adjustable parallelism.
 

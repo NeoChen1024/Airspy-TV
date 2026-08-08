@@ -23,9 +23,12 @@ environment.json
 stages.jsonl
 ctest.jsonl
 fixtures.jsonl
+real-signal-corpus.json
+real-signals.jsonl
 junit/<profile>.xml
 logs/<profile>-<stage>.log
 failures/<profile>/<case>/
+failures/real-signals/<profile>/<case>/
 ```
 
 All validation schemas have version `0` while the project is pre-alpha.
@@ -49,6 +52,16 @@ The JSONL files use one schema each:
   pass/fail/skip state, properties, failure detail, and captured output;
 - `fixtures.jsonl`: one record per completed matrix case, written immediately
   in completion order and carrying a stable `case_index`.
+- `real-signals.jsonl`: one record per real recording, with execution status,
+  decode outcome, regression status, complete bounded decode aggregates, and a
+  stable corpus index. Synthetic exact-match rules do not apply to this stream.
+
+`real-signal-corpus.json` inventories every recognized recording and ignored
+regular file, sidecar pairing, fallback sample rate, file size, estimated
+signal duration, and the long-recording selection policy. A `.json` sidecar
+must identify a same-directory `.cs16` file with `ci16_le`, `IQ`, and a positive
+sample rate. Remaining `.cs16` files use `--real-sample-rate`; `.ts`, `.log`,
+and all other extensions are ignored.
 
 A successful fixture record retains the validated decoder `stats.json`, source
 session, final lock/tracking state, timing and measurement aggregates, event
@@ -128,3 +141,38 @@ machine-readable report. Fixture failures are collected across the selected
 matrix so one bad combination does not hide the others. Existing builds can be
 reused with `--skip-configure --skip-build`; individual stages can also be
 disabled with `--skip-ctest` or `--skip-fixtures`.
+
+## Real-signal benchmarks
+
+Inventory a corpus without building or decoding anything:
+
+```sh
+python3 scripts/run_validation.py \
+  --real-signals-dir ~/scratchpad/DVB-T --list-real-signals
+```
+
+Run the routine corpus on the portable profile. DVB-T transmission mode,
+guard, constellation, and code rate remain automatic and come from TPS;
+channel bandwidth is explicit because TPS does not signal it:
+
+```sh
+python3 scripts/run_validation.py --bootstrap \
+  --profiles portable-release --skip-fixtures \
+  --real-signals-dir ~/scratchpad/DVB-T \
+  --real-channel-bandwidth 6M
+```
+
+Bare recordings default to 10 MS/s; override that with
+`--real-sample-rate HZ`. Real-signal concurrency defaults to one so concurrent
+large reads do not distort storage and decoder timing, and can be changed with
+`--real-jobs N` (or the global `--jobs N`). Files longer than 600 seconds are
+inventoried but excluded by default. `--include-long-real-signals` includes
+them; use it deliberately for the 2.5-hour regression recording.
+
+The decoder writes TS to `/dev/null`, so a benchmark does not duplicate a large
+transport stream. Successful and `no_transport` runs retain their validated
+stats and final source session in `real-signals.jsonl`, then discard detailed
+per-window reports. Execution/report failures retain all artifacts below
+`failures/real-signals/`. `no_transport` is a valid measured outcome for a
+known weak recording. Baseline thresholds are intentionally not enforced yet,
+so every completed record initially has `regression_status: not_evaluated`.

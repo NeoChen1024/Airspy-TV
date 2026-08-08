@@ -87,6 +87,9 @@ class ValidationReport:
         self.stages = JsonlStream(directory / "stages.jsonl", "validation_stage")
         self.ctest = JsonlStream(directory / "ctest.jsonl", "ctest_case")
         self.fixtures = JsonlStream(directory / "fixtures.jsonl", "fixture_case")
+        self.real_signals = JsonlStream(
+            directory / "real-signals.jsonl", "real_signal_case"
+        )
         self._write_manifest()
         atomic_write_json(
             directory / "environment.json",
@@ -111,6 +114,12 @@ class ValidationReport:
                     "record_type": "validation_environment",
                     "schema_version": REPORT_VERSION,
                 },
+                {
+                    "path": "real-signal-corpus.json",
+                    "format": "json",
+                    "record_type": "real_signal_corpus",
+                    "schema_version": REPORT_VERSION,
+                },
             ],
             "streams": [
                 {
@@ -128,11 +137,17 @@ class ValidationReport:
                     "record_type": "fixture_case",
                     "schema_version": REPORT_VERSION,
                 },
+                {
+                    "path": "real-signals.jsonl",
+                    "record_type": "real_signal_case",
+                    "schema_version": REPORT_VERSION,
+                },
             ],
             "artifacts": {
                 "stage_logs": "logs/<profile>-<stage>.log",
                 "ctest_junit": "junit/<profile>.xml",
                 "fixture_failures": "failures/<profile>/<case>/",
+                "real_signal_failures": "failures/real-signals/<profile>/<case>/",
             },
         }
         atomic_write_json(self.directory / "manifest.json", manifest)
@@ -149,10 +164,17 @@ class ValidationReport:
     def write_fixture(self, value: dict[str, Any]) -> dict[str, Any]:
         return self.fixtures.write(value)
 
+    def write_real_signal_corpus(self, value: dict[str, Any]) -> None:
+        atomic_write_json(self.directory / "real-signal-corpus.json", value)
+
+    def write_real_signal(self, value: dict[str, Any]) -> dict[str, Any]:
+        return self.real_signals.write(value)
+
     def close(self) -> None:
         self.stages.close()
         self.ctest.close()
         self.fixtures.close()
+        self.real_signals.close()
 
 
 def command_output(command: list[str], root: Path) -> str | None:
@@ -394,6 +416,7 @@ def validate_report_directory(directory: Path) -> dict[str, int]:
         raise RuntimeError("unsupported validation report version")
     summary = load_json(directory / "summary.json")
     environment = load_json(directory / "environment.json")
+    corpus = load_json(directory / "real-signal-corpus.json")
     if summary.get("record_type") != "validation_summary":
         raise RuntimeError("summary has wrong record type")
     if environment.get("record_type") != "validation_environment":
@@ -402,6 +425,10 @@ def validate_report_directory(directory: Path) -> dict[str, int]:
         raise RuntimeError("summary has wrong schema version")
     if environment.get("schema_version") != REPORT_VERSION:
         raise RuntimeError("environment has wrong schema version")
+    if corpus.get("record_type") != "real_signal_corpus":
+        raise RuntimeError("real-signal corpus has wrong record type")
+    if corpus.get("schema_version") != REPORT_VERSION:
+        raise RuntimeError("real-signal corpus has wrong schema version")
     if summary.get("status") not in {"completed", "failed", "interrupted"}:
         raise RuntimeError("summary does not have a terminal status")
     streams = {
@@ -410,16 +437,29 @@ def validate_report_directory(directory: Path) -> dict[str, int]:
         )
         for entry in manifest["streams"]
     }
+    expected_streams = {
+        "validation_stage",
+        "ctest_case",
+        "fixture_case",
+        "real_signal_case",
+    }
+    if set(streams) != expected_streams:
+        raise RuntimeError("manifest stream inventory is incomplete")
     counts = {
         "stages": len(streams["validation_stage"]),
         "ctest": len(streams["ctest_case"]),
         "fixtures": len(streams["fixture_case"]),
+        "real_signals": len(streams["real_signal_case"]),
     }
     totals = summary.get("totals", {})
     for name, count in counts.items():
-        reported = totals.get(name, {}).get(
-            "completed" if name == "fixtures" else "total"
-        )
+        if name == "real_signals":
+            real_totals = totals.get(name, {})
+            reported = real_totals.get("completed", 0) + real_totals.get("failed", 0)
+        else:
+            reported = totals.get(name, {}).get(
+                "completed" if name == "fixtures" else "total"
+            )
         if reported != count:
             raise RuntimeError(
                 f"summary {name} count is {reported}, stream contains {count}"
@@ -447,12 +487,25 @@ def validate_report_directory(directory: Path) -> dict[str, int]:
     fixtures = totals["fixtures"]
     if fixtures.get("planned", 0) < fixtures.get("completed", 0):
         raise RuntimeError("completed fixture count exceeds planned count")
+    real_signals = totals["real_signals"]
+    validate_real_signal_counts(
+        real_signals, streams["real_signal_case"], "real-signal totals"
+    )
+    if real_signals.get("planned", 0) < len(streams["real_signal_case"]):
+        raise RuntimeError("completed real-signal count exceeds planned count")
+    corpus_totals = corpus.get("totals", {})
+    if corpus_totals.get("selected") != real_signals.get("planned"):
+        raise RuntimeError("real-signal corpus and summary planned count disagree")
     profiles = summary.get("profiles")
     if not isinstance(profiles, dict) or not profiles:
         raise RuntimeError("summary contains no profiles")
     profile_names = set(profiles)
     if set(environment.get("profiles", [])) != profile_names:
         raise RuntimeError("environment profile inventory disagrees with summary")
+    if sum(
+        profile["real_signals"].get("planned", 0) for profile in profiles.values()
+    ) != real_signals.get("planned"):
+        raise RuntimeError("profile real-signal plans disagree with total")
     for stream_name, records in streams.items():
         for record in records:
             if record.get("profile") not in profile_names:
@@ -471,6 +524,11 @@ def validate_report_directory(directory: Path) -> dict[str, int]:
             for record in streams["validation_stage"]
             if record["profile"] == profile
         ]
+        profile_real_signals = [
+            record
+            for record in streams["real_signal_case"]
+            if record["profile"] == profile
+        ]
         require_status_counts(
             profile_summary["ctest"],
             profile_ctest,
@@ -484,6 +542,17 @@ def validate_report_directory(directory: Path) -> dict[str, int]:
             f"profile {profile} fixtures",
             total_field="completed",
         )
+        validate_real_signal_counts(
+            profile_summary["real_signals"],
+            profile_real_signals,
+            f"profile {profile} real signals",
+        )
+        if profile_summary["real_signals"].get("planned", 0) < len(
+            profile_real_signals
+        ):
+            raise RuntimeError(
+                f"profile {profile} completed real signals exceed planned count"
+            )
         if len(profile_summary["stages"]) != len(profile_stages):
             raise RuntimeError(f"profile {profile} stage count disagrees")
         for stage in profile_stages:
@@ -502,11 +571,29 @@ def validate_report_directory(directory: Path) -> dict[str, int]:
             profile_fixtures
         ):
             raise RuntimeError(f"profile {profile} contains duplicate fixture IDs")
+        if len({record["case_index"] for record in profile_real_signals}) != len(
+            profile_real_signals
+        ):
+            raise RuntimeError(
+                f"profile {profile} contains duplicate real-signal indices"
+            )
+        if len({record["case_id"] for record in profile_real_signals}) != len(
+            profile_real_signals
+        ):
+            raise RuntimeError(f"profile {profile} contains duplicate real-signal IDs")
     if summary["status"] == "completed":
         if totals["stages"]["failed"] or totals["ctest"]["failed"]:
             raise RuntimeError("completed report contains a failed stage or CTest")
         if fixtures["failed"] or fixtures["completed"] != fixtures["planned"]:
             raise RuntimeError("completed report has incomplete or failed fixtures")
+        if (
+            real_signals["failed"]
+            or real_signals["regressed"]
+            or real_signals["completed"] != real_signals["planned"]
+        ):
+            raise RuntimeError(
+                "completed report has incomplete, failed, or regressed real signals"
+            )
     for stage in streams["validation_stage"]:
         log_path = directory / stage["log_path"]
         if not log_path.is_file():
@@ -551,6 +638,38 @@ def validate_report_directory(directory: Path) -> dict[str, int]:
                 raise RuntimeError(
                     f"failed fixture has no retained artifacts: {record.get('case_id')}"
                 )
+    for record in streams["real_signal_case"]:
+        if record.get("execution_status") == "completed":
+            outcome = record.get("decode_outcome")
+            stats = record.get("decode_report", {}).get("stats", {})
+            expected_exit = 0 if outcome == "completed" else 2
+            if outcome not in {"completed", "no_transport"}:
+                raise RuntimeError(
+                    f"completed real signal has invalid outcome: {record.get('case_id')}"
+                )
+            if (
+                stats.get("status") != outcome
+                or stats.get("exit_code") != expected_exit
+            ):
+                raise RuntimeError(
+                    f"real-signal decode report disagrees: {record.get('case_id')}"
+                )
+            if record.get("return_code") != expected_exit:
+                raise RuntimeError(
+                    f"real-signal return code disagrees: {record.get('case_id')}"
+                )
+            if "artifacts" in record:
+                raise RuntimeError(
+                    f"completed real signal retained failure artifacts: "
+                    f"{record.get('case_id')}"
+                )
+        else:
+            artifacts = record.get("artifacts")
+            if not isinstance(artifacts, str) or not (directory / artifacts).is_dir():
+                raise RuntimeError(
+                    f"failed real signal has no retained artifacts: "
+                    f"{record.get('case_id')}"
+                )
     return counts
 
 
@@ -567,3 +686,43 @@ def require_status_counts(
         actual = sum(record.get("status") == status for record in records)
         if summary.get(status) != actual:
             raise RuntimeError(f"{location} {status} count disagrees")
+
+
+def validate_real_signal_counts(
+    summary: dict[str, Any], records: list[dict[str, Any]], location: str
+) -> None:
+    completed = sum(record.get("execution_status") == "completed" for record in records)
+    failed = sum(record.get("execution_status") == "failed" for record in records)
+    decode_completed = sum(
+        record.get("execution_status") == "completed"
+        and record.get("decode_outcome") == "completed"
+        for record in records
+    )
+    no_transport = sum(
+        record.get("execution_status") == "completed"
+        and record.get("decode_outcome") == "no_transport"
+        for record in records
+    )
+    regressed = sum(
+        record.get("regression_status") == "regressed" for record in records
+    )
+    not_evaluated = sum(
+        record.get("regression_status") == "not_evaluated" for record in records
+    )
+    if completed + failed != len(records):
+        raise RuntimeError(f"{location} contains an invalid execution status")
+    if decode_completed + no_transport != completed:
+        raise RuntimeError(f"{location} contains an invalid decode outcome")
+    if regressed + not_evaluated != len(records):
+        raise RuntimeError(f"{location} contains an invalid regression status")
+    expected = {
+        "completed": completed,
+        "failed": failed,
+        "decode_completed": decode_completed,
+        "no_transport": no_transport,
+        "regressed": regressed,
+        "not_evaluated": not_evaluated,
+    }
+    for name, actual in expected.items():
+        if summary.get(name) != actual:
+            raise RuntimeError(f"{location} {name} count disagrees")
