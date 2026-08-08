@@ -1,5 +1,6 @@
 #include "widgets.hpp"
 
+#include "decode_reporting.hpp"
 #include "panels.hpp"
 
 #include <fontconfig/fontconfig.h>
@@ -263,12 +264,26 @@ void request_center_frequency(AppState &state,
         return;
     }
 
+    finish_decode_report_source(state);
+    prepare_decode_report(state);
     std::string error;
     if (state.session.retune(frequency_hz, error)) {
         state.settings.center_frequency_hz = frequency_hz;
         state.status = "Center frequency applied";
+        std::string report_error;
+        if (!start_decode_report(state, report_error)) {
+            state.status += "; report unavailable: " + report_error;
+        }
     } else {
         state.status = error;
+        if (state.session.is_streaming()) {
+            std::string report_error;
+            if (!start_decode_report(state, report_error)) {
+                state.status += "; report unavailable: " + report_error;
+            }
+        } else {
+            cancel_decode_report_start(state);
+        }
     }
 }
 

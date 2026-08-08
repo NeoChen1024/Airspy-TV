@@ -1,7 +1,6 @@
-#include "../decode_report.hpp"
-#include "../decoder_diagnostics.hpp"
 #include "airspy_tv/debug.hpp"
 #include "app_state.hpp"
+#include "decode_reporting.hpp"
 #include "panels.hpp"
 #include "widgets.hpp"
 
@@ -13,7 +12,6 @@
 #include <cmath>
 #include <cstdint>
 #include <format>
-#include <iostream>
 #include <optional>
 #include <span>
 #include <string>
@@ -40,19 +38,7 @@ void update_standard_state(AppState &state) {
     const auto snapshot = state.session.dvbt_snapshot();
     state.dvbt.signal = snapshot.signal;
     state.dvbt.decoder = snapshot.decoder;
-    if (is_debug_enabled()) {
-        for (const auto &record : state.session.drain_dvbt_telemetry()) {
-            format_debug_telemetry(std::cerr, record);
-        }
-    }
-
-    static auto last_diagnostics = std::chrono::steady_clock::now();
-    const auto now = std::chrono::steady_clock::now();
-    if (is_debug_enabled() &&
-        now - last_diagnostics >= std::chrono::seconds(10)) {
-        last_diagnostics = now;
-        dump_decoder_diagnostics(state.dvbt.decoder);
-    }
+    update_decode_report(state);
 }
 
 void draw_standard_settings_panel(AppState &state) {

@@ -15,9 +15,14 @@ namespace airspy_tv {
 
 struct DecodeReportConfig {
     std::filesystem::path directory;
+    std::string context;
+};
+
+struct DecodeSourceSessionConfig {
     std::string source;
     std::string destination;
     std::uint32_t sample_rate_hz{};
+    std::uint64_t center_frequency_hz{};
     dvbt::ReceiverParameters decoder;
 };
 
@@ -29,14 +34,22 @@ class DecodeReport {
     DecodeReport(const DecodeReport &) = delete;
     DecodeReport &operator=(const DecodeReport &) = delete;
 
+    void begin_source(DecodeSourceSessionConfig config,
+                      const InputTimelineSnapshot &timeline,
+                      const dvbt::StreamDecoderStats &stats,
+                      double wall_elapsed_seconds);
     void consume(std::span<const dvbt::TelemetryRecord> records);
     void write_pipeline(const dvbt::StreamDecoderStats &stats,
                         std::uint64_t submitted_samples,
                         double wall_elapsed_seconds);
+    void end_source(std::string_view status, std::string_view error,
+                    const dvbt::StreamDecoderStats &stats,
+                    const InputTimelineSnapshot &timeline,
+                    std::uint64_t submitted_samples,
+                    double wall_elapsed_seconds);
     void flush();
     void finalize(std::string_view status, int exit_code,
-                  std::string_view error, const dvbt::StreamDecoderStats &stats,
-                  std::uint64_t submitted_samples, double wall_elapsed_seconds);
+                  std::string_view error, double wall_elapsed_seconds);
 
   private:
     struct Impl;

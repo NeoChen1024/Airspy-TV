@@ -1,4 +1,5 @@
 #include "app_state.hpp"
+#include "decode_reporting.hpp"
 #include "panels.hpp"
 #include "widgets.hpp"
 
@@ -145,12 +146,18 @@ void draw_source_panel(AppState &state) {
     }
     if (selected_iq_source.has_value()) {
         std::string error;
+        prepare_decode_report(state);
         if (state.session.open_iq_file_and_start(*selected_iq_source,
                                                  state.settings, error)) {
             state.status =
                 "Playing I/Q from " +
                 std::filesystem::path(*selected_iq_source).filename().string();
+            std::string report_error;
+            if (!start_decode_report(state, report_error)) {
+                state.status += "; report unavailable: " + report_error;
+            }
         } else {
+            cancel_decode_report_start(state);
             state.status = error;
         }
     }
@@ -194,10 +201,16 @@ void draw_source_panel(AppState &state) {
             std::string error;
             const DeviceDescriptor &descriptor =
                 state.enumeration.devices[state.selected_device];
+            prepare_decode_report(state);
             if (state.session.open_device_and_start(descriptor, state.settings,
                                                     error)) {
                 state.status = "Receiving from " + descriptor.display_name;
+                std::string report_error;
+                if (!start_decode_report(state, report_error)) {
+                    state.status += "; report unavailable: " + report_error;
+                }
             } else {
+                cancel_decode_report_start(state);
                 state.status = error;
             }
         }
@@ -240,6 +253,7 @@ void draw_source_panel(AppState &state) {
                               ? "Close I/Q file"
                               : "Close device",
                           ImVec2(-1.0F, 0.0F))) {
+            finish_decode_report_source(state);
             state.session.close();
             state.status = "Source closed";
         }
@@ -256,9 +270,17 @@ void draw_source_panel(AppState &state) {
             if (!state.session.is_streaming() &&
                 ImGui::Button("Replay from beginning", ImVec2(-1.0F, 0.0F))) {
                 std::string error;
-                state.status = state.session.start_stream(state.settings, error)
-                                   ? "Replaying I/Q file"
-                                   : error;
+                prepare_decode_report(state);
+                if (state.session.start_stream(state.settings, error)) {
+                    state.status = "Replaying I/Q file";
+                    std::string report_error;
+                    if (!start_decode_report(state, report_error)) {
+                        state.status += "; report unavailable: " + report_error;
+                    }
+                } else {
+                    cancel_decode_report_start(state);
+                    state.status = error;
+                }
             }
         } else {
             ImGui::BeginDisabled(state.session.is_recording());
@@ -284,9 +306,18 @@ void draw_source_panel(AppState &state) {
             }
             if (ImGui::Button("Apply sample rate", ImVec2(-1.0F, 0.0F))) {
                 std::string error;
-                state.status = state.session.start_stream(state.settings, error)
-                                   ? "Sample rate applied"
-                                   : error;
+                finish_decode_report_source(state);
+                prepare_decode_report(state);
+                if (state.session.start_stream(state.settings, error)) {
+                    state.status = "Sample rate applied";
+                    std::string report_error;
+                    if (!start_decode_report(state, report_error)) {
+                        state.status += "; report unavailable: " + report_error;
+                    }
+                } else {
+                    cancel_decode_report_start(state);
+                    state.status = error;
+                }
             }
             ImGui::EndDisabled();
         }

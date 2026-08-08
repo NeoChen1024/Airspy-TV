@@ -397,6 +397,126 @@ struct Aggregate {
     }
 };
 
+struct TelemetryAggregate {
+    Aggregate mer;
+    Aggregate sro;
+    Aggregate acquisition_cfo;
+    Aggregate cfo;
+    Aggregate residual_cfo;
+    Aggregate cfo_command;
+    Aggregate cfo_applied;
+    Aggregate timing;
+    std::map<std::string, Aggregate, std::less<>> timing_aggregates;
+    std::map<std::string, std::uint64_t, std::less<>> event_counts;
+    TransportDecoderStats transport;
+    std::uint64_t transport_bytes{};
+    std::uint64_t demod_windows{};
+    std::uint64_t ofdm_locked_windows{};
+    std::uint64_t tps_locked_windows{};
+    std::uint64_t ofdm_symbols{};
+
+    void add(const dvbt::FrontendBlockTelemetry &record) {
+        for (const auto &[name, duration_ms] : record.serial_wall_ms) {
+            timing_aggregates[name].add(duration_ms);
+        }
+    }
+
+    void add(const dvbt::DemodWindowTelemetry &record) {
+        if (record.mer_db) {
+            mer.add(*record.mer_db);
+        }
+        if (record.estimated_sro_ppm) {
+            sro.add(*record.estimated_sro_ppm);
+        }
+        if (record.tracked_cfo_hz) {
+            cfo.add(*record.tracked_cfo_hz);
+        }
+        if (record.acquisition_cfo_hz) {
+            acquisition_cfo.add(*record.acquisition_cfo_hz);
+        }
+        if (record.residual_cfo_hz) {
+            residual_cfo.add(*record.residual_cfo_hz);
+        }
+        cfo_command.add(record.cfo_command_hz);
+        cfo_applied.add(record.cfo_applied_hz);
+        if (record.physical_timing_samples) {
+            timing.add(*record.physical_timing_samples);
+        }
+        for (const auto *values :
+             {&record.serial_busy_ms, &record.wait_ms, &record.nested_ms,
+              &record.aggregate_worker_work_ms}) {
+            for (const auto &[name, value] : *values) {
+                timing_aggregates[name].add(value);
+            }
+        }
+        ++demod_windows;
+        ofdm_symbols += record.symbol_count;
+        if (record.ofdm_locked) {
+            ++ofdm_locked_windows;
+        }
+        if (record.tps_locked) {
+            ++tps_locked_windows;
+        }
+    }
+
+    void add(const dvbt::FecWindowTelemetry &record) {
+        timing_aggregates["fec::total"].add(record.fec_total_ms);
+        timing_aggregates["fec::transport"].add(record.transport_nested_ms);
+        transport_bytes += record.output_bytes_delta;
+        add_transport(record.delta);
+    }
+
+    void add(const dvbt::DecoderEventTelemetry &record) {
+        ++event_counts[record.event];
+    }
+
+    [[nodiscard]] json measurements() const {
+        return {{"mer_db", mer.value()},
+                {"sro_ppm", sro.value()},
+                {"acquisition_cfo_hz", acquisition_cfo.value()},
+                {"tracked_cfo_hz", cfo.value()},
+                {"residual_cfo_hz", residual_cfo.value()},
+                {"commanded_cfo_hz", cfo_command.value()},
+                {"applied_cfo_hz", cfo_applied.value()},
+                {"physical_timing_samples", timing.value()}};
+    }
+
+    [[nodiscard]] json timing_summary() const {
+        json result = json::object();
+        for (const auto &[name, value] : timing_aggregates) {
+            result[name] = value.value();
+        }
+        return result;
+    }
+
+    [[nodiscard]] json event_summary() const {
+        json result = json::object();
+        for (const auto &[name, count] : event_counts) {
+            result[name] = count;
+        }
+        return result;
+    }
+
+  private:
+    void add_transport(const TransportDecoderStats &value) {
+        transport.viterbi_bits += value.viterbi_bits;
+        transport.pre_viterbi_error_bits += value.pre_viterbi_error_bits;
+        transport.pre_viterbi_compared_bits += value.pre_viterbi_compared_bits;
+        transport.post_viterbi_error_bits += value.post_viterbi_error_bits;
+        transport.post_viterbi_compared_bits +=
+            value.post_viterbi_compared_bits;
+        transport.rs_packets += value.rs_packets;
+        transport.rs_uncorrectable_packets += value.rs_uncorrectable_packets;
+        transport.tei_packets += value.tei_packets;
+        transport.ts_packets += value.ts_packets;
+    }
+};
+
+template <typename Value>
+[[nodiscard]] Value counter_delta(const Value current, const Value initial) {
+    return current >= initial ? current - initial : current;
+}
+
 [[nodiscard]] json optional_parameter(const auto &value,
                                       const auto name_function) {
     return value.has_value() ? json(name_function(*value)) : json("auto");
@@ -424,6 +544,19 @@ void write_json_atomic(const std::filesystem::path &path, const json &value) {
 } // namespace
 
 struct DecodeReport::Impl {
+    struct ActiveSource {
+        DecodeSourceSessionConfig config;
+        dvbt::StreamDecoderStats initial_stats;
+        InputTimelineSnapshot initial_timeline;
+        TelemetryAggregate aggregate;
+        double wall_started_seconds{};
+        std::uint64_t sequence{};
+        std::uint64_t first_source_epoch{};
+        std::uint64_t last_source_epoch{};
+        std::uint64_t first_decoder_generation{};
+        std::uint64_t last_decoder_generation{};
+    };
+
     explicit Impl(DecodeReportConfig selected) : config(std::move(selected)) {
         if (config.directory.empty()) {
             throw std::runtime_error("Report directory path is empty");
@@ -441,6 +574,8 @@ struct DecodeReport::Impl {
             std::filesystem::create_directories(config.directory);
         }
 
+        open_stream(source_sessions_stream, source_sessions_writer,
+                    "source-sessions.jsonl");
         open_stream(frontend_stream, frontend_writer, "frontend.jsonl");
         open_stream(pipeline_stream, pipeline_writer, "pipeline.jsonl");
         open_stream(demod_stream, demod_writer, "dvbt-demod.jsonl");
@@ -451,23 +586,12 @@ struct DecodeReport::Impl {
             {"report_format_version", 0},
             {"mode", "dvbt"},
             {"tool", {{"name", "airspy-tv"}, {"version", "0.1.0"}}},
-            {"source",
-             {{"descriptor", config.source},
-              {"sample_rate_hz", config.sample_rate_hz}}},
-            {"destination", {{"descriptor", config.destination}}},
-            {"decoder",
-             {{"channel_bandwidth_hz", config.decoder.channel_bandwidth_hz},
-              {"transmission_mode",
-               optional_parameter(config.decoder.mode, mode_name)},
-              {"guard_interval",
-               optional_parameter(config.decoder.guard_interval, guard_name)},
-              {"constellation", optional_parameter(config.decoder.constellation,
-                                                   constellation_name)},
-              {"code_rate",
-               optional_parameter(config.decoder.code_rate, code_rate_name)},
-              {"worker_threads", config.decoder.worker_threads}}},
+            {"context", config.context},
             {"streams",
-             {{{"path", "frontend.jsonl"},
+             {{{"path", "source-sessions.jsonl"},
+               {"record_type", "source_session"},
+               {"schema_version", 0}},
+              {{"path", "frontend.jsonl"},
                {"record_type", "frontend_block"},
                {"schema_version", 0}},
               {{"path", "pipeline.jsonl"},
@@ -493,7 +617,7 @@ struct DecodeReport::Impl {
         if (!manifest_stream) {
             throw std::runtime_error("Unable to write report manifest");
         }
-        write_summary("running", 0, "", {}, 0, 0.0);
+        write_summary("running", 0, "", 0.0);
     }
 
     void open_stream(std::ofstream &stream,
@@ -517,26 +641,22 @@ struct DecodeReport::Impl {
             std::visit(
                 [this, &frontend, &demod, &fec, &events](const auto &value) {
                     using Value = std::decay_t<decltype(value)>;
+                    global_aggregate.add(value);
+                    if (active_source) {
+                        active_source->aggregate.add(value);
+                        observe(*active_source, value.envelope);
+                    }
                     if constexpr (std::is_same_v<
                                       Value, dvbt::FrontendBlockTelemetry>) {
-                        for (const auto &[name, duration_ms] :
-                             value.serial_wall_ms) {
-                            timing_aggregates[name].add(duration_ms);
-                        }
                         frontend.push_back(to_json_record(value));
                     } else if constexpr (std::is_same_v<
                                              Value,
                                              dvbt::DemodWindowTelemetry>) {
-                        aggregate(value);
                         demod.push_back(to_json_record(value));
                     } else if constexpr (std::is_same_v<
                                              Value, dvbt::FecWindowTelemetry>) {
-                        timing_aggregates["fec::total"].add(value.fec_total_ms);
-                        timing_aggregates["fec::transport"].add(
-                            value.transport_nested_ms);
                         fec.push_back(to_json_record(value));
                     } else {
-                        ++event_counts[value.event];
                         events.push_back(to_json_record(value));
                     }
                 },
@@ -548,46 +668,40 @@ struct DecodeReport::Impl {
         event_writer->write_batch(events);
     }
 
-    void aggregate(const dvbt::DemodWindowTelemetry &record) {
-        if (record.mer_db) {
-            mer.add(*record.mer_db);
+    void begin_source(DecodeSourceSessionConfig selected,
+                      const InputTimelineSnapshot &timeline,
+                      const dvbt::StreamDecoderStats &stats,
+                      const double wall_elapsed_seconds) {
+        if (finalized) {
+            throw std::logic_error(
+                "Cannot begin a source after report finalization");
         }
-        if (record.estimated_sro_ppm) {
-            sro.add(*record.estimated_sro_ppm);
+        if (active_source) {
+            throw std::logic_error(
+                "A decode report source session is already active");
         }
-        if (record.tracked_cfo_hz) {
-            cfo.add(*record.tracked_cfo_hz);
-        }
-        if (record.acquisition_cfo_hz) {
-            acquisition_cfo.add(*record.acquisition_cfo_hz);
-        }
-        if (record.residual_cfo_hz) {
-            residual_cfo.add(*record.residual_cfo_hz);
-        }
-        cfo_command.add(record.cfo_command_hz);
-        cfo_applied.add(record.cfo_applied_hz);
-        if (record.physical_timing_samples) {
-            timing.add(*record.physical_timing_samples);
-        }
-        for (const auto *map :
-             {&record.serial_busy_ms, &record.wait_ms, &record.nested_ms,
-              &record.aggregate_worker_work_ms}) {
-            for (const auto &[name, value] : *map) {
-                timing_aggregates[name].add(value);
-            }
-        }
-        ++demod_windows;
-        if (record.ofdm_locked) {
-            ++ofdm_locked_windows;
-        }
-        if (record.tps_locked) {
-            ++tps_locked_windows;
-        }
+        active_source = ActiveSource{
+            .config = std::move(selected),
+            .initial_stats = stats,
+            .initial_timeline = timeline,
+            .aggregate = {},
+            .wall_started_seconds = wall_elapsed_seconds,
+            .sequence = ++source_sequence,
+            .first_source_epoch = timeline.stream_epoch,
+            .last_source_epoch = timeline.stream_epoch,
+            .first_decoder_generation = stats.decoder_generation,
+            .last_decoder_generation = stats.decoder_generation,
+        };
     }
 
     void write_pipeline(const dvbt::StreamDecoderStats &stats,
                         const std::uint64_t submitted_samples,
                         const double wall_elapsed_seconds) {
+        if (!active_source) {
+            throw std::logic_error(
+                "Pipeline sample has no active source session");
+        }
+        observe(*active_source, stats);
         const auto fraction = [](const std::uint64_t used,
                                  const std::uint64_t capacity) {
             return capacity == 0 ? 0.0
@@ -656,6 +770,7 @@ struct DecodeReport::Impl {
     }
 
     void flush() const {
+        source_sessions_writer->flush();
         frontend_writer->flush();
         pipeline_writer->flush();
         demod_writer->flush();
@@ -663,63 +778,137 @@ struct DecodeReport::Impl {
         event_writer->flush();
     }
 
-    void write_summary(const std::string_view status, const int exit_code,
-                       const std::string_view error,
-                       const dvbt::StreamDecoderStats &stats,
-                       const std::uint64_t submitted_samples,
-                       const double wall_elapsed_seconds) {
-        json timing_summary = json::object();
-        for (const auto &[name, value] : timing_aggregates) {
-            timing_summary[name] = value.value();
+    void end_source(const std::string_view status, const std::string_view error,
+                    const dvbt::StreamDecoderStats &stats,
+                    const InputTimelineSnapshot &timeline,
+                    const std::uint64_t submitted_samples,
+                    const double wall_elapsed_seconds) {
+        if (!active_source) {
+            throw std::logic_error("No active decode report source session");
         }
-        json event_summary = json::object();
-        for (const auto &[name, count] : event_counts) {
-            event_summary[name] = count;
-        }
+        observe(*active_source, stats);
+        observe(*active_source, timeline);
+        const ActiveSource &source = *active_source;
+        const auto &fec = source.aggregate.transport;
+        const std::uint64_t processed_samples =
+            counter_delta(stats.processed_input_samples,
+                          source.initial_stats.processed_input_samples);
         const double signal_seconds =
-            config.sample_rate_hz == 0
+            source.config.sample_rate_hz == 0
                 ? 0.0
                 : static_cast<double>(submitted_samples) /
-                      static_cast<double>(config.sample_rate_hz);
-        const auto &fec = stats.cumulative_transport;
+                      source.config.sample_rate_hz;
+        const double duration_seconds =
+            std::max(0.0, wall_elapsed_seconds - source.wall_started_seconds);
+        json record = {
+            {"schema_version", 0},
+            {"record_type", "source_session"},
+            {"mode", "dvbt"},
+            {"sequence", source.sequence},
+            {"source_session_id", std::format("source-{:06}", source.sequence)},
+            {"source",
+             {{"descriptor", source.config.source},
+              {"sample_rate_hz", source.config.sample_rate_hz},
+              {"center_frequency_hz", source.config.center_frequency_hz}}},
+            {"destination", {{"descriptor", source.config.destination}}},
+            {"decoder", decoder_config(source.config.decoder)},
+            {"correlation",
+             {{"first_source_epoch", source.first_source_epoch},
+              {"last_source_epoch", source.last_source_epoch},
+              {"first_decoder_generation", source.first_decoder_generation},
+              {"last_decoder_generation", source.last_decoder_generation}}},
+            {"source_samples",
+             {{"begin", source.initial_timeline.source_head_sample},
+              {"end", timeline.source_head_sample}}},
+            {"duration",
+             {{"wall_started_seconds", source.wall_started_seconds},
+              {"wall_ended_seconds", wall_elapsed_seconds},
+              {"wall_seconds", duration_seconds},
+              {"signal_seconds", signal_seconds},
+              {"average_realtime_speed", duration_seconds > 0.0
+                                             ? signal_seconds / duration_seconds
+                                             : 0.0}}},
+            {"samples",
+             {{"submitted", submitted_samples},
+              {"processed", processed_samples}}},
+            {"transport",
+             transport_summary(source.aggregate.transport_bytes, fec)},
+            {"counters", counter_summary(source, stats, fec)},
+            {"windows", window_summary(source.aggregate)},
+            {"measurements", source.aggregate.measurements()},
+            {"timing_ms", source.aggregate.timing_summary()},
+            {"events", source.aggregate.event_summary()},
+            {"final_state", final_state(stats)},
+            {"status", status},
+            {"error", error.empty() ? json(nullptr) : json(error)},
+        };
+        source_sessions_writer->write(record);
+
+        ++source_sessions_total;
+        ++source_status_counts[std::string(status)];
+        submitted_samples_total += submitted_samples;
+        processed_samples_total += processed_samples;
+        signal_seconds_total += signal_seconds;
+        dropped_blocks_total += counter_delta(
+            stats.dropped_blocks, source.initial_stats.dropped_blocks);
+        phase_discontinuities_total +=
+            counter_delta(stats.pilot_phase_discontinuities,
+                          source.initial_stats.pilot_phase_discontinuities);
+        overlap_packets_total += counter_delta(
+            stats.ts_overlap_packets, source.initial_stats.ts_overlap_packets);
+        overlap_join_failures_total +=
+            counter_delta(stats.ts_overlap_join_failures,
+                          source.initial_stats.ts_overlap_join_failures);
+        fec_sessions_total += counter_delta(stats.fec_sessions,
+                                            source.initial_stats.fec_sessions);
+        bootstrap_attempts_total += counter_delta(
+            stats.bootstrap_attempts, source.initial_stats.bootstrap_attempts);
+        cfo_rebootstrap_requests_total +=
+            counter_delta(stats.cfo_rebootstrap_requests,
+                          source.initial_stats.cfo_rebootstrap_requests);
+        cfo_rebootstrap_count_total +=
+            counter_delta(stats.cfo_rebootstrap_count,
+                          source.initial_stats.cfo_rebootstrap_count);
+        active_source.reset();
+    }
+
+    void write_summary(const std::string_view status, const int exit_code,
+                       const std::string_view error,
+                       const double wall_elapsed_seconds) const {
+        const auto &fec = global_aggregate.transport;
         json summary = {
             {"schema_version", 0},
             {"status", status},
             {"program_version", "0.1.0"},
             {"mode", "dvbt"},
-            {"source",
-             {{"descriptor", config.source},
-              {"sample_rate_hz", config.sample_rate_hz}}},
-            {"destination", {{"descriptor", config.destination}}},
+            {"context", config.context},
             {"duration",
              {{"wall_seconds", wall_elapsed_seconds},
-              {"signal_seconds", signal_seconds},
+              {"signal_seconds", signal_seconds_total},
               {"average_realtime_speed",
                wall_elapsed_seconds > 0.0
-                   ? signal_seconds / wall_elapsed_seconds
+                   ? signal_seconds_total / wall_elapsed_seconds
                    : 0.0}}},
             {"samples",
-             {{"submitted", submitted_samples},
-              {"processed", stats.processed_input_samples}}},
+             {{"submitted", submitted_samples_total},
+              {"processed", processed_samples_total}}},
+            {"source_sessions",
+             {{"total", source_sessions_total},
+              {"completed", source_status_count("completed")},
+              {"no_transport", source_status_count("no_transport")},
+              {"failed", source_status_count("failed")}}},
             {"transport",
-             {{"bytes", stats.transport_bytes},
-              {"emitted_packets", stats.transport_bytes / 188},
-              {"emitted_partial_bytes", stats.transport_bytes % 188},
-              {"decoded_packets", fec.ts_packets},
-              {"tei_packets", fec.tei_packets},
-              {"usable_packets", fec.ts_packets >= fec.tei_packets
-                                     ? fec.ts_packets - fec.tei_packets
-                                     : 0}}},
+             transport_summary(global_aggregate.transport_bytes, fec)},
             {"counters",
-             {{"dropped_blocks", stats.dropped_blocks},
-              {"ofdm_symbols", stats.ofdm_symbols},
-              {"phase_discontinuities", stats.pilot_phase_discontinuities},
-              {"overlap_packets", stats.ts_overlap_packets},
-              {"overlap_join_failures", stats.ts_overlap_join_failures},
-              {"fec_sessions", stats.fec_sessions},
-              {"bootstrap_attempts", stats.bootstrap_attempts},
-              {"cfo_rebootstrap_requests", stats.cfo_rebootstrap_requests},
-              {"cfo_rebootstrap_count", stats.cfo_rebootstrap_count},
+             {{"dropped_blocks", dropped_blocks_total},
+              {"ofdm_symbols", global_aggregate.ofdm_symbols},
+              {"phase_discontinuities", phase_discontinuities_total},
+              {"overlap_packets", overlap_packets_total},
+              {"overlap_join_failures", overlap_join_failures_total},
+              {"fec_sessions", fec_sessions_total},
+              {"bootstrap_attempts", bootstrap_attempts_total},
+              {"cfo_rebootstrap_requests", cfo_rebootstrap_requests_total},
+              {"cfo_rebootstrap_count", cfo_rebootstrap_count_total},
               {"pre_viterbi_error_bits", fec.pre_viterbi_error_bits},
               {"pre_viterbi_compared_bits", fec.pre_viterbi_compared_bits},
               {"post_viterbi_error_bits", fec.post_viterbi_error_bits},
@@ -727,91 +916,201 @@ struct DecodeReport::Impl {
               {"rs_packets", fec.rs_packets},
               {"rs_uncorrectable_packets", fec.rs_uncorrectable_packets},
               {"tei_packets", fec.tei_packets}}},
-            {"windows",
-             {{"demod", demod_windows},
-              {"ofdm_locked", ofdm_locked_windows},
-              {"tps_locked", tps_locked_windows}}},
-            {"measurements",
-             {{"mer_db", mer.value()},
-              {"sro_ppm", sro.value()},
-              {"acquisition_cfo_hz", acquisition_cfo.value()},
-              {"tracked_cfo_hz", cfo.value()},
-              {"residual_cfo_hz", residual_cfo.value()},
-              {"commanded_cfo_hz", cfo_command.value()},
-              {"applied_cfo_hz", cfo_applied.value()},
-              {"physical_timing_samples", timing.value()}}},
-            {"timing_ms", timing_summary},
-            {"events", event_summary},
-            {"final_state",
-             {{"ofdm_locked", stats.ofdm_locked},
-              {"tps_locked", stats.tps_locked},
-              {"rs_synchronized", stats.transport.rs_synchronized},
-              {"energy_synchronized", stats.transport.energy_synchronized},
-              {"estimated_sro_ppm",
-               json_finite_or_null(stats.sample_clock_offset_ppm)},
-              {"applied_sro_ppm",
-               json_finite_or_null(stats.sro_resampler_applied_ppm)},
-              {"acquisition_cfo_hz",
-               json_finite_or_null(stats.acquisition_cfo_hz)},
-              {"acquisition_fractional_cfo_hz",
-               json_finite_or_null(stats.acquisition_fractional_cfo_hz)},
-              {"acquisition_carrier_bin_offset",
-               stats.acquisition_carrier_bin_offset},
-              {"estimated_cfo_hz",
-               json_finite_or_null(stats.tracked_carrier_offset_hz)},
-              {"residual_cfo_hz",
-               json_finite_or_null(stats.residual_carrier_offset_hz)},
-              {"commanded_cfo_hz",
-               json_finite_or_null(stats.cfo_resampler_command_hz)},
-              {"applied_cfo_hz",
-               json_finite_or_null(stats.cfo_resampler_applied_hz)},
-              {"cfo_rebootstrap_last_residual_hz",
-               json_finite_or_null(stats.cfo_rebootstrap_last_residual_hz)},
-              {"cfo_rebootstrap_output_sample",
-               stats.cfo_rebootstrap_output_sample},
-              {"cfo_rebootstrap_source_sample",
-               stats.cfo_rebootstrap_source_sample},
-              {"bootstrap_replayed_input_samples",
-               stats.bootstrap_replayed_input_samples},
-              {"bootstrap_retained_peak_samples",
-               stats.bootstrap_retained_peak_samples}}},
+            {"windows", window_summary(global_aggregate)},
+            {"measurements", global_aggregate.measurements()},
+            {"timing_ms", global_aggregate.timing_summary()},
+            {"events", global_aggregate.event_summary()},
             {"exit_code", exit_code},
             {"error", error.empty() ? json(nullptr) : json(error)},
         };
         write_json_atomic(config.directory / "stats.json", summary);
     }
 
+    static json decoder_config(const dvbt::ReceiverParameters &decoder) {
+        return {
+            {"channel_bandwidth_hz", decoder.channel_bandwidth_hz},
+            {"transmission_mode", optional_parameter(decoder.mode, mode_name)},
+            {"guard_interval",
+             optional_parameter(decoder.guard_interval, guard_name)},
+            {"constellation",
+             optional_parameter(decoder.constellation, constellation_name)},
+            {"code_rate",
+             optional_parameter(decoder.code_rate, code_rate_name)},
+            {"worker_threads", decoder.worker_threads}};
+    }
+
+    static json transport_summary(const std::uint64_t bytes,
+                                  const TransportDecoderStats &fec) {
+        return {{"bytes", bytes},
+                {"emitted_packets", bytes / 188},
+                {"emitted_partial_bytes", bytes % 188},
+                {"decoded_packets", fec.ts_packets},
+                {"tei_packets", fec.tei_packets},
+                {"usable_packets", fec.ts_packets >= fec.tei_packets
+                                       ? fec.ts_packets - fec.tei_packets
+                                       : 0}};
+    }
+
+    static json counter_summary(const ActiveSource &source,
+                                const dvbt::StreamDecoderStats &stats,
+                                const TransportDecoderStats &fec) {
+        return {
+            {"dropped_blocks",
+             counter_delta(stats.dropped_blocks,
+                           source.initial_stats.dropped_blocks)},
+            {"ofdm_symbols", source.aggregate.ofdm_symbols},
+            {"phase_discontinuities",
+             counter_delta(stats.pilot_phase_discontinuities,
+                           source.initial_stats.pilot_phase_discontinuities)},
+            {"overlap_packets",
+             counter_delta(stats.ts_overlap_packets,
+                           source.initial_stats.ts_overlap_packets)},
+            {"overlap_join_failures",
+             counter_delta(stats.ts_overlap_join_failures,
+                           source.initial_stats.ts_overlap_join_failures)},
+            {"fec_sessions", counter_delta(stats.fec_sessions,
+                                           source.initial_stats.fec_sessions)},
+            {"bootstrap_attempts",
+             counter_delta(stats.bootstrap_attempts,
+                           source.initial_stats.bootstrap_attempts)},
+            {"cfo_rebootstrap_requests",
+             counter_delta(stats.cfo_rebootstrap_requests,
+                           source.initial_stats.cfo_rebootstrap_requests)},
+            {"cfo_rebootstrap_count",
+             counter_delta(stats.cfo_rebootstrap_count,
+                           source.initial_stats.cfo_rebootstrap_count)},
+            {"pre_viterbi_error_bits", fec.pre_viterbi_error_bits},
+            {"pre_viterbi_compared_bits", fec.pre_viterbi_compared_bits},
+            {"post_viterbi_error_bits", fec.post_viterbi_error_bits},
+            {"post_viterbi_compared_bits", fec.post_viterbi_compared_bits},
+            {"rs_packets", fec.rs_packets},
+            {"rs_uncorrectable_packets", fec.rs_uncorrectable_packets},
+            {"tei_packets", fec.tei_packets}};
+    }
+
+    static json window_summary(const TelemetryAggregate &aggregate) {
+        return {{"demod", aggregate.demod_windows},
+                {"ofdm_locked", aggregate.ofdm_locked_windows},
+                {"tps_locked", aggregate.tps_locked_windows}};
+    }
+
+    static json final_state(const dvbt::StreamDecoderStats &stats) {
+        return {{"ofdm_locked", stats.ofdm_locked},
+                {"tps_locked", stats.tps_locked},
+                {"rs_synchronized", stats.transport.rs_synchronized},
+                {"energy_synchronized", stats.transport.energy_synchronized},
+                {"estimated_sro_ppm",
+                 json_finite_or_null(stats.sample_clock_offset_ppm)},
+                {"applied_sro_ppm",
+                 json_finite_or_null(stats.sro_resampler_applied_ppm)},
+                {"acquisition_cfo_hz",
+                 json_finite_or_null(stats.acquisition_cfo_hz)},
+                {"acquisition_fractional_cfo_hz",
+                 json_finite_or_null(stats.acquisition_fractional_cfo_hz)},
+                {"acquisition_carrier_bin_offset",
+                 stats.acquisition_carrier_bin_offset},
+                {"estimated_cfo_hz",
+                 json_finite_or_null(stats.tracked_carrier_offset_hz)},
+                {"residual_cfo_hz",
+                 json_finite_or_null(stats.residual_carrier_offset_hz)},
+                {"commanded_cfo_hz",
+                 json_finite_or_null(stats.cfo_resampler_command_hz)},
+                {"applied_cfo_hz",
+                 json_finite_or_null(stats.cfo_resampler_applied_hz)},
+                {"cfo_rebootstrap_last_residual_hz",
+                 json_finite_or_null(stats.cfo_rebootstrap_last_residual_hz)},
+                {"cfo_rebootstrap_output_sample",
+                 stats.cfo_rebootstrap_output_sample},
+                {"cfo_rebootstrap_source_sample",
+                 stats.cfo_rebootstrap_source_sample},
+                {"bootstrap_replayed_input_samples",
+                 stats.bootstrap_replayed_input_samples},
+                {"bootstrap_retained_peak_samples",
+                 stats.bootstrap_retained_peak_samples}};
+    }
+
+    static void update_range(std::uint64_t &first, std::uint64_t &last,
+                             const std::uint64_t value) {
+        if (value == 0) {
+            return;
+        }
+        first = first == 0 ? value : std::min(first, value);
+        last = std::max(last, value);
+    }
+
+    static void observe(ActiveSource &source,
+                        const dvbt::TelemetryEnvelope &value) {
+        update_range(source.first_source_epoch, source.last_source_epoch,
+                     value.source_epoch);
+        update_range(source.first_decoder_generation,
+                     source.last_decoder_generation, value.decoder_generation);
+    }
+
+    static void observe(ActiveSource &source,
+                        const dvbt::StreamDecoderStats &value) {
+        update_range(source.first_source_epoch, source.last_source_epoch,
+                     value.source_epoch);
+        update_range(source.first_decoder_generation,
+                     source.last_decoder_generation, value.decoder_generation);
+    }
+
+    static void observe(ActiveSource &source,
+                        const InputTimelineSnapshot &value) {
+        update_range(source.first_source_epoch, source.last_source_epoch,
+                     value.stream_epoch);
+    }
+
+    [[nodiscard]] std::uint64_t
+    source_status_count(const std::string_view status) const {
+        const auto found = source_status_counts.find(status);
+        return found == source_status_counts.end() ? 0 : found->second;
+    }
+
     DecodeReportConfig config;
+    std::ofstream source_sessions_stream;
     std::ofstream frontend_stream;
     std::ofstream pipeline_stream;
     std::ofstream demod_stream;
     std::ofstream fec_stream;
     std::ofstream event_stream;
+    std::unique_ptr<JsonlWriter> source_sessions_writer;
     std::unique_ptr<JsonlWriter> frontend_writer;
     std::unique_ptr<JsonlWriter> pipeline_writer;
     std::unique_ptr<JsonlWriter> demod_writer;
     std::unique_ptr<JsonlWriter> fec_writer;
     std::unique_ptr<JsonlWriter> event_writer;
     std::uint64_t pipeline_sequence{};
-    std::uint64_t demod_windows{};
-    std::uint64_t ofdm_locked_windows{};
-    std::uint64_t tps_locked_windows{};
-    Aggregate mer;
-    Aggregate sro;
-    Aggregate acquisition_cfo;
-    Aggregate cfo;
-    Aggregate residual_cfo;
-    Aggregate cfo_command;
-    Aggregate cfo_applied;
-    Aggregate timing;
-    std::map<std::string, Aggregate, std::less<>> timing_aggregates;
-    std::map<std::string, std::uint64_t, std::less<>> event_counts;
+    std::uint64_t source_sequence{};
+    std::optional<ActiveSource> active_source;
+    TelemetryAggregate global_aggregate;
+    std::map<std::string, std::uint64_t, std::less<>> source_status_counts;
+    std::uint64_t source_sessions_total{};
+    std::uint64_t submitted_samples_total{};
+    std::uint64_t processed_samples_total{};
+    std::uint64_t dropped_blocks_total{};
+    std::uint64_t phase_discontinuities_total{};
+    std::uint64_t overlap_packets_total{};
+    std::uint64_t overlap_join_failures_total{};
+    std::uint64_t fec_sessions_total{};
+    std::uint64_t bootstrap_attempts_total{};
+    std::uint64_t cfo_rebootstrap_requests_total{};
+    std::uint64_t cfo_rebootstrap_count_total{};
+    double signal_seconds_total{};
+    bool finalized{};
 };
 
 DecodeReport::DecodeReport(DecodeReportConfig config)
     : impl_(std::make_unique<Impl>(std::move(config))) {}
 
 DecodeReport::~DecodeReport() noexcept = default;
+
+void DecodeReport::begin_source(DecodeSourceSessionConfig config,
+                                const InputTimelineSnapshot &timeline,
+                                const dvbt::StreamDecoderStats &stats,
+                                const double wall_elapsed_seconds) {
+    impl_->begin_source(std::move(config), timeline, stats,
+                        wall_elapsed_seconds);
+}
 
 void DecodeReport::consume(
     const std::span<const dvbt::TelemetryRecord> records) {
@@ -824,21 +1123,36 @@ void DecodeReport::write_pipeline(const dvbt::StreamDecoderStats &stats,
     impl_->write_pipeline(stats, submitted_samples, wall_elapsed_seconds);
 }
 
+void DecodeReport::end_source(const std::string_view status,
+                              const std::string_view error,
+                              const dvbt::StreamDecoderStats &stats,
+                              const InputTimelineSnapshot &timeline,
+                              const std::uint64_t submitted_samples,
+                              const double wall_elapsed_seconds) {
+    impl_->end_source(status, error, stats, timeline, submitted_samples,
+                      wall_elapsed_seconds);
+}
+
 void DecodeReport::flush() { impl_->flush(); }
 
 void DecodeReport::finalize(const std::string_view status, const int exit_code,
                             const std::string_view error,
-                            const dvbt::StreamDecoderStats &stats,
-                            const std::uint64_t submitted_samples,
                             const double wall_elapsed_seconds) {
+    if (impl_->active_source) {
+        throw std::logic_error(
+            "Cannot finalize a decode report with an active source session");
+    }
+    if (impl_->finalized) {
+        throw std::logic_error("Decode report is already finalized");
+    }
     std::exception_ptr flush_error;
     try {
         impl_->flush();
     } catch (...) {
         flush_error = std::current_exception();
     }
-    impl_->write_summary(status, exit_code, error, stats, submitted_samples,
-                         wall_elapsed_seconds);
+    impl_->write_summary(status, exit_code, error, wall_elapsed_seconds);
+    impl_->finalized = true;
     if (flush_error) {
         std::rethrow_exception(flush_error);
     }

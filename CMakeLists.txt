@@ -116,9 +116,9 @@ target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F airspy-tv-common
     Threads::Threads PRIVATE solid-resampler::solid-resampler)
 
 add_executable(airspy-tv
-    src/decoder_diagnostics.cpp
     src/epg.cpp
     src/gui/app.cpp
+    src/gui/decode_reporting.cpp
     src/gui/dvbt_panels.cpp
     src/gui/media_panels.cpp
     src/gui/receiver_panels.cpp
@@ -171,6 +171,18 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME jsonl COMMAND jsonl-test)
+
+    add_executable(decode-report-test
+        tests/decode_report_test.cpp
+        src/decode_report.cpp
+    )
+    target_include_directories(decode-report-test PRIVATE src)
+    target_link_libraries(decode-report-test PRIVATE airspy-tv-dvbt)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(decode-report-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME decode-report COMMAND decode-report-test)
 
     add_executable(sample-timeline-test
         tests/sample_timeline_test.cpp

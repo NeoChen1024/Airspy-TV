@@ -18,10 +18,9 @@
 
 namespace airspy_tv::dvbt {
 
-// Where each pipeline worker thread currently is, for diagnostics: the GUI
-// dumps these plus the queue/ring watermarks every few seconds so a stall
-// (a worker parked on a wait that can never be satisfied) is visible instead
-// of presenting as "TS stopped and CPU dropped".
+// Where each pipeline worker thread currently is. GUI and machine-readable
+// pipeline snapshots combine these states with queue/ring watermarks so a
+// parked or backpressured stage can be distinguished from an idle decoder.
 enum class WorkerState : int {
     idle = 0,
     processing,

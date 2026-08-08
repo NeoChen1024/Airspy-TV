@@ -201,6 +201,14 @@ auto-detection from the TPS and can be forced when the signal is marginal or
 the capture metadata is incomplete. Pass `-d` or `--debug` to include worker
 allocation, per-stage timings, tracking events, and detailed FEC diagnostics.
 
+Pass `--report-dir DIR` to either offline decoding or the GUI receiver to write
+the machine-readable report described in
+[`docs/machine-readable-performance-report.md`](docs/machine-readable-performance-report.md).
+In GUI mode the report starts with the first opened source and is finalized at
+application shutdown. Each I/Q replay, source reopen, sample-rate restart, or
+retune appends one final record to `source-sessions.jsonl`; `stats.json` remains
+a run-wide summary. The directory must be absent or empty when the run starts.
+
 ## Decoder architecture
 
 <details>

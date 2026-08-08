@@ -160,8 +160,10 @@ int main(const int argc, char **argv) {
         cli_usage_error("--decode-iq, --record-first and --inspect-iq are "
                         "mutually exclusive");
     }
-    if (report_directory.has_value() && !decode_iq_path.has_value()) {
-        cli_usage_error("--report-dir is only valid with --decode-iq");
+    if (report_directory.has_value() &&
+        (inspect_iq_path.has_value() || record_path.has_value())) {
+        cli_usage_error(
+            "--report-dir is valid with --decode-iq or the GUI receiver");
     }
 
     if (inspect_iq_path.has_value()) {
@@ -191,5 +193,5 @@ int main(const int argc, char **argv) {
         return record_first_cli(*record_path, duration_ms, settings);
     }
 
-    return airspy_tv::gui::run_gui();
+    return airspy_tv::gui::run_gui(report_directory);
 }

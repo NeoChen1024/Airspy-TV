@@ -3,9 +3,9 @@
 ## Status and goals
 
 This document specifies the implemented long-run report format for offline I/Q
-decoding. The first pre-alpha implementation landed on August 7, 2026. All
-report-owned schema versions remain `0` while field names and stream contents
-are still allowed to evolve.
+decoding and interactive GUI receiver sessions. The first pre-alpha
+implementation landed on August 7, 2026. All report-owned schema versions
+remain `0` while field names and stream contents are still allowed to evolve.
 
 The report must support performance comparisons and clock/FEC failure analysis
 without parsing the verbose `--debug` output. A report is a directory containing
@@ -16,6 +16,7 @@ final summary. For a DVB-T run:
 REPORT_DIR/
   manifest.json
   stats.json
+  source-sessions.jsonl
   frontend.jsonl
   pipeline.jsonl
   dvbt-demod.jsonl
@@ -61,20 +62,26 @@ Report conversion must use `json_finite_or_null()` to write non-finite
 floating-point values as `null`. The writer rejects any unhandled NaN or
 infinity rather than relying on a serializer's implicit replacement behavior.
 
-## CLI contract
+## Report activation
 
-Add the following offline-decode option:
+The same option enables reports for offline decoding and the GUI receiver:
 
 ```text
 --report-dir DIR
 ```
 
-The directory may be absent or empty. Decoding refuses a non-empty directory
-so a new run cannot silently mix with or overwrite an older report.
-`manifest.json` and all streams listed in it are created immediately. Every
-JSONL writer is flushed at least once per wall-clock second and at shutdown.
-`stats.json` is initially written with `"status": "running"`, then atomically
-replaced at shutdown with one of:
+The directory may be absent or empty. Decoding refuses a non-empty directory so
+a new run cannot silently mix with or overwrite an older report. Offline mode
+creates the report immediately and writes exactly one final source-session
+record. GUI mode arms the report at startup and creates it when the first SDR
+or I/Q-file source opens. The writer remains open until GUI shutdown. I/Q EOF,
+explicit source close, replay, sample-rate restart, and retune end the current
+source session without finalizing the run; the next successful stream start
+appends another record to `source-sessions.jsonl`.
+
+Every JSONL writer is flushed at least once per wall-clock second and at
+shutdown. `stats.json` is initially written with `"status": "running"`, then
+atomically replaced at shutdown with one of:
 
 - `completed`: decoding completed and emitted transport packets;
 - `no_transport`: decoding completed but emitted no transport packets;
@@ -85,15 +92,21 @@ If the process is interrupted, the running status and the valid JSONL prefix
 make the incomplete run identifiable and still analyzable.
 
 `manifest.json` is ordinary JSON and remains immutable after report creation.
-It contains the report-format version, receiver mode, run/tool identity,
-effective configuration, and the stream inventory. Each inventory entry names
-the path, one `record_type`, and its independent `schema_version`, for example:
+It contains the report-format version, receiver mode, run context/tool
+identity, and the stream inventory. Per-source descriptors and decoder
+configuration are deliberately excluded. Each inventory entry names the path,
+one `record_type`, and its independent `schema_version`, for example:
 
 ```json
 {
   "report_format_version": 0,
   "mode": "dvbt",
   "streams": [
+    {
+      "path": "source-sessions.jsonl",
+      "record_type": "source_session",
+      "schema_version": 0
+    },
     {
       "path": "frontend.jsonl",
       "record_type": "frontend_block",
@@ -166,15 +179,17 @@ different intervals:
   worker.
 
 The decoder exposes an opt-in, drainable queue of typed DVB-T telemetry
-records. Each owning stage appends its completed record under the
-existing coordinator mutex. The CLI drains records after submissions and after
-`flush()`, then performs JSON conversion and file I/O on the CLI thread.
-Normal GUI and non-report users leave collection disabled, so they incur no
-record retention. No decoder worker may serialize JSON or write the report.
+records. Each owning stage appends its completed record under the existing
+coordinator mutex. Offline decoding drains records after submissions and after
+`flush()`; the GUI drains them during frame-state refresh. Both paths perform
+JSON conversion and file I/O on their application thread. GUI sessions without
+a report or `--debug`, and other non-report users, leave collection disabled,
+so they incur no record retention. No decoder worker may serialize JSON or
+write the report.
 
 Collection is enabled when either `--report-dir` or `--debug` requires detailed
-records. After each drain, the CLI passes the same record batch to zero or more
-consumers:
+records. After each drain, the owning application path passes the same record
+batch to zero or more consumers:
 
 1. a report router that batches records by their homogeneous JSONL stream;
 2. the human-readable debug formatter;
@@ -214,14 +229,16 @@ The first report version uses these homogeneous streams:
 
 | File | Record type | Emission point | Purpose |
 | --- | --- | --- | --- |
+| `source-sessions.jsonl` | `source_session` | one source session ends | Source/destination/configuration, correlation ranges, per-source totals, outcome, and final decoder state |
 | `frontend.jsonl` | `frontend_block` | one input block completes | CS16 conversion, resampling, SRO actuator, and source/output sample spans |
 | `pipeline.jsonl` | `pipeline_sample` | once per wall-clock second | Queue occupancy, worker states, latest locks/quality, and cumulative progress |
 | `dvbt-demod.jsonl` | `demod_window` | one stats window completes | Lock, RF/OFDM quality, CFO/SRO/timing state, and demod/symbol timing |
 | `dvbt-fec.jsonl` | `fec_window` | a numbered stats marker reaches FEC | FEC timing, session identity, output deltas, BER, RS, TEI, and sync state |
 | `events.jsonl` | `decoder_event` | a diagnostic state transition occurs | Acquisition, lock, fade, phase, timing-rejection, and FEC-gating events |
 
-Lifecycle and configuration belong in `manifest.json` and `stats.json`, not as
-different `run_start`/`run_end` schemas mixed into a telemetry stream.
+Run lifecycle belongs in `manifest.json` and `stats.json`. Per-source lifecycle
+and configuration belong in the homogeneous `source_session` stream, not as
+different `run_start`/`run_end` schemas mixed into detailed telemetry.
 
 Every event record has the same envelope: `event`, `severity`, nullable source,
 resampled-sample and OFDM-symbol positions, and a `fields` object containing
@@ -260,13 +277,11 @@ their own `stderr` records. This keeps `events.jsonl`, event counts, and
 The following output deliberately remains outside that event stream:
 
 - command-line errors, warnings, and once-per-second offline progress;
-- the GUI's periodic `[diag]` snapshot, which describes current queue/thread
-  state rather than a decoder transition;
 - the demod worker's last-resort synchronous exception message immediately
   before the exception is propagated to the coordinator.
 
-The process-global debug flag therefore only selects human-readable rendering
-and the GUI snapshot. It is not an input to common decoding components.
+The process-global debug flag therefore only selects human-readable rendering.
+It is not an input to common decoding components.
 
 FEC stats markers need the associated demod-window sequence. FEC decoder
 creation/reset also needs a monotonically increasing `fec_session` identifier.
@@ -379,6 +394,26 @@ it is valid:
 Unavailable measurements are `null`, not magic zero values. Enum values and
 states are stable lowercase strings rather than implementation ordinals.
 
+## Source-session correlation
+
+`source-sessions.jsonl` contains one compact final record per successful source
+start. Its source and destination descriptors, center/sample frequencies,
+DVB-T decoder configuration, wall and source-sample ranges, status/error, and
+final decoder state apply only to that source session. The record also contains
+the same bounded measurements, timing, event, transport, and FEC summaries
+scoped to that source.
+
+Detailed records do not repeat file names or device descriptors. A source
+session stores first/last `source_epoch` and first/last `decoder_generation`;
+readers map detailed records into those ranges. One input can span multiple
+source epochs because a dropped-sample discontinuity advances the epoch.
+Decoder generations can also advance independently when acquisition or
+parameters reset without changing the input source.
+
+FEC and emitted-TS totals are accumulated from `FecWindowTelemetry::delta` and
+`output_bytes_delta`. They are not inferred from the final decoder snapshot,
+because active FEC-session counters can reset within one source session.
+
 ## `stats.json`
 
 The final summary is intentionally smaller than the telemetry stream. It
@@ -386,8 +421,7 @@ contains:
 
 - `schema_version: 0`, status, program version, and optional build/revision
   identity;
-- top-level receiver `mode`, source/destination descriptors, and effective
-  decoder configuration;
+- top-level receiver `mode`, run context, and source-session outcome counts;
 - wall duration, decoded signal duration, submitted/processed samples, and
   average realtime speed;
 - output bytes, actual emitted 188-byte packet count, emitted partial bytes,
@@ -397,16 +431,19 @@ contains:
   errors, RS packets/failures, and TEI packets;
 - MER and SRO/CFO/timing count/min/mean/max over valid demod windows;
 - for each timing key, sample count, total, mean, and maximum milliseconds;
-- final lock and clock-tracking state;
 - exit code and error.
+
+It intentionally contains no source descriptor, decoder configuration,
+per-source final state, or source array. Consumers that need those fields read
+`source-sessions.jsonl`; this keeps the ordinary JSON summary bounded even for
+an indefinitely running GUI.
 
 `transport_bytes / 188` (plus a separately reported remainder) is the
 authoritative count of packets actually delivered to the TS callback. The
 current `TransportDecoderStats` values describe only the active FEC decoder
-session and can reset on a gated region or parameter change. Before report
-summaries claim run-wide RS, TEI, BER, or TS totals, the FEC stage must preserve
-final per-session counters and expose monotonic cumulative values. Inferring a
-reset only from a decreasing polled counter is not exact and is not acceptable.
+session and can reset on a gated region or parameter change. Report summaries
+therefore aggregate typed FEC-window deltas. Inferring a reset only from a
+decreasing polled counter is not exact and is not used.
 
 Percentiles are deliberately omitted from the first in-process summary. The
 online aggregator remains bounded by keeping count, total, minimum, and
@@ -428,6 +465,12 @@ Implemented:
   by JSONL output and the human-readable `--debug` renderer;
 - homogeneous structured decoder events shared by `events.jsonl`, summary
   event counts, and the `--debug` event renderer;
+- GUI report lifecycle integration using the same telemetry queue, JSONL
+  writers, periodic pipeline samples, and final summary as offline decoding;
+- one run-wide `stats.json` plus homogeneous per-source summaries across GUI
+  EOF, close, replay, sample-rate restart, and retune boundaries;
+- headless schema coverage for two source sessions, epoch/generation ranges,
+  non-empty-directory refusal, and exact FEC-delta aggregation;
 - short real-capture validation of stdin/stdout, JSON validity, failure and
   no-transport statuses, and byte-identical TS output compared with file I/O.
 
@@ -435,6 +478,8 @@ Remaining validation and follow-up:
 
 - run the complete 545 MHz capture and compare report-disabled/report-enabled
   TS output, dropped-block count, and throughput;
+- validate GUI reports across I/Q end-of-file, explicit source close, replay,
+  retune, and live receiver shutdown;
 - add standalone schema-validation tooling once the version-0 fields settle.
 
 Tests must cover a non-empty report-directory refusal, output/report write

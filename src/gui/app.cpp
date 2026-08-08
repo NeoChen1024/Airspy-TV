@@ -1,6 +1,7 @@
 #include "app.hpp"
 
 #include "app_state.hpp"
+#include "decode_reporting.hpp"
 #include "panels.hpp"
 #include "widgets.hpp"
 #include <SDL3/SDL.h>
@@ -16,6 +17,7 @@
 #include <ranges>
 #include <span>
 #include <string>
+#include <utility>
 
 namespace airspy_tv::gui {
 namespace {
@@ -128,7 +130,7 @@ void draw_application(AppState &state) {
 
 } // namespace
 
-int run_gui() {
+int run_gui(std::optional<std::filesystem::path> report_directory) {
     SDL_SetAppMetadata("Airspy TV", "0.1.0", "io.github.airspy-tv");
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         std::cerr << "SDL_Init failed: " << SDL_GetError() << '\n';
@@ -177,7 +179,7 @@ int run_gui() {
     ImGui_ImplSDL3_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
-    AppState state;
+    AppState state(std::move(report_directory));
     initialize_standard_state(state);
     state.window = window;
     std::string player_error;
@@ -234,6 +236,7 @@ int run_gui() {
         SDL_GL_SwapWindow(window);
     }
 
+    finalize_decode_report(state);
     state.session.set_transport_sink({});
     state.session.close();
     state.player.shutdown();

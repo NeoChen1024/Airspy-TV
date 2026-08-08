@@ -24,6 +24,7 @@ namespace {
 
 using airspy_tv::DecodeReport;
 using airspy_tv::DecodeReportConfig;
+using airspy_tv::DecodeSourceSessionConfig;
 using airspy_tv::dvbt::StreamDecoder;
 using airspy_tv::dvbt::StreamDecoderStats;
 
@@ -122,14 +123,35 @@ int offline_decode_cli(
         try {
             report = std::make_unique<DecodeReport>(DecodeReportConfig{
                 .directory = *report_directory,
-                .source = stdin_source ? "stdin" : source.string(),
-                .destination =
-                    stdout_destination ? "stdout" : destination.string(),
-                .sample_rate_hz = info.sample_rate_hz,
-                .decoder = parameters,
+                .context = "offline",
             });
         } catch (const std::exception &exception) {
             std::cerr << "Unable to initialize performance report: "
+                      << exception.what() << '\n';
+            return 1;
+        }
+    }
+
+    StreamDecoder decoder;
+    decoder.set_parameters(parameters);
+    const bool detailed = report != nullptr || airspy_tv::is_debug_enabled();
+    decoder.set_telemetry_enabled(detailed, started_at);
+    airspy_tv::InputSampleTimeline input_timeline;
+    input_timeline.begin_stream(info.sample_rate_hz);
+    if (report) {
+        try {
+            report->begin_source(
+                DecodeSourceSessionConfig{
+                    .source = stdin_source ? "stdin" : source.string(),
+                    .destination =
+                        stdout_destination ? "stdout" : destination.string(),
+                    .sample_rate_hz = info.sample_rate_hz,
+                    .center_frequency_hz = info.center_frequency_hz,
+                    .decoder = parameters,
+                },
+                input_timeline.snapshot(), decoder.stats(), 0.0);
+        } catch (const std::exception &exception) {
+            std::cerr << "Unable to begin performance report source: "
                       << exception.what() << '\n';
             return 1;
         }
@@ -155,7 +177,9 @@ int offline_decode_cli(
         std::cerr << error << '\n';
         if (report) {
             try {
-                report->finalize("failed", 1, error, {}, 0, 0.0);
+                report->end_source("failed", error, decoder.stats(),
+                                   input_timeline.snapshot(), 0, 0.0);
+                report->finalize("failed", 1, error, 0.0);
             } catch (const std::exception &exception) {
                 std::cerr << "Unable to finalize performance report: "
                           << exception.what() << '\n';
@@ -164,10 +188,6 @@ int offline_decode_cli(
         return 1;
     }
 
-    StreamDecoder decoder;
-    decoder.set_parameters(parameters);
-    const bool detailed = report != nullptr || airspy_tv::is_debug_enabled();
-    decoder.set_telemetry_enabled(detailed, started_at);
     std::atomic_bool output_failed{};
     decoder.set_transport_callback(
         [output, &output_failed](const std::span<const std::uint8_t> ts) {
@@ -178,8 +198,6 @@ int offline_decode_cli(
             }
         });
 
-    airspy_tv::InputSampleTimeline input_timeline;
-    input_timeline.begin_stream(info.sample_rate_hz);
     const std::size_t scalar_samples =
         StreamDecoder::chunk_samples_for(info.sample_rate_hz) * 2;
     std::vector<std::int16_t> block(scalar_samples);
@@ -307,8 +325,9 @@ int offline_decode_cli(
     }
     if (report) {
         try {
-            report->finalize(status, exit_code, error, stats, submitted_samples,
-                             wall_seconds);
+            report->end_source(status, error, stats, input_timeline.snapshot(),
+                               submitted_samples, wall_seconds);
+            report->finalize(status, exit_code, error, wall_seconds);
         } catch (const std::exception &exception) {
             std::cerr << "Unable to finalize performance report: "
                       << exception.what() << '\n';
