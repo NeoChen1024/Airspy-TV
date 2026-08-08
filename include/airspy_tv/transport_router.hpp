@@ -1,6 +1,7 @@
 #pragma once
 
 #include "airspy_tv/recorder.hpp"
+#include "airspy_tv/rtp_udp_output.hpp"
 #include "airspy_tv/transport_stream.hpp"
 
 #include <cstdint>
@@ -18,7 +19,8 @@ class TransportStreamRouter {
     using Sink = std::function<void(std::span<const std::uint8_t>)>;
 
     TransportStreamRouter(TransportStreamModel &model,
-                          TransportStreamRecorder &recorder) noexcept;
+                          TransportStreamRecorder &recorder,
+                          RtpUdpTransportOutput &rtp_output) noexcept;
 
     void consume(std::span<const std::uint8_t> transport_stream);
     void set_sink(Sink sink);
@@ -26,6 +28,7 @@ class TransportStreamRouter {
   private:
     TransportStreamModel &model_;
     TransportStreamRecorder &recorder_;
+    RtpUdpTransportOutput &rtp_output_;
     mutable std::mutex sink_mutex_;
     Sink sink_;
 };

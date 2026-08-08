@@ -91,6 +91,8 @@ add_library(airspy-tv-common STATIC
     src/fec/reed_solomon.cpp
     src/fec/soft_viterbi.cpp
     src/jsonl.cpp
+    src/rtp_udp_output.cpp
+    src/transport_output.cpp
 )
 target_include_directories(airspy-tv-common PUBLIC include)
 target_link_libraries(airspy-tv-common PUBLIC Threads::Threads
@@ -126,10 +128,13 @@ add_executable(airspy-tv
     src/gui/spectrum_panels.cpp
     src/gui/widgets.cpp
     src/iq_file.cpp
+    src/live_decode.cpp
     src/main.cpp
     src/mpv_player.cpp
     src/offline_decode.cpp
     src/decode_report.cpp
+    src/decode_progress.cpp
+    src/decode_run_reporter.cpp
     src/receiver_session.cpp
     src/recorder.cpp
     src/sdr.cpp
@@ -286,6 +291,26 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME byte-rate-tracker COMMAND byte-rate-tracker-test)
+
+    add_executable(transport-output-test
+        tests/transport_output_test.cpp
+    )
+    target_link_libraries(transport-output-test PRIVATE airspy-tv-common)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(transport-output-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME transport-output COMMAND transport-output-test)
+
+    add_executable(rtp-udp-output-test
+        tests/rtp_udp_output_test.cpp
+    )
+    target_link_libraries(rtp-udp-output-test PRIVATE airspy-tv-common)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(rtp-udp-output-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME rtp-udp-output COMMAND rtp-udp-output-test)
 
     add_executable(vector-ops-test
         tests/vector_ops_test.cpp

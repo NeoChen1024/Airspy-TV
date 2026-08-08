@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../byte_rate_tracker.hpp"
+#include "../decode_run_reporter.hpp"
 #include "../pipeline_load_monitor.hpp"
 #include "../receiver_session.hpp"
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
@@ -20,10 +21,6 @@
 #include <vector>
 
 struct SDL_Window;
-
-namespace airspy_tv {
-class DecodeReport;
-}
 
 namespace airspy_tv::gui {
 
@@ -59,33 +56,10 @@ struct WaterfallDisplay {
     void destroy();
 };
 
-struct GuiDecodeReportState {
-    explicit GuiDecodeReportState(
-        std::optional<std::filesystem::path> report_directory = std::nullopt);
-    ~GuiDecodeReportState();
-
-    GuiDecodeReportState(const GuiDecodeReportState &) = delete;
-    GuiDecodeReportState &operator=(const GuiDecodeReportState &) = delete;
-
-    std::optional<std::filesystem::path> directory;
-    std::unique_ptr<DecodeReport> writer;
-    std::chrono::steady_clock::time_point started_at{};
-    std::chrono::steady_clock::time_point last_periodic{};
-    InputTimelineSnapshot source_timeline_baseline;
-    dvbt::StreamDecoderStats source_stats_baseline;
-    bool prepared{};
-    bool source_active{};
-    bool completed{};
-    bool saw_streaming{};
-    bool any_transport{};
-    bool any_failed{};
-    std::uint64_t source_sessions{};
-};
-
 struct AppState {
     explicit AppState(
         std::optional<std::filesystem::path> report_directory = std::nullopt)
-        : decode_report(std::move(report_directory)) {}
+        : decode_report(std::move(report_directory), "gui") {}
 
     MpvPlayer player;
     ReceiverSession session;
@@ -96,8 +70,11 @@ struct AppState {
     std::string status{"Ready"};
     std::string recording_path{"capture.cs16"};
     std::string ts_recording_path{"capture.ts"};
+    std::string rtp_host{"127.0.0.1"};
+    std::uint16_t rtp_port{5004};
     ByteRateTracker iq_write_rate;
     ByteRateTracker ts_write_rate;
+    ByteRateTracker rtp_write_rate;
     std::size_t selected_colormap{};
     float display_floor_dbfs{default_display_floor_dbfs};
     float display_ceiling_dbfs{default_display_ceiling_dbfs};
@@ -127,7 +104,8 @@ struct AppState {
         std::make_shared<FileDialogState>()};
     EpgModel epg;
     const DeviceDescriptor *last_source_descriptor{};
-    GuiDecodeReportState decode_report;
+    bool observed_input_exhausted{};
+    DecodeRunReporter decode_report;
 };
 
 } // namespace airspy_tv::gui

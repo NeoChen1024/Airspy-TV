@@ -9,7 +9,11 @@ enum CliOption : int {
     opt_enumerate = 1000,
     opt_inspect_iq,
     opt_decode_iq,
+    opt_decode_live,
+    opt_device,
+    opt_iq_input,
     opt_ts_output,
+    opt_rtp_output,
     opt_report_dir,
     opt_sample_rate,
     opt_mode,
@@ -33,7 +37,11 @@ constexpr option cli_options[] = {
     {"enumerate", no_argument, nullptr, opt_enumerate},
     {"inspect-iq", required_argument, nullptr, opt_inspect_iq},
     {"decode-iq", required_argument, nullptr, opt_decode_iq},
+    {"decode-live", no_argument, nullptr, opt_decode_live},
+    {"device", required_argument, nullptr, opt_device},
+    {"iq-input", required_argument, nullptr, opt_iq_input},
     {"ts-output", required_argument, nullptr, opt_ts_output},
+    {"rtp-output", required_argument, nullptr, opt_rtp_output},
     {"report-dir", required_argument, nullptr, opt_report_dir},
     {"sample-rate", required_argument, nullptr, opt_sample_rate},
     // Broadcast standard selection: DVB-T is the only implemented value
@@ -91,6 +99,19 @@ void print_cli_usage() {
            "10000000)\n"
         << "      --decoder-threads N       Worker budget 0..256 "
            "(default 0 = auto)\n"
+        << "\n"
+        << "Live MPEG-TS decoding (SDR or real-time I/Q replay):\n"
+        << "      --decode-live             Decode continuously until "
+           "SIGINT/SIGTERM\n"
+        << "      --device ID               Exact device ID from --enumerate "
+           "(default: native Airspy or first)\n"
+        << "      --iq-input PATH|-         Replay an I/Q file or stdin in real time "
+           "instead of using an SDR\n"
+        << "      --ts-output PATH|-        MPEG-TS file or stdout\n"
+        << "      --rtp-output HOST:PORT    RTP/UDP output; IPv6 uses "
+           "[ADDRESS]:PORT\n"
+        << "                                 (at least one live output is "
+           "required)\n"
         << "\n"
         << "Broadcast standard (default dvbt):\n"
         << "      --mode STANDARD           dvbt (DVB-C/DVB-T2/DTMB/ATSC "

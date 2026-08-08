@@ -5,13 +5,15 @@
 namespace airspy_tv {
 
 TransportStreamRouter::TransportStreamRouter(
-    TransportStreamModel &model, TransportStreamRecorder &recorder) noexcept
-    : model_(model), recorder_(recorder) {}
+    TransportStreamModel &model, TransportStreamRecorder &recorder,
+    RtpUdpTransportOutput &rtp_output) noexcept
+    : model_(model), recorder_(recorder), rtp_output_(rtp_output) {}
 
 void TransportStreamRouter::consume(
     const std::span<const std::uint8_t> transport_stream) {
     model_.consume(transport_stream);
     recorder_.submit(transport_stream);
+    rtp_output_.submit(transport_stream);
 
     Sink sink;
     {

@@ -117,6 +117,7 @@ void draw_application(AppState &state) {
     draw_playback_panel(state);
     draw_epg_panel(state);
     draw_ts_recorder_panel(state);
+    draw_rtp_streaming_panel(state);
     draw_recorder_panel(state);
     ImGui::EndChild();
     ImGui::SameLine();
@@ -218,6 +219,11 @@ int run_gui(std::optional<std::filesystem::path> report_directory) {
         if (!runtime_error.empty()) {
             state.status = runtime_error;
         }
+        const bool input_exhausted = state.session.input_exhausted();
+        if (input_exhausted && !state.observed_input_exhausted) {
+            state.status = "I/Q file playback finished";
+        }
+        state.observed_input_exhausted = input_exhausted;
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();

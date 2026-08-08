@@ -33,7 +33,8 @@ transport/playback observability, portability, and new-standard DSP.
 
 ### StreamDecoder integration
 
-- Add end-to-end synthetic 2K fixtures and cover every guard interval.
+- Run the checked-in streaming 2K end-to-end validator routinely and extend it
+  across every guard interval, bandwidth, modulation, and code rate.
 - Cover automatic and forced transmission-mode transitions.
 - Verify continuous-resampler equivalence across random input block boundaries
   and supported rate changes.

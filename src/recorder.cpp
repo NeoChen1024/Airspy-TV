@@ -1,4 +1,5 @@
 #include "airspy_tv/recorder.hpp"
+#include "airspy_tv/transport_output.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -20,7 +21,6 @@ constexpr std::size_t recorder_buffer_seconds = 5;
 // 24 MiB holds more than five seconds at DVB-T's maximum useful
 // transport-stream rate while keeping the capacity independent of callback
 // block boundaries.
-constexpr std::size_t transport_queue_capacity_bytes = 24U << 20U;
 
 } // namespace
 
@@ -196,43 +196,12 @@ RecordingStats RawIqRecorder::stats() const {
 }
 
 struct TransportStreamRecorder::Impl {
-    mutable std::mutex mutex;
-    std::condition_variable ready;
-    std::deque<std::vector<std::uint8_t>> queue;
-    std::ofstream output;
-    std::thread worker;
-    std::chrono::steady_clock::time_point started_at;
-    std::size_t queued_bytes{};
-    std::size_t queue_capacity_bytes{transport_queue_capacity_bytes};
-    bool stopping{};
-    std::atomic<bool> active;
-    std::atomic<std::uint64_t> elapsed_milliseconds;
-    std::atomic<std::uint64_t> bytes_written;
-    std::atomic<std::uint64_t> dropped_blocks;
-
-    void run() {
-        while (true) {
-            std::vector<std::uint8_t> block;
-            {
-                std::unique_lock lock(mutex);
-                ready.wait(lock, [this] { return stopping || !queue.empty(); });
-                if (queue.empty() && stopping) {
-                    break;
-                }
-                block = std::move(queue.front());
-                queue.pop_front();
-                queued_bytes -= block.size();
-            }
-            output.write(reinterpret_cast<const char *>(block.data()),
-                         static_cast<std::streamsize>(block.size()));
-            if (!output) {
-                active = false;
-                continue;
-            }
-            bytes_written += block.size();
-        }
-        output.flush();
-    }
+    AsyncTransportOutput output{TransportOutputConfig{
+        .queue_capacity_bytes = 24U << 20U,
+        .overflow_policy = TransportOverflowPolicy::drop_newest,
+        .criticality = TransportSinkCriticality::optional,
+        .thread_name = "ts-recorder",
+    }};
 };
 
 TransportStreamRecorder::TransportStreamRecorder()
@@ -242,78 +211,26 @@ TransportStreamRecorder::~TransportStreamRecorder() noexcept { stop(); }
 
 bool TransportStreamRecorder::start(const std::filesystem::path &path,
                                     std::string &error) {
-    stop();
     if (path.empty()) {
         error = "Transport-stream recording path is empty";
         return false;
     }
-    impl_->output.open(path, std::ios::binary | std::ios::trunc);
-    if (!impl_->output) {
-        error = "Unable to open transport-stream recording: " + path.string();
-        return false;
-    }
-    impl_->stopping = false;
-    impl_->queued_bytes = 0;
-    impl_->queue_capacity_bytes = transport_queue_capacity_bytes;
-    impl_->started_at = std::chrono::steady_clock::now();
-    impl_->elapsed_milliseconds = 0;
-    impl_->bytes_written = 0;
-    impl_->dropped_blocks = 0;
-    impl_->active = true;
-    impl_->worker = std::thread([this] { impl_->run(); });
-    return true;
+    return impl_->output.start_file(path, error);
 }
 
 void TransportStreamRecorder::submit(
     const std::span<const std::uint8_t> transport_stream) {
-    if (!impl_->active || transport_stream.empty()) {
-        return;
-    }
-    const std::scoped_lock lock(impl_->mutex);
-    impl_->queue_capacity_bytes =
-        std::max(impl_->queue_capacity_bytes, transport_stream.size());
-    if (impl_->queued_bytes + transport_stream.size() >
-        impl_->queue_capacity_bytes) {
-        ++impl_->dropped_blocks;
-        return;
-    }
-    impl_->queue.emplace_back(transport_stream.begin(), transport_stream.end());
-    impl_->queued_bytes += transport_stream.size();
-    impl_->ready.notify_one();
+    static_cast<void>(impl_->output.submit(transport_stream));
 }
 
-void TransportStreamRecorder::stop() noexcept {
-    if (!impl_->worker.joinable()) {
-        return;
-    }
-    {
-        const std::scoped_lock lock(impl_->mutex);
-        impl_->stopping = true;
-        impl_->active = false;
-    }
-    impl_->ready.notify_one();
-    impl_->worker.join();
-    impl_->elapsed_milliseconds = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - impl_->started_at)
-            .count());
-    impl_->output.close();
-    impl_->queue.clear();
-    impl_->queued_bytes = 0;
-}
+void TransportStreamRecorder::stop() noexcept { impl_->output.stop(); }
 
 TransportRecordingStats TransportStreamRecorder::stats() const {
-    std::uint64_t elapsed = impl_->elapsed_milliseconds;
-    if (impl_->active) {
-        elapsed = static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - impl_->started_at)
-                .count());
-    }
-    return {.active = impl_->active,
-            .elapsed_milliseconds = elapsed,
-            .bytes_written = impl_->bytes_written,
-            .dropped_blocks = impl_->dropped_blocks};
+    const auto stats = impl_->output.stats();
+    return {.active = stats.active,
+            .elapsed_milliseconds = stats.elapsed_milliseconds,
+            .bytes_written = stats.bytes_written,
+            .dropped_blocks = stats.dropped_blocks};
 }
 
 } // namespace airspy_tv

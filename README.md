@@ -47,6 +47,9 @@ so GNU Radio appears only as an offline test fixture.
 - Real-time replay of application sidecars and raw `airspy_rx` INT16_IQ files.
 - Decoder-paced offline I/Q-to-MPEG-TS extraction without realtime throttling
   or file-input drops.
+- Headless live SDR or real-time I/Q replay to MPEG-TS file/stdout and
+  RTP/UDP, using the same receiver, decoder, reporting, and bounded output
+  paths as the GUI.
 - Continuous DVB-T sample-clock correction through the common variable-rate
   arbitrary resampler, independently of LO/CFO tracking.
 
@@ -104,6 +107,31 @@ CPU. The default soft-Viterbi backend is ViterbiDecoderCpp's AVX2-u16
 implementation when the compiler target supports AVX2, with SSE4.1 and AArch64
 NEON selected on suitable targets and a scalar backend used otherwise.
 Configure with `-DAIRSPY_TV_USE_SIMD_VITERBI=OFF` to force the scalar backend.
+
+Checked-in CMake presets provide reproducible optimized, assertion-enabled,
+portable, and sanitizer builds. Each configure preset has a matching build and
+test preset:
+
+```sh
+cmake --preset optimized-debug
+cmake --build --preset optimized-debug
+ctest --preset optimized-debug
+
+cmake --preset asan-ubsan
+cmake --build --preset asan-ubsan
+ctest --preset asan-ubsan
+
+cmake --preset tsan
+cmake --build --preset tsan
+ctest --preset tsan
+```
+
+The available names are `optimized-debug`, `assertion-debug`,
+`portable-release`, `asan-ubsan`, and `tsan`. The ASan preset also enables
+UBSan and integrated LeakSanitizer. TSan uses a separate binary because its
+runtime cannot be combined with ASan. Sanitizer and portable presets disable
+host-native code generation and the optional SIMD Viterbi backend; they are
+correctness configurations, not realtime throughput baselines.
 
 ## Using the receiver
 
@@ -192,6 +220,46 @@ needed for bare INT16_IQ files; pass it with `--sample-rate HZ`. Offline
 decoding uses blocking submission and does not drop input when the decoder is
 slower than the file reader.
 
+Decode a live SDR source until `SIGINT` or `SIGTERM`. With no `--device`, the
+first native Airspy is preferred and the first remaining SDR is the fallback.
+RTP follows RFC 2250 with payload type 33 and normally carries seven TS packets
+per UDP datagram:
+
+```sh
+./build/airspy-tv --decode-live --frequency 545000000 \
+  --sample-rate 10000000 --ts-output live.ts
+./build/airspy-tv --decode-live --device DEVICE_ID \
+  --frequency 545000000 --ts-output - | mpv -
+./build/airspy-tv --decode-live --frequency 545000000 \
+  --rtp-output 192.0.2.10:5004
+./build/airspy-tv --decode-live --frequency 545000000 \
+  --rtp-output '[2001:db8::10]:5004'
+```
+
+`DEVICE_ID` is the exact third column printed by `--enumerate`. A finite I/Q
+capture can use the same live path with wall-clock pacing, which is useful for
+testing an RTP receiver without SDR hardware:
+
+```sh
+./build/airspy-tv --decode-live --iq-input capture.cs16.json \
+  --rtp-output 127.0.0.1:5004
+./build/airspy-tv --decode-live --iq-input capture.cs16 \
+  --sample-rate 10000000 --ts-output replay.ts \
+  --rtp-output '[::1]:5004'
+producer | ./build/airspy-tv --decode-live --iq-input - \
+  --sample-rate 10000000 --rtp-output 127.0.0.1:5004
+```
+
+I/Q sidecar metadata is honored. Stdin requires an explicit sample rate and is
+cancellable even while its producer is idle. Normal file or stdin EOF completes
+the live command. The live input callback remains non-blocking. File and stdout
+output use an independent 8 MiB queue. If downstream output cannot keep up, the
+CLI warns on stderr and drops the oldest queued TS blocks so reception stays at
+the live edge. An actual file/stdout write error fails the command. RTP/UDP
+queue pressure or send errors instead drop datagrams, update counters, and
+leave reception and other outputs running. The GUI exposes the same IPv4/IPv6
+RTP output between the MPEG-TS and raw I/Q recorder panels.
+
 The decoder worker budget defaults to `std::thread::hardware_concurrency()`.
 `--decoder-threads N` overrides it; the same option appears in the GUI and is
 fixed while a source is open. `0` selects the automatic default. The DVB-T
@@ -201,8 +269,8 @@ auto-detection from the TPS and can be forced when the signal is marginal or
 the capture metadata is incomplete. Pass `-d` or `--debug` to include worker
 allocation, per-stage timings, tracking events, and detailed FEC diagnostics.
 
-Pass `--report-dir DIR` to either offline decoding or the GUI receiver to write
-the machine-readable report described in
+Pass `--report-dir DIR` to offline decoding, live decoding, or the GUI receiver
+to write the machine-readable report described in
 [`docs/machine-readable-performance-report.md`](docs/machine-readable-performance-report.md).
 In GUI mode the report starts with the first opened source and is finalized at
 application shutdown. Each I/Q replay, source reopen, sample-rate restart, or
@@ -240,9 +308,10 @@ remaining validation are maintained in
 
 ## Reproducible test signal
 
-An offline GNU Radio reference transmitter generates a deterministic ideal
-6 MHz, 8K, guard-1/4, 64-QAM, rate-2/3 fixture. This helper requires GNU
-Radio's Python bindings, NumPy, and FFmpeg, but they are not application runtime
+A GNU Radio reference transmitter generates deterministic ideal DVB-T fixtures
+in 2K or 8K mode, every guard interval, 5/6/7/8 MHz bandwidth, QPSK/16-QAM/
+64-QAM, and every non-hierarchical code rate. This helper requires GNU Radio's
+Python bindings, NumPy, and FFmpeg, but they are not application runtime
 dependencies.
 
 ```sh
@@ -258,6 +327,43 @@ The generator writes an application-compatible JSON sidecar and the
 unmodulated source stream as `airspy-tv-ideal.expected.ts`. The current ideal
 regression deterministically recovers packet-aligned TS with a valid PAT and
 PMT.
+
+Use `-` to stream CS16 directly to offline decoding without creating a large
+I/Q file. Generator and GNU Radio diagnostics remain on stderr. The fixed CS16
+scale leaves frontend-like headroom at approximately -20 dBFS RMS instead of
+normalizing each finite fixture to its largest sample:
+
+```sh
+XDG_CACHE_HOME=/tmp/airspy-tv-gnuradio-cache \
+  python3 tools/generate_dvbt_fixture.py - \
+    --duration 3 --dvbt-mode 2k --dvbt-guard 1/32 |
+./build/airspy-tv --decode-iq - --sample-rate 10000000 \
+  --ts-output /tmp/airspy-tv-2k.ts
+```
+
+The same producer can exercise wall-clock pacing and RTP through the live stdin
+source:
+
+```sh
+XDG_CACHE_HOME=/tmp/airspy-tv-gnuradio-cache \
+  python3 tools/generate_dvbt_fixture.py - \
+    --duration 10 --dvbt-mode 2k --dvbt-guard 1/32 |
+./build/airspy-tv --decode-live --iq-input - --sample-rate 10000000 \
+  --rtp-output 127.0.0.1:5004
+```
+
+Run the checked-in streaming end-to-end validator to require zero TEI packets
+and exact cyclic packet identity against the source transport stream:
+
+```sh
+python3 tools/validate_dvbt_fixture_stream.py \
+  --build-dir build --dvbt-mode 2k --dvbt-guard 1/32
+```
+
+Pass `--work-dir PATH` to retain each run in a new child directory containing
+its expected TS, recovered TS, logs, and machine-readable report. Without that
+option, no CS16 fixture is written and all small supporting artifacts are
+temporary.
 
 Sample-clock and LO impairments can be injected independently. Offsets set the
 initial error; drift rates change that error linearly over the fixture:

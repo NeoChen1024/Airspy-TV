@@ -287,6 +287,60 @@ void draw_ts_recorder_panel(AppState &state) {
     ImGui::PopID();
 }
 
+void draw_rtp_streaming_panel(AppState &state) {
+    if (!ImGui::CollapsingHeader("RTP/UDP MPEG-TS Streaming",
+                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+    ImGui::PushID("rtp-streaming");
+    const auto stats = state.session.rtp_streaming_stats();
+    ImGui::BeginDisabled(stats.active);
+    ImGui::TextUnformatted("Destination host");
+    ImGui::SetNextItemWidth(-1.0F);
+    ImGui::InputText("##rtp-host", &state.rtp_host);
+    ImGui::TextUnformatted("UDP port");
+    ImGui::SetNextItemWidth(-1.0F);
+    ImGui::InputScalar("##rtp-port", ImGuiDataType_U16, &state.rtp_port);
+    ImGui::EndDisabled();
+
+    if (!stats.active) {
+        ImGui::BeginDisabled(!state.session.is_streaming() ||
+                             state.rtp_host.empty() || state.rtp_port == 0);
+        if (ImGui::Button("Start streaming", ImVec2(-1.0F, 0.0F))) {
+            std::string error;
+            const RtpUdpEndpoint endpoint{.host = state.rtp_host,
+                                          .port = state.rtp_port};
+            state.status = state.session.start_rtp_streaming(endpoint, error)
+                               ? "Streaming MPEG-TS over RTP/UDP to " +
+                                     format_rtp_udp_endpoint(endpoint)
+                               : error;
+        }
+        ImGui::EndDisabled();
+    } else if (ImGui::Button("Stop streaming", ImVec2(-1.0F, 0.0F))) {
+        state.session.stop_rtp_streaming();
+        state.status = "RTP/UDP streaming stopped";
+    }
+
+    const double mib_per_second =
+        state.rtp_write_rate.update(stats.active, stats.wire_bytes_sent);
+    ImGui::Text("Duration: %s",
+                format_recording_duration(stats.elapsed_milliseconds).c_str());
+    ImGui::Text("Sent: %.2f MiB",
+                static_cast<double>(stats.wire_bytes_sent) / (1024.0 * 1024.0));
+    ImGui::Text("Send rate: %.2f MiB/s", mib_per_second);
+    ImGui::Text("Datagrams: %llu",
+                static_cast<unsigned long long>(stats.datagrams_sent));
+    ImGui::Text("Queued: %.1f KiB",
+                static_cast<double>(stats.queued_bytes) / 1024.0);
+    ImGui::Text("Dropped: %llu   Send errors: %llu",
+                static_cast<unsigned long long>(stats.dropped_datagrams),
+                static_cast<unsigned long long>(stats.write_errors));
+    if (!stats.last_error.empty()) {
+        ImGui::TextWrapped("Last send error: %s", stats.last_error.c_str());
+    }
+    ImGui::PopID();
+}
+
 void draw_playback_panel(AppState &state) {
     if (!ImGui::CollapsingHeader("Playback", ImGuiTreeNodeFlags_DefaultOpen)) {
         return;

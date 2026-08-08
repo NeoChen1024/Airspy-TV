@@ -404,26 +404,24 @@ DemodFlow StreamDecoder::Impl::demod_prepare_stream(DemodRuntimeState &state) {
         }
         demod_state.store(static_cast<int>(WorkerState::processing));
         const float score = demod_run_acquisition(state);
+        bool closed_without_grid = false;
         if (!have_grid) {
             {
                 const std::scoped_lock lock(mutex);
                 demod_busy = false;
                 acquisition_pending = false;
+                closed_without_grid = ring_closed;
+                if (closed_without_grid) {
+                    // No acquisition means these samples cannot be consumed by
+                    // the symbol loop. Drop the closed stream's dead data
+                    // before parking for reset or a new source, so
+                    // wait_until_idle can observe a genuinely drained decoder.
+                    ring_read_pos = ring_write_pos;
+                }
             }
             idle.notify_all();
         }
-        if (!have_grid && ring_closed) {
-            {
-                const std::scoped_lock lock(mutex);
-                demod_busy = false;
-                // No acquisition means these samples cannot be
-                // consumed by the symbol loop. Drop the closed
-                // stream's dead data before parking for reset or a
-                // new source, so wait_until_idle can observe a
-                // genuinely drained decoder.
-                ring_read_pos = ring_write_pos;
-                idle.notify_all();
-            }
+        if (closed_without_grid) {
             // The stream ended without a signal. Stay alive for
             // the next stream: a reset bumps the sync version and
             // a reopened ring refills the data.

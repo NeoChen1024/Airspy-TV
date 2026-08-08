@@ -26,6 +26,10 @@ bool ReceiverSession::is_open() const { return device_.is_open(); }
 
 bool ReceiverSession::is_streaming() const { return device_.is_streaming(); }
 
+bool ReceiverSession::input_exhausted() const {
+    return device_.input_exhausted();
+}
+
 bool ReceiverSession::is_recording() const { return device_.is_recording(); }
 
 const DeviceDescriptor *ReceiverSession::descriptor() const {
@@ -46,6 +50,10 @@ RecordingStats ReceiverSession::recording_stats() const {
 
 TransportRecordingStats ReceiverSession::ts_recording_stats() const {
     return device_.ts_recording_stats();
+}
+
+RtpUdpStats ReceiverSession::rtp_streaming_stats() const {
+    return device_.rtp_streaming_stats();
 }
 
 SpectrumSnapshot ReceiverSession::spectrum_snapshot() const {
@@ -213,6 +221,8 @@ bool ReceiverSession::start_stream(const SourceSettings &settings,
 
 void ReceiverSession::stop_stream() { device_.stop_stream(); }
 
+void ReceiverSession::finish_stream() { device_.finish_stream(); }
+
 void ReceiverSession::close() { device_.close(); }
 
 bool ReceiverSession::retune(const std::uint64_t frequency_hz,
@@ -253,6 +263,13 @@ bool ReceiverSession::start_ts_recording(const std::filesystem::path &path,
 }
 
 void ReceiverSession::stop_ts_recording() { device_.stop_ts_recording(); }
+
+bool ReceiverSession::start_rtp_streaming(const RtpUdpEndpoint &endpoint,
+                                          std::string &error) {
+    return device_.start_rtp_streaming(endpoint, error);
+}
+
+void ReceiverSession::stop_rtp_streaming() { device_.stop_rtp_streaming(); }
 
 void ReceiverSession::set_transport_sink(TransportSink sink) {
     device_.set_transport_sink(std::move(sink));

@@ -2,6 +2,7 @@
 
 #include "airspy_tv/demodulator.hpp"
 #include "airspy_tv/recorder.hpp"
+#include "airspy_tv/rtp_udp_output.hpp"
 #include "airspy_tv/spectrum.hpp"
 #include "airspy_tv/transport_stream.hpp"
 
@@ -68,6 +69,7 @@ class SdrDevice {
     void close();
     bool configure(const SourceSettings &settings, std::string &error);
     bool start_stream(const SourceSettings &settings, std::string &error);
+    void finish_stream();
     void stop_stream();
     bool set_center_frequency(std::uint64_t frequency_hz, std::string &error);
     bool set_frequency_correction_ppm(double ppm, std::string &error);
@@ -90,16 +92,21 @@ class SdrDevice {
     bool start_ts_recording(const std::filesystem::path &path,
                             std::string &error);
     void stop_ts_recording();
+    bool start_rtp_streaming(const RtpUdpEndpoint &endpoint,
+                             std::string &error);
+    void stop_rtp_streaming();
     void set_transport_sink(TransportSink sink);
 
     [[nodiscard]] bool is_open() const;
     [[nodiscard]] bool is_streaming() const;
+    [[nodiscard]] bool input_exhausted() const;
     [[nodiscard]] bool is_recording() const;
     [[nodiscard]] const DeviceDescriptor *descriptor() const;
     [[nodiscard]] const std::vector<std::uint32_t> &sample_rates() const;
     [[nodiscard]] std::optional<std::pair<double, double>> gain_range() const;
     [[nodiscard]] RecordingStats recording_stats() const;
     [[nodiscard]] TransportRecordingStats ts_recording_stats() const;
+    [[nodiscard]] RtpUdpStats rtp_streaming_stats() const;
     [[nodiscard]] SpectrumSnapshot spectrum_snapshot() const;
     [[nodiscard]] SignalSnapshot signal_snapshot() const;
     [[nodiscard]] PipelineSnapshot pipeline_snapshot() const;

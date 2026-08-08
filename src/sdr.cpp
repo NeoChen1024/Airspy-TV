@@ -10,10 +10,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <format>
@@ -22,10 +24,12 @@
 #include <libairspy/airspy.h>
 #include <limits>
 #include <mutex>
+#include <poll.h>
 #include <span>
 #include <sstream>
 #include <string_view>
 #include <thread>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -82,17 +86,21 @@ struct SdrDevice::Impl {
     std::optional<std::pair<double, double>> soapy_gain_range;
     RawIqRecorder recorder;
     TransportStreamRecorder ts_recorder;
+    RtpUdpTransportOutput rtp_output;
     TransportStreamModel transport_model;
-    TransportStreamRouter transport_router{transport_model, ts_recorder};
+    TransportStreamRouter transport_router{transport_model, ts_recorder,
+                                           rtp_output};
     SpectrumAnalyzer analyzer;
     InputSampleTimeline input_timeline;
     std::unique_ptr<Demodulator> demodulator;
     std::thread soapy_worker;
     std::thread file_worker;
     std::filesystem::path file_path;
+    bool file_stdin{};
     std::uint64_t center_frequency_hz{};
     double frequency_correction_ppm{};
     std::atomic<bool> streaming;
+    std::atomic<bool> input_exhausted;
     std::atomic<std::uint32_t> active_sample_rate;
     std::atomic<std::uint32_t> active_channel_bandwidth{6'000'000};
     mutable std::mutex error_mutex;
@@ -194,12 +202,19 @@ struct SdrDevice::Impl {
         std::vector<std::int16_t> samples(file_block_samples * 2);
         const auto started_at = std::chrono::steady_clock::now();
         std::uint64_t emitted_samples = 0;
+        bool reached_eof = false;
         while (streaming) {
             input.read(reinterpret_cast<char *>(samples.data()),
                        static_cast<std::streamsize>(samples.size() *
                                                     sizeof(std::int16_t)));
             const std::streamsize bytes_read = input.gcount();
             if (bytes_read <= 0) {
+                if (input.eof()) {
+                    reached_eof = true;
+                } else {
+                    set_async_error("Unable to read I/Q file: " +
+                                    file_path.string());
+                }
                 break;
             }
             const std::size_t scalar_count =
@@ -221,18 +236,102 @@ struct SdrDevice::Impl {
         if (streaming && demodulator) {
             demodulator->flush();
         }
-        if (streaming.exchange(false)) {
-            set_async_error("I/Q file playback finished");
+        if (streaming.exchange(false) && reached_eof) {
+            input_exhausted = true;
         }
     }
 
-    void stop_source() {
+    void run_stdin() {
+        std::vector<std::int16_t> samples(file_block_samples * 2);
+        const std::size_t capacity_bytes =
+            samples.size() * sizeof(samples.front());
+        std::size_t buffered_bytes = 0;
+        const auto started_at = std::chrono::steady_clock::now();
+        std::uint64_t emitted_samples = 0;
+        bool reached_eof = false;
+
+        const auto submit_buffer = [&] {
+            const std::size_t scalar_count =
+                buffered_bytes / sizeof(samples.front());
+            const std::span sample_block(samples.data(), scalar_count);
+            submit_source_block(sample_block);
+            emitted_samples += scalar_count / 2;
+            buffered_bytes = 0;
+
+            const auto elapsed = std::chrono::duration<double>(
+                static_cast<double>(emitted_samples) /
+                static_cast<double>(active_sample_rate.load()));
+            std::this_thread::sleep_until(started_at + elapsed);
+        };
+
+        while (streaming) {
+            pollfd input{.fd = STDIN_FILENO, .events = POLLIN, .revents = 0};
+            const int ready = ::poll(&input, 1, 50);
+            if (ready < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                set_async_error(std::string("Unable to poll stdin I/Q: ") +
+                                std::strerror(errno));
+                break;
+            }
+            if (ready == 0) {
+                continue;
+            }
+            if ((input.revents & (POLLERR | POLLNVAL)) != 0) {
+                set_async_error("Unable to read stdin I/Q stream");
+                break;
+            }
+            if ((input.revents & (POLLIN | POLLHUP)) == 0) {
+                continue;
+            }
+
+            const ssize_t bytes_read = ::read(
+                STDIN_FILENO,
+                reinterpret_cast<char *>(samples.data()) + buffered_bytes,
+                capacity_bytes - buffered_bytes);
+            if (bytes_read < 0) {
+                if (errno == EINTR || errno == EAGAIN) {
+                    continue;
+                }
+                set_async_error(std::string("Unable to read stdin I/Q: ") +
+                                std::strerror(errno));
+                break;
+            }
+            if (bytes_read == 0) {
+                reached_eof = true;
+                break;
+            }
+            buffered_bytes += static_cast<std::size_t>(bytes_read);
+            if (buffered_bytes == capacity_bytes) {
+                submit_buffer();
+            }
+        }
+
+        if (reached_eof && buffered_bytes != 0) {
+            if (buffered_bytes % (sizeof(std::int16_t) * 2) != 0) {
+                set_async_error(
+                    "stdin I/Q ended with an incomplete complex sample");
+                reached_eof = false;
+            } else {
+                submit_buffer();
+            }
+        }
+        if (streaming && demodulator) {
+            demodulator->flush();
+        }
+        if (streaming.exchange(false) && reached_eof) {
+            input_exhausted = true;
+        }
+    }
+
+    void stop_source(const bool reset_demodulator = true) {
         const bool was_streaming = streaming.exchange(false);
-        // Cancel queued/active DSP immediately. In particular, the native
-        // DVB-T worker may otherwise continue decoding a large chunk while
-        // the UI is already tearing down after a window-close request.
+        // The normal GUI stop path cancels queued DSP immediately. The live
+        // CLI graceful path instead stops input first and flushes below so its
+        // final decoder statistics remain available for reporting.
         analyzer.reset();
-        if (demodulator) {
+        if (reset_demodulator && demodulator) {
             // Reset decoder state; smart-pointer ownership is unchanged.
             // NOLINTNEXTLINE(readability-ambiguous-smartptr-reset-call)
             demodulator->reset();
@@ -252,12 +351,16 @@ struct SdrDevice::Impl {
             soapy->closeStream(soapy_stream);
             soapy_stream = nullptr;
         }
+        if (!reset_demodulator && was_streaming && demodulator) {
+            demodulator->flush();
+        }
     }
 
     void stop_all() {
         stop_source();
         recorder.stop();
         ts_recorder.stop();
+        rtp_output.stop();
     }
 };
 
@@ -406,22 +509,37 @@ bool SdrDevice::open_iq_file(const std::filesystem::path &path,
     close();
     impl_->transport_model.reset();
     IqFileInfo info;
-    if (!resolve_iq_file(path, settings.sample_rate_hz,
-                         settings.center_frequency_hz, info, error)) {
+    const bool stdin_source = path == std::filesystem::path("-");
+    if (stdin_source) {
+        if (settings.sample_rate_hz == 0) {
+            error = "A positive sample rate is required for stdin I/Q";
+            return false;
+        }
+        info = {.data_path = {},
+                .source = "stdin raw little-endian interleaved CS16",
+                .sample_rate_hz = settings.sample_rate_hz,
+                .center_frequency_hz = settings.center_frequency_hz,
+                .file_size_bytes = 0};
+    } else if (!resolve_iq_file(path, settings.sample_rate_hz,
+                                settings.center_frequency_hz, info, error)) {
         return false;
     }
     settings.sample_rate_hz = info.sample_rate_hz;
     settings.center_frequency_hz = info.center_frequency_hz;
     impl_->file_path = info.data_path;
+    impl_->file_stdin = stdin_source;
     impl_->rates = {settings.sample_rate_hz};
     impl_->current = {
         .backend = SdrBackend::File,
-        .id = "file:" + info.data_path.string(),
-        .display_name = info.data_path.filename().string() + " [I/Q file]",
-        .driver = "file",
+        .id = stdin_source ? "stream:stdin" : "file:" + info.data_path.string(),
+        .display_name =
+            stdin_source ? "stdin [I/Q stream]"
+                         : info.data_path.filename().string() + " [I/Q file]",
+        .driver = stdin_source ? "stdin" : "file",
         .serial = {},
         .arguments = {{"source", info.source},
-                      {"path", info.data_path.string()}},
+                      {"path",
+                       stdin_source ? "stdin" : info.data_path.string()}},
     };
     impl_->async_error.clear();
     impl_->opened = true;
@@ -440,6 +558,7 @@ void SdrDevice::close() {
     }
     impl_->opened = false;
     impl_->file_path.clear();
+    impl_->file_stdin = false;
     impl_->center_frequency_hz = 0;
     impl_->frequency_correction_ppm = 0.0;
     impl_->rates.clear();
@@ -528,11 +647,18 @@ bool SdrDevice::start_stream(const SourceSettings &settings,
     }
 
     impl_->async_error.clear();
+    impl_->input_exhausted = false;
     impl_->active_sample_rate = settings.sample_rate_hz;
     impl_->input_timeline.begin_stream(settings.sample_rate_hz);
     if (impl_->current.backend == SdrBackend::File) {
         impl_->streaming = true;
-        impl_->file_worker = std::thread([this] { impl_->run_file(); });
+        impl_->file_worker = std::thread([this] {
+            if (impl_->file_stdin) {
+                impl_->run_stdin();
+            } else {
+                impl_->run_file();
+            }
+        });
         return true;
     }
     if (impl_->current.backend == SdrBackend::AirspyNative) {
@@ -570,6 +696,11 @@ bool SdrDevice::start_stream(const SourceSettings &settings,
 
 void SdrDevice::stop_stream() {
     impl_->stop_source();
+    impl_->recorder.stop();
+}
+
+void SdrDevice::finish_stream() {
+    impl_->stop_source(false);
     impl_->recorder.stop();
 }
 
@@ -786,6 +917,17 @@ bool SdrDevice::start_ts_recording(const std::filesystem::path &path,
 
 void SdrDevice::stop_ts_recording() { impl_->ts_recorder.stop(); }
 
+bool SdrDevice::start_rtp_streaming(const RtpUdpEndpoint &endpoint,
+                                    std::string &error) {
+    if (!impl_->streaming) {
+        error = "Start an SDR or I/Q file source before RTP/UDP streaming";
+        return false;
+    }
+    return impl_->rtp_output.start(endpoint, error);
+}
+
+void SdrDevice::stop_rtp_streaming() { impl_->rtp_output.stop(); }
+
 void SdrDevice::set_transport_sink(TransportSink sink) {
     impl_->transport_router.set_sink(std::move(sink));
 }
@@ -793,6 +935,8 @@ void SdrDevice::set_transport_sink(TransportSink sink) {
 bool SdrDevice::is_open() const { return impl_->opened; }
 
 bool SdrDevice::is_streaming() const { return impl_->streaming; }
+
+bool SdrDevice::input_exhausted() const { return impl_->input_exhausted; }
 
 bool SdrDevice::is_recording() const { return impl_->recorder.stats().active; }
 
@@ -814,6 +958,10 @@ RecordingStats SdrDevice::recording_stats() const {
 
 TransportRecordingStats SdrDevice::ts_recording_stats() const {
     return impl_->ts_recorder.stats();
+}
+
+RtpUdpStats SdrDevice::rtp_streaming_stats() const {
+    return impl_->rtp_output.stats();
 }
 
 SpectrumSnapshot SdrDevice::spectrum_snapshot() const {

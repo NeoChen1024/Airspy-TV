@@ -16,10 +16,12 @@ file-level cleanup rather than a known unsafe data-flow design.
 
 The current tests cover the main 8K stream path, reset/reopen and rapid-retune
 shapes, inner/outer FEC, pipeline-load telemetry, EPG, and recorder byte-rate
-tracking. They do not yet cover several important contracts:
+tracking. An opt-in GNU Radio validator also streams synthetic 2K/8K input
+through stdin and checks exact recovered TS packet identity. Several important
+contracts remain outside the routine suite:
 
-- 2K end-to-end decoding;
-- every guard-interval and automatic/manual mode transition;
+- the full 2K/8K, guard-interval, bandwidth, modulation, and code-rate matrix;
+- automatic/manual mode transitions;
 - continuous-resampler equivalence over random block boundaries and rate
   changes;
 - repeated concurrent submit/reset/flush/stop stress;
@@ -30,16 +32,16 @@ tracking. They do not yet cover several important contracts:
 - PAT/PMT/SDT version changes and malformed-section handling;
 - long synthetic SRO/CFO fixtures as retained opt-in regressions.
 
-Priority should go to lifecycle stress, 2K coverage, and fake-reader playback
-tests because these protect the broadest behavior during further refactoring.
+Priority should go to making the synthetic mode matrix routine, lifecycle
+stress, and fake-reader playback tests because these protect the broadest
+behavior during further refactoring.
 
-### Medium: full runtime and sanitizer validation remains incomplete
+### Medium: extended runtime and sanitizer validation remains incomplete
 
-The existing optimized, assertion-enabled, portable, and targeted TSAN runs
-are useful, but the following validation is still needed after substantial
-pipeline or GUI changes:
+The full current CTest suite passes under the checked-in ASan/UBSan/LSan and
+standalone TSan presets. The following longer or hardware-dependent validation
+is still needed after substantial pipeline or GUI changes:
 
-- a complete ASan/UBSan/LSan run;
 - longer repeated TSAN lifecycle stress rather than only deterministic cases;
 - a fresh full 363.9 GB 545 MHz replay after major DSP changes;
 - 557/581 MHz multipath replay;
@@ -49,10 +51,12 @@ pipeline or GUI changes:
 Long-capture timing requirements remain in
 [clock-tracking.md](clock-tracking.md) rather than in this architecture review.
 
-### Medium: build defaults are optimized for this workstation, not portability
+### Medium: portable and sanitizer profiles are not yet exercised in CI
 
-The following policies remain deliberate but should be isolated or exercised
-in CI:
+`CMakePresets.json` now defines optimized-debug, assertion-debug,
+portable-release, ASan/UBSan/LSan, and standalone TSan configure/build/test
+profiles. The remaining gap is routine CI execution across these deliberate
+policy choices:
 
 - default Debug uses `-O3 -DNDEBUG` unless `AIRSPY_TV_OPTIMIZED_DEBUG=OFF`;
 - `AIRSPY_TV_NATIVE_ARCH=ON` adds `-march=native`;
@@ -61,69 +65,15 @@ in CI:
 
 Recommended direction:
 
-1. define explicit optimized-debug, assertion-debug, portable-release, and
-   sanitizer presets;
-2. make host-native optimization an explicit release/profile choice for
-   distributable builds;
-3. keep SIMD and scalar Viterbi paths buildable until portable coverage is
-   routine.
-
-### Medium: GUI path is split into mode-aware translation units
-
-The former `src/main_gui.hpp` include fragment and its anonymous-namespace
-dependencies have been removed. The desktop path now uses ordinary translation
-units in `src/gui/`, with the following ownership and dependency direction:
-
-```text
-main.cpp -> gui/app.hpp -> gui/app.cpp
-                         -> gui/app_state.hpp
-                         -> gui/widgets.cpp
-                         -> gui/spectrum_panels.cpp
-                         -> gui/source_panels.cpp
-                         -> gui/receiver_panels.cpp
-                         -> gui/dvbt_panels.cpp
-                         -> gui/media_panels.cpp
-```
-
-`gui/app.hpp` exposes only the desktop entry point. `gui/app.cpp` owns SDL,
-OpenGL, and ImGui initialization and shutdown, frame polling, snapshot refresh,
-and top-level composition. Shared widgets, theme/font loading, frequency
-input, and file-dialog plumbing belong in `gui/widgets.cpp`. Spectrum,
-waterfall, and constellation panels; source controls; standard-neutral
-receiver status; DVB-T settings and diagnostics; and transport/media panels
-are separate compilation units. `panels.hpp` is the small internal declaration
-surface; no panel implementation is included into another source file.
-
-The behavior-preserving move retains one internal `AppState`. Its GUI-only
-members may later be grouped into source, spectrum, recorder, transport, and
-typed per-standard sub-states. Do not add a virtual panel framework: free draw
-functions and explicit standard dispatch are sufficient. Common GUI code should
-call standard dispatch points for settings, state refresh, and diagnostics;
-DVB-T types must remain confined to the DVB-T state and panel implementation.
-
-GUI `--report-dir` lifecycle handling is isolated in `gui/decode_reporting.cpp`.
-It consumes the same typed DVB-T telemetry and `DecodeReport` implementation as
-offline decoding; there is no separate periodic GUI diagnostics formatter.
-The report writer is run-scoped, while source sessions are finalized at EOF,
-close, replay, sample-rate restart, or retune and appended to
-`source-sessions.jsonl`. `stats.json` remains a bounded run-wide summary.
-`ReceiverSession` remains the only owner of source start/restart/retune and
-demodulator replacement.
-
-The split preserves these GUI-specific lifecycle constraints:
-
-- SDL file-dialog callbacks retain shared state until asynchronous completion;
-- all ImGui and OpenGL calls remain on the GUI thread;
-- the waterfall texture is destroyed while its OpenGL context is still live;
-- transport sinks are disconnected and source/player workers are stopped
-  before GUI backend teardown;
-- frame refresh and rendering are separate functions, so state polling and
-  debug telemetry do not become implicit panel side effects.
+1. exercise portable-release and both sanitizer profiles in routine CI;
+2. keep host-native optimization confined to explicit local performance
+   profiles and use portable-release for distributable builds;
+3. retain both SIMD and scalar Viterbi build coverage.
 
 ## Recommended order
 
-1. Add 2K and lifecycle/playback regression coverage.
-2. Add build presets and routine portable/sanitizer configurations.
+1. Make the synthetic DVB-T matrix routine and add lifecycle/playback coverage.
+2. Add routine CI execution for portable and sanitizer presets.
 3. Perform full-capture and live-hardware validation after major DSP or source
    changes.
 

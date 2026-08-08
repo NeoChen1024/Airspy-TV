@@ -20,6 +20,7 @@ void draw_standard_diagnostics_panel(AppState &state);
 void draw_playback_panel(AppState &state);
 void draw_epg_panel(AppState &state);
 void draw_ts_recorder_panel(AppState &state);
+void draw_rtp_streaming_panel(AppState &state);
 void draw_recorder_panel(AppState &state);
 void draw_video_panel(AppState &state);
 

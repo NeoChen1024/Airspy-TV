@@ -135,7 +135,8 @@ Because standard input has no sidecar metadata, this form requires an explicit
 option was supplied rather than accepting the current implicit 10 MHz default.
 Input size and signal duration remain unknown until EOF.
 
-`--ts-output -` writes only MPEG-TS bytes to standard output. All progress,
+`--ts-output -` writes only MPEG-TS bytes to standard output for both
+`--decode-iq` and `--decode-live`. All progress,
 warnings, debug diagnostics, and errors continue to use standard error, so the
 following is valid:
 
@@ -143,6 +144,13 @@ following is valid:
 producer | airspy-tv --decode-iq - --sample-rate 10000000 \
   --ts-output - | consumer
 ```
+
+`--decode-live --iq-input PATH|-` uses the same sidecar-aware file source as the
+GUI, or raw little-endian CS16 from stdin, but paces samples against wall clock
+rather than decoding as fast as possible. Stdin requires an explicit sample
+rate and uses cancellable reads. It may write file/stdout MPEG-TS, RTP/UDP, or
+both; normal file or stdin EOF finalizes one source-session record without
+classifying the run as an input failure.
 
 Path collision checks apply only when both operands are real paths.
 

@@ -4,16 +4,14 @@
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 #include "airspy_tv/iq_file.hpp"
 #include "airspy_tv/sample_timeline.hpp"
+#include "decode_progress.hpp"
 #include "decode_report.hpp"
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <format>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -26,50 +24,6 @@ using airspy_tv::DecodeReport;
 using airspy_tv::DecodeReportConfig;
 using airspy_tv::DecodeSourceSessionConfig;
 using airspy_tv::dvbt::StreamDecoder;
-using airspy_tv::dvbt::StreamDecoderStats;
-
-[[nodiscard]] int percent(const std::uint64_t used,
-                          const std::uint64_t capacity) {
-    if (capacity == 0) {
-        return 0;
-    }
-    return static_cast<int>(std::clamp(100.0 * static_cast<double>(used) /
-                                           static_cast<double>(capacity),
-                                       0.0, 100.0));
-}
-
-void print_progress(const StreamDecoderStats &stats,
-                    const std::uint64_t submitted_samples,
-                    const std::uint32_t sample_rate_hz,
-                    const double wall_seconds) {
-    const double input_seconds = sample_rate_hz == 0
-                                     ? 0.0
-                                     : static_cast<double>(submitted_samples) /
-                                           static_cast<double>(sample_rate_hz);
-    const double speed =
-        wall_seconds > 0.0 ? input_seconds / wall_seconds : 0.0;
-    const int iq =
-        percent(stats.queued_input_samples, stats.input_queue_capacity_samples);
-    const int demod = static_cast<int>(
-        std::clamp(100.0F * stats.demod_busy_fraction, 0.0F, 100.0F));
-    const int fec = percent(stats.queued_symbols, stats.symbol_queue_capacity);
-    std::cerr << std::fixed << std::setprecision(1) << "wall=" << wall_seconds
-              << "s input=" << input_seconds << "s speed=" << speed << "x MER=";
-    if (stats.ofdm_locked) {
-        std::cerr << stats.mer_db << "dB";
-    } else {
-        std::cerr << "--";
-    }
-    std::cerr << " OFDM=" << (stats.ofdm_locked ? "lock" : "search")
-              << " TPS=" << (stats.tps_locked ? "lock" : "search")
-              << " TS=" << std::setprecision(1)
-              << static_cast<double>(stats.transport_bytes) / (1024.0 * 1024.0)
-              << "MiB TEI=" << stats.cumulative_transport.tei_packets
-              << std::format(" IQ={:3d}% Demod={:3d}% FEC={:3d}%", iq, demod,
-                             fec)
-              << '\n';
-}
-
 } // namespace
 
 int offline_decode_cli(
@@ -236,7 +190,8 @@ int offline_decode_cli(
         const double elapsed =
             std::chrono::duration<double>(now - started_at).count();
         const auto stats = decoder.stats();
-        print_progress(stats, submitted_samples, info.sample_rate_hz, elapsed);
+        airspy_tv::format_decode_progress(std::cerr, stats, submitted_samples,
+                                          info.sample_rate_hz, elapsed);
         if (report && !report_failed) {
             try {
                 report->write_pipeline(stats, submitted_samples, elapsed);
@@ -310,9 +265,8 @@ int offline_decode_cli(
         exit_code = 1;
         status = "failed";
     } else if (stats.dropped_blocks != 0) {
-        error = std::format(
-            "Internal error: decoder-paced input dropped {} block(s)",
-            stats.dropped_blocks);
+        error = "Internal error: decoder-paced input dropped " +
+                std::to_string(stats.dropped_blocks) + " block(s)";
         exit_code = 1;
         status = "failed";
     } else if (stats.transport_bytes == 0) {
