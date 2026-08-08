@@ -133,6 +133,16 @@ runtime cannot be combined with ASan. Sanitizer and portable presets disable
 host-native code generation and the optional SIMD Viterbi backend; they are
 correctness configurations, not realtime throughput baselines.
 
+The repository validation runner configures, builds, and runs CTest for
+`portable-release`, `asan-ubsan`, and `tsan`, then exercises the full synthetic
+DVB-T matrix under portable and ASan builds and a deterministic all-pairs set
+under TSan. It also validates exact recovered TS identity and every JSON/JSONL
+decode report. Each run emits a versioned machine-readable manifest, bounded
+summary and environment description, homogeneous stage/CTest/fixture JSONL
+streams, native JUnit, full stage logs, and complete failure artifacts. See
+[scripts/README.md](scripts/README.md) for the report schemas, reproducible venv
+bootstrap, smoke mode, and independently adjustable parallelism.
+
 ## Using the receiver
 
 The Source panel exposes the decoder worker budget and available input sources.

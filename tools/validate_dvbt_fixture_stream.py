@@ -6,10 +6,15 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
+import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+from typing import Any
+
+from validate_decode_report import validate_decode_report
 
 TS_PACKET_BYTES = 188
 
@@ -47,6 +52,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-dir", type=Path, default=Path("build"))
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument("--duration", type=float, default=3.0)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        help="pipeline timeout in seconds (default: max(30, duration * 10))",
+    )
+    parser.add_argument("--decoder-threads", type=int, default=0)
+    parser.add_argument("--result-json", type=Path)
     parser.add_argument("--dvbt-mode", choices=("2k", "8k"), default="2k")
     parser.add_argument(
         "--dvbt-channel-bandwidth",
@@ -71,10 +83,14 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.duration <= 0.0:
         parser.error("duration must be positive")
+    if args.timeout is not None and args.timeout <= 0.0:
+        parser.error("timeout must be positive")
+    if not 0 <= args.decoder_threads <= 256:
+        parser.error("decoder threads must be between 0 and 256")
     return args
 
 
-def run_validation(args: argparse.Namespace, work_dir: Path) -> None:
+def run_validation(args: argparse.Namespace, work_dir: Path) -> dict[str, Any]:
     root = Path(__file__).resolve().parents[1]
     decoder = args.build_dir.resolve() / "airspy-tv"
     if not decoder.is_file():
@@ -89,7 +105,7 @@ def run_validation(args: argparse.Namespace, work_dir: Path) -> None:
     env["XDG_CACHE_HOME"] = str(work_dir / "cache")
 
     generator_command = [
-        "python3",
+        sys.executable,
         str(root / "tools/generate_dvbt_fixture.py"),
         "-",
         "--duration",
@@ -120,6 +136,8 @@ def run_validation(args: argparse.Namespace, work_dir: Path) -> None:
         "--report-dir",
         str(report_dir),
     ]
+    if args.decoder_threads != 0:
+        decoder_command.extend(("--decoder-threads", str(args.decoder_threads)))
 
     with generator_log.open("wb") as generator_stderr, decoder_log.open(
         "wb"
@@ -142,7 +160,7 @@ def run_validation(args: argparse.Namespace, work_dir: Path) -> None:
             stderr=subprocess.STDOUT,
         )
         generator.stdout.close()
-        timeout = max(30.0, args.duration * 10.0)
+        timeout = args.timeout or max(30.0, args.duration * 10.0)
         try:
             decoder_result = native_decoder.wait(timeout=timeout)
             generator_result = generator.wait(timeout=10.0)
@@ -169,29 +187,108 @@ def run_validation(args: argparse.Namespace, work_dir: Path) -> None:
     if tei_packets != 0:
         raise RuntimeError(f"recovered MPEG-TS contains {tei_packets} TEI packets")
     source_offset = require_cyclic_match(expected, recovered)
+    report = validate_decode_report(
+        report_dir,
+        expected_samples=round(args.duration * 10_000_000),
+        expected_packets=len(recovered),
+        expected_sample_rate=10_000_000,
+        expected_bandwidth_hz=int(args.dvbt_channel_bandwidth[:-1]) * 1_000_000,
+        expected_transmission_mode=args.dvbt_mode,
+        expected_guard_interval=args.dvbt_guard,
+        expected_constellation=args.dvbt_modulation,
+        expected_code_rate=args.dvbt_code_rate,
+    )
     print(
         f"passed: {args.dvbt_mode.upper()} GI {args.dvbt_guard}, "
         f"{len(recovered)} exact TS packets, source offset {source_offset}, "
-        "TEI=0"
+        f"TEI=0, {sum(report['stream_records'].values())} report records"
     )
+    return {
+        "schema_version": 0,
+        "record_type": "fixture_validation",
+        "status": "passed",
+        "configuration": {
+            "duration_seconds": args.duration,
+            "sample_rate_hz": 10_000_000,
+            "decoder_threads": args.decoder_threads,
+            "transmission_mode": args.dvbt_mode,
+            "channel_bandwidth": args.dvbt_channel_bandwidth,
+            "guard_interval": args.dvbt_guard,
+            "constellation": args.dvbt_modulation,
+            "code_rate": args.dvbt_code_rate,
+        },
+        "transport_validation": {
+            "source_cycle_packets": len(expected),
+            "recovered_packets": len(recovered),
+            "source_offset_packets": source_offset,
+            "tei_packets": tei_packets,
+            "exact_cyclic_match": True,
+        },
+        "decode_report": {
+            "manifest": report["manifest"],
+            "record_counts": report["stream_records"],
+            "stats": report["stats"],
+            "source_session": report["source_session"],
+        },
+    }
+
+
+def write_result(path: Path, result: dict[str, Any]) -> None:
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def main() -> int:
     args = parse_args()
-    with ExitStack() as stack:
-        if args.work_dir is None:
-            work_dir = Path(
-                stack.enter_context(
-                    tempfile.TemporaryDirectory(prefix="airspy-tv-e2e-")
+    try:
+        with ExitStack() as stack:
+            if args.work_dir is None:
+                work_dir = Path(
+                    stack.enter_context(
+                        tempfile.TemporaryDirectory(prefix="airspy-tv-e2e-")
+                    )
                 )
+            else:
+                retained_root = args.work_dir.resolve()
+                retained_root.mkdir(parents=True, exist_ok=True)
+                work_dir = Path(
+                    tempfile.mkdtemp(prefix="dvbt-fixture-", dir=retained_root)
+                )
+            result = run_validation(args, work_dir)
+            if args.result_json is not None:
+                write_result(args.result_json, result)
+            if args.work_dir is not None:
+                print(f"artifacts: {work_dir}")
+    except Exception as exception:
+        if args.result_json is not None:
+            write_result(
+                args.result_json,
+                {
+                    "schema_version": 0,
+                    "record_type": "fixture_validation",
+                    "status": "failed",
+                    "configuration": {
+                        "duration_seconds": args.duration,
+                        "decoder_threads": args.decoder_threads,
+                        "transmission_mode": args.dvbt_mode,
+                        "channel_bandwidth": args.dvbt_channel_bandwidth,
+                        "guard_interval": args.dvbt_guard,
+                        "constellation": args.dvbt_modulation,
+                        "code_rate": args.dvbt_code_rate,
+                    },
+                    "error": {
+                        "type": type(exception).__name__,
+                        "message": str(exception),
+                    },
+                },
             )
-        else:
-            retained_root = args.work_dir.resolve()
-            retained_root.mkdir(parents=True, exist_ok=True)
-            work_dir = Path(tempfile.mkdtemp(prefix="dvbt-fixture-", dir=retained_root))
-        run_validation(args, work_dir)
-        if args.work_dir is not None:
-            print(f"artifacts: {work_dir}")
+        raise
     return 0
 
 
