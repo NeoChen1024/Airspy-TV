@@ -1,5 +1,6 @@
 #include "airspy_tv/dvbt/decoder.hpp"
 #include "airspy_tv/dvbt/transport_decoder.hpp"
+#include "airspy_tv/fec/outer_fec.hpp"
 #include "airspy_tv/fec/reed_solomon.hpp"
 
 #include <algorithm>
@@ -28,6 +29,7 @@ using airspy_tv::dvbt::SymbolDeinterleaver;
 using airspy_tv::dvbt::TransmissionMode;
 using airspy_tv::dvbt::TransportDecoder;
 using airspy_tv::fec::DvbReedSolomon;
+using airspy_tv::fec::OuterFec;
 
 constexpr std::size_t ts_packet_size = 188;
 constexpr std::size_t rs_packet_size = 204;
@@ -104,6 +106,31 @@ outer_interleave(const std::span<const std::uint8_t> input) {
         output.push_back(queue.back());
         queue.pop_back();
         branch = (branch + 1) % branches;
+    }
+    return output;
+}
+
+std::vector<std::uint8_t>
+prepend_bits(const std::span<const std::uint8_t> input,
+             const std::size_t prefix_bits) {
+    require(prefix_bits < 8, "bit-alignment prefix range");
+    if (prefix_bits == 0) {
+        return {input.begin(), input.end()};
+    }
+
+    const std::size_t output_bits = prefix_bits + (input.size() * 8);
+    std::vector<std::uint8_t> output((output_bits + 7) / 8, 0);
+    for (std::size_t bit = 0; bit < prefix_bits; ++bit) {
+        const std::uint8_t value =
+            static_cast<std::uint8_t>((0xA5U >> (7U - bit)) & 1U);
+        output[bit / 8] |= static_cast<std::uint8_t>(value << (7U - (bit % 8)));
+    }
+    for (std::size_t bit = 0; bit < input.size() * 8; ++bit) {
+        const std::uint8_t value = static_cast<std::uint8_t>(
+            (input[bit / 8] >> (7U - (bit % 8))) & 1U);
+        const std::size_t output_bit = prefix_bits + bit;
+        output[output_bit / 8] |=
+            static_cast<std::uint8_t>(value << (7U - (output_bit % 8)));
     }
     return output;
 }
@@ -232,6 +259,38 @@ std::vector<std::uint8_t> make_transport_stream() {
     return stream;
 }
 
+void test_outer_fec_bit_alignment() {
+    const auto expected = make_transport_stream();
+    const auto randomized = energy_scramble(expected);
+    const auto rs = rs_encode(randomized);
+    const auto interleaved = outer_interleave(rs);
+
+    for (std::size_t bit_offset = 0; bit_offset < 8; ++bit_offset) {
+        const auto shifted = prepend_bits(interleaved, bit_offset);
+        OuterFec outer;
+        std::vector<std::uint8_t> recovered;
+        constexpr std::size_t chunk_size = 960;
+        for (std::size_t offset = 0; offset < shifted.size();
+             offset += chunk_size) {
+            const auto packets =
+                outer.process(std::span<const std::uint8_t>{shifted}.subspan(
+                    offset, std::min(chunk_size, shifted.size() - offset)));
+            recovered.insert(recovered.end(), packets.begin(), packets.end());
+        }
+
+        require(!recovered.empty(), "bit-aligned outer FEC produced TS");
+        const auto match = std::search(expected.begin(), expected.end(),
+                                       recovered.begin(), recovered.end());
+        require(match != expected.end(),
+                "bit-aligned outer FEC recovered original TS");
+        const auto stats = outer.stats();
+        require(stats.outer_bit_offset == static_cast<int>(bit_offset),
+                "outer FEC selected expected bit offset");
+        require(stats.rs_uncorrectable_packets == 0,
+                "bit-aligned outer FEC has no RS failures");
+    }
+}
+
 void test_transport_decoder(const CodeRate rate,
                             const std::size_t viterbi_workers = 1) {
     const auto expected = make_transport_stream();
@@ -257,7 +316,8 @@ void test_transport_decoder(const CodeRate rate,
     if (recovered.empty()) {
         const auto failed_stats = decoder.stats();
         throw std::runtime_error(
-            "decoder produced no transport packets; outer phase=" +
+            "decoder produced no transport packets; outer bit offset=" +
+            std::to_string(failed_stats.outer_bit_offset) + ", phase=" +
             std::to_string(failed_stats.outer_deinterleaver_phase) +
             ", RS=" + std::to_string(failed_stats.rs_packets) + ", failures=" +
             std::to_string(failed_stats.rs_uncorrectable_packets) +
@@ -375,7 +435,9 @@ void test_uncorrectable_packet_is_emitted_with_tei() {
     require(tei_packets == 1, "exactly one output packet has TEI set");
 }
 
-void test_equalized_symbol_decoder(const DecoderParameters parameters) {
+void test_equalized_symbol_decoder(const DecoderParameters parameters,
+                                   const std::size_t first_symbol = 0,
+                                   const int expected_bit_offset = 0) {
     const auto expected = make_transport_stream();
     const auto randomized = energy_scramble(expected);
     const auto rs = rs_encode(randomized);
@@ -398,7 +460,8 @@ void test_equalized_symbol_decoder(const DecoderParameters parameters) {
     std::vector<float> reliability(carriers, 32.0F);
     std::vector<std::uint8_t> recovered;
 
-    for (std::size_t symbol = 0; symbol < symbol_count; ++symbol) {
+    require(first_symbol < symbol_count, "equalized decoder symbol offset");
+    for (std::size_t symbol = first_symbol; symbol < symbol_count; ++symbol) {
         const auto decoded_metrics = std::span<const float>{metrics}.subspan(
             symbol * metrics_per_symbol, metrics_per_symbol);
         const auto bit_interleaved = bit_interleave(decoded_metrics, bits);
@@ -426,6 +489,8 @@ void test_equalized_symbol_decoder(const DecoderParameters parameters) {
     require(match != expected.end(), "equalized-symbol TS round trip");
     require(decoder.stats().rs_uncorrectable_packets == 0,
             "equalized-symbol RS failures");
+    require(decoder.stats().outer_bit_offset == expected_bit_offset,
+            "equalized-symbol outer bit alignment");
 }
 
 } // namespace
@@ -438,6 +503,7 @@ int main() {
         test_transport_decoder(CodeRate::rate_5_6);
         test_transport_decoder(CodeRate::rate_7_8);
         test_transport_decoder(CodeRate::rate_2_3, 4);
+        test_outer_fec_bit_alignment();
         test_prepared_soft_transport();
         test_uncorrectable_packet_is_emitted_with_tei();
         test_equalized_symbol_decoder(
@@ -445,6 +511,21 @@ int main() {
         test_equalized_symbol_decoder({TransmissionMode::k8,
                                        Constellation::qam64, CodeRate::rate_2_3,
                                        4});
+        test_equalized_symbol_decoder(
+            {TransmissionMode::k2, Constellation::qpsk, CodeRate::rate_3_4, 1},
+            1, 4);
+        test_equalized_symbol_decoder(
+            {TransmissionMode::k2, Constellation::qpsk, CodeRate::rate_7_8, 1},
+            1, 2);
+        test_equalized_symbol_decoder(
+            {TransmissionMode::k2, Constellation::qam16, CodeRate::rate_7_8, 1},
+            1, 4);
+        test_equalized_symbol_decoder(
+            {TransmissionMode::k2, Constellation::qam64, CodeRate::rate_3_4, 1},
+            1, 4);
+        test_equalized_symbol_decoder(
+            {TransmissionMode::k2, Constellation::qam64, CodeRate::rate_7_8, 1},
+            1, 6);
     } catch (const std::exception &error) {
         std::cerr << "DVB-T transport decoder test failed: " << error.what()
                   << '\n';

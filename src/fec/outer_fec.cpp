@@ -19,6 +19,7 @@ namespace {
 constexpr std::size_t rs_packet_size = 204;
 constexpr std::size_t ts_packet_size = 188;
 constexpr std::size_t packets_per_energy_frame = 8;
+constexpr std::size_t bit_alignment_phases = 8;
 constexpr std::size_t outer_interleaver_branches = 12;
 constexpr std::size_t outer_interleaver_step = 17;
 constexpr std::size_t minimum_alignment_rs_evidence = 4;
@@ -27,6 +28,41 @@ constexpr std::size_t minimum_alignment_rs_evidence = 4;
 // EnergyDescrambler::process_corrupt() to preserve TS cadence; only a much
 // longer run is treated as evidence of a false outer-phase lock.
 constexpr std::size_t uncorrectable_reset_threshold = 512;
+
+class BitRepacker {
+  public:
+    void reset(const std::size_t bit_offset) {
+        bit_offset_ = bit_offset % bit_alignment_phases;
+        previous_ = 0;
+        have_previous_ = false;
+    }
+
+    [[nodiscard]] std::vector<std::uint8_t>
+    process(const std::span<const std::uint8_t> input) {
+        if (bit_offset_ == 0) {
+            return {input.begin(), input.end()};
+        }
+
+        std::vector<std::uint8_t> output;
+        output.reserve(input.size());
+        for (const std::uint8_t byte : input) {
+            if (have_previous_) {
+                output.push_back(static_cast<std::uint8_t>(
+                    (static_cast<unsigned int>(previous_) << bit_offset_) |
+                    (static_cast<unsigned int>(byte) >>
+                     (bit_alignment_phases - bit_offset_))));
+            }
+            previous_ = byte;
+            have_previous_ = true;
+        }
+        return output;
+    }
+
+  private:
+    std::size_t bit_offset_{};
+    std::uint8_t previous_{};
+    bool have_previous_{};
+};
 
 class ByteDeinterleaver {
   public:
@@ -237,19 +273,29 @@ struct OuterFec::Impl {
     Impl() { reset(); }
 
     void reset() {
-        selected_outer_phase = outer_interleaver_branches;
-        for (std::size_t phase = 0; phase < outer_interleavers.size();
-             ++phase) {
-            outer_interleavers[phase].reset(phase);
-            outer_candidates[phase].clear();
-        }
+        reset_alignment_paths();
         energy_descrambler.reset();
         statistics = {};
         uncorrectable_since_sync = 0;
         alignment_search_bytes = 0;
         alignment_search_count = 0;
         alignment_search_done = false;
+    }
+
+    void reset_alignment_paths() {
+        selected_bit_offset = bit_alignment_phases;
+        selected_outer_phase = outer_interleaver_branches;
+        pending_alignment_bit_offset = bit_alignment_phases;
         pending_alignment_phase = outer_interleaver_branches;
+        for (std::size_t bit_offset = 0; bit_offset < bit_alignment_phases;
+             ++bit_offset) {
+            bit_repackers[bit_offset].reset(bit_offset);
+            for (std::size_t phase = 0; phase < outer_interleaver_branches;
+                 ++phase) {
+                outer_interleavers[bit_offset][phase].reset(phase);
+                outer_candidates[bit_offset][phase].clear();
+            }
+        }
     }
 
     [[nodiscard]] bool diagnostics_enabled() const {
@@ -268,30 +314,39 @@ struct OuterFec::Impl {
     process(const std::span<const std::uint8_t> decoded) {
         constexpr std::size_t maximum_search = 32 * rs_packet_size;
         if (selected_outer_phase == outer_interleaver_branches) {
-            // Searching all 12 deinterleaver branches is deliberately kept
-            // out of the per-symbol hot path.  A marginal channel can lose
-            // an already selected RS phase for a short burst; repeatedly
-            // scanning the same 6.5 KiB window in that state makes the FEC
-            // worker spend seconds in Reed-Solomon checks and back-pressure
-            // the demod queue.  The window itself is retained, so a real
-            // alignment remains available for the next search.
+            // Searching all 8 bit offsets and 12 deinterleaver branches is
+            // deliberately kept out of the steady-state hot path. A marginal
+            // channel can lose an already selected RS phase for a short burst;
+            // repeatedly scanning the same 6.5 KiB window in that state makes
+            // the FEC worker spend seconds in Reed-Solomon checks and
+            // back-pressure the demod queue. The window itself is retained, so
+            // a real alignment remains available for the next search.
             alignment_search_bytes += decoded.size();
-            for (std::size_t phase = 0; phase < outer_interleavers.size();
-                 ++phase) {
-                auto deinterleaved = outer_interleavers[phase].process(decoded);
-                auto &candidate = outer_candidates[phase];
-                candidate.insert(candidate.end(), deinterleaved.begin(),
-                                 deinterleaved.end());
-                if (candidate.size() > maximum_search) {
-                    candidate.erase(
-                        candidate.begin(),
-                        candidate.end() -
-                            static_cast<std::ptrdiff_t>(maximum_search));
+            for (std::size_t bit_offset = 0; bit_offset < bit_alignment_phases;
+                 ++bit_offset) {
+                const auto repacked =
+                    bit_repackers[bit_offset].process(decoded);
+                for (std::size_t phase = 0; phase < outer_interleaver_branches;
+                     ++phase) {
+                    auto deinterleaved =
+                        outer_interleavers[bit_offset][phase].process(repacked);
+                    auto &candidate = outer_candidates[bit_offset][phase];
+                    candidate.insert(candidate.end(), deinterleaved.begin(),
+                                     deinterleaved.end());
+                    if (candidate.size() > maximum_search) {
+                        candidate.erase(
+                            candidate.begin(),
+                            candidate.end() -
+                                static_cast<std::ptrdiff_t>(maximum_search));
+                    }
                 }
             }
             const bool candidates_full = std::ranges::all_of(
-                outer_candidates, [](const auto &candidate) {
-                    return candidate.size() >= maximum_search;
+                outer_candidates, [](const auto &bit_candidates) {
+                    return std::ranges::all_of(
+                        bit_candidates, [](const auto &candidate) {
+                            return candidate.size() >= maximum_search;
+                        });
                 });
             // Once a candidate is pending confirmation, do the second check
             // on the next decoded chunk. Keep the longer cadence only while
@@ -299,7 +354,7 @@ struct OuterFec::Impl {
             // window here would slide the candidate past the first packets
             // of a short finite stream before the lock is confirmed.
             const std::size_t next_search_interval =
-                pending_alignment_phase != outer_interleaver_branches
+                pending_alignment_bit_offset != bit_alignment_phases
                     ? 1U
                     : alignment_search_interval;
             const bool search_requested =
@@ -312,67 +367,81 @@ struct OuterFec::Impl {
             alignment_search_done = true;
             alignment_search_bytes = 0;
             ++alignment_search_count;
-            std::array<AlignmentEvidence, outer_interleaver_branches>
+            std::array<
+                std::array<AlignmentEvidence, outer_interleaver_branches>,
+                bit_alignment_phases>
                 evidence{};
-            for (std::size_t phase = 0; phase < outer_candidates.size();
-                 ++phase) {
-                evidence[phase] =
-                    find_rs_alignment(outer_candidates[phase], reed_solomon);
+            for (std::size_t bit_offset = 0; bit_offset < bit_alignment_phases;
+                 ++bit_offset) {
+                for (std::size_t phase = 0; phase < outer_interleaver_branches;
+                     ++phase) {
+                    evidence[bit_offset][phase] = find_rs_alignment(
+                        outer_candidates[bit_offset][phase], reed_solomon);
+                }
             }
             if (diagnostics_enabled()) {
                 DiagnosticEventFields fields{
                     {"search_count", alignment_search_count}};
-                for (std::size_t phase = 0; phase < outer_candidates.size();
-                     ++phase) {
-                    const auto &candidate_evidence = evidence[phase];
+                for (std::size_t bit_offset = 0;
+                     bit_offset < bit_alignment_phases; ++bit_offset) {
+                    std::size_t best_phase = 0;
+                    for (std::size_t phase = 1;
+                         phase < outer_interleaver_branches; ++phase) {
+                        const auto &candidate = evidence[bit_offset][phase];
+                        const auto &best = evidence[bit_offset][best_phase];
+                        if (candidate.rs_successes > best.rs_successes ||
+                            (candidate.rs_successes == best.rs_successes &&
+                             candidate.sync_distance < best.sync_distance)) {
+                            best_phase = phase;
+                        }
+                    }
+                    const auto &best = evidence[bit_offset][best_phase];
                     const std::string prefix =
-                        "phase_" + std::to_string(phase) + '_';
-                    const bool available =
-                        candidate_evidence.start !=
-                        std::numeric_limits<std::size_t>::max();
-                    fields.emplace(prefix + "available", available);
-                    fields.emplace(prefix + "sync_distance",
-                                   static_cast<std::uint64_t>(
-                                       candidate_evidence.sync_distance));
-                    fields.emplace(prefix + "rs_successes",
-                                   static_cast<std::uint64_t>(
-                                       candidate_evidence.rs_successes));
+                        "bit_" + std::to_string(bit_offset) + '_';
+                    fields.emplace(prefix + "best_phase",
+                                   static_cast<std::uint64_t>(best_phase));
                     fields.emplace(
-                        prefix + "start",
-                        static_cast<std::uint64_t>(
-                            available ? candidate_evidence.start : 0));
-                    fields.emplace(prefix + "energy_phase",
-                                   static_cast<std::uint64_t>(
-                                       candidate_evidence.energy_phase));
+                        prefix + "sync_distance",
+                        static_cast<std::uint64_t>(best.sync_distance));
+                    fields.emplace(
+                        prefix + "rs_successes",
+                        static_cast<std::uint64_t>(best.rs_successes));
                 }
                 emit_diagnostic("outer_fec_alignment_search",
                                 DiagnosticEventSeverity::info,
                                 std::move(fields));
             }
+            std::size_t acquired_bit_offset = bit_alignment_phases;
             std::size_t selected_phase = outer_interleaver_branches;
             AlignmentEvidence selected_evidence;
             unsigned int global_sync_distance =
                 std::numeric_limits<unsigned int>::max();
             std::size_t global_rs_evidence = 0;
-            for (std::size_t phase = 0; phase < evidence.size(); ++phase) {
-                const auto &candidate_evidence = evidence[phase];
-                global_sync_distance = std::min(
-                    global_sync_distance, candidate_evidence.sync_distance);
-                global_rs_evidence = std::max(global_rs_evidence,
-                                              candidate_evidence.rs_successes);
-                if (candidate_evidence.rs_successes <
-                    minimum_alignment_rs_evidence) {
-                    continue;
-                }
-                if (selected_phase == outer_interleaver_branches ||
-                    candidate_evidence.rs_successes >
-                        selected_evidence.rs_successes ||
-                    (candidate_evidence.rs_successes ==
-                         selected_evidence.rs_successes &&
-                     candidate_evidence.sync_distance <
-                         selected_evidence.sync_distance)) {
-                    selected_phase = phase;
-                    selected_evidence = candidate_evidence;
+            for (std::size_t bit_offset = 0; bit_offset < evidence.size();
+                 ++bit_offset) {
+                for (std::size_t phase = 0; phase < evidence[bit_offset].size();
+                     ++phase) {
+                    const auto &candidate_evidence =
+                        evidence[bit_offset][phase];
+                    global_sync_distance = std::min(
+                        global_sync_distance, candidate_evidence.sync_distance);
+                    global_rs_evidence = std::max(
+                        global_rs_evidence, candidate_evidence.rs_successes);
+                    if (candidate_evidence.rs_successes <
+                        minimum_alignment_rs_evidence) {
+                        continue;
+                    }
+                    if (acquired_bit_offset == bit_alignment_phases ||
+                        candidate_evidence.rs_successes >
+                            selected_evidence.rs_successes ||
+                        (candidate_evidence.rs_successes ==
+                             selected_evidence.rs_successes &&
+                         candidate_evidence.sync_distance <
+                             selected_evidence.sync_distance)) {
+                        acquired_bit_offset = bit_offset;
+                        selected_phase = phase;
+                        selected_evidence = candidate_evidence;
+                    }
                 }
             }
             statistics.outer_sync_distance =
@@ -381,15 +450,19 @@ struct OuterFec::Impl {
                     : global_sync_distance;
             statistics.outer_rs_evidence =
                 static_cast<std::uint32_t>(global_rs_evidence);
-            if (selected_phase != outer_interleaver_branches) {
-                if (pending_alignment_phase != selected_phase) {
+            if (acquired_bit_offset != bit_alignment_phases) {
+                if (pending_alignment_bit_offset != acquired_bit_offset ||
+                    pending_alignment_phase != selected_phase) {
+                    pending_alignment_bit_offset = acquired_bit_offset;
                     pending_alignment_phase = selected_phase;
                     statistics.rs_synchronized = false;
                     if (diagnostics_enabled()) {
                         emit_diagnostic(
                             "outer_fec_alignment_pending",
                             DiagnosticEventSeverity::info,
-                            {{"phase",
+                            {{"bit_offset",
+                              static_cast<std::uint64_t>(acquired_bit_offset)},
+                             {"phase",
                               static_cast<std::uint64_t>(selected_phase)},
                              {"sync_distance",
                               static_cast<std::uint64_t>(
@@ -400,11 +473,16 @@ struct OuterFec::Impl {
                     }
                     return {};
                 }
+                pending_alignment_bit_offset = bit_alignment_phases;
                 pending_alignment_phase = outer_interleaver_branches;
+                selected_bit_offset = acquired_bit_offset;
                 selected_outer_phase = selected_phase;
+                statistics.outer_bit_offset =
+                    static_cast<int>(acquired_bit_offset);
                 statistics.outer_deinterleaver_phase =
                     static_cast<int>(selected_phase);
-                const auto &candidate = outer_candidates[selected_phase];
+                const auto &candidate =
+                    outer_candidates[acquired_bit_offset][selected_phase];
                 rs_bytes.assign(
                     candidate.begin() +
                         static_cast<std::ptrdiff_t>(selected_evidence.start),
@@ -416,7 +494,9 @@ struct OuterFec::Impl {
                     emit_diagnostic(
                         "outer_fec_alignment_locked",
                         DiagnosticEventSeverity::info,
-                        {{"phase", static_cast<std::uint64_t>(selected_phase)},
+                        {{"bit_offset",
+                          static_cast<std::uint64_t>(acquired_bit_offset)},
+                         {"phase", static_cast<std::uint64_t>(selected_phase)},
                          {"start",
                           static_cast<std::uint64_t>(selected_evidence.start)},
                          {"sync_distance",
@@ -428,10 +508,13 @@ struct OuterFec::Impl {
                                               selected_evidence.energy_phase)},
                          {"candidate_bytes",
                           static_cast<std::uint64_t>(
-                              outer_candidates[selected_phase].size())},
+                              outer_candidates[acquired_bit_offset]
+                                              [selected_phase]
+                                                  .size())},
                          {"confirmation_count", std::uint64_t{2}}});
                 }
             } else {
+                pending_alignment_bit_offset = bit_alignment_phases;
                 pending_alignment_phase = outer_interleaver_branches;
                 if (diagnostics_enabled()) {
                     emit_diagnostic("outer_fec_alignment_missed",
@@ -449,8 +532,11 @@ struct OuterFec::Impl {
                 return {};
             }
         } else {
+            const auto repacked =
+                bit_repackers[selected_bit_offset].process(decoded);
             auto deinterleaved =
-                outer_interleavers[selected_outer_phase].process(decoded);
+                outer_interleavers[selected_bit_offset][selected_outer_phase]
+                    .process(repacked);
             rs_bytes.insert(rs_bytes.end(), deinterleaved.begin(),
                             deinterleaved.end());
         }
@@ -523,17 +609,14 @@ struct OuterFec::Impl {
                     // re-locks with real RS evidence once the garbage has
                     // slid out.
                     uncorrectable_since_sync = 0;
-                    selected_outer_phase = outer_interleaver_branches;
+                    reset_alignment_paths();
                     rs_bytes.clear();
-                    for (auto &outer_candidate : outer_candidates) {
-                        outer_candidate.clear();
-                    }
                     energy_descrambler.reset();
                     alignment_search_bytes = 0;
                     alignment_search_done = false;
-                    pending_alignment_phase = outer_interleaver_branches;
                     statistics.rs_synchronized = false;
                     statistics.energy_synchronized = false;
+                    statistics.outer_bit_offset = -1;
                     statistics.outer_deinterleaver_phase = -1;
                     statistics.outer_sync_distance = 0;
                     statistics.outer_rs_evidence = 0;
@@ -581,10 +664,15 @@ struct OuterFec::Impl {
         return transport_stream;
     }
 
-    std::array<ByteDeinterleaver, outer_interleaver_branches>
+    std::array<BitRepacker, bit_alignment_phases> bit_repackers;
+    std::array<std::array<ByteDeinterleaver, outer_interleaver_branches>,
+               bit_alignment_phases>
         outer_interleavers;
-    std::array<std::vector<std::uint8_t>, outer_interleaver_branches>
+    std::array<
+        std::array<std::vector<std::uint8_t>, outer_interleaver_branches>,
+        bit_alignment_phases>
         outer_candidates;
+    std::size_t selected_bit_offset{bit_alignment_phases};
     std::size_t selected_outer_phase{outer_interleaver_branches};
     DvbReedSolomon reed_solomon;
     EnergyDescrambler energy_descrambler;
@@ -605,6 +693,7 @@ struct OuterFec::Impl {
         std::size_t{32} * 32U * 204U;
     std::size_t alignment_search_bytes{};
     std::uint64_t alignment_search_count{};
+    std::size_t pending_alignment_bit_offset{bit_alignment_phases};
     std::size_t pending_alignment_phase{outer_interleaver_branches};
     bool alignment_search_done{};
     DiagnosticEventHandler diagnostic_handler;

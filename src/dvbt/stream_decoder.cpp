@@ -64,6 +64,7 @@ void add_transport_counters(TransportDecoderStats &destination,
     destination.rs_uncorrectable_packets += source.rs_uncorrectable_packets;
     destination.tei_packets += source.tei_packets;
     destination.ts_packets += source.ts_packets;
+    destination.outer_bit_offset = source.outer_bit_offset;
     destination.outer_deinterleaver_phase = source.outer_deinterleaver_phase;
     destination.outer_sync_distance = source.outer_sync_distance;
     destination.outer_rs_evidence = source.outer_rs_evidence;

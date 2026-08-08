@@ -134,6 +134,7 @@ TransportDecoderStats TransportDecoder::stats() const {
     statistics.rs_uncorrectable_packets = outer_stats.rs_uncorrectable_packets;
     statistics.tei_packets = outer_stats.tei_packets;
     statistics.ts_packets = outer_stats.ts_packets;
+    statistics.outer_bit_offset = outer_stats.outer_bit_offset;
     statistics.outer_deinterleaver_phase =
         outer_stats.outer_deinterleaver_phase;
     statistics.outer_sync_distance = outer_stats.outer_sync_distance;

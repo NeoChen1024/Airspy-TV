@@ -131,6 +131,7 @@ worker_state_name_json(const dvbt::WorkerState state) {
         {"rs_uncorrectable_packets", stats.rs_uncorrectable_packets},
         {"tei_packets", stats.tei_packets},
         {"ts_packets", stats.ts_packets},
+        {"outer_bit_offset", stats.outer_bit_offset},
         {"outer_deinterleaver_phase", stats.outer_deinterleaver_phase},
         {"outer_sync_distance", stats.outer_sync_distance},
         {"outer_rs_evidence", stats.outer_rs_evidence},
