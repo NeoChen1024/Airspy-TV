@@ -2,6 +2,7 @@
 
 #include "airspy_tv/transport_telemetry.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -26,6 +27,11 @@ struct TransportOutputConfig {
     TransportSinkCriticality criticality{TransportSinkCriticality::required};
     TransportWriteErrorPolicy write_error_policy{
         TransportWriteErrorPolicy::fail_sink};
+    // Byte-stream/file sinks may coalesce adjacent logical blocks before a
+    // write. Leave this at zero for message-oriented sinks such as UDP, where
+    // every submit() call is one datagram.
+    std::size_t write_batch_bytes{};
+    std::chrono::microseconds write_batch_delay{};
     std::string thread_name{"ts-output"};
 };
 

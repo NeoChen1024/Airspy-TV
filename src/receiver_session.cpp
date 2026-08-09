@@ -7,7 +7,8 @@
 
 namespace airspy_tv {
 
-ReceiverSession::ReceiverSession() : receiver_(transport_) {
+ReceiverSession::ReceiverSession(TransportPipelineConfig transport_config)
+    : transport_(transport_config), receiver_(transport_) {
     std::string error;
     install_demodulator(make_demodulator(ReceiveStandard::DvbT, error),
                         ReceiveStandard::DvbT);

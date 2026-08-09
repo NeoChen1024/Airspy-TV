@@ -15,6 +15,14 @@
 
 namespace airspy_tv {
 
+struct TransportPipelineConfig {
+    bool metadata_observers_enabled{true};
+
+    [[nodiscard]] static constexpr TransportPipelineConfig headless() noexcept {
+        return {.metadata_observers_enabled = false};
+    }
+};
+
 struct TransportPipelineSnapshot {
     TransportObserverStats service_observer;
     TransportObserverStats epg_observer;
@@ -27,7 +35,7 @@ class TransportPipeline {
     using Sink = std::function<void(std::span<const std::uint8_t>)>;
     using DiscontinuitySink = std::function<void(TransportDiscontinuity)>;
 
-    TransportPipeline();
+    explicit TransportPipeline(TransportPipelineConfig config = {});
     ~TransportPipeline() noexcept;
 
     TransportPipeline(const TransportPipeline &) = delete;

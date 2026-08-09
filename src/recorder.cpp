@@ -250,6 +250,8 @@ struct TransportStreamRecorder::Impl {
         .queue_capacity_bytes = 24U << 20U,
         .overflow_policy = TransportOverflowPolicy::drop_oldest,
         .criticality = TransportSinkCriticality::optional,
+        .write_batch_bytes = 256U << 10U,
+        .write_batch_delay = std::chrono::milliseconds(2),
         .thread_name = "ts-recorder",
     }};
 };

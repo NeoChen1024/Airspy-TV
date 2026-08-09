@@ -32,7 +32,9 @@ struct TransportObserverStats {
 
 // A latest-state TS observer. Each instance owns its queue and worker; queue
 // overflow is converted into a local FEC-region discontinuity so a section
-// parser cannot join bytes across a dropped region.
+// parser cannot join bytes across a dropped region. A single producer block
+// may temporarily exceed the nominal capacity so large decode batches remain
+// observable instead of being rejected unconditionally.
 class AsyncTransportObserver {
   public:
     using Consume = std::function<void(std::span<const std::uint8_t>)>;

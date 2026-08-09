@@ -27,7 +27,7 @@ class ReceiverSession {
     using TransportSink = TransportPipeline::Sink;
     using DiscontinuityCallback = Demodulator::DiscontinuityCallback;
 
-    ReceiverSession();
+    explicit ReceiverSession(TransportPipelineConfig transport_config = {});
     ~ReceiverSession() noexcept = default;
 
     ReceiverSession(const ReceiverSession &) = delete;

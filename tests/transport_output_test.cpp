@@ -64,6 +64,8 @@ bool test_ordered_file_round_trip_and_drain() {
         .queue_capacity_bytes = 1U << 20U,
         .overflow_policy = airspy_tv::TransportOverflowPolicy::fail_sink,
         .criticality = airspy_tv::TransportSinkCriticality::required,
+        .write_batch_bytes = 188 * 28,
+        .write_batch_delay = std::chrono::milliseconds(2),
         .thread_name = "ts-out-test",
     });
     std::string error;
@@ -84,6 +86,8 @@ bool test_ordered_file_round_trip_and_drain() {
 
     const auto stats = output.stats();
     return require(!stats.failed, "lossless file output did not fail") &&
+           require(stats.blocks_accepted == 32 && stats.blocks_written == 32,
+                   "batching preserves logical block statistics") &&
            require(stats.bytes_written == expected.size(),
                    "all queued bytes were drained") &&
            require(read_bytes(file.path) == expected,

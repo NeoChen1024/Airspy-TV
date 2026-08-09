@@ -2,6 +2,7 @@
 
 #include "airspy_tv/thread_name.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -28,11 +29,20 @@ namespace {
 } // namespace
 
 struct AsyncTransportOutput::Impl {
+    struct Entry {
+        std::vector<std::uint8_t> data;
+        std::uint64_t logical_blocks{1};
+    };
+
     explicit Impl(TransportOutputConfig selected)
         : config(std::move(selected)) {
         if (config.queue_capacity_bytes == 0) {
             config.queue_capacity_bytes = 1;
         }
+        config.write_batch_bytes =
+            std::min(config.write_batch_bytes, config.queue_capacity_bytes);
+        config.write_batch_delay =
+            std::max(config.write_batch_delay, std::chrono::microseconds{0});
     }
 
     ~Impl() { close_output(); }
@@ -103,7 +113,7 @@ struct AsyncTransportOutput::Impl {
     void run() {
         set_current_thread_name(config.thread_name);
         while (true) {
-            std::vector<std::uint8_t> block;
+            Entry block;
             {
                 std::unique_lock lock(mutex);
                 ready.wait(lock,
@@ -111,35 +121,53 @@ struct AsyncTransportOutput::Impl {
                 if (queue.empty() && stop_requested) {
                     break;
                 }
+                if (!stop_requested && queue.size() == 1 &&
+                    config.write_batch_bytes != 0 &&
+                    queue.front().data.size() < config.write_batch_bytes &&
+                    config.write_batch_delay.count() != 0) {
+                    ready.wait_for(lock, config.write_batch_delay, [this] {
+                        return stop_requested || queue.size() != 1 ||
+                               queue.front().data.size() >=
+                                   config.write_batch_bytes;
+                    });
+                }
+                if (queue.empty()) {
+                    if (stop_requested) {
+                        break;
+                    }
+                    continue;
+                }
                 block = std::move(queue.front());
                 queue.pop_front();
-                queued_bytes -= block.size();
-                in_flight_bytes = block.size();
+                queued_bytes -= block.data.size();
+                in_flight_bytes = block.data.size();
+                in_flight_blocks = block.logical_blocks;
                 space_available.notify_all();
             }
 
             std::string write_error;
-            if (!write_all(block, write_error)) {
+            if (!write_all(block.data, write_error)) {
                 const std::scoped_lock lock(mutex);
                 in_flight_bytes = 0;
+                in_flight_blocks = 0;
                 if (write_error.empty()) {
-                    ++dropped_blocks;
-                    dropped_bytes += block.size();
+                    dropped_blocks += block.logical_blocks;
+                    dropped_bytes += block.data.size();
                     break;
                 }
                 ++write_errors;
                 if (config.write_error_policy ==
                     TransportWriteErrorPolicy::drop_block) {
-                    ++dropped_blocks;
-                    dropped_bytes += block.size();
+                    dropped_blocks += block.logical_blocks;
+                    dropped_bytes += block.data.size();
                     error = std::move(write_error);
                     continue;
                 }
                 fail_locked(std::move(write_error));
                 for (const auto &queued : queue) {
-                    dropped_bytes += queued.size();
+                    dropped_bytes += queued.data.size();
+                    dropped_blocks += queued.logical_blocks;
                 }
-                dropped_blocks += queue.size();
                 queue.clear();
                 queued_bytes = 0;
                 space_available.notify_all();
@@ -148,9 +176,10 @@ struct AsyncTransportOutput::Impl {
             {
                 const std::scoped_lock lock(mutex);
                 in_flight_bytes = 0;
+                in_flight_blocks = 0;
             }
-            bytes_written += block.size();
-            ++blocks_written;
+            bytes_written += block.data.size();
+            blocks_written += block.logical_blocks;
         }
     }
 
@@ -158,7 +187,7 @@ struct AsyncTransportOutput::Impl {
     mutable std::mutex mutex;
     std::condition_variable ready;
     std::condition_variable space_available;
-    std::deque<std::vector<std::uint8_t>> queue;
+    std::deque<Entry> queue;
     std::thread worker;
     std::chrono::steady_clock::time_point started_at;
     int fd{-1};
@@ -168,6 +197,7 @@ struct AsyncTransportOutput::Impl {
     std::string descriptor;
     std::size_t queued_bytes{};
     std::size_t in_flight_bytes{};
+    std::uint64_t in_flight_blocks{};
     bool accepting{};
     bool stop_requested{};
     bool failed{};
@@ -237,6 +267,7 @@ bool AsyncTransportOutput::start_fd(const int fd, const bool close_fd,
         impl_->queue.clear();
         impl_->queued_bytes = 0;
         impl_->in_flight_bytes = 0;
+        impl_->in_flight_blocks = 0;
         impl_->accepting = true;
         impl_->stop_requested = false;
         impl_->failed = false;
@@ -305,9 +336,9 @@ bool AsyncTransportOutput::submit(
         while (!impl_->queue.empty() &&
                impl_->queued_bytes + transport_stream.size() >
                    impl_->config.queue_capacity_bytes) {
-            impl_->queued_bytes -= impl_->queue.front().size();
-            impl_->dropped_bytes += impl_->queue.front().size();
-            ++impl_->dropped_blocks;
+            impl_->queued_bytes -= impl_->queue.front().data.size();
+            impl_->dropped_bytes += impl_->queue.front().data.size();
+            impl_->dropped_blocks += impl_->queue.front().logical_blocks;
             impl_->queue.pop_front();
         }
     } else if (impl_->queued_bytes + transport_stream.size() >
@@ -321,20 +352,37 @@ bool AsyncTransportOutput::submit(
         return false;
     }
 
-    impl_->queue.emplace_back(transport_stream.begin(), transport_stream.end());
+    const bool queue_was_empty = impl_->queue.empty();
+    bool batch_reached_target = false;
+    if (impl_->config.write_batch_bytes != 0 && !impl_->queue.empty() &&
+        impl_->queue.back().data.size() + transport_stream.size() <=
+            impl_->config.write_batch_bytes) {
+        auto &batch = impl_->queue.back();
+        batch.data.insert(batch.data.end(), transport_stream.begin(),
+                          transport_stream.end());
+        ++batch.logical_blocks;
+        batch_reached_target =
+            batch.data.size() >= impl_->config.write_batch_bytes;
+    } else {
+        impl_->queue.push_back(
+            {.data = {transport_stream.begin(), transport_stream.end()},
+             .logical_blocks = 1});
+    }
     impl_->queued_bytes += transport_stream.size();
     ++impl_->blocks_accepted;
     impl_->bytes_accepted += transport_stream.size();
-    impl_->ready.notify_one();
+    if (queue_was_empty || batch_reached_target) {
+        impl_->ready.notify_one();
+    }
     return true;
 }
 
 void AsyncTransportOutput::discard_queued() noexcept {
     const std::scoped_lock lock(impl_->mutex);
     for (const auto &block : impl_->queue) {
-        impl_->dropped_bytes += block.size();
+        impl_->dropped_bytes += block.data.size();
+        impl_->dropped_blocks += block.logical_blocks;
     }
-    impl_->dropped_blocks += impl_->queue.size();
     impl_->queue.clear();
     impl_->queued_bytes = 0;
     impl_->space_available.notify_all();
@@ -352,9 +400,9 @@ void AsyncTransportOutput::stop(const bool drain) noexcept {
         if (!drain) {
             impl_->abort_writes.store(true, std::memory_order_relaxed);
             for (const auto &block : impl_->queue) {
-                impl_->dropped_bytes += block.size();
+                impl_->dropped_bytes += block.data.size();
+                impl_->dropped_blocks += block.logical_blocks;
             }
-            impl_->dropped_blocks += impl_->queue.size();
             impl_->queue.clear();
             impl_->queued_bytes = 0;
         }

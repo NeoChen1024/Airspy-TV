@@ -336,6 +336,51 @@ bool test_source_only_file_callbacks() {
     return result;
 }
 
+bool test_unpaced_source_uses_throughput_blocks() {
+    const TemporaryDirectory directory;
+    const auto path = directory.path / "throughput-blocks.cs16";
+    constexpr std::size_t sample_rate = 200'000;
+    constexpr std::size_t expected_block_samples = sample_rate / 5;
+    const std::vector<std::int16_t> iq((expected_block_samples + 1) * 2, 1);
+    {
+        std::ofstream output(path, std::ios::binary);
+        output.write(
+            reinterpret_cast<const char *>(iq.data()),
+            static_cast<std::streamsize>(iq.size() * sizeof(iq.front())));
+    }
+
+    airspy_tv::SdrDevice source;
+    airspy_tv::SourceSettings settings;
+    settings.sample_rate_hz = sample_rate;
+    std::vector<std::size_t> callback_samples;
+    std::string error;
+    if (!require(source.open_iq_file(path, settings,
+                                     airspy_tv::IqPlaybackPacing::unpaced,
+                                     error),
+                 "throughput file source opens: " + error) ||
+        !require(source.start_stream(
+                     settings,
+                     {.samples =
+                          [&](const std::span<const std::int16_t> block) {
+                              callback_samples.push_back(block.size() / 2);
+                          },
+                      .discontinuity = {},
+                      .finite_input_complete = {},
+                      .unexpected_stop = {}},
+                     error),
+                 "throughput file source starts: " + error) ||
+        !require(wait_until([&source] { return !source.is_streaming(); }),
+                 "throughput file source reaches EOF")) {
+        return false;
+    }
+    source.stop_stream();
+    const bool result = require(
+        callback_samples == std::vector<std::size_t>{expected_block_samples, 1},
+        "unpaced source emits 0.2-second throughput blocks");
+    source.close();
+    return result;
+}
+
 bool test_stdin_source_pipeline() {
     StdinPipe input;
     const std::vector<std::int16_t> iq{11, -11, 12, -12, 13, -13, 14, -14};
@@ -525,6 +570,7 @@ bool test_unpaced_blocking_playback_policy() {
 int main() {
     try {
         return test_source_only_file_callbacks() &&
+                       test_unpaced_source_uses_throughput_blocks() &&
                        test_file_source_pipeline() &&
                        test_stdin_source_pipeline() &&
                        test_file_runtime_failure_is_restartable() &&

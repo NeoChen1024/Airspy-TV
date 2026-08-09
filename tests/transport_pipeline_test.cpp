@@ -49,6 +49,30 @@ bool test_capacities_and_external_fanout() {
                    "external sink receives typed retune discontinuity");
 }
 
+bool test_headless_pipeline_omits_metadata_observers() {
+    airspy_tv::TransportPipeline pipeline(
+        airspy_tv::TransportPipelineConfig::headless());
+    const std::vector<std::uint8_t> packet(188, 0x47);
+    pipeline.consume(packet);
+    pipeline.notify_discontinuity(
+        airspy_tv::TransportDiscontinuity::fec_region_reset);
+    const auto snapshot = pipeline.snapshot();
+    const auto telemetry = pipeline.output_telemetry();
+    return require(!snapshot.service_observer.active &&
+                       snapshot.service_observer.queue_capacity_bytes == 0,
+                   "headless pipeline does not create the service observer") &&
+           require(!snapshot.epg_observer.active &&
+                       snapshot.epg_observer.queue_capacity_bytes == 0,
+                   "headless pipeline does not create the EPG observer") &&
+           require(telemetry.size() == 2,
+                   "headless telemetry omits disabled metadata observers");
+}
+
 } // namespace
 
-int main() { return test_capacities_and_external_fanout() ? 0 : 1; }
+int main() {
+    return test_capacities_and_external_fanout() &&
+                   test_headless_pipeline_omits_metadata_observers()
+               ? 0
+               : 1;
+}

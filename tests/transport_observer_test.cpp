@@ -95,6 +95,34 @@ bool test_overflow_is_local_and_recovers() {
            require(!stats.failed, "overflow does not fail the observer");
 }
 
+bool test_single_oversized_block_is_processed() {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::size_t processed_bytes{};
+    airspy_tv::AsyncTransportObserver observer(
+        [&](const std::span<const std::uint8_t> block) {
+            const std::scoped_lock lock(mutex);
+            processed_bytes += block.size();
+            ready.notify_all();
+        },
+        [](airspy_tv::TransportDiscontinuity) {},
+        {.queue_capacity_bytes = 188, .thread_name = "ts-obs-test"});
+    const std::vector<std::uint8_t> oversized(188 * 4, 0x47);
+    const bool accepted = observer.submit(oversized);
+    {
+        std::unique_lock lock(mutex);
+        ready.wait_for(lock, std::chrono::seconds(1),
+                       [&] { return processed_bytes == oversized.size(); });
+    }
+    observer.stop(true);
+    const auto stats = observer.stats();
+    return require(accepted, "single oversized observer block is accepted") &&
+           require(processed_bytes == oversized.size(),
+                   "single oversized observer block is processed") &&
+           require(stats.blocks_accepted == 1 && stats.dropped_blocks == 0,
+                   "oversized observer block is not reported as dropped");
+}
+
 bool test_stats_are_safe_during_callback_completion() {
     std::mutex mutex;
     std::condition_variable ready;
@@ -144,6 +172,7 @@ bool test_stats_are_safe_during_callback_completion() {
 int main() {
     return test_ordering_and_retune() &&
                    test_overflow_is_local_and_recovers() &&
+                   test_single_oversized_block_is_processed() &&
                    test_stats_are_safe_during_callback_completion()
                ? 0
                : 1;

@@ -88,6 +88,8 @@ int offline_decode_cli(
         .queue_capacity_bytes = 24U << 20U,
         .overflow_policy = airspy_tv::TransportOverflowPolicy::block_producer,
         .criticality = airspy_tv::TransportSinkCriticality::required,
+        .write_batch_bytes = 256U << 10U,
+        .write_batch_delay = std::chrono::milliseconds(2),
         .thread_name = "ts-offline-output",
     });
     const bool output_started =
@@ -107,7 +109,8 @@ int offline_decode_cli(
         .decoder_backpressure = airspy_tv::DecoderBackpressurePolicy::block,
     };
 
-    airspy_tv::ReceiverSession session;
+    airspy_tv::ReceiverSession session(
+        airspy_tv::TransportPipelineConfig::headless());
     session.set_display_analysis_enabled(false);
     session.set_dvbt_parameters(parameters);
     session.set_transport_sink(

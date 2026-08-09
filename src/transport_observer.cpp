@@ -150,16 +150,11 @@ bool AsyncTransportObserver::submit(
     if (!impl_->active || impl_->stopping) {
         return false;
     }
-    if (transport_stream.size() > impl_->config.queue_capacity_bytes) {
-        ++impl_->dropped_blocks;
-        impl_->dropped_bytes += transport_stream.size();
-        impl_->insert_local_gap_locked();
-        impl_->ready.notify_one();
-        return false;
-    }
+    const std::size_t effective_capacity =
+        std::max(impl_->config.queue_capacity_bytes, transport_stream.size());
     bool dropped = false;
     while (impl_->queued_bytes + transport_stream.size() >
-           impl_->config.queue_capacity_bytes) {
+           effective_capacity) {
         const auto data =
             std::ranges::find_if(impl_->queue, [](const Impl::Entry &entry) {
                 return !entry.control;

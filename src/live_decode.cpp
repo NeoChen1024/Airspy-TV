@@ -110,6 +110,8 @@ int live_decode_cli(LiveDecodeConfig config) {
                 .overflow_policy =
                     airspy_tv::TransportOverflowPolicy::drop_oldest,
                 .criticality = airspy_tv::TransportSinkCriticality::required,
+                .write_batch_bytes = 256U << 10U,
+                .write_batch_delay = std::chrono::milliseconds(2),
                 .thread_name = "ts-cli-output",
             });
         const bool output_started =
@@ -122,7 +124,8 @@ int live_decode_cli(LiveDecodeConfig config) {
         }
     }
 
-    airspy_tv::ReceiverSession session;
+    airspy_tv::ReceiverSession session(
+        airspy_tv::TransportPipelineConfig::headless());
     session.set_display_analysis_enabled(false);
     session.set_dvbt_parameters(config.dvbt);
     if (!session.select_standard(config.standard, config.source, false,

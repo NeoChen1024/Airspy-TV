@@ -36,6 +36,7 @@ namespace {
 
 constexpr std::size_t max_airspy_devices = 32;
 constexpr std::size_t source_block_samples = 32'768;
+constexpr std::size_t unpaced_block_duration_denominator = 5;
 
 std::string format_serial(const std::uint64_t serial) {
     std::ostringstream output;
@@ -537,6 +538,17 @@ class FileIqSource final : public SourceBase {
     }
 
   private:
+    [[nodiscard]] std::size_t block_samples() const noexcept {
+        if (pacing_ == IqPlaybackPacing::realtime) {
+            return source_block_samples;
+        }
+        const auto throughput_block =
+            (static_cast<std::size_t>(sample_rate_hz_) +
+             unpaced_block_duration_denominator - 1) /
+            unpaced_block_duration_denominator;
+        return std::max(source_block_samples, throughput_block);
+    }
+
     void complete(const bool reached_eof) {
         if (!stop_streaming()) {
             return;
@@ -573,7 +585,7 @@ class FileIqSource final : public SourceBase {
             return;
         }
 
-        std::vector<std::int16_t> samples(source_block_samples * 2);
+        std::vector<std::int16_t> samples(block_samples() * 2);
         const auto started_at = std::chrono::steady_clock::now();
         std::uint64_t emitted_samples = 0;
         bool reached_eof = false;
@@ -607,7 +619,7 @@ class FileIqSource final : public SourceBase {
 
     void run_stdin() {
         set_current_thread_name("iq-stdin");
-        std::vector<std::int16_t> samples(source_block_samples * 2);
+        std::vector<std::int16_t> samples(block_samples() * 2);
         const std::size_t capacity_bytes =
             samples.size() * sizeof(samples.front());
         std::size_t buffered_bytes = 0;

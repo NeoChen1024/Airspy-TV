@@ -43,7 +43,7 @@ int record_first_cli(const std::filesystem::path &path, const int duration_ms,
         });
     const DeviceDescriptor &descriptor =
         native == result.devices.end() ? result.devices.front() : *native;
-    ReceiverSession receiver;
+    ReceiverSession receiver(TransportPipelineConfig::headless());
     std::string error;
     SourceSettings effective = settings;
     if (!receiver.open_device_and_start(descriptor, effective, error)) {
@@ -83,7 +83,7 @@ int record_first_cli(const std::filesystem::path &path, const int duration_ms,
 int inspect_iq_cli(const std::filesystem::path &path,
                    const std::uint32_t raw_sample_rate_hz,
                    const std::uint64_t raw_center_frequency_hz) {
-    ReceiverSession receiver;
+    ReceiverSession receiver(TransportPipelineConfig::headless());
     SourceSettings settings;
     settings.sample_rate_hz = raw_sample_rate_hz;
     settings.center_frequency_hz = raw_center_frequency_hz;
