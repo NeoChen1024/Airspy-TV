@@ -8,9 +8,7 @@ This document intentionally tracks unfinished work. Detailed timing research
 is in [docs/clock-tracking.md](docs/clock-tracking.md), current pipeline
 mechanics are in
 [docs/worker-pools-and-dataflow.md](docs/worker-pools-and-dataflow.md), and
-cross-cutting cleanup is in
-[docs/architecture-refactor-review-2026-08-09.md](docs/architecture-refactor-review-2026-08-09.md),
-while remaining validation gaps are maintained in
+remaining validation gaps are maintained in
 [docs/architecture-review-2026-08-06.md](docs/architecture-review-2026-08-06.md).
 
 ## Current baseline
@@ -86,7 +84,7 @@ real-signal baselines, application maintainability, and new-standard DSP.
   offset, queue growth, decoder stalls, and intentional drop-old recovery.
 
 Further cleanup and validation details are maintained in the architecture
-reviews rather than duplicated here. The report, GUI-state, source, and
+review rather than duplicated here. The report, GUI-state, source, and
 transport-observer boundaries are complete; follow-up should be driven by
 measured regressions or a concrete second receiver implementation.
 

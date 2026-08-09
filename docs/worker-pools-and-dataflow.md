@@ -242,21 +242,35 @@ contract.
 
 ## Queues and backpressure
 
-| Buffer                     | Policy                                                  | Current sizing                                 |
-| -------------------------- | ------------------------------------------------------- | ---------------------------------------------- |
-| StreamDecoder input        | Live drop; offline block                                | About 0.2 s of source samples                  |
-| Resampled sample ring      | Frontend blocks                                         | About 0.2 s, minimum 1,048,576 complex samples |
-| Symbol/FEC-item queue      | Demod blocks                                            | About 0.2 s at current mode/bandwidth          |
-| Viterbi task queue         | Producer blocks                                         | `max(2 * workers, 1024)` windows             |
-| mpv TS queue               | Drop oldest only at hard capacity; buffering hysteresis | 8 MiB capacity, 1 MiB low, 2 MiB resume        |
-| Raw I/Q recorder           | Drop/reject on recorder overload                        | At least 5 s from active sample rate           |
-| TS recorder                | Drop oldest                                             | 24 MiB independent write queue                 |
-| RTP/UDP                    | Drop oldest                                             | 8 MiB independent datagram queue               |
-| Live CLI TS output         | Drop oldest and warn                                    | 8 MiB independent write queue                  |
-| Offline exact TS output    | Block producer; drops are errors                        | 24 MiB independent write queue                 |
-| Service model observer     | Drop oldest; inject local parser reset                  | 256 KiB independent queue                      |
-| EPG model observer         | Drop oldest; inject local parser reset                  | 256 KiB independent queue                      |
-| Spectrum/pre-lock analyzer | Latest-data behavior                                    | Display-oriented, not a history queue          |
+| Buffer                     | Policy                           | Current sizing                                                |
+| -------------------------- | -------------------------------- | ------------------------------------------------------------- |
+| StreamDecoder input        | Live drop; offline block         | About 0.2 s of source samples                                 |
+| Resampled sample ring      | Frontend blocks                  | About 0.2 s, minimum 1,048,576 complex samples                |
+| Symbol/FEC-item queue      | Demod blocks                     | About 0.2 s live; offline decode defaults to a measured 4x    |
+| Viterbi task queue         | Producer blocks                  | `max(2 * workers, 1024)` windows                              |
+| Raw I/Q recorder           | Drop/reject on recorder overload | At least 5 s from active sample rate                          |
+| Spectrum/pre-lock analyzer | Latest-data behavior             | Display-oriented, not a history queue                         |
+
+Offline decoding can override the symbol/FEC capacity with
+`--offline-queue-multiplier`; GUI and CLI live decoding retain the 1x live
+capacity. The input queue, resampled ring, Viterbi queue, and transport sinks
+are not affected by that option.
+
+### Transport consumer policies
+
+| Consumer                     | Capacity | Overflow policy                     | Completion role                         |
+| ---------------------------- | -------: | ----------------------------------- | --------------------------------------- |
+| mpv playback                 |    8 MiB | drop oldest at hard capacity        | optional live sink                      |
+| RTP/UDP                      |    8 MiB | drop oldest                         | optional live sink                      |
+| live CLI TS file/stdout      |    8 MiB | drop oldest and warn                | required destination, lossy live policy |
+| TS recorder                  |   24 MiB | drop oldest                         | optional live sink                      |
+| service model                |  256 KiB | drop oldest plus local parser reset | latest-state observer                   |
+| EPG model                    |  256 KiB | drop oldest plus local parser reset | latest-state observer                   |
+| offline exact TS file/stdout |   24 MiB | block producer                      | required exact sink                     |
+
+mpv retains its 1 MiB low and 2 MiB resume watermarks. No transport queue
+uses shared blocks; independent ownership keeps failure, overload, and lifetime
+rules local to each consumer.
 
 Every transport consumer owns copied blocks; queues do not share allocation or
 retention state. The mpv queue and TS-recorder queue serve different purposes

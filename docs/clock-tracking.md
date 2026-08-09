@@ -43,6 +43,39 @@ measurement, and continuous TS output. It is not long enough to characterize
 loop convergence: the SRO estimator needs roughly ten seconds of history, so
 control-loop experiments require longer retained fixtures.
 
+## Input clock-error operating envelope
+
+Treat 20 ppm as the absolute sanity bound for both sample-clock error and LO
+error on an SDR admitted to this receiver. In this document:
+
+```text
+abs(sample_rate_error / nominal_sample_rate) <= 20 ppm
+abs(LO_frequency_error / tuned_RF_frequency) <= 20 ppm
+```
+
+This is an operational input contract, not a claim that SRO and LO error share
+one reference or should be coupled in the controller. A frontend capable of at
+least 10 MS/s is expected to have been calibrated well enough to satisfy both
+bounds independently. If either error exceeds 20 ppm, the receiver should
+treat it as an implausible configuration, reference-clock, or calibration
+problem and ask the user to correct the device rather than widening the
+tracking loops indefinitely.
+
+For TCXO-equipped equipment, use 0.5--1.0 ppm as the normal expected range and
+5 ppm as a conservative outer range. The interval from 5 to 20 ppm exists for
+uncalibrated or lower-grade references and validation of the sanity boundary;
+it is not the normal tuning target. Running a device such as HackRF without an
+appropriate TCXO or manual calibration does not require the receiver to accept
+errors beyond the 20 ppm contract.
+
+The 20 ppm input envelope is separate from actuator and ambiguity limits. A
+controller may need a much narrower output clamp because its estimator cannot
+move safely by 20 ppm after lock. Abrupt jumps still return to acquisition, and
+an out-of-envelope estimate must not be integrated into SRO or CFO state.
+Measurement confidence also remains channel-dependent: the hardware envelope
+defines plausible clock values, but does not establish the confidence expected
+during fades, multipath changes, or low MER.
+
 ## Open validation work
 
 ### 1. CIR timing-coordinate rebasing
@@ -169,13 +202,13 @@ Packet and TEI counts in this table were measured directly from the emitted
 188-byte transport streams so that they remain cumulative across demodulator
 session resets.
 
-| Capture | Baseline packets / TEI | Feedback packets / TEI | Result |
-| --- | ---: | ---: | --- |
-| `557mhz-horizontal` | 1,487,603 / 0 | 1,487,603 / 0 | Byte-identical; no bad lock or outer reset |
-| `557mhz-vertical` | 724,527 / 84,932 | 723,700 / 112,582 | Severe loss/recovery stress case; 16 outer resets in both paths |
-| `581mhz` | 973,084 / 1,537 | 973,084 / 1,558 | Same output count; feedback had 21 additional TEI packets |
-| `581mhz-2` | 1,257,810 / 0 | 1,257,810 / 0 | Byte-identical; no bad lock or outer reset |
-| `581mhz-3` | 1,437,707 / 26 | 1,437,707 / 26 | Byte-identical |
+| Capture               | Baseline packets / TEI | Feedback packets / TEI | Result                                                          |
+| --------------------- | ---------------------: | ---------------------: | --------------------------------------------------------------- |
+| `557mhz-horizontal` |          1,487,603 / 0 |          1,487,603 / 0 | Byte-identical; no bad lock or outer reset                      |
+| `557mhz-vertical`   |       724,527 / 84,932 |      723,700 / 112,582 | Severe loss/recovery stress case; 16 outer resets in both paths |
+| `581mhz`            |        973,084 / 1,537 |        973,084 / 1,558 | Same output count; feedback had 21 additional TEI packets       |
+| `581mhz-2`          |          1,257,810 / 0 |          1,257,810 / 0 | Byte-identical; no bad lock or outer reset                      |
+| `581mhz-3`          |         1,437,707 / 26 |         1,437,707 / 26 | Byte-identical                                                  |
 
 The clean captures show that feedback does not alter decoded output when the
 channel has adequate margin. `581mhz` contains a deep disturbance and recovers
@@ -361,7 +394,8 @@ signs, initial fractional plus multi-bin offsets, fragmented bootstrap input,
 raw-buffer replay through successful TS recovery, zero production carrier-bin
 offset, and a slow linear LO drift reaching the sample-stamped frontend
 actuator. Remaining work is real-capture validation, simultaneous non-zero SRO
-and CFO ramps, fades/retunes during bootstrap, and 2K coverage. Synthetic
+and CFO ramps and reversals with controlled phase relationships, fades/retunes
+during bootstrap, and 2K coverage. Synthetic
 coverage now includes a continuous mid-stream integer-plus-fractional CFO jump,
 generation/discontinuity handling, raw-suffix replay, reacquisition of the new
 CFO, and post-jump TS recovery.
@@ -469,12 +503,13 @@ thresholds. Use a hierarchical objective:
 4. use MER and CPU cost as secondary metrics rather than sole objectives.
 
 Tune on deterministic synthetic fixtures spanning independent SRO/CFO offsets,
-ramps, reversals, jumps, fades, multipath changes, and queue pressure. Divide
-real recordings into tuning, validation, and untouched holdout sets; include
-the full 545 MHz capture only as one member of that matrix. Optimize aggregate
-worst-case or high-percentile behavior rather than only the mean, and require a
-same-build comparison against the current controller before accepting any
-optimized parameter set.
+in-phase, inverted, and randomly phase-offset ramps and reversals, jumps,
+fades, multipath changes, and queue pressure. Divide real recordings into
+tuning, validation, and untouched holdout sets; include the full 545 MHz
+capture only as one member of that matrix. Optimize aggregate worst-case or
+high-percentile behavior rather than only the mean, and require a same-build
+comparison against the current controller before accepting any optimized
+parameter set.
 
 ### 7. Sample-clock and LO-clock relationship
 
@@ -486,10 +521,12 @@ the observed relationship between LO error and sample-clock error is
 hardware- and topology-dependent. A second-order drift model makes an assumed
 cross-loop relationship still less reliable.
 
-Continue generating independent, correlated, and deliberately conflicting
+Continue generating independent, in-phase, inverted, and randomly out-of-phase
 sample/LO drift fixtures, but use them to prove that each loop remains correct
-when the other changes. Correlation is a test dimension, not a controller
-input.
+when the other changes. For ramps and reversals, phase describes the normalized
+drift trajectory and reversal timing: in-phase cases align them, inverted cases
+use opposite signs, and random cases use a reproducible non-zero phase/time
+offset. Correlation is a test dimension, not a controller input.
 
 ## Experiment matrix
 
@@ -499,10 +536,10 @@ Each new algorithm should cover at least:
 | ------------------ | ------------------------------------------------------------------ |
 | DVB-T mode         | 2K, 8K                                                             |
 | Channel bandwidth  | supported 5/6/7/8 MHz cases where fixtures exist                   |
-| Sample clock       | zero, positive/negative offset, linear ramp, reversal              |
-| LO clock           | zero, positive/negative offset, linear ramp                        |
-| Clock relationship | independent, correlated, conflicting                               |
-| Controller         | baseline, reference PI, alpha-beta/gamma, delayed PI                |
+| Sample clock       | zero, +/-0.5--1, +/-5, and +/-20 ppm; linear ramp and reversal     |
+| LO clock           | zero, +/-0.5--1, +/-5, and +/-20 ppm; linear ramp and reversal     |
+| Clock relationship | independent; in phase; inverted; random non-zero phase offset      |
+| Controller         | baseline, reference PI, alpha-beta/gamma, delayed PI               |
 | Channel            | clean synthetic, static multipath, moving CIR, fade, real captures |
 | Input path         | deterministic offline replay; live SDR where practical             |
 
@@ -513,7 +550,8 @@ queue watermarks, and dropped blocks.
 ## Recommended order
 
 1. Complete 2K, 557/581 MHz, and synthetic CIR-bias validation.
-2. Establish expected confidence and ppm ranges for those inputs.
+2. Establish expected confidence ranges for those inputs and exercise the
+   established 0.5--1, 5, and 20 ppm operating points.
 3. Add confidence gating as an isolated control change.
 4. Run the remaining 2K, queue-pressure, retune, and ramping/reversal matrix
    against the variable-rate resampler path.
