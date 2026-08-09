@@ -2,13 +2,16 @@
 
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 #include "airspy_tv/sdr.hpp"
+#include "airspy_tv/transport_telemetry.hpp"
 
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace airspy_tv {
 
@@ -20,6 +23,8 @@ class ReceiverSession;
 // argument parsing, signal handling, or source-start policy.
 class DecodeRunReporter {
   public:
+    using TransportOutputProvider =
+        std::function<std::vector<TransportOutputTelemetry>()>;
     DecodeRunReporter(
         std::optional<std::filesystem::path> directory = std::nullopt,
         std::string context = {});
@@ -42,6 +47,7 @@ class DecodeRunReporter {
 
     [[nodiscard]] bool enabled() const noexcept;
     [[nodiscard]] bool source_active() const noexcept;
+    void set_transport_output_provider(TransportOutputProvider provider);
 
   private:
     [[nodiscard]] std::uint64_t
@@ -51,10 +57,13 @@ class DecodeRunReporter {
     bool abandon(ReceiverSession &session, std::string_view message,
                  std::string &error);
     bool drain_telemetry(ReceiverSession &session, std::string &error);
+    [[nodiscard]] std::vector<TransportOutputTelemetry>
+    transport_outputs(const ReceiverSession &session) const;
 
     std::optional<std::filesystem::path> directory_;
     std::string context_;
     std::unique_ptr<DecodeReport> writer_;
+    TransportOutputProvider transport_output_provider_;
     std::chrono::steady_clock::time_point started_at_{};
     std::chrono::steady_clock::time_point last_periodic_{};
     InputTimelineSnapshot source_timeline_baseline_;

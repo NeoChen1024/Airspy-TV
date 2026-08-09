@@ -61,6 +61,7 @@ struct AsyncTransportOutput::Impl {
         stop_requested = true;
         abort_writes.store(true, std::memory_order_relaxed);
         error = std::move(message);
+        space_available.notify_all();
     }
 
     [[nodiscard]] bool write_all(const std::span<const std::uint8_t> block,
@@ -114,6 +115,7 @@ struct AsyncTransportOutput::Impl {
                 queue.pop_front();
                 queued_bytes -= block.size();
                 in_flight_bytes = block.size();
+                space_available.notify_all();
             }
 
             std::string write_error;
@@ -140,6 +142,7 @@ struct AsyncTransportOutput::Impl {
                 dropped_blocks += queue.size();
                 queue.clear();
                 queued_bytes = 0;
+                space_available.notify_all();
                 break;
             }
             {
@@ -154,6 +157,7 @@ struct AsyncTransportOutput::Impl {
     TransportOutputConfig config;
     mutable std::mutex mutex;
     std::condition_variable ready;
+    std::condition_variable space_available;
     std::deque<std::vector<std::uint8_t>> queue;
     std::thread worker;
     std::chrono::steady_clock::time_point started_at;
@@ -169,6 +173,8 @@ struct AsyncTransportOutput::Impl {
     bool failed{};
     std::string error;
     std::atomic<std::uint64_t> elapsed_milliseconds;
+    std::atomic<std::uint64_t> blocks_accepted;
+    std::atomic<std::uint64_t> bytes_accepted;
     std::atomic<std::uint64_t> bytes_written;
     std::atomic<std::uint64_t> blocks_written;
     std::atomic<std::uint64_t> dropped_blocks;
@@ -237,6 +243,8 @@ bool AsyncTransportOutput::start_fd(const int fd, const bool close_fd,
         impl_->error.clear();
         impl_->started_at = std::chrono::steady_clock::now();
         impl_->elapsed_milliseconds = 0;
+        impl_->blocks_accepted = 0;
+        impl_->bytes_accepted = 0;
         impl_->bytes_written = 0;
         impl_->blocks_written = 0;
         impl_->dropped_blocks = 0;
@@ -262,7 +270,7 @@ bool AsyncTransportOutput::submit(
     if (transport_stream.empty()) {
         return true;
     }
-    const std::scoped_lock lock(impl_->mutex);
+    std::unique_lock lock(impl_->mutex);
     if (!impl_->accepting) {
         return false;
     }
@@ -279,6 +287,18 @@ bool AsyncTransportOutput::submit(
             impl_->ready.notify_one();
         }
         return false;
+    }
+
+    if (impl_->config.overflow_policy ==
+        TransportOverflowPolicy::block_producer) {
+        impl_->space_available.wait(lock, [this, &transport_stream] {
+            return !impl_->accepting || impl_->stop_requested ||
+                   impl_->queued_bytes + transport_stream.size() <=
+                       impl_->config.queue_capacity_bytes;
+        });
+        if (!impl_->accepting || impl_->stop_requested) {
+            return false;
+        }
     }
 
     if (impl_->config.overflow_policy == TransportOverflowPolicy::drop_oldest) {
@@ -303,8 +323,21 @@ bool AsyncTransportOutput::submit(
 
     impl_->queue.emplace_back(transport_stream.begin(), transport_stream.end());
     impl_->queued_bytes += transport_stream.size();
+    ++impl_->blocks_accepted;
+    impl_->bytes_accepted += transport_stream.size();
     impl_->ready.notify_one();
     return true;
+}
+
+void AsyncTransportOutput::discard_queued() noexcept {
+    const std::scoped_lock lock(impl_->mutex);
+    for (const auto &block : impl_->queue) {
+        impl_->dropped_bytes += block.size();
+    }
+    impl_->dropped_blocks += impl_->queue.size();
+    impl_->queue.clear();
+    impl_->queued_bytes = 0;
+    impl_->space_available.notify_all();
 }
 
 void AsyncTransportOutput::stop(const bool drain) noexcept {
@@ -327,6 +360,7 @@ void AsyncTransportOutput::stop(const bool drain) noexcept {
         }
     }
     impl_->ready.notify_one();
+    impl_->space_available.notify_all();
     impl_->worker.join();
     impl_->elapsed_milliseconds = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -350,14 +384,37 @@ TransportOutputStats AsyncTransportOutput::stats() const {
         .required =
             impl_->config.criticality == TransportSinkCriticality::required,
         .elapsed_milliseconds = elapsed,
+        .blocks_accepted = impl_->blocks_accepted,
+        .bytes_accepted = impl_->bytes_accepted,
         .bytes_written = impl_->bytes_written,
         .blocks_written = impl_->blocks_written,
         .dropped_blocks = impl_->dropped_blocks,
         .dropped_bytes = impl_->dropped_bytes,
         .write_errors = impl_->write_errors,
         .queued_bytes = impl_->queued_bytes + impl_->in_flight_bytes,
+        .queue_capacity_bytes = impl_->config.queue_capacity_bytes,
         .error = impl_->error,
     };
+}
+
+TransportOutputTelemetry
+transport_output_telemetry(std::string name, std::string type,
+                           const TransportOutputStats &stats) {
+    return {.name = std::move(name),
+            .type = std::move(type),
+            .active = stats.active,
+            .required = stats.required,
+            .failed = stats.failed,
+            .blocks_accepted = stats.blocks_accepted,
+            .bytes_accepted = stats.bytes_accepted,
+            .blocks_processed = stats.blocks_written,
+            .bytes_processed = stats.bytes_written,
+            .dropped_blocks = stats.dropped_blocks,
+            .dropped_bytes = stats.dropped_bytes,
+            .errors = stats.write_errors,
+            .queued_bytes = stats.queued_bytes,
+            .queue_capacity_bytes = stats.queue_capacity_bytes,
+            .error = stats.error};
 }
 
 } // namespace airspy_tv

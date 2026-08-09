@@ -1,5 +1,6 @@
 #pragma once
 
+#include "airspy_tv/demodulator.hpp"
 #include "airspy_tv/dvbt/receiver_parameters.hpp"
 #include "airspy_tv/sdr.hpp"
 

@@ -57,6 +57,7 @@ class TransportStreamModel {
     TransportStreamModel &operator=(TransportStreamModel &&) = delete;
 
     void reset();
+    void on_discontinuity(TransportDiscontinuity discontinuity);
     void consume(std::span<const std::uint8_t> transport_stream);
     [[nodiscard]] std::vector<TransportService> services() const;
 

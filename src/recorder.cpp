@@ -248,7 +248,7 @@ RecordingStats RawIqRecorder::stats() const {
 struct TransportStreamRecorder::Impl {
     AsyncTransportOutput output{TransportOutputConfig{
         .queue_capacity_bytes = 24U << 20U,
-        .overflow_policy = TransportOverflowPolicy::drop_newest,
+        .overflow_policy = TransportOverflowPolicy::drop_oldest,
         .criticality = TransportSinkCriticality::optional,
         .thread_name = "ts-recorder",
     }};
@@ -273,6 +273,10 @@ void TransportStreamRecorder::submit(
     static_cast<void>(impl_->output.submit(transport_stream));
 }
 
+void TransportStreamRecorder::discard_queued() noexcept {
+    impl_->output.discard_queued();
+}
+
 void TransportStreamRecorder::stop() noexcept { impl_->output.stop(); }
 
 TransportRecordingStats TransportStreamRecorder::stats() const {
@@ -280,9 +284,15 @@ TransportRecordingStats TransportStreamRecorder::stats() const {
     return {.active = stats.active,
             .failed = stats.failed,
             .elapsed_milliseconds = stats.elapsed_milliseconds,
+            .blocks_accepted = stats.blocks_accepted,
             .bytes_written = stats.bytes_written,
+            .bytes_accepted = stats.bytes_accepted,
+            .blocks_written = stats.blocks_written,
             .dropped_blocks = stats.dropped_blocks,
+            .dropped_bytes = stats.dropped_bytes,
             .write_errors = stats.write_errors,
+            .queued_bytes = stats.queued_bytes,
+            .queue_capacity_bytes = stats.queue_capacity_bytes,
             .error = stats.error};
 }
 

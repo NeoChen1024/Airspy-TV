@@ -1,5 +1,7 @@
 #pragma once
 
+#include "airspy_tv/transport_stream.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -46,6 +48,7 @@ class EpgModel {
     EpgModel &operator=(EpgModel &&) = delete;
 
     void reset();
+    void on_discontinuity(TransportDiscontinuity discontinuity);
     void consume(std::span<const std::uint8_t> transport_stream);
     [[nodiscard]] EpgSnapshot snapshot(std::uint16_t service_id) const;
 

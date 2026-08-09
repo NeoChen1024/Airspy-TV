@@ -15,6 +15,17 @@ class ReportValidationError(RuntimeError):
     """Raised when a decode report violates its schema or invariants."""
 
 
+EXPECTED_RECORD_TYPES = {
+    "source_session",
+    "frontend_block",
+    "pipeline_sample",
+    "transport_output_sample",
+    "demod_window",
+    "fec_window",
+    "decoder_event",
+}
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ReportValidationError(message)
@@ -164,6 +175,49 @@ def require_real_samples(
     )
 
 
+def require_non_negative_integer(value: Any, location: str) -> None:
+    require(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+        f"{location} is not a non-negative integer",
+    )
+
+
+def require_transport_output_record(value: dict[str, Any], location: str) -> None:
+    require_non_negative_integer(
+        field(value, "decoder_generation"), f"{location}.decoder_generation"
+    )
+    require_non_negative_integer(
+        field(value, "source_epoch"), f"{location}.source_epoch"
+    )
+    sink = field(value, "sink")
+    for name in ("name", "type"):
+        require(
+            isinstance(field(sink, name), str) and bool(field(sink, name)),
+            f"{location}.sink.{name} is not a non-empty string",
+        )
+    for name in ("active", "required", "failed"):
+        require(
+            isinstance(field(value, name), bool), f"{location}.{name} is not boolean"
+        )
+    for group in ("accepted", "processed", "dropped"):
+        for name in ("blocks", "bytes"):
+            require_non_negative_integer(
+                field(value, group, name), f"{location}.{group}.{name}"
+            )
+    require_non_negative_integer(field(value, "errors"), f"{location}.errors")
+    require_non_negative_integer(
+        field(value, "queue", "used_bytes"), f"{location}.queue.used_bytes"
+    )
+    require_non_negative_integer(
+        field(value, "queue", "capacity_bytes"), f"{location}.queue.capacity_bytes"
+    )
+    error = field(value, "error")
+    require(
+        error is None or isinstance(error, str),
+        f"{location}.error is not null or a string",
+    )
+
+
 def load_decode_report(report_dir: Path) -> dict[str, Any]:
     report_dir = report_dir.resolve()
     manifest = load_json(report_dir / "manifest.json")
@@ -213,15 +267,12 @@ def load_decode_report(report_dir: Path) -> dict[str, Any]:
             previous_sequence = sequence
         streams[record_type] = records
 
-    expected_types = {
-        "source_session",
-        "frontend_block",
-        "pipeline_sample",
-        "demod_window",
-        "fec_window",
-        "decoder_event",
-    }
-    require(set(streams) == expected_types, "manifest stream inventory is incomplete")
+    require(
+        set(streams) == EXPECTED_RECORD_TYPES,
+        "manifest stream inventory is incomplete",
+    )
+    for index, record in enumerate(streams["transport_output_sample"], start=1):
+        require_transport_output_record(record, f"transport-outputs.jsonl:{index}")
     stats = load_json(report_dir / "stats.json")
     require(field(stats, "schema_version") == 0, "stats schema version is not 0")
     require(field(stats, "mode") == "dvbt", "stats mode is not dvbt")
@@ -333,16 +384,11 @@ def validate_decode_report(
     loaded = load_decode_report(report_dir)
     manifest = loaded["manifest"]
     streams = loaded["streams"]
-    expected_types = {
-        "source_session",
-        "frontend_block",
-        "pipeline_sample",
-        "demod_window",
-        "fec_window",
-        "decoder_event",
-    }
-    require(set(streams) == expected_types, "manifest stream inventory is incomplete")
-    for record_type in expected_types - {"decoder_event"}:
+    require(
+        set(streams) == EXPECTED_RECORD_TYPES,
+        "manifest stream inventory is incomplete",
+    )
+    for record_type in EXPECTED_RECORD_TYPES - {"decoder_event"}:
         require(streams[record_type], f"{record_type} stream is empty")
 
     stats = loaded["stats"]

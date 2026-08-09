@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <fcntl.h>
@@ -225,6 +226,118 @@ bool test_blocked_output_drops_and_remains_cancellable() {
                    "blocked output cancellation does not hang");
 }
 
+bool test_blocking_output_applies_backpressure() {
+    std::array<int, 2> pipe_fds{};
+    if (!require(::pipe(pipe_fds.data()) == 0,
+                 "blocking-output pipe is created")) {
+        return false;
+    }
+
+    const int original_flags = ::fcntl(pipe_fds[1], F_GETFL);
+    if (original_flags < 0 ||
+        ::fcntl(pipe_fds[1], F_SETFL, original_flags | O_NONBLOCK) < 0) {
+        static_cast<void>(::close(pipe_fds[0]));
+        static_cast<void>(::close(pipe_fds[1]));
+        return false;
+    }
+    const std::vector<std::uint8_t> filler(4096, 0x00);
+    while (::write(pipe_fds[1], filler.data(), filler.size()) > 0) {
+    }
+
+    airspy_tv::AsyncTransportOutput output({
+        .queue_capacity_bytes = 188,
+        .overflow_policy = airspy_tv::TransportOverflowPolicy::block_producer,
+        .criticality = airspy_tv::TransportSinkCriticality::required,
+        .thread_name = "ts-out-test",
+    });
+    std::string error;
+    if (!require(output.start_fd(pipe_fds[1], true, "blocking pipe", error),
+                 "blocking pipe output starts")) {
+        static_cast<void>(::close(pipe_fds[0]));
+        return false;
+    }
+
+    const std::vector<std::uint8_t> packet(188, 0x47);
+    if (!require(output.submit(packet), "first blocking packet is accepted")) {
+        static_cast<void>(::close(pipe_fds[0]));
+        return false;
+    }
+    if (!require(output.submit(packet), "second blocking packet is accepted")) {
+        static_cast<void>(::close(pipe_fds[0]));
+        return false;
+    }
+
+    std::atomic_bool producer_finished{};
+    std::atomic_bool third_accepted{};
+    std::thread producer([&] {
+        third_accepted = output.submit(packet);
+        producer_finished = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const bool producer_blocked = !producer_finished.load();
+    std::array<std::uint8_t, 8192> drained{};
+    static_cast<void>(::read(pipe_fds[0], drained.data(), drained.size()));
+    for (int attempt = 0; attempt < 100 && !producer_finished.load();
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    output.stop(false);
+    producer.join();
+    static_cast<void>(::close(pipe_fds[0]));
+    const auto stats = output.stats();
+    return require(producer_blocked,
+                   "full blocking queue applies producer backpressure") &&
+           require(third_accepted.load(),
+                   "blocked producer resumes when queue space is available") &&
+           require(stats.blocks_accepted == 3,
+                   "blocking output accepts every producer block") &&
+           require(stats.queue_capacity_bytes == packet.size(),
+                   "blocking output reports its queue capacity");
+}
+
+bool test_discard_queued_is_sink_local() {
+    std::array<int, 2> pipe_fds{};
+    if (!require(::pipe(pipe_fds.data()) == 0,
+                 "discard-output pipe is created")) {
+        return false;
+    }
+    const int original_flags = ::fcntl(pipe_fds[1], F_GETFL);
+    if (original_flags < 0 ||
+        ::fcntl(pipe_fds[1], F_SETFL, original_flags | O_NONBLOCK) < 0) {
+        static_cast<void>(::close(pipe_fds[0]));
+        static_cast<void>(::close(pipe_fds[1]));
+        return false;
+    }
+    const std::vector<std::uint8_t> filler(4096, 0x00);
+    while (::write(pipe_fds[1], filler.data(), filler.size()) > 0) {
+    }
+
+    airspy_tv::AsyncTransportOutput output({
+        .queue_capacity_bytes = 1024,
+        .overflow_policy = airspy_tv::TransportOverflowPolicy::drop_oldest,
+        .criticality = airspy_tv::TransportSinkCriticality::optional,
+        .thread_name = "ts-out-test",
+    });
+    std::string error;
+    if (!require(output.start_fd(pipe_fds[1], true, "discard pipe", error),
+                 "discard pipe output starts")) {
+        static_cast<void>(::close(pipe_fds[0]));
+        return false;
+    }
+    const std::vector<std::uint8_t> block(256, 0x47);
+    for (int index = 0; index < 4; ++index) {
+        static_cast<void>(output.submit(block));
+    }
+    output.discard_queued();
+    const auto discarded = output.stats();
+    output.stop(false);
+    static_cast<void>(::close(pipe_fds[0]));
+    return require(discarded.dropped_blocks != 0,
+                   "discard records queued blocks as dropped") &&
+           require(discarded.queued_bytes <= block.size(),
+                   "discard leaves at most the in-flight block");
+}
+
 } // namespace
 
 int main() {
@@ -232,6 +345,8 @@ int main() {
                     test_required_overflow_fails_sink() &&
                     test_optional_overflow_is_sink_local() &&
                     test_write_failure_is_reported() &&
-                    test_blocked_output_drops_and_remains_cancellable();
+                    test_blocked_output_drops_and_remains_cancellable() &&
+                    test_blocking_output_applies_backpressure() &&
+                    test_discard_queued_is_sink_local();
     return ok ? 0 : 1;
 }

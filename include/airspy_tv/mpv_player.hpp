@@ -13,6 +13,7 @@ namespace airspy_tv {
 // All fields are monotonic or point-in-time snapshots safe to read from the
 // UI thread while the decoder feeds the player.
 struct PlaybackTelemetry {
+    bool active{};
     double playback_time_s{};
     // libmpv's audio-vs-video presentation offset in milliseconds; positive
     // means audio is ahead of video.
@@ -21,6 +22,12 @@ struct PlaybackTelemetry {
     std::int64_t vo_dropped_frames{};
     std::size_t queued_bytes{};
     std::size_t queue_capacity{};
+    std::uint64_t blocks_accepted{};
+    std::uint64_t bytes_accepted{};
+    std::uint64_t blocks_processed{};
+    std::uint64_t bytes_processed{};
+    std::uint64_t dropped_blocks{};
+    std::uint64_t dropped_bytes{};
     // True while the player's own queue is below its recovery watermark.
     // Playback starts/resumes at 2 MiB and re-enters buffering at 1 MiB.
     bool buffering{};

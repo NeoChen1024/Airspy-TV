@@ -1,5 +1,7 @@
 #include "airspy_tv/demodulator.hpp"
 #include "airspy_tv/sdr.hpp"
+#include "airspy_tv/transport_pipeline.hpp"
+#include "receiver_pipeline.hpp"
 
 #include <array>
 #include <atomic>
@@ -196,7 +198,7 @@ bool require(const bool condition, const std::string_view message) {
     return condition;
 }
 
-bool wait_for_exhaustion(const airspy_tv::SdrDevice &device) {
+bool wait_for_exhaustion(const airspy_tv::ReceiverPipeline &device) {
     for (int attempt = 0; attempt < 200 && !device.input_exhausted();
          ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -223,7 +225,8 @@ bool test_file_source_pipeline() {
             static_cast<std::streamsize>(iq.size() * sizeof(std::int16_t)));
     }
 
-    airspy_tv::SdrDevice device;
+    airspy_tv::TransportPipeline transport;
+    airspy_tv::ReceiverPipeline device(transport);
     auto demodulator = std::make_unique<ProbeDemodulator>();
     const ProbeDemodulator *probe = demodulator.get();
     device.set_demodulator(std::move(demodulator));
@@ -232,7 +235,7 @@ bool test_file_source_pipeline() {
     airspy_tv::SourceSettings settings;
     settings.sample_rate_hz = 1'000'000;
     std::string error;
-    if (!require(device.open_iq_file(path, settings, error),
+    if (!require(device.open_iq_file(path, settings, {}, error),
                  "file source opens: " + error) ||
         !require(device.start_stream(settings, error),
                  "file source starts: " + error) ||
@@ -287,6 +290,52 @@ bool test_file_source_pipeline() {
                    "closing the pipeline releases source ownership");
 }
 
+bool test_source_only_file_callbacks() {
+    const TemporaryDirectory directory;
+    const auto path = directory.path / "source-only.cs16";
+    const std::vector<std::int16_t> iq{1, -1, 2, -2, 3, -3, 4, -4};
+    {
+        std::ofstream output(path, std::ios::binary);
+        output.write(
+            reinterpret_cast<const char *>(iq.data()),
+            static_cast<std::streamsize>(iq.size() * sizeof(iq.front())));
+    }
+
+    airspy_tv::SdrDevice source;
+    airspy_tv::SourceSettings settings;
+    settings.sample_rate_hz = 1'000'000;
+    std::atomic<std::uint64_t> samples{};
+    std::atomic<bool> completed{};
+    std::string error;
+    if (!require(source.open_iq_file(path, settings,
+                                     airspy_tv::IqPlaybackPacing::unpaced,
+                                     error),
+                 "source-only file opens: " + error) ||
+        !require(source.start_stream(
+                     settings,
+                     {.samples =
+                          [&](const std::span<const std::int16_t> block) {
+                              samples += block.size() / 2;
+                          },
+                      .discontinuity = {},
+                      .finite_input_complete = [&] { completed = true; },
+                      .unexpected_stop = {}},
+                     error),
+                 "source-only file starts: " + error) ||
+        !require(wait_until([&source] { return !source.is_streaming(); }),
+                 "source-only file reaches EOF")) {
+        return false;
+    }
+    const bool result =
+        require(samples == 4, "raw source callback receives every sample") &&
+        require(completed, "raw source publishes finite completion") &&
+        require(source.input_exhausted(), "raw source classifies clean EOF") &&
+        require(source.runtime_error().empty(),
+                "raw source EOF does not become a runtime error");
+    source.close();
+    return result;
+}
+
 bool test_stdin_source_pipeline() {
     StdinPipe input;
     const std::vector<std::int16_t> iq{11, -11, 12, -12, 13, -13, 14, -14};
@@ -296,7 +345,8 @@ bool test_stdin_source_pipeline() {
     }
     input.close_writer();
 
-    airspy_tv::SdrDevice device;
+    airspy_tv::TransportPipeline transport;
+    airspy_tv::ReceiverPipeline device(transport);
     auto demodulator = std::make_unique<ProbeDemodulator>();
     const ProbeDemodulator *probe = demodulator.get();
     device.set_demodulator(std::move(demodulator));
@@ -305,7 +355,7 @@ bool test_stdin_source_pipeline() {
     airspy_tv::SourceSettings settings;
     settings.sample_rate_hz = 1'000'000;
     std::string error;
-    if (!require(device.open_iq_file("-", settings, error),
+    if (!require(device.open_iq_file("-", settings, {}, error),
                  "stdin source opens: " + error) ||
         !require(device.start_stream(settings, error),
                  "stdin source starts: " + error) ||
@@ -339,7 +389,8 @@ bool test_file_runtime_failure_is_restartable() {
             static_cast<std::streamsize>(iq.size() * sizeof(iq.front())));
     }
 
-    airspy_tv::SdrDevice device;
+    airspy_tv::TransportPipeline transport;
+    airspy_tv::ReceiverPipeline device(transport);
     auto demodulator = std::make_unique<ProbeDemodulator>();
     const ProbeDemodulator *probe = demodulator.get();
     device.set_demodulator(std::move(demodulator));
@@ -347,7 +398,7 @@ bool test_file_runtime_failure_is_restartable() {
     airspy_tv::SourceSettings settings;
     settings.sample_rate_hz = 1'000'000;
     std::string error;
-    if (!require(device.open_iq_file(path, settings, error),
+    if (!require(device.open_iq_file(path, settings, {}, error),
                  "file source opens before removal: " + error)) {
         return false;
     }
@@ -398,7 +449,8 @@ bool test_stop_interrupts_file_pacing() {
             static_cast<std::streamsize>(iq.size() * sizeof(iq.front())));
     }
 
-    airspy_tv::SdrDevice device;
+    airspy_tv::TransportPipeline transport;
+    airspy_tv::ReceiverPipeline device(transport);
     auto demodulator = std::make_unique<ProbeDemodulator>();
     const ProbeDemodulator *probe = demodulator.get();
     device.set_demodulator(std::move(demodulator));
@@ -406,7 +458,7 @@ bool test_stop_interrupts_file_pacing() {
     airspy_tv::SourceSettings settings;
     settings.sample_rate_hz = 1;
     std::string error;
-    if (!require(device.open_iq_file(path, settings, error),
+    if (!require(device.open_iq_file(path, settings, {}, error),
                  "slow file source opens: " + error) ||
         !require(device.start_stream(settings, error),
                  "slow file source starts: " + error) ||
@@ -435,7 +487,8 @@ bool test_unpaced_blocking_playback_policy() {
             static_cast<std::streamsize>(iq.size() * sizeof(iq.front())));
     }
 
-    airspy_tv::SdrDevice device;
+    airspy_tv::TransportPipeline transport;
+    airspy_tv::ReceiverPipeline device(transport);
     auto demodulator = std::make_unique<ProbeDemodulator>();
     const ProbeDemodulator *probe = demodulator.get();
     device.set_demodulator(std::move(demodulator));
@@ -471,7 +524,9 @@ bool test_unpaced_blocking_playback_policy() {
 
 int main() {
     try {
-        return test_file_source_pipeline() && test_stdin_source_pipeline() &&
+        return test_source_only_file_callbacks() &&
+                       test_file_source_pipeline() &&
+                       test_stdin_source_pipeline() &&
                        test_file_runtime_failure_is_restartable() &&
                        test_stop_interrupts_file_pacing() &&
                        test_unpaced_blocking_playback_policy()

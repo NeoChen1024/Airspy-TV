@@ -14,6 +14,7 @@
 #include <thread>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -137,6 +138,14 @@ int live_decode_cli(LiveDecodeConfig config) {
     }
 
     airspy_tv::DecodeRunReporter reporter(config.report_directory, "live-cli");
+    reporter.set_transport_output_provider([&output] {
+        std::vector<airspy_tv::TransportOutputTelemetry> result;
+        if (output != nullptr) {
+            result.push_back(airspy_tv::transport_output_telemetry(
+                "cli-ts-output", "file-or-stream", output->stats()));
+        }
+        return result;
+    });
     reporter.prepare(session);
     const bool source_started =
         config.iq_input.has_value()

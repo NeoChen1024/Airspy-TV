@@ -1,17 +1,12 @@
 #pragma once
 
-#include "airspy_tv/demodulator.hpp"
-#include "airspy_tv/recorder.hpp"
-#include "airspy_tv/rtp_udp_output.hpp"
-#include "airspy_tv/spectrum.hpp"
-#include "airspy_tv/transport_stream.hpp"
-
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,8 +36,6 @@ inline constexpr double max_frequency_correction_ppm = 1000.0;
 
 struct SourceSettings {
     std::uint64_t center_frequency_hz{545'000'000};
-    // Software LO correction applied as
-    // hardware_frequency = nominal_frequency * (1 + ppm / 1e6).
     double frequency_correction_ppm{};
     std::uint32_t sample_rate_hz{10'000'000};
     AirspyGainMode airspy_gain_mode{AirspyGainMode::Sensitivity};
@@ -57,10 +50,18 @@ struct IqPlaybackPolicy {
         DecoderBackpressurePolicy::drop_when_busy};
 };
 
+struct SdrSourceCallbacks {
+    std::function<void(std::span<const std::int16_t>)> samples;
+    std::function<void(std::uint64_t)> discontinuity;
+    std::function<void()> finite_input_complete;
+    std::function<void()> unexpected_stop;
+};
+
+// Source-only owner for Airspy, SoapySDR, and file/stdin I/Q backends. Signal
+// analysis, timeline stamping, demodulation, and recording belong to the
+// receiver pipeline above this boundary.
 class SdrDevice {
   public:
-    using TransportSink = std::function<void(std::span<const std::uint8_t>)>;
-
     SdrDevice();
     ~SdrDevice() noexcept;
 
@@ -73,57 +74,24 @@ class SdrDevice {
 
     bool open(const DeviceDescriptor &descriptor, std::string &error);
     bool open_iq_file(const std::filesystem::path &path,
-                      SourceSettings &settings, std::string &error);
-    bool open_iq_file(const std::filesystem::path &path,
-                      SourceSettings &settings, IqPlaybackPolicy policy,
+                      SourceSettings &settings, IqPlaybackPacing pacing,
                       std::string &error);
-    void close();
+    void close() noexcept;
     bool configure(const SourceSettings &settings, std::string &error);
-    bool start_stream(const SourceSettings &settings, std::string &error);
-    void finish_stream();
-    void stop_stream();
+    bool start_stream(const SourceSettings &settings,
+                      SdrSourceCallbacks callbacks, std::string &error);
+    void stop_stream() noexcept;
     bool set_center_frequency(std::uint64_t frequency_hz, std::string &error);
     bool set_frequency_correction_ppm(double ppm, std::string &error);
     bool set_gain(const SourceSettings &settings, std::string &error);
     bool set_bias_tee(bool enabled, std::string &error);
-    void set_display_smoothing(bool fft_enabled, int fft_speed,
-                               bool snr_enabled, int snr_speed);
-    void set_display_analysis_enabled(bool enabled) noexcept;
-    void set_demodulator_signal_smoothing(bool enabled, int speed);
-    // Install the standard demodulator. The demodulator takes over the
-    // MPEG-TS pipeline (service model, TS recorder, transport sink) via its
-    // transport callback. Standard-specific parameters are configured on the
-    // concrete type before injection. A null demodulator disconnects the
-    // pipeline.
-    void set_demodulator(std::unique_ptr<Demodulator> demodulator);
-    void set_channel_bandwidth(std::uint32_t bandwidth_hz);
-
-    bool start_recording(const std::filesystem::path &path,
-                         const SourceSettings &settings, std::string &error);
-    void stop_recording();
-    bool start_ts_recording(const std::filesystem::path &path,
-                            std::string &error);
-    void stop_ts_recording();
-    bool start_rtp_streaming(const RtpUdpEndpoint &endpoint,
-                             std::string &error);
-    void stop_rtp_streaming();
-    void set_transport_sink(TransportSink sink);
 
     [[nodiscard]] bool is_open() const;
     [[nodiscard]] bool is_streaming() const;
     [[nodiscard]] bool input_exhausted() const;
-    [[nodiscard]] bool is_recording() const;
     [[nodiscard]] const DeviceDescriptor *descriptor() const;
     [[nodiscard]] const std::vector<std::uint32_t> &sample_rates() const;
     [[nodiscard]] std::optional<std::pair<double, double>> gain_range() const;
-    [[nodiscard]] RecordingStats recording_stats() const;
-    [[nodiscard]] TransportRecordingStats ts_recording_stats() const;
-    [[nodiscard]] RtpUdpStats rtp_streaming_stats() const;
-    [[nodiscard]] SpectrumSnapshot spectrum_snapshot() const;
-    [[nodiscard]] SignalSnapshot signal_snapshot() const;
-    [[nodiscard]] PipelineSnapshot pipeline_snapshot() const;
-    [[nodiscard]] InputTimelineSnapshot input_timeline_snapshot() const;
-    [[nodiscard]] std::vector<TransportService> transport_services() const;
     [[nodiscard]] std::string runtime_error() const;
 
   private:

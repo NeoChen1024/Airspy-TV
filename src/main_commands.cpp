@@ -2,6 +2,7 @@
 
 #include "airspy_tv/dvbt/signal_analyzer.hpp"
 #include "airspy_tv/dvbt/stream_decoder.hpp"
+#include "receiver_session.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -42,20 +43,12 @@ int record_first_cli(const std::filesystem::path &path, const int duration_ms,
         });
     const DeviceDescriptor &descriptor =
         native == result.devices.end() ? result.devices.front() : *native;
-    SdrDevice receiver;
+    ReceiverSession receiver;
     std::string error;
-    if (!receiver.open(descriptor, error)) {
+    SourceSettings effective = settings;
+    if (!receiver.open_device_and_start(descriptor, effective, error)) {
         std::cerr << error << '\n';
         return 1;
-    }
-
-    SourceSettings effective = settings;
-    if (!receiver.sample_rates().empty()) {
-        effective.sample_rate_hz = *std::ranges::min_element(
-            receiver.sample_rates(), {},
-            [target = effective.sample_rate_hz](const std::uint32_t rate) {
-                return std::llabs(static_cast<long long>(rate) - target);
-            });
     }
     if (!receiver.start_recording(path, effective, error)) {
         std::cerr << error << '\n';
@@ -64,9 +57,8 @@ int record_first_cli(const std::filesystem::path &path, const int duration_ms,
     ++effective.airspy_gain;
     if (!receiver.set_gain(effective, error) ||
         !receiver.set_bias_tee(false, error) ||
-        !receiver.set_center_frequency(effective.center_frequency_hz + 1'000,
-                                       error) ||
-        !receiver.set_center_frequency(effective.center_frequency_hz, error)) {
+        !receiver.retune(effective.center_frequency_hz + 1'000, error) ||
+        !receiver.retune(effective.center_frequency_hz, error)) {
         receiver.stop_recording();
         std::cerr << error << '\n';
         return 1;
@@ -91,16 +83,12 @@ int record_first_cli(const std::filesystem::path &path, const int duration_ms,
 int inspect_iq_cli(const std::filesystem::path &path,
                    const std::uint32_t raw_sample_rate_hz,
                    const std::uint64_t raw_center_frequency_hz) {
-    SdrDevice receiver;
-    auto demodulator = std::make_unique<dvbt::StreamDecoder>();
-    const dvbt::StreamDecoder *dvbt_demod = demodulator.get();
-    receiver.set_demodulator(std::move(demodulator));
+    ReceiverSession receiver;
     SourceSettings settings;
     settings.sample_rate_hz = raw_sample_rate_hz;
     settings.center_frequency_hz = raw_center_frequency_hz;
     std::string error;
-    if (!receiver.open_iq_file(path, settings, error) ||
-        !receiver.start_stream(settings, error)) {
+    if (!receiver.open_iq_file_and_start(path, settings, error)) {
         std::cerr << error << '\n';
         return 1;
     }
@@ -111,7 +99,7 @@ int inspect_iq_cli(const std::filesystem::path &path,
         std::chrono::steady_clock::now() + std::chrono::seconds(6);
     while (std::chrono::steady_clock::now() < deadline) {
         spectrum = receiver.spectrum_snapshot();
-        analysis = dvbt_demod->analysis_snapshot();
+        analysis = receiver.dvbt_snapshot().signal;
         if (spectrum.sequence >= 50 && analysis.locked) {
             break;
         }

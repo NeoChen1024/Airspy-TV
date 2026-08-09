@@ -2,6 +2,7 @@
 
 #include "airspy_tv/demodulator.hpp"
 #include "airspy_tv/dvbt/receiver_parameters.hpp"
+#include "airspy_tv/rtp_udp_output.hpp"
 #include "airspy_tv/sdr.hpp"
 
 #include <filesystem>

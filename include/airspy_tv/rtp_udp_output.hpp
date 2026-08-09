@@ -17,13 +17,17 @@ struct RtpUdpEndpoint {
 
 struct RtpUdpStats {
     bool active{};
+    bool failed{};
     std::uint64_t elapsed_milliseconds{};
+    std::uint64_t datagrams_accepted{};
+    std::uint64_t wire_bytes_accepted{};
     std::uint64_t wire_bytes_sent{};
     std::uint64_t datagrams_sent{};
     std::uint64_t dropped_datagrams{};
     std::uint64_t dropped_wire_bytes{};
     std::uint64_t write_errors{};
     std::size_t queued_bytes{};
+    std::size_t queue_capacity_bytes{};
     std::string last_error;
 };
 
@@ -48,6 +52,7 @@ class RtpUdpTransportOutput {
 
     bool start(const RtpUdpEndpoint &endpoint, std::string &error);
     void submit(std::span<const std::uint8_t> transport_stream);
+    void discard_queued() noexcept;
     void stop() noexcept;
 
     [[nodiscard]] RtpUdpStats stats() const;

@@ -2,6 +2,8 @@
 
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 #include "airspy_tv/sdr.hpp"
+#include "airspy_tv/transport_pipeline.hpp"
+#include "receiver_pipeline.hpp"
 
 #include <filesystem>
 #include <functional>
@@ -22,7 +24,7 @@ struct DvbTSessionSnapshot {
 // rebinds callbacks, then optionally restarts it.
 class ReceiverSession {
   public:
-    using TransportSink = SdrDevice::TransportSink;
+    using TransportSink = TransportPipeline::Sink;
     using DiscontinuityCallback = Demodulator::DiscontinuityCallback;
 
     ReceiverSession();
@@ -47,6 +49,10 @@ class ReceiverSession {
     [[nodiscard]] RtpUdpStats rtp_streaming_stats() const;
     [[nodiscard]] SpectrumSnapshot spectrum_snapshot() const;
     [[nodiscard]] std::vector<TransportService> transport_services() const;
+    [[nodiscard]] EpgSnapshot epg_snapshot(std::uint16_t service_id) const;
+    [[nodiscard]] TransportPipelineSnapshot transport_snapshot() const;
+    [[nodiscard]] std::vector<TransportOutputTelemetry>
+    transport_output_telemetry() const;
     [[nodiscard]] std::string runtime_error() const;
 
     bool select_standard(ReceiveStandard standard,
@@ -101,7 +107,8 @@ class ReceiverSession {
                              ReceiveStandard standard);
     void configure_active_demodulator();
 
-    SdrDevice device_;
+    TransportPipeline transport_;
+    ReceiverPipeline receiver_;
     ReceiveStandard standard_{ReceiveStandard::DvbT};
     dvbt::ReceiverParameters dvbt_parameters_;
     dvbt::StreamDecoder *dvbt_{};

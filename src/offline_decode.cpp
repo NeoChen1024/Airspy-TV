@@ -1,20 +1,20 @@
 #include "offline_decode.hpp"
 
 #include "airspy_tv/iq_file.hpp"
+#include "airspy_tv/transport_output.hpp"
 #include "decode_progress.hpp"
 #include "decode_run_reporter.hpp"
 #include "receiver_session.hpp"
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <memory>
 #include <span>
 #include <string>
 #include <thread>
+#include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -84,15 +84,18 @@ int offline_decode_cli(
         return 1;
     }
 
-    std::unique_ptr<std::ofstream> output_file;
-    std::ostream *output = &std::cout;
-    if (!stdout_destination) {
-        output_file = std::make_unique<std::ofstream>(
-            destination, std::ios::binary | std::ios::trunc);
-        output = output_file.get();
-    }
-    if (!*output) {
-        std::cerr << "Unable to open MPEG-TS output\n";
+    airspy_tv::AsyncTransportOutput output({
+        .queue_capacity_bytes = 24U << 20U,
+        .overflow_policy = airspy_tv::TransportOverflowPolicy::block_producer,
+        .criticality = airspy_tv::TransportSinkCriticality::required,
+        .thread_name = "ts-offline-output",
+    });
+    const bool output_started =
+        stdout_destination
+            ? output.start_fd(STDOUT_FILENO, false, "stdout", error)
+            : output.start_file(destination, error);
+    if (!output_started) {
+        std::cerr << error << '\n';
         return 1;
     }
 
@@ -107,17 +110,17 @@ int offline_decode_cli(
     airspy_tv::ReceiverSession session;
     session.set_display_analysis_enabled(false);
     session.set_dvbt_parameters(parameters);
-    std::atomic_bool output_failed{};
     session.set_transport_sink(
-        [output, &output_failed](const std::span<const std::uint8_t> ts) {
-            output->write(reinterpret_cast<const char *>(ts.data()),
-                          static_cast<std::streamsize>(ts.size()));
-            if (!*output) {
-                output_failed.store(true, std::memory_order_relaxed);
-            }
+        [&output](const std::span<const std::uint8_t> ts) {
+            static_cast<void>(output.submit(ts));
         });
 
     airspy_tv::DecodeRunReporter reporter(report_directory, "offline");
+    reporter.set_transport_output_provider([&output] {
+        return std::vector<airspy_tv::TransportOutputTelemetry>{
+            airspy_tv::transport_output_telemetry(
+                "offline-ts-output", "file-or-stream", output.stats())};
+    });
     reporter.prepare(session);
     const auto initial_timeline = session.input_timeline_snapshot();
     if (!session.open_iq_file_and_start(source, settings, playback_policy,
@@ -148,8 +151,9 @@ int offline_decode_cli(
             error = runtime_error;
             break;
         }
-        if (output_failed.load(std::memory_order_relaxed)) {
-            error = "Failed while writing MPEG-TS output";
+        const auto output_stats = output.stats();
+        if (output_stats.failed) {
+            error = output_stats.error;
             break;
         }
         const auto stats = session.dvbt_snapshot().decoder;
@@ -178,14 +182,14 @@ int offline_decode_cli(
 
     session.finish_stream();
     session.set_transport_sink({});
-    output->flush();
+    output.stop(error.empty());
 
     if (error.empty()) {
         const std::string runtime_error = session.runtime_error();
         if (!runtime_error.empty()) {
             error = runtime_error;
-        } else if (output_failed.load(std::memory_order_relaxed)) {
-            error = "Failed while writing MPEG-TS output";
+        } else if (output.stats().failed) {
+            error = output.stats().error;
         } else if (!session.input_exhausted()) {
             error = "I/Q input stream stopped";
         }
@@ -210,7 +214,12 @@ int offline_decode_cli(
                 std::to_string(stats.dropped_blocks) + " block(s)";
     }
 
-    if (report_failed || !error.empty() || !*output) {
+    const auto output_stats = output.stats();
+    if (error.empty() && output_stats.dropped_blocks != 0) {
+        error = "Internal error: exact MPEG-TS output dropped " +
+                std::to_string(output_stats.dropped_blocks) + " block(s)";
+    }
+    if (report_failed || !error.empty() || output_stats.failed) {
         if (error.empty()) {
             error = "Failed while writing MPEG-TS output";
         }

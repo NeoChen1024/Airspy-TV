@@ -201,6 +201,15 @@ void EpgModel::reset() {
     impl_->feed.reset();
 }
 
+void EpgModel::on_discontinuity(const TransportDiscontinuity discontinuity) {
+    const std::scoped_lock lock(impl_->mutex);
+    impl_->feed.reset();
+    if (discontinuity == TransportDiscontinuity::retune) {
+        impl_->events.clear();
+        impl_->utc_time.reset();
+    }
+}
+
 void EpgModel::consume(const std::span<const std::uint8_t> transport_stream) {
     const std::scoped_lock lock(impl_->mutex);
     impl_->feed.consume(transport_stream);

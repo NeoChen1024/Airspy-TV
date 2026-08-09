@@ -100,7 +100,7 @@ std::string format_rtp_udp_endpoint(const RtpUdpEndpoint &endpoint) {
 struct RtpUdpTransportOutput::Impl {
     Impl()
         : output(TransportOutputConfig{
-              .queue_capacity_bytes = 1U << 20U,
+              .queue_capacity_bytes = 8U << 20U,
               .overflow_policy = TransportOverflowPolicy::drop_oldest,
               .criticality = TransportSinkCriticality::optional,
               .write_error_policy = TransportWriteErrorPolicy::drop_block,
@@ -278,17 +278,29 @@ void RtpUdpTransportOutput::stop() noexcept {
     impl_->output.stop(false);
 }
 
+void RtpUdpTransportOutput::discard_queued() noexcept {
+    {
+        const std::scoped_lock lock(impl_->mutex);
+        impl_->pending.clear();
+    }
+    impl_->output.discard_queued();
+}
+
 RtpUdpStats RtpUdpTransportOutput::stats() const {
     const auto output = impl_->output.stats();
     return {
         .active = output.active,
+        .failed = output.failed,
         .elapsed_milliseconds = output.elapsed_milliseconds,
+        .datagrams_accepted = output.blocks_accepted,
+        .wire_bytes_accepted = output.bytes_accepted,
         .wire_bytes_sent = output.bytes_written,
         .datagrams_sent = output.blocks_written,
         .dropped_datagrams = output.dropped_blocks,
         .dropped_wire_bytes = output.dropped_bytes,
         .write_errors = output.write_errors,
         .queued_bytes = output.queued_bytes,
+        .queue_capacity_bytes = output.queue_capacity_bytes,
         .last_error = output.error,
     };
 }

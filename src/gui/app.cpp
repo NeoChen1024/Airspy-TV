@@ -18,6 +18,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace airspy_tv::gui {
 namespace {
@@ -25,48 +26,69 @@ namespace {
 constexpr float panel_width = 410.0F;
 
 void update_app_state(AppState &state) {
-    state.player.set_source_active(state.session.is_streaming());
-    const std::uint64_t source_epoch =
-        state.session.input_timeline_snapshot().stream_epoch;
-    if (source_epoch != 0 && source_epoch != state.last_source_epoch) {
-        state.epg.reset();
-        state.last_source_epoch = source_epoch;
+    state.frame.standard = state.session.standard();
+    state.frame.channel_bandwidth_hz = state.session.channel_bandwidth_hz();
+    state.frame.source_open = state.session.is_open();
+    state.frame.source_streaming = state.session.is_streaming();
+    state.frame.input_exhausted = state.session.input_exhausted();
+    state.frame.iq_recording = state.session.is_recording();
+    if (const auto *descriptor = state.session.descriptor();
+        descriptor != nullptr) {
+        state.frame.descriptor = *descriptor;
+    } else {
+        state.frame.descriptor.reset();
     }
-    state.player.poll_events();
-    state.spectrum = state.session.spectrum_snapshot();
-    state.signal = state.session.signal_snapshot();
-    state.pipeline = state.session.pipeline_snapshot();
+    state.frame.sample_rates = state.session.sample_rates();
+    state.frame.gain_range = state.session.gain_range();
+    state.output.player.set_source_active(state.frame.source_streaming);
+    state.output.player.poll_events();
+    state.frame.playback = state.output.player.telemetry();
+    state.frame.spectrum = state.session.spectrum_snapshot();
+    state.frame.signal = state.session.signal_snapshot();
+    state.frame.pipeline = state.session.pipeline_snapshot();
+    state.frame.iq_recording_stats = state.session.recording_stats();
+    state.frame.ts_recording_stats = state.session.ts_recording_stats();
+    state.frame.rtp_stats = state.session.rtp_streaming_stats();
     update_standard_state(state);
     float queue_pressure = 0.0F;
-    for (std::size_t index = 0; index < state.pipeline.stage_count; ++index) {
-        const auto &stage = state.pipeline.stages[index];
+    for (std::size_t index = 0; index < state.frame.pipeline.stage_count;
+         ++index) {
+        const auto &stage = state.frame.pipeline.stages[index];
         if (stage.queue_valid) {
             queue_pressure = std::max(queue_pressure, stage.queue_fraction);
         }
     }
-    state.pipeline_load = state.pipeline_load_monitor.update(PipelineLoadSample{
-        .active = state.session.is_streaming() || state.pipeline.processing,
-        .realtime_ratio = state.pipeline.processing_realtime_ratio,
-        .queue_pressure_fraction = queue_pressure,
-        .dropped_blocks = state.pipeline.dropped_blocks,
-        .sequence = state.pipeline.sequence});
-    state.services = state.session.transport_services();
-    if (!state.services.empty() &&
-        std::ranges::none_of(state.services, [&state](const auto &service) {
-            return state.selected_service_id == service.service_id;
-        })) {
-        state.selected_service_id = state.services.front().service_id;
+    state.frame.pipeline_load =
+        state.display.pipeline_load_monitor.update(PipelineLoadSample{
+            .active =
+                state.frame.source_streaming || state.frame.pipeline.processing,
+            .realtime_ratio = state.frame.pipeline.processing_realtime_ratio,
+            .queue_pressure_fraction = queue_pressure,
+            .dropped_blocks = state.frame.pipeline.dropped_blocks,
+            .sequence = state.frame.pipeline.sequence});
+    state.frame.services = state.session.transport_services();
+    if (!state.frame.services.empty() &&
+        std::ranges::none_of(
+            state.frame.services, [&state](const auto &service) {
+                return state.output.selected_service_id == service.service_id;
+            })) {
+        state.output.selected_service_id =
+            state.frame.services.front().service_id;
     }
-    if (state.selected_service_id.has_value()) {
+    if (state.output.selected_service_id.has_value()) {
         const auto service = std::ranges::find_if(
-            state.services, [&state](const TransportService &candidate) {
-                return candidate.service_id == *state.selected_service_id;
+            state.frame.services, [&state](const TransportService &candidate) {
+                return candidate.service_id ==
+                       *state.output.selected_service_id;
             });
-        if (service != state.services.end()) {
-            state.player.select_service(*service);
+        if (service != state.frame.services.end()) {
+            state.output.player.select_service(*service);
         }
+        state.frame.epg =
+            state.session.epg_snapshot(*state.output.selected_service_id);
     } else {
-        state.player.clear_service();
+        state.output.player.clear_service();
+        state.frame.epg = {};
     }
 }
 
@@ -84,24 +106,24 @@ void draw_application(AppState &state) {
     ImGui::TextColored(accent, "AIRSPY TV");
     ImGui::SameLine(128.0F);
     const bool file_source =
-        state.session.descriptor() != nullptr &&
-        state.session.descriptor()->backend == SdrBackend::File;
+        state.frame.descriptor.has_value() &&
+        state.frame.descriptor->backend == SdrBackend::File;
     ImGui::BeginDisabled(file_source);
     if (const auto frequency = draw_frequency_control(
-            "center-frequency", state.settings.center_frequency_hz);
+            "center-frequency", state.source.settings.center_frequency_hz);
         frequency.has_value()) {
         request_center_frequency(state, *frequency);
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
-    const float status_width = ImGui::CalcTextSize(state.status.c_str()).x;
+    const float status_width = ImGui::CalcTextSize(state.ui.status.c_str()).x;
     ImGui::SetCursorPosX(
         std::max(ImGui::GetCursorPosX(),
                  ImGui::GetWindowWidth() - status_width - 20.0F));
-    ImGui::TextColored(state.session.is_recording()
+    ImGui::TextColored(state.frame.iq_recording
                            ? ImVec4(1.0F, 0.30F, 0.28F, 1.0F)
                            : ImVec4(0.58F, 0.66F, 0.74F, 1.0F),
-                       "%s", state.status.c_str());
+                       "%s", state.ui.status.c_str());
     ImGui::EndChild();
 
     const float sidebar =
@@ -182,10 +204,27 @@ int run_gui(std::optional<std::filesystem::path> report_directory) {
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
     AppState state(std::move(report_directory));
+    state.reporting.decode_report.set_transport_output_provider([&state] {
+        const auto playback = state.output.player.telemetry();
+        return std::vector<TransportOutputTelemetry>{
+            {.name = "mpv-playback",
+             .type = "playback",
+             .active = playback.active,
+             .blocks_accepted = playback.blocks_accepted,
+             .bytes_accepted = playback.bytes_accepted,
+             .blocks_processed = playback.blocks_processed,
+             .bytes_processed = playback.bytes_processed,
+             .dropped_blocks = playback.dropped_blocks,
+             .dropped_bytes = playback.dropped_bytes,
+             .queued_bytes = playback.queued_bytes,
+             .queue_capacity_bytes = playback.queue_capacity,
+             .error = {}},
+        };
+    });
     initialize_standard_state(state);
-    state.window = window;
+    state.ui.window = window;
     std::string player_error;
-    if (!state.player.initialize(player_error)) {
+    if (!state.output.player.initialize(player_error)) {
         std::cerr << player_error << '\n';
         ImGui_ImplOpenGL3_Shutdown();
         ImGui_ImplSDL3_Shutdown();
@@ -197,12 +236,11 @@ int run_gui(std::optional<std::filesystem::path> report_directory) {
     }
     state.session.set_transport_sink(
         [&state](const std::span<const std::uint8_t> ts) {
-            state.epg.consume(ts);
-            state.player.submit(ts);
+            state.output.player.submit(ts);
         });
     state.session.set_discontinuity_callback(
         [&state](const TransportDiscontinuity discontinuity) {
-            state.player.on_discontinuity(discontinuity);
+            state.output.player.on_discontinuity(discontinuity);
         });
     refresh_devices(state);
     bool running = true;
@@ -218,13 +256,13 @@ int run_gui(std::optional<std::filesystem::path> report_directory) {
 
         const std::string runtime_error = state.session.runtime_error();
         if (!runtime_error.empty()) {
-            state.status = runtime_error;
+            state.ui.status = runtime_error;
         }
-        const bool input_exhausted = state.session.input_exhausted();
-        if (input_exhausted && !state.observed_input_exhausted) {
-            state.status = "I/Q file playback finished";
+        const bool input_exhausted = state.frame.input_exhausted;
+        if (input_exhausted && !state.source.observed_input_exhausted) {
+            state.ui.status = "I/Q file playback finished";
         }
-        state.observed_input_exhausted = input_exhausted;
+        state.source.observed_input_exhausted = input_exhausted;
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
@@ -246,8 +284,8 @@ int run_gui(std::optional<std::filesystem::path> report_directory) {
     finalize_decode_report(state);
     state.session.set_transport_sink({});
     state.session.close();
-    state.player.shutdown();
-    state.waterfall.destroy();
+    state.output.player.shutdown();
+    state.display.waterfall.destroy();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

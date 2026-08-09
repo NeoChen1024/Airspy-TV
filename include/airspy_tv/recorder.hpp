@@ -59,9 +59,15 @@ struct TransportRecordingStats {
     bool active{};
     bool failed{};
     std::uint64_t elapsed_milliseconds{};
+    std::uint64_t blocks_accepted{};
     std::uint64_t bytes_written{};
+    std::uint64_t bytes_accepted{};
+    std::uint64_t blocks_written{};
     std::uint64_t dropped_blocks{};
+    std::uint64_t dropped_bytes{};
     std::uint64_t write_errors{};
+    std::size_t queued_bytes{};
+    std::size_t queue_capacity_bytes{};
     std::string error;
 };
 
@@ -78,6 +84,7 @@ class TransportStreamRecorder {
 
     bool start(const std::filesystem::path &path, std::string &error);
     void submit(std::span<const std::uint8_t> transport_stream);
+    void discard_queued() noexcept;
     void stop() noexcept;
     [[nodiscard]] TransportRecordingStats stats() const;
 

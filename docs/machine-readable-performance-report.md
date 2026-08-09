@@ -19,6 +19,7 @@ REPORT_DIR/
   source-sessions.jsonl
   frontend.jsonl
   pipeline.jsonl
+  transport-outputs.jsonl
   dvbt-demod.jsonl
   dvbt-fec.jsonl
   events.jsonl
@@ -240,6 +241,7 @@ The first report version uses these homogeneous streams:
 | `source-sessions.jsonl` | `source_session` | one source session ends | Source/destination/configuration, correlation ranges, per-source totals, outcome, and final decoder state |
 | `frontend.jsonl` | `frontend_block` | one input block completes | CS16 conversion, resampling, SRO actuator, and source/output sample spans |
 | `pipeline.jsonl` | `pipeline_sample` | once per wall-clock second | Queue occupancy, worker states, latest locks/quality, and cumulative progress |
+| `transport-outputs.jsonl` | `transport_output_sample` | once per wall-clock second for each active/used sink | Per-sink activity, required/failure state, accepted/processed/drop/error counters, and queue occupancy/capacity |
 | `dvbt-demod.jsonl` | `demod_window` | one stats window completes | Lock, RF/OFDM quality, CFO/SRO/timing state, and demod/symbol timing |
 | `dvbt-fec.jsonl` | `fec_window` | a numbered stats marker reaches FEC | FEC timing, session identity, output deltas, BER, RS, TEI, and sync state |
 | `events.jsonl` | `decoder_event` | a diagnostic state transition occurs | Acquisition, lock, fade, phase, timing-rejection, and FEC-gating events |
@@ -247,6 +249,39 @@ The first report version uses these homogeneous streams:
 Run lifecycle belongs in `manifest.json` and `stats.json`. Per-source lifecycle
 and configuration belong in the homogeneous `source_session` stream, not as
 different `run_start`/`run_end` schemas mixed into detailed telemetry.
+
+Transport-output records use stable sink names such as `service-model`,
+`epg-model`, `ts-recorder`, `rtp-udp`, `mpv-playback`, `cli-ts-output`, and
+`offline-ts-output`. Their `type` identifies observer, file, network,
+file-or-stream, or playback behavior without making the report depend on a UI.
+Counters are cumulative snapshots in JSONL. Source-session and run summaries
+calculate deltas across samples and handle a sink counter reset as a new local
+counter epoch, so stopping and restarting a recorder does not erase its earlier
+totals.
+
+The common fields are:
+
+```json
+{
+  "schema_version": 0,
+  "record_type": "transport_output_sample",
+  "mode": "dvbt",
+  "sequence": 42,
+  "decoder_generation": 3,
+  "source_epoch": 7,
+  "wall_elapsed_ms": 12000.0,
+  "sink": {"name": "ts-recorder", "type": "file"},
+  "active": true,
+  "required": false,
+  "failed": false,
+  "accepted": {"blocks": 120, "bytes": 15728640},
+  "processed": {"blocks": 118, "bytes": 15466496},
+  "dropped": {"blocks": 0, "bytes": 0},
+  "errors": 0,
+  "queue": {"used_bytes": 262144, "capacity_bytes": 25165824},
+  "error": null
+}
+```
 
 Every event record has the same envelope: `event`, `severity`, nullable source,
 resampled-sample and OFDM-symbol positions, and a `fields` object containing
@@ -439,6 +474,8 @@ contains:
   errors, RS packets/failures, and TEI packets;
 - MER and SRO/CFO/timing count/min/mean/max over valid demod windows;
 - for each timing key, sample count, total, mean, and maximum milliseconds;
+- for each observed transport sink, accepted/processed/drop/error totals,
+  final state, queue capacity, and maximum observed queue use;
 - exit code and error.
 
 It intentionally contains no source descriptor, decoder configuration,
@@ -467,6 +504,8 @@ Implemented:
   steady-clock one-second progress line;
 - report-directory creation/refusal rules, immutable manifest, homogeneous
   JSONL routing, periodic flushing, and atomic running/final `stats.json`;
+- a mode-independent `TelemetryStreamRouter`, DVB-T-specific report codec, and
+  one shared typed representation for JSONL and `--debug` rendering;
 - opt-in frontend/demod/FEC typed telemetry with source and resampled sample
   spans, demod-window IDs, FEC sessions, and exact run-wide counters;
 - bounded summary aggregation and one canonical timing representation shared
@@ -477,6 +516,8 @@ Implemented:
   writers, periodic pipeline samples, and final summary as offline decoding;
 - one run-wide `stats.json` plus homogeneous per-source summaries across GUI
   EOF, close, replay, sample-rate restart, and retune boundaries;
+- transport-output JSONL plus per-source/run queue and loss totals for metadata
+  observers, recorder, RTP, mpv, and CLI file/stdout sinks;
 - headless schema coverage for two source sessions, epoch/generation ranges,
   non-empty-directory refusal, and exact FEC-delta aggregation;
 - short real-capture validation of stdin/stdout, JSON validity, failure and

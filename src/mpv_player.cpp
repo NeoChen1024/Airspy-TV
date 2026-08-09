@@ -67,6 +67,12 @@ struct MpvPlayer::Impl {
     std::deque<std::vector<std::uint8_t>> queue;
     std::size_t front_offset{};
     std::size_t queued_bytes{};
+    std::uint64_t blocks_accepted{};
+    std::uint64_t bytes_accepted{};
+    std::uint64_t blocks_processed{};
+    std::uint64_t bytes_processed{};
+    std::uint64_t dropped_blocks{};
+    std::uint64_t dropped_bytes{};
     // Do not let libmpv consume a short tail immediately after startup or a
     // dropout.  The hysteresis avoids repeatedly entering/leaving buffering
     // at the same threshold while preserving a bounded live latency.
@@ -140,8 +146,10 @@ struct MpvPlayer::Impl {
             if (self.front_offset == block.size()) {
                 self.queue.pop_front();
                 self.front_offset = 0;
+                ++self.blocks_processed;
             }
         }
+        self.bytes_processed += copied;
         if (self.queued_bytes <= playback_queue_low_watermark) {
             self.buffering = true;
         }
@@ -160,6 +168,8 @@ struct MpvPlayer::Impl {
     }
 
     void clear_queue_locked() {
+        dropped_blocks += queue.size();
+        dropped_bytes += queued_bytes;
         queue.clear();
         front_offset = 0;
         queued_bytes = 0;
@@ -381,8 +391,11 @@ void MpvPlayer::submit(const std::span<const std::uint8_t> transport_stream) {
         }
         while (!impl_->queue.empty() && impl_->queued_bytes + filtered.size() >
                                             playback_queue_capacity) {
-            impl_->queued_bytes -=
+            const std::size_t dropped =
                 impl_->queue.front().size() - impl_->front_offset;
+            ++impl_->dropped_blocks;
+            impl_->dropped_bytes += dropped;
+            impl_->queued_bytes -= dropped;
             impl_->queue.pop_front();
             impl_->front_offset = 0;
         }
@@ -390,9 +403,13 @@ void MpvPlayer::submit(const std::span<const std::uint8_t> transport_stream) {
             const std::size_t keep =
                 playback_queue_capacity -
                 (playback_queue_capacity % transport_packet_size);
+            ++impl_->dropped_blocks;
+            impl_->dropped_bytes += filtered.size() - keep;
             filtered.erase(filtered.begin(),
                            filtered.end() - static_cast<std::ptrdiff_t>(keep));
         }
+        ++impl_->blocks_accepted;
+        impl_->bytes_accepted += filtered.size();
         impl_->queued_bytes += filtered.size();
         impl_->queue.push_back(std::move(filtered));
         if (impl_->buffering &&
@@ -521,6 +538,13 @@ PlaybackTelemetry MpvPlayer::telemetry() const {
         const std::scoped_lock lock(impl_->mutex);
         result.queued_bytes = impl_->queued_bytes;
         result.queue_capacity = playback_queue_capacity;
+        result.active = impl_->source_active;
+        result.blocks_accepted = impl_->blocks_accepted;
+        result.bytes_accepted = impl_->bytes_accepted;
+        result.blocks_processed = impl_->blocks_processed;
+        result.bytes_processed = impl_->bytes_processed;
+        result.dropped_blocks = impl_->dropped_blocks;
+        result.dropped_bytes = impl_->dropped_bytes;
         result.buffering = impl_->source_active && impl_->buffering;
         result.discontinuities = impl_->discontinuity_count;
     }

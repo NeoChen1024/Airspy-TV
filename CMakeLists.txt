@@ -132,16 +132,21 @@ target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F airspy-tv-common
 add_library(airspy-tv-runtime STATIC
     src/decode_progress.cpp
     src/decode_report.cpp
+    src/dvbt/dvbt_report_codec.cpp
     src/decode_run_reporter.cpp
     src/epg.cpp
     src/iq_file.cpp
     src/iq_source.cpp
     src/receiver_session.cpp
+    src/receiver_controller.cpp
+    src/receiver_pipeline.cpp
     src/recorder.cpp
     src/sdr.cpp
     src/si_common.cpp
     src/spectrum.cpp
-    src/transport_router.cpp
+    src/telemetry_stream_router.cpp
+    src/transport_observer.cpp
+    src/transport_pipeline.cpp
     src/transport_stream.cpp
 )
 target_include_directories(airspy-tv-runtime PUBLIC include PRIVATE src)
@@ -216,6 +221,28 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME decode-report COMMAND decode-report-test)
+
+    add_executable(receiver-controller-test
+        tests/receiver_controller_test.cpp
+    )
+    target_include_directories(receiver-controller-test PRIVATE src)
+    target_link_libraries(receiver-controller-test PRIVATE airspy-tv-runtime)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(receiver-controller-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME receiver-controller COMMAND receiver-controller-test)
+
+    add_executable(telemetry-stream-router-test
+        tests/telemetry_stream_router_test.cpp
+    )
+    target_include_directories(telemetry-stream-router-test PRIVATE src)
+    target_link_libraries(telemetry-stream-router-test PRIVATE airspy-tv-runtime)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(telemetry-stream-router-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME telemetry-stream-router COMMAND telemetry-stream-router-test)
 
     add_executable(sample-timeline-test
         tests/sample_timeline_test.cpp
@@ -355,6 +382,7 @@ if(BUILD_TESTING)
         tests/sdr_file_source_test.cpp
     )
     target_link_libraries(sdr-file-source-test PRIVATE airspy-tv-runtime)
+    target_include_directories(sdr-file-source-test PRIVATE src)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(sdr-file-source-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -370,6 +398,26 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME transport-output COMMAND transport-output-test)
+
+    add_executable(transport-observer-test
+        tests/transport_observer_test.cpp
+    )
+    target_link_libraries(transport-observer-test PRIVATE airspy-tv-runtime)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(transport-observer-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME transport-observer COMMAND transport-observer-test)
+
+    add_executable(transport-pipeline-test
+        tests/transport_pipeline_test.cpp
+    )
+    target_link_libraries(transport-pipeline-test PRIVATE airspy-tv-runtime)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(transport-pipeline-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME transport-pipeline COMMAND transport-pipeline-test)
 
     add_executable(rtp-udp-output-test
         tests/rtp_udp_output_test.cpp

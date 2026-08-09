@@ -302,15 +302,16 @@ void draw_spectrum_panel(AppState &state) {
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::PushID("spectrum-panel");
         const ColormapOption &selected =
-            colormap_options[state.selected_colormap];
+            colormap_options[state.display.selected_colormap];
         ImGui::SetNextItemWidth(-1.0F);
         if (ImGui::BeginCombo("##waterfall-colormap", selected.name)) {
             for (std::size_t index = 0; index < colormap_options.size();
                  ++index) {
-                const bool is_selected = index == state.selected_colormap;
+                const bool is_selected =
+                    index == state.display.selected_colormap;
                 if (ImGui::Selectable(colormap_options[index].name,
                                       is_selected)) {
-                    state.selected_colormap = index;
+                    state.display.selected_colormap = index;
                 }
                 if (is_selected) {
                     ImGui::SetItemDefaultFocus();
@@ -321,54 +322,61 @@ void draw_spectrum_panel(AppState &state) {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Waterfall colormap");
         }
-        draw_spectrum(ImVec2(-1.0F, 150.0F), state.spectrum,
-                      state.session.channel_bandwidth_hz(),
-                      state.display_floor_dbfs, state.display_ceiling_dbfs);
-        draw_waterfall(ImVec2(-1.0F, 150.0F), state.waterfall, state.spectrum,
-                       state.selected_colormap,
-                       state.session.channel_bandwidth_hz(),
-                       state.display_floor_dbfs, state.display_ceiling_dbfs);
+        draw_spectrum(ImVec2(-1.0F, 150.0F), state.frame.spectrum,
+                      state.frame.channel_bandwidth_hz,
+                      state.display.display_floor_dbfs,
+                      state.display.display_ceiling_dbfs);
+        draw_waterfall(ImVec2(-1.0F, 150.0F), state.display.waterfall,
+                       state.frame.spectrum, state.display.selected_colormap,
+                       state.frame.channel_bandwidth_hz,
+                       state.display.display_floor_dbfs,
+                       state.display.display_ceiling_dbfs);
 
         ImGui::TextDisabled("Display range");
         const float ceiling_min =
-            state.display_floor_dbfs + minimum_display_range_db;
+            state.display.display_floor_dbfs + minimum_display_range_db;
         ImGui::SliderFloat("Ceiling##spectrum-range",
-                           &state.display_ceiling_dbfs, ceiling_min,
+                           &state.display.display_ceiling_dbfs, ceiling_min,
                            signal_meter_ceiling_dbfs, "%.0f dBFS");
-        state.display_ceiling_dbfs = std::clamp(
-            state.display_ceiling_dbfs, ceiling_min, signal_meter_ceiling_dbfs);
+        state.display.display_ceiling_dbfs =
+            std::clamp(state.display.display_ceiling_dbfs, ceiling_min,
+                       signal_meter_ceiling_dbfs);
         const float floor_max =
-            state.display_ceiling_dbfs - minimum_display_range_db;
-        ImGui::SliderFloat("Floor##spectrum-range", &state.display_floor_dbfs,
+            state.display.display_ceiling_dbfs - minimum_display_range_db;
+        ImGui::SliderFloat("Floor##spectrum-range",
+                           &state.display.display_floor_dbfs,
                            signal_meter_floor_dbfs, floor_max, "%.0f dBFS");
-        state.display_floor_dbfs = std::clamp(
-            state.display_floor_dbfs, signal_meter_floor_dbfs, floor_max);
+        state.display.display_floor_dbfs =
+            std::clamp(state.display.display_floor_dbfs,
+                       signal_meter_floor_dbfs, floor_max);
 
         bool smoothing_changed = false;
         smoothing_changed |=
-            ImGui::Checkbox("FFT smoothing", &state.fft_smoothing);
-        ImGui::BeginDisabled(!state.fft_smoothing);
+            ImGui::Checkbox("FFT smoothing", &state.display.fft_smoothing);
+        ImGui::BeginDisabled(!state.display.fft_smoothing);
         ImGui::TextUnformatted("FFT smoothing speed");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1.0F);
-        smoothing_changed |= ImGui::InputInt("##fft-smoothing-speed",
-                                             &state.fft_smoothing_speed);
-        state.fft_smoothing_speed = std::max(state.fft_smoothing_speed, 1);
+        smoothing_changed |= ImGui::InputInt(
+            "##fft-smoothing-speed", &state.display.fft_smoothing_speed);
+        state.display.fft_smoothing_speed =
+            std::max(state.display.fft_smoothing_speed, 1);
         ImGui::EndDisabled();
         smoothing_changed |=
-            ImGui::Checkbox("SNR smoothing", &state.snr_smoothing);
-        ImGui::BeginDisabled(!state.snr_smoothing);
+            ImGui::Checkbox("SNR smoothing", &state.display.snr_smoothing);
+        ImGui::BeginDisabled(!state.display.snr_smoothing);
         ImGui::TextUnformatted("SNR smoothing speed");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1.0F);
-        smoothing_changed |= ImGui::InputInt("##snr-smoothing-speed",
-                                             &state.snr_smoothing_speed);
-        state.snr_smoothing_speed = std::max(state.snr_smoothing_speed, 1);
+        smoothing_changed |= ImGui::InputInt(
+            "##snr-smoothing-speed", &state.display.snr_smoothing_speed);
+        state.display.snr_smoothing_speed =
+            std::max(state.display.snr_smoothing_speed, 1);
         ImGui::EndDisabled();
         if (smoothing_changed) {
             state.session.set_display_smoothing(
-                state.fft_smoothing, state.fft_smoothing_speed,
-                state.snr_smoothing, state.snr_smoothing_speed);
+                state.display.fft_smoothing, state.display.fft_smoothing_speed,
+                state.display.snr_smoothing, state.display.snr_smoothing_speed);
         }
         ImGui::PopID();
     }
@@ -378,7 +386,7 @@ void draw_constellation_panel(AppState &state) {
     if (ImGui::CollapsingHeader("Constellation",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::PushID("constellation-panel");
-        draw_constellation(ImVec2(-1.0F, 300.0F), state.signal);
+        draw_constellation(ImVec2(-1.0F, 300.0F), state.frame.signal);
         ImGui::PopID();
     }
 }

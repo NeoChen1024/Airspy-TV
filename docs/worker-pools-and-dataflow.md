@@ -22,7 +22,15 @@ belong in git history; remaining experiments are listed at the end.
 
 ```text
 ReceiverSession
-  owns SdrDevice and the active Demodulator
+  +-- ReceiverPipeline
+  |     +-- source-only SdrDevice
+  |     +-- InputSampleTimeline / SpectrumAnalyzer / RawIqRecorder
+  |     `-- active Demodulator
+  `-- TransportPipeline
+        +-- service and EPG observer queues
+        +-- TS recorder queue
+        +-- RTP/UDP queue
+        `-- external queued sink (mpv or CLI output)
         |
         v
 Airspy callback / Soapy worker / I/Q-file worker
@@ -55,13 +63,19 @@ Airspy callback / Soapy worker / I/Q-file worker
          RS(204,188) / energy descramble / TS recovery
              |
              v
-       transport model + TS recorder + mpv/CLI sink
+       TransportPipeline fanout
+         +--> service model observer worker
+         +--> EPG observer worker
+         +--> TS recorder worker
+         +--> RTP/UDP worker
+         `--> mpv or CLI output queue
 ```
 
 `ReceiverSession` preserves the decoder object for a same-standard retune and
 performs an explicit replacement transaction when the receive standard
-changes. `SdrDevice` owns the standard-neutral demodulator and routes its TS
-output to common consumers.
+changes. `SdrDevice` is source-only. `ReceiverPipeline` owns timeline stamping,
+display analysis, recording, and the standard-neutral demodulator.
+`TransportPipeline` owns metadata observers and built-in transport outputs.
 
 The DVB-T decoder also owns a lightweight `SignalAnalyzer`. It is used only
 while the production demodulator has not published a locked signal snapshot.
@@ -81,6 +95,8 @@ calculation.
 | `dvbt-fec`                  | Own decoder regions, outer FEC, TS emission, and final stream-end delivery     | Strict FEC/TS order                         |
 | Viterbi pool (`dvbt-vit-*`) | Decode overlapping mother-code windows                                         | Results joined by sequence before outer FEC |
 | Recorder workers              | Write raw I/Q or TS without blocking source/DSP workers                        | Preserve submitted byte order               |
+| Service/EPG observer workers  | Parse copied TS blocks into latest-state models                                | Preserve local order; reset after local drop |
+| RTP/CLI/mpv output workers    | Consume independent live TS queues                                             | Preserve each sink's accepted order          |
 
 The named DVB-T threads are visible in tools such as `htop`. Pool instances
 are persistent for a compatible stream configuration; they are not recreated
@@ -234,13 +250,19 @@ contract.
 | Viterbi task queue         | Producer blocks                                         | `max(2 * workers, 1024)` windows             |
 | mpv TS queue               | Drop oldest only at hard capacity; buffering hysteresis | 8 MiB capacity, 1 MiB low, 2 MiB resume        |
 | Raw I/Q recorder           | Drop/reject on recorder overload                        | At least 5 s from active sample rate           |
-| TS recorder                | Drop/reject on recorder overload                        | 24 MiB independent write queue                 |
+| TS recorder                | Drop oldest                                             | 24 MiB independent write queue                 |
+| RTP/UDP                    | Drop oldest                                             | 8 MiB independent datagram queue               |
+| Live CLI TS output         | Drop oldest and warn                                    | 8 MiB independent write queue                  |
+| Offline exact TS output    | Block producer; drops are errors                        | 24 MiB independent write queue                 |
+| Service model observer     | Drop oldest; inject local parser reset                  | 256 KiB independent queue                      |
+| EPG model observer         | Drop oldest; inject local parser reset                  | 256 KiB independent queue                      |
 | Spectrum/pre-lock analyzer | Latest-data behavior                                    | Display-oriented, not a history queue          |
 
-The mpv queue and TS-recorder queue serve different purposes and must not
-share watermarks. An empty playback queue is not itself a transport
-discontinuity; retune, finite stream end, and FEC-region reset are explicit
-out-of-band events.
+Every transport consumer owns copied blocks; queues do not share allocation or
+retention state. The mpv queue and TS-recorder queue serve different purposes
+and must not share watermarks. An empty playback queue is not itself a
+transport discontinuity; retune, finite stream end, and FEC-region reset are
+explicit out-of-band events.
 
 ## Ordering, generations, and reset
 

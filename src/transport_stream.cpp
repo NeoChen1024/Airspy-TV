@@ -138,6 +138,15 @@ void TransportStreamModel::reset() {
     impl_->feed.reset();
 }
 
+void TransportStreamModel::on_discontinuity(
+    const TransportDiscontinuity discontinuity) {
+    const std::scoped_lock lock(impl_->mutex);
+    impl_->feed.reset();
+    if (discontinuity == TransportDiscontinuity::retune) {
+        impl_->services.clear();
+    }
+}
+
 void TransportStreamModel::consume(
     const std::span<const std::uint8_t> transport_stream) {
     const std::scoped_lock lock(impl_->mutex);

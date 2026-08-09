@@ -1,6 +1,5 @@
 #include "widgets.hpp"
 
-#include "decode_reporting.hpp"
 #include "panels.hpp"
 
 #include <fontconfig/fontconfig.h>
@@ -140,18 +139,20 @@ void apply_dark_theme() {
 }
 
 void refresh_devices(AppState &state) {
-    state.enumeration = SdrDevice::enumerate(state.show_soapy_airspy);
-    if (state.enumeration.devices.empty()) {
-        state.selected_device = 0;
+    state.source.enumeration =
+        SdrDevice::enumerate(state.source.show_soapy_airspy);
+    if (state.source.enumeration.devices.empty()) {
+        state.source.selected_device = 0;
     } else {
-        state.selected_device = std::min(state.selected_device,
-                                         state.enumeration.devices.size() - 1);
+        state.source.selected_device =
+            std::min(state.source.selected_device,
+                     state.source.enumeration.devices.size() - 1);
     }
-    if (state.enumeration.devices.empty()) {
-        state.status = "No SDR devices found";
+    if (state.source.enumeration.devices.empty()) {
+        state.ui.status = "No SDR devices found";
     } else {
-        state.status = std::format("Found {} SDR device(s)",
-                                   state.enumeration.devices.size());
+        state.ui.status = std::format("Found {} SDR device(s)",
+                                      state.source.enumeration.devices.size());
     }
 }
 
@@ -258,33 +259,7 @@ draw_frequency_control(const char *id, const std::uint64_t frequency_hz) {
 
 void request_center_frequency(AppState &state,
                               const std::uint64_t frequency_hz) {
-    if (!state.session.is_open()) {
-        state.settings.center_frequency_hz = frequency_hz;
-        state.status = "Center frequency selected";
-        return;
-    }
-
-    finish_decode_report_source(state);
-    prepare_decode_report(state);
-    std::string error;
-    if (state.session.retune(frequency_hz, error)) {
-        state.settings.center_frequency_hz = frequency_hz;
-        state.status = "Center frequency applied";
-        std::string report_error;
-        if (!start_decode_report(state, report_error)) {
-            state.status += "; report unavailable: " + report_error;
-        }
-    } else {
-        state.status = error;
-        if (state.session.is_streaming()) {
-            std::string report_error;
-            if (!start_decode_report(state, report_error)) {
-                state.status += "; report unavailable: " + report_error;
-            }
-        } else {
-            cancel_decode_report_start(state);
-        }
-    }
+    state.ui.status = state.reporting.controller.retune(frequency_hz).message;
 }
 
 void draw_metric(const char *label, const char *value, const float fraction,
@@ -351,10 +326,10 @@ void consume_file_dialog_result(AppState &state,
     if (dialog->selected_path.has_value()) {
         path = std::move(*dialog->selected_path);
         dialog->selected_path.reset();
-        state.status = std::string(description) + " path selected";
+        state.ui.status = std::string(description) + " path selected";
     }
     if (dialog->error.has_value()) {
-        state.status = "File dialog: " + *dialog->error;
+        state.ui.status = "File dialog: " + *dialog->error;
         dialog->error.reset();
     }
 }
@@ -380,7 +355,7 @@ void show_recording_file_dialog(
     auto callback_state =
         std::make_unique<std::shared_ptr<FileDialogState>>(dialog);
     SDL_ShowSaveFileDialog(&file_dialog_callback, callback_state.release(),
-                           state.window, filters.data(),
+                           state.ui.window, filters.data(),
                            static_cast<int>(filters.size()),
                            dialog->default_location.c_str());
 }

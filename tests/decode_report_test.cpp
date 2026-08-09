@@ -19,6 +19,7 @@ using airspy_tv::DecodeReportConfig;
 using airspy_tv::DecodeSourceSessionConfig;
 using airspy_tv::InputTimelineSnapshot;
 using airspy_tv::JsonlReader;
+using airspy_tv::TransportOutputTelemetry;
 using airspy_tv::dvbt::FecWindowTelemetry;
 using airspy_tv::dvbt::StreamDecoderStats;
 using airspy_tv::dvbt::TelemetryRecord;
@@ -185,9 +186,88 @@ void test_non_empty_directory_is_rejected() {
     throw std::runtime_error("non-empty report directory was accepted");
 }
 
+void test_transport_output_stream_and_totals() {
+    TemporaryDirectory directory;
+    DecodeReport report({.directory = directory.path, .context = "test"});
+    StreamDecoderStats stats;
+    stats.decoder_generation = 4;
+    stats.source_epoch = 7;
+    const std::array<TransportOutputTelemetry, 1> baseline{{
+        {.name = "offline-ts-output",
+         .type = "file",
+         .active = true,
+         .required = true,
+         .blocks_accepted = 10,
+         .bytes_accepted = 1'880,
+         .blocks_processed = 8,
+         .bytes_processed = 1'504,
+         .queue_capacity_bytes = 24U << 20U,
+         .error = {}},
+    }};
+    report.begin_source(
+        DecodeSourceSessionConfig{.source = "stdin",
+                                  .destination = "stdout",
+                                  .sample_rate_hz = 10'000'000,
+                                  .decoder = {}},
+        InputTimelineSnapshot{.stream_epoch = 7, .sample_rate_hz = 10'000'000},
+        stats, 0.0, baseline);
+    const std::array<TransportOutputTelemetry, 1> sample{{
+        {.name = "offline-ts-output",
+         .type = "file",
+         .active = true,
+         .required = true,
+         .blocks_accepted = 15,
+         .bytes_accepted = 2'820,
+         .blocks_processed = 13,
+         .bytes_processed = 2'444,
+         .dropped_blocks = 2,
+         .dropped_bytes = 376,
+         .queued_bytes = 376,
+         .queue_capacity_bytes = 24U << 20U,
+         .error = {}},
+    }};
+    report.write_transport_outputs(sample, 4, 7, 1.0);
+    report.end_source("completed", "", stats,
+                      InputTimelineSnapshot{.stream_epoch = 7,
+                                            .source_head_sample = 1'000,
+                                            .delivered_samples = 1'000,
+                                            .sample_rate_hz = 10'000'000},
+                      1'000, 1.0);
+    report.finalize("completed", 0, "", 1.0);
+
+    std::ifstream stream(directory.path / "transport-outputs.jsonl");
+    JsonlReader reader(stream);
+    const auto record = reader.read();
+    require(record.has_value(), "transport output sample is missing");
+    require(record->value.at("schema_version") == 0 &&
+                record->value.at("mode") == "dvbt",
+            "transport output envelope is wrong");
+    require(record->value.at("source_epoch") == 7 &&
+                record->value.at("decoder_generation") == 4,
+            "transport output correlation is wrong");
+    require(record->value.at("queue").at("capacity_bytes") == (24U << 20U),
+            "transport output capacity is wrong");
+
+    std::ifstream sessions_stream(directory.path / "source-sessions.jsonl");
+    JsonlReader sessions(sessions_stream);
+    const auto session = sessions.read();
+    require(session.has_value(), "source session is missing");
+    const auto &source_output = session->value.at("transport_outputs").at(0);
+    require(source_output.at("accepted").at("bytes") == 940,
+            "source output bytes did not use its baseline");
+    require(source_output.at("dropped").at("blocks") == 2,
+            "source output drops were not aggregated");
+
+    const json summary = read_json(directory.path / "stats.json");
+    const auto &run_output = summary.at("transport_outputs").at(0);
+    require(run_output.at("processed").at("bytes") == 940,
+            "run output totals are wrong");
+}
+
 } // namespace
 
 int main() {
     test_multiple_source_sessions_share_one_report();
+    test_transport_output_stream_and_totals();
     test_non_empty_directory_is_rejected();
 }

@@ -17,8 +17,8 @@ while remaining validation gaps are maintained in
 
 - Airspy, SoapySDR, CS16 file, and stdin inputs are separated behind the
   `IqSource` boundary and feed the same receiver pipeline. Source workers own
-  backend handles and pacing; `SdrDevice` owns timeline stamping, optional
-  spectrum analysis, demodulation, and transport outputs.
+  backend handles and pacing; source-only `SdrDevice`, `ReceiverPipeline`, and
+  `TransportPipeline` have separate ownership.
 - The DVB-T path supports 2K/8K, guard intervals 1/4 through 1/32, QPSK,
   16-QAM, 64-QAM, and all non-hierarchical convolutional code rates.
 - Continuous resampling, OFDM acquisition/tracking, symbol workers,
@@ -32,7 +32,10 @@ while remaining validation gaps are maintained in
   symbol postprocessing, statistics, and telemetry. `StreamDecoder::Impl`
   retains lifecycle and external callback wiring.
 - Playback, TS recording, service discovery, now/next EPG, and common signal
-  and pipeline snapshots run in process.
+  and pipeline snapshots run in process. Every transport consumer owns an
+  independent bounded queue: 8 MiB for mpv/RTP/live CLI, 24 MiB for the TS
+  recorder, and 256 KiB for each metadata observer. Offline exact output uses
+  a separate 24 MiB blocking queue.
 - `ReceiverSession` coordinates source and demodulator lifecycle for GUI, live
   CLI, and offline decoding. File pacing and decoder backpressure are explicit
   policies: live paths are realtime and may drop when busy, while offline
@@ -45,6 +48,12 @@ while remaining validation gaps are maintained in
 - Machine-readable decode reports and the validation runner cover all 480 ideal
   DVB-T parameter combinations under portable Release and ASan/UBSan, plus a
   deterministic all-pairs TSan set and optional real-signal corpora.
+- Machine-readable reports include homogeneous per-output queue/counter
+  telemetry and per-source/run sink totals. Common stream routing, DVB-T JSON
+  encoding, and report lifecycle have separate owners.
+- GUI runtime state is grouped by responsibility; panels read one per-frame
+  snapshot and invoke source/report/output transitions through a headless
+  controller.
 
 The baseline is functional, not feature-complete. The remaining work is
 primarily targeted lifecycle and playback regression coverage,
@@ -77,9 +86,9 @@ real-signal baselines, application maintainability, and new-standard DSP.
   offset, queue growth, decoder stalls, and intentional drop-old recovery.
 
 Further cleanup and validation details are maintained in the architecture
-reviews rather than duplicated here. Report codec, GUI state, and
-transport-observer boundaries remain possible refactoring work where their
-current size or runtime behavior provides concrete justification.
+reviews rather than duplicated here. The report, GUI-state, source, and
+transport-observer boundaries are complete; follow-up should be driven by
+measured regressions or a concrete second receiver implementation.
 
 ## 2. DVB-T completeness and channel robustness
 
@@ -165,17 +174,15 @@ and lifecycle APIs are stable.
 
 ## Recommended implementation order
 
-1. Separate report serialization from report lifecycle where this reduces the
-   current `decode_report.cpp` complexity.
-2. Add lifecycle, playback-queue, and SI-table regressions as gates for those
-   ownership changes.
-3. Establish real-signal thresholds and rerun the synthetic, sanitizer, and
+1. Add lifecycle, playback-queue, and SI-table regressions around the current
+   source, transport, and report boundaries.
+2. Establish real-signal thresholds and rerun the synthetic, sanitizer, and
    retained-capture gates after each affected phase.
-4. Complete the AFC bias-validation set and long-capture clock experiments.
-5. Validate or replace the CIR estimator on long-delay/SFN input.
-6. Add hierarchical DVB-T, remaining TPS metadata, and timestamp/playback
+3. Complete the AFC bias-validation set and long-capture clock experiments.
+4. Validate or replace the CIR estimator on long-delay/SFN input.
+5. Add hierarchical DVB-T, remaining TPS metadata, and timestamp/playback
    diagnostics.
-7. Begin the first second-standard implementation using the existing common
+6. Begin the first second-standard implementation using the existing common
    lifecycle and extract additional shared code only where duplication appears.
 
 ## Release gates

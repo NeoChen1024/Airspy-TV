@@ -1,5 +1,7 @@
 #pragma once
 
+#include "airspy_tv/transport_telemetry.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -9,7 +11,12 @@
 
 namespace airspy_tv {
 
-enum class TransportOverflowPolicy { fail_sink, drop_newest, drop_oldest };
+enum class TransportOverflowPolicy {
+    fail_sink,
+    drop_newest,
+    drop_oldest,
+    block_producer,
+};
 enum class TransportSinkCriticality { optional, required };
 enum class TransportWriteErrorPolicy { fail_sink, drop_block };
 
@@ -27,14 +34,21 @@ struct TransportOutputStats {
     bool failed{};
     bool required{};
     std::uint64_t elapsed_milliseconds{};
+    std::uint64_t blocks_accepted{};
+    std::uint64_t bytes_accepted{};
     std::uint64_t bytes_written{};
     std::uint64_t blocks_written{};
     std::uint64_t dropped_blocks{};
     std::uint64_t dropped_bytes{};
     std::uint64_t write_errors{};
     std::size_t queued_bytes{};
+    std::size_t queue_capacity_bytes{};
     std::string error;
 };
+
+[[nodiscard]] TransportOutputTelemetry
+transport_output_telemetry(std::string name, std::string type,
+                           const TransportOutputStats &stats);
 
 // Bounded asynchronous byte sink for ordered MPEG-TS output. submit() never
 // performs I/O and is safe to call from the decoder transport callback.
@@ -52,6 +66,7 @@ class AsyncTransportOutput {
     bool start_fd(int fd, bool close_fd, std::string descriptor,
                   std::string &error);
     bool submit(std::span<const std::uint8_t> transport_stream) noexcept;
+    void discard_queued() noexcept;
     void stop(bool drain = true) noexcept;
 
     [[nodiscard]] TransportOutputStats stats() const;

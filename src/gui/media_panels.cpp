@@ -68,48 +68,46 @@ void draw_recorder_panel(AppState &state) {
         return;
     }
     ImGui::PushID("iq-recorder");
-    consume_file_dialog_result(state, state.file_dialog, state.recording_path,
-                               "I/Q recording");
-    const bool dialog_open = file_dialog_is_open(state.file_dialog);
+    consume_file_dialog_result(state, state.output.file_dialog,
+                               state.output.recording_path, "I/Q recording");
+    const bool dialog_open = file_dialog_is_open(state.output.file_dialog);
     draw_disabled_wrapped("Interleaved signed 16-bit little-endian I/Q (CS16)");
     ImGui::TextUnformatted("Output file");
-    ImGui::BeginDisabled(state.session.is_recording() || dialog_open);
+    ImGui::BeginDisabled(state.frame.iq_recording || dialog_open);
     ImGui::SetNextItemWidth(-92.0F);
-    ImGui::InputText("##recording-output", &state.recording_path);
+    ImGui::InputText("##recording-output", &state.output.recording_path);
     ImGui::SameLine();
     if (ImGui::Button("Browse...")) {
-        show_recording_file_dialog(state, state.file_dialog,
-                                   state.recording_path, recording_filters);
+        show_recording_file_dialog(state, state.output.file_dialog,
+                                   state.output.recording_path,
+                                   recording_filters);
     }
     ImGui::EndDisabled();
     if (dialog_open) {
         ImGui::TextDisabled("Waiting for file selection...");
     }
 
-    if (!state.session.is_recording()) {
+    if (!state.frame.iq_recording) {
         const bool file_source =
-            state.session.descriptor() != nullptr &&
-            state.session.descriptor()->backend == SdrBackend::File;
-        ImGui::BeginDisabled(!state.session.is_open() || file_source ||
-                             dialog_open || state.recording_path.empty());
+            state.frame.descriptor.has_value() &&
+            state.frame.descriptor->backend == SdrBackend::File;
+        ImGui::BeginDisabled(!state.frame.source_open || file_source ||
+                             dialog_open ||
+                             state.output.recording_path.empty());
         if (ImGui::Button("Start recording", ImVec2(-1.0F, 0.0F))) {
-            std::string error;
-            if (state.session.start_recording(
-                    std::filesystem::path(state.recording_path), state.settings,
-                    error)) {
-                state.status = "Recording raw I/Q";
-            } else {
-                state.status = error;
-            }
+            state.ui.status =
+                state.reporting.controller
+                    .start_iq_recording(state.output.recording_path)
+                    .message;
         }
         ImGui::EndDisabled();
     } else if (ImGui::Button("Stop recording", ImVec2(-1.0F, 0.0F))) {
-        state.session.stop_recording();
-        state.status = "Recording stopped; JSON sidecar written";
+        state.ui.status =
+            state.reporting.controller.stop_iq_recording().message;
     }
 
-    const auto stats = state.session.recording_stats();
-    draw_recorder_write_stats(state.iq_write_rate, stats);
+    const auto stats = state.frame.iq_recording_stats;
+    draw_recorder_write_stats(state.output.iq_write_rate, stats);
     ImGui::Text("Source drops: %llu",
                 static_cast<unsigned long long>(stats.source_dropped_samples));
     ImGui::PopID();
@@ -120,23 +118,23 @@ void draw_epg_panel(AppState &state) {
         return;
     }
     ImGui::PushID("epg-panel");
-    if (state.services.empty()) {
+    if (state.frame.services.empty()) {
         draw_disabled_wrapped("No services detected");
         ImGui::PopID();
         return;
     }
     // The EPG follows the service selected for playback; there is no
     // second selector here.
-    if (!state.selected_service_id.has_value()) {
+    if (!state.output.selected_service_id.has_value()) {
         draw_disabled_wrapped("Select a service in the player controls");
         ImGui::PopID();
         return;
     }
     const auto selected_service = std::ranges::find_if(
-        state.services, [&state](const TransportService &service) {
-            return state.selected_service_id == service.service_id;
+        state.frame.services, [&state](const TransportService &service) {
+            return state.output.selected_service_id == service.service_id;
         });
-    if (selected_service != state.services.end()) {
+    if (selected_service != state.frame.services.end()) {
         ImGui::TextDisabled(
             "%s", selected_service->name.empty()
                       ? std::format("Service {}", selected_service->service_id)
@@ -145,7 +143,7 @@ void draw_epg_panel(AppState &state) {
                                     selected_service->service_id)
                             .c_str());
     }
-    const EpgSnapshot snapshot = state.epg.snapshot(*state.selected_service_id);
+    const EpgSnapshot snapshot = state.frame.epg;
     if (snapshot.events.empty()) {
         draw_disabled_wrapped("Waiting for EIT p/f data...");
         ImGui::PopID();
@@ -250,21 +248,22 @@ void draw_ts_recorder_panel(AppState &state) {
         return;
     }
     ImGui::PushID("ts-recorder");
-    consume_file_dialog_result(state, state.ts_file_dialog,
-                               state.ts_recording_path, "MPEG-TS recording");
-    const bool dialog_open = file_dialog_is_open(state.ts_file_dialog);
-    const bool ts_source_available = state.session.is_streaming();
-    const auto ts_stats = state.session.ts_recording_stats();
+    consume_file_dialog_result(state, state.output.ts_file_dialog,
+                               state.output.ts_recording_path,
+                               "MPEG-TS recording");
+    const bool dialog_open = file_dialog_is_open(state.output.ts_file_dialog);
+    const bool ts_source_available = state.frame.source_streaming;
+    const auto ts_stats = state.frame.ts_recording_stats;
 
     draw_disabled_wrapped("Decoded transport stream (MPEG-TS)");
     ImGui::TextUnformatted("Output file");
     ImGui::BeginDisabled(dialog_open);
     ImGui::SetNextItemWidth(-92.0F);
-    ImGui::InputText("##ts-recording-output", &state.ts_recording_path);
+    ImGui::InputText("##ts-recording-output", &state.output.ts_recording_path);
     ImGui::SameLine();
     if (ImGui::Button("Browse...")) {
-        show_recording_file_dialog(state, state.ts_file_dialog,
-                                   state.ts_recording_path,
+        show_recording_file_dialog(state, state.output.ts_file_dialog,
+                                   state.output.ts_recording_path,
                                    transport_stream_filters);
     }
     ImGui::EndDisabled();
@@ -274,21 +273,20 @@ void draw_ts_recorder_panel(AppState &state) {
 
     if (!ts_stats.active) {
         ImGui::BeginDisabled(!ts_source_available || dialog_open ||
-                             state.ts_recording_path.empty());
+                             state.output.ts_recording_path.empty());
         if (ImGui::Button("Start recording", ImVec2(-1.0F, 0.0F))) {
-            std::string error;
-            state.status =
-                state.session.start_ts_recording(state.ts_recording_path, error)
-                    ? "Recording decoded MPEG-TS"
-                    : error;
+            state.ui.status =
+                state.reporting.controller
+                    .start_ts_recording(state.output.ts_recording_path)
+                    .message;
         }
         ImGui::EndDisabled();
     } else if (ImGui::Button("Stop recording", ImVec2(-1.0F, 0.0F))) {
-        state.session.stop_ts_recording();
-        state.status = "MPEG-TS recording stopped";
+        state.ui.status =
+            state.reporting.controller.stop_ts_recording().message;
     }
 
-    draw_recorder_write_stats(state.ts_write_rate, ts_stats);
+    draw_recorder_write_stats(state.output.ts_write_rate, ts_stats);
     ImGui::PopID();
 }
 
@@ -298,36 +296,33 @@ void draw_rtp_streaming_panel(AppState &state) {
         return;
     }
     ImGui::PushID("rtp-streaming");
-    const auto stats = state.session.rtp_streaming_stats();
+    const auto stats = state.frame.rtp_stats;
     ImGui::BeginDisabled(stats.active);
     ImGui::TextUnformatted("Destination host");
     ImGui::SetNextItemWidth(-1.0F);
-    ImGui::InputText("##rtp-host", &state.rtp_host);
+    ImGui::InputText("##rtp-host", &state.output.rtp_host);
     ImGui::TextUnformatted("UDP port");
     ImGui::SetNextItemWidth(-1.0F);
-    ImGui::InputScalar("##rtp-port", ImGuiDataType_U16, &state.rtp_port);
+    ImGui::InputScalar("##rtp-port", ImGuiDataType_U16, &state.output.rtp_port);
     ImGui::EndDisabled();
 
     if (!stats.active) {
-        ImGui::BeginDisabled(!state.session.is_streaming() ||
-                             state.rtp_host.empty() || state.rtp_port == 0);
+        ImGui::BeginDisabled(!state.frame.source_streaming ||
+                             state.output.rtp_host.empty() ||
+                             state.output.rtp_port == 0);
         if (ImGui::Button("Start streaming", ImVec2(-1.0F, 0.0F))) {
-            std::string error;
-            const RtpUdpEndpoint endpoint{.host = state.rtp_host,
-                                          .port = state.rtp_port};
-            state.status = state.session.start_rtp_streaming(endpoint, error)
-                               ? "Streaming MPEG-TS over RTP/UDP to " +
-                                     format_rtp_udp_endpoint(endpoint)
-                               : error;
+            const RtpUdpEndpoint endpoint{.host = state.output.rtp_host,
+                                          .port = state.output.rtp_port};
+            state.ui.status =
+                state.reporting.controller.start_rtp(endpoint).message;
         }
         ImGui::EndDisabled();
     } else if (ImGui::Button("Stop streaming", ImVec2(-1.0F, 0.0F))) {
-        state.session.stop_rtp_streaming();
-        state.status = "RTP/UDP streaming stopped";
+        state.ui.status = state.reporting.controller.stop_rtp().message;
     }
 
     const double mib_per_second =
-        state.rtp_write_rate.update(stats.active, stats.wire_bytes_sent);
+        state.output.rtp_write_rate.update(stats.active, stats.wire_bytes_sent);
     ImGui::Text("Duration: %s",
                 format_recording_duration(stats.elapsed_milliseconds).c_str());
     ImGui::Text("Sent: %.2f MiB",
@@ -350,19 +345,20 @@ void draw_playback_panel(AppState &state) {
     if (!ImGui::CollapsingHeader("Playback", ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
-    const auto telemetry = state.player.telemetry();
-    const bool playing =
-        state.player.ready() && !telemetry.paused && !telemetry.buffering;
+    const auto telemetry = state.frame.playback;
+    const bool playing = state.output.player.ready() && !telemetry.paused &&
+                         !telemetry.buffering;
     const char *playback_status =
-        telemetry.buffering
-            ? "BUFFERING"
-            : (state.player.ready() ? (telemetry.paused ? "PAUSED" : "PLAYING")
-                                    : "PLAYER IDLE");
-    draw_status_indicator(playback_status,
-                          playing ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
-                                  : (telemetry.buffering || state.player.ready()
-                                         ? ImVec4(0.95F, 0.72F, 0.30F, 1.0F)
-                                         : ImVec4(0.55F, 0.62F, 0.70F, 1.0F)));
+        telemetry.buffering ? "BUFFERING"
+                            : (state.output.player.ready()
+                                   ? (telemetry.paused ? "PAUSED" : "PLAYING")
+                                   : "PLAYER IDLE");
+    draw_status_indicator(
+        playback_status,
+        playing ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
+                : (telemetry.buffering || state.output.player.ready()
+                       ? ImVec4(0.95F, 0.72F, 0.30F, 1.0F)
+                       : ImVec4(0.55F, 0.62F, 0.70F, 1.0F)));
     std::string position = "--:--:--";
     if (telemetry.playback_time_s > 0.0) {
         const auto total = static_cast<std::int64_t>(telemetry.playback_time_s);
@@ -439,16 +435,16 @@ void draw_video_panel(AppState &state) {
     const ImVec2 footer_origin{origin.x, extent.y - footer_height};
     const ImVec2 video_origin{origin.x, origin.y + header_height};
     const ImVec2 video_extent{extent.x, footer_origin.y};
-    const float pixel_density = state.window == nullptr
-                                    ? 1.0F
-                                    : SDL_GetWindowPixelDensity(state.window);
+    const float pixel_density =
+        state.ui.window == nullptr ? 1.0F
+                                   : SDL_GetWindowPixelDensity(state.ui.window);
     const int video_width = static_cast<int>(
         std::max(1.0F, (video_extent.x - video_origin.x) * pixel_density));
     const int video_height = static_cast<int>(
         std::max(1.0F, (video_extent.y - video_origin.y) * pixel_density));
     const std::uint32_t video_texture =
-        state.player.render(video_width, video_height);
-    if (video_texture != 0 && state.player.ready()) {
+        state.output.player.render(video_width, video_height);
+    if (video_texture != 0 && state.output.player.ready()) {
         draw->AddImage(static_cast<ImTextureID>(video_texture), video_origin,
                        video_extent);
     }
@@ -456,11 +452,11 @@ void draw_video_panel(AppState &state) {
     draw->AddRectFilled(origin, ImVec2(extent.x, origin.y + header_height),
                         IM_COL32(15, 24, 35, 255), 5.0F);
     const auto selected_service = std::ranges::find_if(
-        state.services, [&state](const TransportService &service) {
-            return state.selected_service_id == service.service_id;
+        state.frame.services, [&state](const TransportService &service) {
+            return state.output.selected_service_id == service.service_id;
         });
     const std::string program_title =
-        selected_service == state.services.end()
+        selected_service == state.frame.services.end()
             ? "DIGITAL TV SERVICE"
             : std::format(
                   "DIGITAL TV  {}",
@@ -474,8 +470,8 @@ void draw_video_panel(AppState &state) {
 
     const ImVec2 center{(origin.x + extent.x) * 0.5F,
                         (origin.y + footer_origin.y) * 0.5F};
-    const std::string player_status = state.player.status();
-    if (!state.player.ready()) {
+    const std::string player_status = state.output.player.status();
+    if (!state.output.player.ready()) {
         draw->AddCircle(center, 54.0F, IM_COL32(55, 78, 102, 255), 0, 2.0F);
         draw->AddTriangleFilled(ImVec2(center.x - 14.0F, center.y - 24.0F),
                                 ImVec2(center.x - 14.0F, center.y + 24.0F),
@@ -496,25 +492,25 @@ void draw_video_panel(AppState &state) {
     const float service_width = std::max(180.0F, available.x * 0.48F);
     ImGui::SetNextItemWidth(service_width);
     const std::string service_preview =
-        selected_service == state.services.end()
+        selected_service == state.frame.services.end()
             ? "No services"
             : (selected_service->name.empty()
                    ? std::format("Service {}", selected_service->service_id)
                    : std::format("{}  ({})", selected_service->name,
                                  selected_service->service_id));
-    ImGui::BeginDisabled(state.services.empty());
+    ImGui::BeginDisabled(state.frame.services.empty());
     if (ImGui::BeginCombo("##service-selection", service_preview.c_str())) {
-        for (const auto &service : state.services) {
+        for (const auto &service : state.frame.services) {
             const std::string label =
                 service.name.empty()
                     ? std::format("Service {}", service.service_id)
                     : std::format("{}  ({})", service.name, service.service_id);
             const bool selected =
-                state.selected_service_id == service.service_id;
+                state.output.selected_service_id == service.service_id;
             if (ImGui::Selectable(label.c_str(), selected)) {
-                state.selected_service_id = service.service_id;
-                state.player.select_service(service);
-                state.status = "Selected " + label;
+                state.output.selected_service_id = service.service_id;
+                state.output.player.select_service(service);
+                state.ui.status = "Selected " + label;
             }
             if (selected) {
                 ImGui::SetItemDefaultFocus();
@@ -524,18 +520,18 @@ void draw_video_panel(AppState &state) {
     }
     ImGui::EndDisabled();
     ImGui::SameLine(0.0F, control_spacing);
-    if (ImGui::Button(state.player.muted() ? "Unmute" : "Mute",
+    if (ImGui::Button(state.output.player.muted() ? "Unmute" : "Mute",
                       ImVec2(mute_width, 0.0F))) {
-        state.player.set_muted(!state.player.muted());
+        state.output.player.set_muted(!state.output.player.muted());
     }
     ImGui::SameLine(0.0F, control_spacing);
-    float volume = state.player.volume();
+    float volume = state.output.player.volume();
     ImGui::SetNextItemWidth(std::max(
         100.0F, available.x - (horizontal_padding * 2.0F) - service_width -
                     mute_width - (control_spacing * 2.0F)));
     if (ImGui::SliderFloat("##playback-volume", &volume, 0.0F, 100.0F,
                            "Volume %.0f%%")) {
-        state.player.set_volume(volume);
+        state.output.player.set_volume(volume);
     }
 }
 

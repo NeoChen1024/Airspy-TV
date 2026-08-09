@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <exception>
 #include <iostream>
+#include <iterator>
 #include <utility>
 
 namespace airspy_tv {
@@ -23,6 +24,22 @@ bool DecodeRunReporter::enabled() const noexcept {
 
 bool DecodeRunReporter::source_active() const noexcept {
     return source_active_;
+}
+
+void DecodeRunReporter::set_transport_output_provider(
+    TransportOutputProvider provider) {
+    transport_output_provider_ = std::move(provider);
+}
+
+std::vector<TransportOutputTelemetry>
+DecodeRunReporter::transport_outputs(const ReceiverSession &session) const {
+    auto outputs = session.transport_output_telemetry();
+    if (transport_output_provider_) {
+        auto external = transport_output_provider_();
+        outputs.insert(outputs.end(), std::make_move_iterator(external.begin()),
+                       std::make_move_iterator(external.end()));
+    }
+    return outputs;
 }
 
 std::uint64_t
@@ -145,6 +162,7 @@ bool DecodeRunReporter::start_source(ReceiverSession &session,
         auto initial_stats = source_stats_baseline_;
         initial_stats.decoder_generation = current_stats.decoder_generation;
         initial_stats.source_epoch = current_stats.source_epoch;
+        const auto outputs = transport_outputs(session);
         writer_->begin_source(
             DecodeSourceSessionConfig{
                 .source = descriptor->id.empty() ? descriptor->display_name
@@ -154,7 +172,7 @@ bool DecodeRunReporter::start_source(ReceiverSession &session,
                 .center_frequency_hz = settings.center_frequency_hz,
                 .decoder = parameters,
             },
-            timeline, initial_stats, elapsed_seconds());
+            timeline, initial_stats, elapsed_seconds(), outputs);
     } catch (const std::exception &exception) {
         return abandon(session, exception.what(), error);
     }
@@ -177,9 +195,12 @@ bool DecodeRunReporter::update(ReceiverSession &session, std::string &error,
     if (now - last_periodic_ >= std::chrono::seconds(1)) {
         last_periodic_ = now;
         try {
-            writer_->write_pipeline(session.dvbt_snapshot().decoder,
-                                    submitted_samples(session),
-                                    elapsed_seconds());
+            const auto stats = session.dvbt_snapshot().decoder;
+            const double elapsed = elapsed_seconds();
+            writer_->write_pipeline(stats, submitted_samples(session), elapsed);
+            writer_->write_transport_outputs(transport_outputs(session),
+                                             stats.decoder_generation,
+                                             stats.source_epoch, elapsed);
             writer_->flush();
         } catch (const std::exception &exception) {
             return abandon(session, exception.what(), error);
@@ -228,6 +249,9 @@ bool DecodeRunReporter::finish_source(ReceiverSession &session,
     }
     try {
         writer_->write_pipeline(stats, samples, elapsed);
+        writer_->write_transport_outputs(transport_outputs(session),
+                                         stats.decoder_generation,
+                                         stats.source_epoch, elapsed);
         writer_->end_source(status, source_error, stats,
                             session.input_timeline_snapshot(), samples,
                             elapsed);
