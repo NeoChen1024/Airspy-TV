@@ -1,13 +1,17 @@
-// Internal StreamDecoder::Impl worker definition.
+#include "demod_stage_internal.hpp"
+
+namespace airspy_tv::dvbt {
+
+// DemodStage worker definition.
 
 // ------------------------------------------------------------------ //
 // Demod thread: contiguous symbol extraction, CFO/channel/TPS tracking,
 // symbol postprocessing, and the windowed MER gate. One continuous symbol
 // stream per sync; re-anchors and resets are handled at the loop heads.
 // ------------------------------------------------------------------ //
-void StreamDecoder::Impl::run_demod() {
+void DemodStage::Impl::run() {
     try {
-        DemodRuntimeState runtime{latest_generation.load()};
+        DemodRuntimeState runtime{sample_channel.generation()};
         auto &decoder_parameters = runtime.decoder_parameters;
         auto &postprocessor = runtime.postprocessor;
         auto &demod_generation = runtime.demod_generation;
@@ -17,7 +21,8 @@ void StreamDecoder::Impl::run_demod() {
         auto &window_symbol_count = runtime.window_symbol_count;
         auto &demod_busy_started_at = runtime.demod_busy_started_at;
         const auto finish_symbol_attempt = [&] {
-            demod_busy_time_sum_ms += duration_ms(demod_busy_started_at);
+            runtime.demod_busy_time_sum_ms +=
+                duration_ms(demod_busy_started_at);
             runtime.demod_busy_active = false;
         };
         while (true) {
@@ -38,16 +43,12 @@ void StreamDecoder::Impl::run_demod() {
                     }
                 }
                 fire_pending_discontinuity();
-                if (cfo_rebootstrap_requested.load(std::memory_order_acquire)) {
-                    std::unique_lock lock(mutex);
+                if (clock_control.rebootstrap_requested()) {
                     demod_state.store(
                         static_cast<int>(WorkerState::waiting_sync));
-                    ring_data.wait(lock, [this, &seen_sync_version] {
-                        return stopping || sync.version != seen_sync_version ||
-                               !cfo_rebootstrap_requested.load(
-                                   std::memory_order_acquire);
-                    });
-                    if (stopping) {
+                    if (sample_channel.wait_for_rebootstrap(
+                            seen_sync_version) ==
+                        SampleChannel::WaitStatus::stop) {
                         demod_state.store(
                             static_cast<int>(WorkerState::exited));
                         return;
@@ -152,3 +153,5 @@ void StreamDecoder::Impl::run_demod() {
         throw;
     }
 }
+
+} // namespace airspy_tv::dvbt

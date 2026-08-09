@@ -1,6 +1,10 @@
+#include "demod_stage_internal.hpp"
+
+namespace airspy_tv::dvbt {
+
 // Demod output, FEC gate, and telemetry helpers.
 
-float StreamDecoder::Impl::demod_fec_floor(
+float DemodStage::Impl::demod_fec_floor(
     const Constellation constellation) noexcept {
     switch (constellation) {
     case Constellation::qpsk:
@@ -13,7 +17,7 @@ float StreamDecoder::Impl::demod_fec_floor(
     return 14.0F;
 }
 
-void StreamDecoder::Impl::demod_process_batch(
+void DemodStage::Impl::demod_process_batch(
     DemodRuntimeState &state, std::vector<PostprocessedSymbol> batch) {
     for (auto &symbol : batch) {
         state.mer_sum += symbol.mer_db;
@@ -37,8 +41,7 @@ void StreamDecoder::Impl::demod_process_batch(
                                           (2.0F * std::numbers::pi_v<float> *
                                            static_cast<float>(state.period));
             const float carrier_offset_hz =
-                static_cast<float>(
-                    cfo_resampler_applied_hz.load(std::memory_order_relaxed)) +
+                static_cast<float>(clock_control.snapshot().cfo_applied_hz) +
                 residual_cfo_hz;
             analysis_publisher.publish(
                 symbol.carriers, symbol.mer_db, state.latest_cp_snr_db,
@@ -79,7 +82,7 @@ void StreamDecoder::Impl::demod_process_batch(
             std::uint64_t source_epoch = state.window_source_epoch;
             {
                 const std::scoped_lock guard(mutex);
-                if (const auto mapped = resampler_timeline.input_at_output(
+                if (const auto mapped = clock_control.input_at_output(
                         state.next_symbol_start)) {
                     source_epoch = mapped->stream_epoch;
                 }
@@ -121,7 +124,7 @@ void StreamDecoder::Impl::demod_process_batch(
     }
 }
 
-bool StreamDecoder::Impl::demod_start_decoder(DemodRuntimeState &state) {
+bool DemodStage::Impl::demod_start_decoder(DemodRuntimeState &state) {
     if (!state.decoder_parameters || state.postprocessor != nullptr) {
         return true;
     }
@@ -151,7 +154,7 @@ bool StreamDecoder::Impl::demod_start_decoder(DemodRuntimeState &state) {
 }
 
 DemodWindowMetrics
-StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
+DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
     auto &period = state.period;
     auto &window_started_at = state.window_started_at;
     auto &window_symbol_count = state.window_symbol_count;
@@ -205,9 +208,9 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
     {
         const std::scoped_lock lock(mutex);
         const auto mapped_begin =
-            resampler_timeline.input_at_output(output_begin_sample);
+            clock_control.input_at_output(output_begin_sample);
         const auto mapped_end =
-            resampler_timeline.input_at_output(output_end_sample);
+            clock_control.input_at_output(output_end_sample);
         if (mapped_begin.has_value() && mapped_end.has_value() &&
             mapped_begin->stream_epoch == mapped_end->stream_epoch) {
             source_epoch = mapped_begin->stream_epoch;
@@ -249,12 +252,12 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             const std::scoped_lock lock(mutex);
             if (state.last_timing_sample_position.has_value()) {
                 interval_correction =
-                    resampler_timeline
+                    clock_control
                         .average_correction(*state.last_timing_sample_position,
                                             timing_sample_position)
                         .value_or(0.0);
             }
-            resampler_timeline.discard_before(timing_sample_position);
+            clock_control.discard_before(timing_sample_position);
         }
         tau_interval_correction_history[tau_history_head] = interval_correction;
         state.last_timing_sample_position = timing_sample_position;
@@ -318,13 +321,16 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                                             static_cast<double>(window_symbols);
         if (tau_history_count >= tau_history_min && confidence >= 0.75) {
             const std::scoped_lock lock(mutex);
-            const std::uint64_t command_output_sample = ring_read_pos;
+            const std::uint64_t command_output_sample =
+                sample_channel.read_position();
             const auto mapped =
-                resampler_timeline.input_at_output(command_output_sample);
-            if (mapped.has_value()) {
+                clock_control.input_at_output(command_output_sample);
+            if (mapped.has_value() &&
+                state.demod_generation == sample_channel.generation()) {
+                const auto clock = clock_control.snapshot();
                 const std::uint64_t fixed_delay = sro_fixed_delay_samples(
-                    mapped->input_rate_hz, current_bandwidth);
-                scheduled_sro_commands.push_back({
+                    mapped->input_rate_hz, clock.bandwidth_hz);
+                clock_control.schedule_sro({
                     .generation = state.demod_generation,
                     .source_epoch = mapped->stream_epoch,
                     .command_output_sample = command_output_sample,
@@ -334,16 +340,14 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                     .fixed_delay_samples = fixed_delay,
                     .target_ppm = smoothed_sample_clock_ppm,
                 });
+                const auto scheduled = clock_control.snapshot();
                 latest.sro_command_output_sample = command_output_sample;
                 latest.sro_command_input_sample = mapped->input_sample;
                 latest.sro_effective_input_sample =
                     mapped->input_sample + fixed_delay;
                 latest.sro_fixed_delay_samples = fixed_delay;
                 latest.sro_input_sample_rate_hz = mapped->input_rate_hz;
-                latest.sro_pending_commands = scheduled_sro_commands.size();
-                sro_resampler_command_ppm.store(smoothed_sample_clock_ppm,
-                                                std::memory_order_relaxed);
-                sro_resampler_ready.store(true, std::memory_order_relaxed);
+                latest.sro_pending_commands = scheduled.pending_sro;
             }
         }
     }
@@ -352,27 +356,29 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
         static_cast<double>(sync.resampled_rate) /
         (2.0 * std::numbers::pi_v<double> * static_cast<double>(period));
     if (window_symbols != 0 && fade_indicator > 0.5F &&
-        cfo_resampler_ready.load(std::memory_order_acquire) &&
+        clock_control.snapshot().cfo_ready &&
         std::abs(residual_cfo_hz) >= 0.05) {
         const std::scoped_lock lock(mutex);
-        const std::uint64_t command_output_sample = ring_read_pos;
+        const std::uint64_t command_output_sample =
+            sample_channel.read_position();
         const auto mapped =
-            resampler_timeline.input_at_output(command_output_sample);
+            clock_control.input_at_output(command_output_sample);
         // residual_phase_ema was measured from the symbols ending this
         // window. At a span boundary, ring_read_pos may already name the
         // correction for future output, so look up the final consumed sample
         // rather than the command timestamp.
-        const auto applied = resampler_timeline.cfo_correction_at(
+        const auto applied = clock_control.cfo_correction_at(
             output_end_sample > output_begin_sample ? output_end_sample - 1U
                                                     : output_end_sample);
-        if (mapped.has_value() && applied.has_value()) {
+        if (mapped.has_value() && applied.has_value() &&
+            state.demod_generation == sample_channel.generation()) {
+            const auto clock = clock_control.snapshot();
             const std::uint64_t fixed_delay = sro_fixed_delay_samples(
-                mapped->input_rate_hz, current_bandwidth);
+                mapped->input_rate_hz, clock.bandwidth_hz);
             const double target_hz = *applied + residual_cfo_hz;
             // A newer residual estimate supersedes any unapplied steady-state
             // CFO command from the same stream.
-            scheduled_cfo_commands.clear();
-            scheduled_cfo_commands.push_back({
+            clock_control.replace_cfo({
                 .generation = state.demod_generation,
                 .source_epoch = mapped->stream_epoch,
                 .command_output_sample = command_output_sample,
@@ -381,16 +387,15 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                 .fixed_delay_samples = fixed_delay,
                 .target_hz = target_hz,
             });
+            const auto scheduled = clock_control.snapshot();
             latest.cfo_command_output_sample = command_output_sample;
             latest.cfo_command_input_sample = mapped->input_sample;
             latest.cfo_effective_input_sample =
                 mapped->input_sample + fixed_delay;
             latest.cfo_fixed_delay_samples = fixed_delay;
             latest.cfo_input_sample_rate_hz = mapped->input_rate_hz;
-            latest.cfo_pending_commands = scheduled_cfo_commands.size();
+            latest.cfo_pending_commands = scheduled.pending_cfo;
             latest.cfo_resampler_command_hz = static_cast<float>(target_hz);
-            cfo_resampler_command_hz.store(target_hz,
-                                           std::memory_order_relaxed);
         }
     }
     return {.wall_time_ms = window_wall,
@@ -410,7 +415,7 @@ StreamDecoder::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             .source_sample_rate_hz = source_sample_rate_hz};
 }
 
-void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
+void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     auto &period = state.period;
     auto &timing_count = state.timing_count;
     auto &fft_size = state.fft_size;
@@ -443,6 +448,7 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     const double observed_drift = metrics.observed_drift;
     const double smoothed_timing_drift = metrics.smoothed_timing_drift;
     state.window_source_epoch = metrics.source_epoch;
+    const auto clock_snapshot = clock_control.snapshot();
     const std::scoped_lock lock(mutex);
     latest.ofdm_locked = true;
     latest.fft_size = static_cast<std::uint32_t>(fft_size);
@@ -470,12 +476,11 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         static_cast<float>(smoothed_timing_drift);
     latest.sample_clock_offset_ppm =
         static_cast<float>(smoothed_sample_clock_ppm);
-    latest.sro_resampler_ready =
-        sro_resampler_ready.load(std::memory_order_relaxed);
-    latest.sro_resampler_command_ppm = static_cast<float>(
-        sro_resampler_command_ppm.load(std::memory_order_relaxed));
-    latest.sro_resampler_applied_ppm = static_cast<float>(
-        sro_resampler_applied_ppm.load(std::memory_order_relaxed));
+    latest.sro_resampler_ready = clock_snapshot.sro_ready;
+    latest.sro_resampler_command_ppm =
+        static_cast<float>(clock_snapshot.sro_command_ppm);
+    latest.sro_resampler_applied_ppm =
+        static_cast<float>(clock_snapshot.sro_applied_ppm);
     latest.cir_offset_samples = static_cast<float>(window_cir_avg);
     latest.timing_confidence =
         window_symbols == 0 ? 0.0F
@@ -497,12 +502,11 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     latest.residual_carrier_offset_hz =
         frontend.residual_phase_ema * sync.resampled_rate /
         (2.0F * std::numbers::pi_v<float> * static_cast<float>(period));
-    latest.cfo_resampler_ready =
-        cfo_resampler_ready.load(std::memory_order_relaxed);
-    latest.cfo_resampler_command_hz = static_cast<float>(
-        cfo_resampler_command_hz.load(std::memory_order_relaxed));
-    latest.cfo_resampler_applied_hz = static_cast<float>(
-        cfo_resampler_applied_hz.load(std::memory_order_relaxed));
+    latest.cfo_resampler_ready = clock_snapshot.cfo_ready;
+    latest.cfo_resampler_command_hz =
+        static_cast<float>(clock_snapshot.cfo_command_hz);
+    latest.cfo_resampler_applied_hz =
+        static_cast<float>(clock_snapshot.cfo_applied_hz);
     latest.tracked_carrier_offset_hz =
         latest.cfo_resampler_applied_hz + latest.residual_carrier_offset_hz;
     latest.pilot_phase_discontinuities = frontend.phase_discontinuities;
@@ -511,11 +515,12 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         input_seconds > 0.0F ? (window_wall / 1000.0F) / input_seconds : 0.0F;
     latest.demod_busy_fraction =
         window_wall > 0.0F
-            ? static_cast<float>(demod_busy_time_sum_ms /
+            ? static_cast<float>(state.demod_busy_time_sum_ms /
                                  static_cast<double>(window_wall))
             : 0.0F;
     latest.demod_window_wall_time_ms = window_wall;
-    latest.demod_busy_time_ms = static_cast<float>(demod_busy_time_sum_ms);
+    latest.demod_busy_time_ms =
+        static_cast<float>(state.demod_busy_time_sum_ms);
     latest.demod_ring_wait_time_ms =
         static_cast<float>(state.ring_wait_time_sum_ms);
     latest.demod_ring_copy_time_ms =
@@ -569,8 +574,7 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         state.payload_extract_time_sum_ms + state.symbol_submit_time_sum_ms +
         state.postprocess_wait_time_sum_ms + state.output_time_sum_ms;
     latest.demod_other_time_ms = static_cast<float>(
-        std::max(0.0, demod_busy_time_sum_ms - accounted_demod_time_ms));
-    demod_busy_time_sum_ms = 0.0;
+        std::max(0.0, state.demod_busy_time_sum_ms - accounted_demod_time_ms));
     latest.symbol_preprocess_work_time_ms = preprocess_time_sum;
     latest.symbol_demap_work_time_ms = demap_time_sum;
     latest.symbol_deinterleave_work_time_ms = deinterleave_time_sum;
@@ -726,7 +730,7 @@ void StreamDecoder::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     acquisition_time_ms = 0.0F;
 }
 
-void StreamDecoder::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
+void DemodStage::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
     state.window_started_at = std::chrono::steady_clock::now();
     state.window_symbol_count = 0;
     state.window_output_begin_sample = 0;
@@ -736,6 +740,7 @@ void StreamDecoder::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
     state.demap_time_sum = 0.0F;
     state.deinterleave_time_sum = 0.0F;
     state.depuncture_time_sum = 0.0F;
+    state.demod_busy_time_sum_ms = 0.0;
     state.ring_wait_time_sum_ms = 0.0;
     state.ring_copy_time_sum_ms = 0.0;
     state.fft_cfo_time_sum_ms = 0.0;
@@ -762,11 +767,11 @@ void StreamDecoder::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
     state.timing_rejected_count = 0;
 }
 
-void StreamDecoder::Impl::demod_advance_symbol(DemodRuntimeState &state) {
+void DemodStage::Impl::demod_advance_symbol(DemodRuntimeState &state) {
     state.next_symbol_start += state.period;
 }
 
-bool StreamDecoder::Impl::demod_dispatch_payload(
+bool DemodStage::Impl::demod_dispatch_payload(
     DemodRuntimeState &state, const PilotLock &lock,
     const std::vector<std::complex<float>> &channel) {
     auto &payload_indices = state.payload_indices;
@@ -857,7 +862,7 @@ bool StreamDecoder::Impl::demod_dispatch_payload(
     return true;
 }
 
-void StreamDecoder::Impl::demod_finish_stream(DemodRuntimeState &state) {
+void DemodStage::Impl::demod_finish_stream(DemodRuntimeState &state) {
     auto &postprocessor = state.postprocessor;
     auto &gate_buffer = state.gate_buffer;
     auto &decoder_parameters = state.decoder_parameters;
@@ -936,15 +941,12 @@ void StreamDecoder::Impl::demod_finish_stream(DemodRuntimeState &state) {
                                            .symbol_index = 0}));
         }
     }
-    {
-        const std::scoped_lock lock(mutex);
-        // A finite stream can end with a partial next symbol (the
-        // guard prefix or a truncated FFT window). It is not
-        // decodable input and must not keep wait_until_idle from
-        // observing a drained stream after the valid tail flush.
-        ring_read_pos = ring_write_pos;
-        demod_busy = false;
-        acquisition_pending = false;
-    }
-    idle.notify_all();
+    // A finite stream can end with a partial next symbol (the guard prefix or
+    // a truncated FFT window). It is not decodable input and must not keep
+    // wait_until_idle from observing a drained stream after the valid tail.
+    sample_channel.discard_all();
+    sample_channel.set_demod_busy(false);
+    sample_channel.set_acquisition_pending(false);
 }
+
+} // namespace airspy_tv::dvbt

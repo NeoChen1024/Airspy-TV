@@ -1,6 +1,10 @@
+#include "demod_stage_internal.hpp"
+
+namespace airspy_tv::dvbt {
+
 // Per-symbol carrier, pilot, channel, timing, and TPS helpers.
 
-bool StreamDecoder::Impl::demod_maybe_reacquire(DemodRuntimeState &state) {
+bool DemodStage::Impl::demod_maybe_reacquire(DemodRuntimeState &state) {
     if (events_enabled()) {
         emit_event(
             "reanchor_triggered", DecoderEventSeverity::warning,
@@ -35,7 +39,7 @@ bool StreamDecoder::Impl::demod_maybe_reacquire(DemodRuntimeState &state) {
     return true;
 }
 
-bool StreamDecoder::Impl::demod_request_cfo_rebootstrap(
+bool DemodStage::Impl::demod_request_cfo_rebootstrap(
     DemodRuntimeState &state, const char *reason, const float residual_phase) {
     const float residual_hz =
         residual_phase * sync.resampled_rate /
@@ -43,21 +47,17 @@ bool StreamDecoder::Impl::demod_request_cfo_rebootstrap(
     std::uint64_t source_sample = 0;
     {
         const std::scoped_lock lock(mutex);
-        if (state.demod_generation !=
-            latest_generation.load(std::memory_order_relaxed)) {
+        if (state.demod_generation != sample_channel.generation()) {
             return false;
         }
-        bool expected = false;
-        if (!cfo_rebootstrap_requested.compare_exchange_strong(
-                expected, true, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
+        if (!clock_control.request_rebootstrap()) {
             return false;
         }
         ++latest.cfo_rebootstrap_requests;
         latest.cfo_rebootstrap_last_residual_hz = residual_hz;
         latest.cfo_rebootstrap_output_sample = state.next_symbol_start;
         if (const auto mapped =
-                resampler_timeline.input_at_output(state.next_symbol_start)) {
+                clock_control.input_at_output(state.next_symbol_start)) {
             source_sample = mapped->input_sample;
             latest.cfo_rebootstrap_source_sample = source_sample;
         }
@@ -75,13 +75,12 @@ bool StreamDecoder::Impl::demod_request_cfo_rebootstrap(
              {"recovery_symbols", state.cfo_recovery_symbol_count},
              {"hopeless_windows", state.hopeless_window_count}});
     }
-    input_ready.notify_all();
-    ring_space.notify_all();
-    ring_data.notify_all();
+    sample_channel.notify_frontend();
+    sample_channel.notify_ring();
     return true;
 }
 
-void StreamDecoder::Impl::demod_execute_fft_and_measure_cfo(
+void DemodStage::Impl::demod_execute_fft_and_measure_cfo(
     DemodRuntimeState &state) {
     auto &next_symbol_start = state.next_symbol_start;
     auto &plan = state.plan;
@@ -179,7 +178,7 @@ void StreamDecoder::Impl::demod_execute_fft_and_measure_cfo(
 }
 
 std::optional<PilotLock>
-StreamDecoder::Impl::demod_lock_pilots(DemodRuntimeState &state) {
+DemodStage::Impl::demod_lock_pilots(DemodRuntimeState &state) {
     auto &lock_hold = state.lock_hold;
     auto &fade_indicator = state.fade_indicator;
     auto &hopeless_window_count = state.hopeless_window_count;
@@ -379,8 +378,8 @@ StreamDecoder::Impl::demod_lock_pilots(DemodRuntimeState &state) {
 }
 
 std::vector<std::complex<float>>
-StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
-                                            const PilotLock &lock) {
+DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
+                                         const PilotLock &lock) {
     auto &maximum = state.maximum;
     auto &pilot_indices = state.pilot_indices;
     auto &fft_out = state.fft_out;
@@ -483,7 +482,8 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
     // the timing loop is never perturbed by a jump.
     if (++frontend.cir_symbol_count >= 68) {
         frontend.cir_symbol_count = 0;
-        if (fade_indicator > 0.25F && frontend.cir_plan) {
+        if (fade_indicator > 0.25F && frontend.cir_plan &&
+            !frontend.cir_response.empty()) {
             std::fill(frontend.cir_grid.begin(), frontend.cir_grid.end(),
                       std::complex<float>{});
             const std::size_t phase = static_cast<std::size_t>(lock.phase);
@@ -514,7 +514,7 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
             // Only trust a structured response: the peak tap
             // must hold a meaningful share of the energy, so
             // a noise-driven CIR cannot drag the window.
-            if (total > 0.0 && peak_energy / total > 0.05) {
+            if (n != 0 && total > 0.0 && peak_energy / total > 0.05) {
                 // Contiguous main lobe: taps above 1% of the
                 // peak, wrapping the IFFT window (taps that
                 // arrive before the FFT window fold to its
@@ -619,7 +619,7 @@ StreamDecoder::Impl::demod_estimate_channel(DemodRuntimeState &state,
     return channel;
 }
 
-DemodFlow StreamDecoder::Impl::demod_process_tps(DemodRuntimeState &state) {
+DemodFlow DemodStage::Impl::demod_process_tps(DemodRuntimeState &state) {
     auto &tps_values = state.tps_values;
     auto &tps_mismatch_symbols = state.tps_mismatch_symbols;
     auto &decoder_parameters = state.decoder_parameters;
@@ -685,3 +685,5 @@ DemodFlow StreamDecoder::Impl::demod_process_tps(DemodRuntimeState &state) {
     }
     return DemodFlow::proceed;
 }
+
+} // namespace airspy_tv::dvbt

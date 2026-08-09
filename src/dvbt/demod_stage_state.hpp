@@ -1,4 +1,4 @@
-// Demod-thread-owned state that persists across OFDM symbols.
+// DemodStage worker state that persists across OFDM symbols.
 
 enum class DemodFlow { proceed, restart, stop };
 enum class DemodInputFlow { ready, retry, end, stop };
@@ -79,6 +79,7 @@ struct DemodRuntimeState {
     float demap_time_sum{};
     float deinterleave_time_sum{};
     float depuncture_time_sum{};
+    double demod_busy_time_sum_ms{};
     double ring_wait_time_sum_ms{};
     double ring_copy_time_sum_ms{};
     double fft_cfo_time_sum_ms{};

@@ -165,7 +165,8 @@ bool DecodeRunReporter::start_source(ReceiverSession &session,
     return true;
 }
 
-bool DecodeRunReporter::update(ReceiverSession &session, std::string &error) {
+bool DecodeRunReporter::update(ReceiverSession &session, std::string &error,
+                               const bool finish_stopped_source) {
     if (!drain_telemetry(session, error) || writer_ == nullptr ||
         !source_active_) {
         return error.empty();
@@ -185,7 +186,7 @@ bool DecodeRunReporter::update(ReceiverSession &session, std::string &error) {
         }
     }
 
-    if (saw_streaming_ && !session.is_streaming()) {
+    if (finish_stopped_source && saw_streaming_ && !session.is_streaming()) {
         return finish_source(session, error);
     }
     return true;

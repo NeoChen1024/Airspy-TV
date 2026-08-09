@@ -142,6 +142,11 @@ void ReceiverSession::set_display_smoothing(const bool fft_enabled,
     device_.set_demodulator_signal_smoothing(signal_enabled, signal_speed);
 }
 
+void ReceiverSession::set_display_analysis_enabled(
+    const bool enabled) noexcept {
+    device_.set_display_analysis_enabled(enabled);
+}
+
 void ReceiverSession::set_dvbt_telemetry_enabled(
     const bool enabled, const dvbt::TelemetryClock::time_point started_at) {
     dvbt_telemetry_enabled_ = enabled;
@@ -204,8 +209,15 @@ bool ReceiverSession::open_device_and_start(const DeviceDescriptor &descriptor,
 bool ReceiverSession::open_iq_file_and_start(const std::filesystem::path &path,
                                              SourceSettings &settings,
                                              std::string &error) {
+    return open_iq_file_and_start(path, settings, {}, error);
+}
+
+bool ReceiverSession::open_iq_file_and_start(const std::filesystem::path &path,
+                                             SourceSettings &settings,
+                                             const IqPlaybackPolicy policy,
+                                             std::string &error) {
     configure_active_demodulator();
-    if (device_.open_iq_file(path, settings, error) &&
+    if (device_.open_iq_file(path, settings, policy, error) &&
         device_.start_stream(settings, error)) {
         return true;
     }

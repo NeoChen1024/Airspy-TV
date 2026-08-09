@@ -20,6 +20,8 @@ namespace airspy_tv {
 
 enum class SdrBackend { AirspyNative, Soapy, File };
 enum class AirspyGainMode { Sensitivity, Linearity };
+enum class IqPlaybackPacing { realtime, unpaced };
+enum class DecoderBackpressurePolicy { drop_when_busy, block };
 
 struct DeviceDescriptor {
     SdrBackend backend{SdrBackend::AirspyNative};
@@ -49,6 +51,12 @@ struct SourceSettings {
     bool bias_tee{};
 };
 
+struct IqPlaybackPolicy {
+    IqPlaybackPacing pacing{IqPlaybackPacing::realtime};
+    DecoderBackpressurePolicy decoder_backpressure{
+        DecoderBackpressurePolicy::drop_when_busy};
+};
+
 class SdrDevice {
   public:
     using TransportSink = std::function<void(std::span<const std::uint8_t>)>;
@@ -66,6 +74,9 @@ class SdrDevice {
     bool open(const DeviceDescriptor &descriptor, std::string &error);
     bool open_iq_file(const std::filesystem::path &path,
                       SourceSettings &settings, std::string &error);
+    bool open_iq_file(const std::filesystem::path &path,
+                      SourceSettings &settings, IqPlaybackPolicy policy,
+                      std::string &error);
     void close();
     bool configure(const SourceSettings &settings, std::string &error);
     bool start_stream(const SourceSettings &settings, std::string &error);
@@ -77,6 +88,7 @@ class SdrDevice {
     bool set_bias_tee(bool enabled, std::string &error);
     void set_display_smoothing(bool fft_enabled, int fft_speed,
                                bool snr_enabled, int snr_speed);
+    void set_display_analysis_enabled(bool enabled) noexcept;
     void set_demodulator_signal_smoothing(bool enabled, int speed);
     // Install the standard demodulator. The demodulator takes over the
     // MPEG-TS pipeline (service model, TS recorder, transport sink) via its

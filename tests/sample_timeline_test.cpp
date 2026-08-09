@@ -38,10 +38,17 @@ void test_input_timeline() {
                 next_stream.discontinuity_before,
             "new stream epoch must preserve monotonic source position");
     const auto snapshot = timeline.snapshot();
-    require(snapshot.source_head_sample == 20 &&
+    require(snapshot.stream_epoch == 3 && snapshot.source_head_sample == 20 &&
                 snapshot.delivered_samples == 13 &&
                 snapshot.sample_rate_hz == 8'000'000,
             "input timeline snapshot");
+
+    timeline.mark_discontinuity();
+    const auto retuned = timeline.snapshot();
+    require(retuned.stream_epoch == 4 &&
+                retuned.source_head_sample == snapshot.source_head_sample &&
+                retuned.delivered_samples == snapshot.delivered_samples,
+            "retune must change source identity without rewinding counters");
 }
 
 void test_resampler_timeline() {

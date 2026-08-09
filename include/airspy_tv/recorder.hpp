@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -16,16 +17,24 @@ struct RecordingMetadata {
 
 struct RecordingStats {
     bool active{};
+    bool failed{};
     std::uint64_t elapsed_milliseconds{};
     std::uint64_t complex_samples{};
     std::uint64_t bytes_written{};
     std::uint64_t dropped_blocks{};
     std::uint64_t source_dropped_samples{};
+    std::uint64_t write_errors{};
+    std::string error;
+};
+
+struct RawIqRecorderConfig {
+    // Zero derives a five-second queue from the recording sample rate.
+    std::size_t queue_capacity_samples{};
 };
 
 class RawIqRecorder {
   public:
-    RawIqRecorder();
+    explicit RawIqRecorder(RawIqRecorderConfig config = {});
     ~RawIqRecorder() noexcept;
 
     RawIqRecorder(const RawIqRecorder &) = delete;
@@ -48,9 +57,12 @@ class RawIqRecorder {
 
 struct TransportRecordingStats {
     bool active{};
+    bool failed{};
     std::uint64_t elapsed_milliseconds{};
     std::uint64_t bytes_written{};
     std::uint64_t dropped_blocks{};
+    std::uint64_t write_errors{};
+    std::string error;
 };
 
 class TransportStreamRecorder {

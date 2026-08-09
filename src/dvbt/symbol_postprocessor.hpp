@@ -1,5 +1,4 @@
-// Internal behavior-preserving components used by StreamDecoder::Impl.
-// Kept in the coordinator's anonymous namespace by the include site.
+// Ordered parallel symbol postprocessing owned by DemodStage.
 struct PostprocessedSymbol {
     std::vector<std::complex<float>> carriers;
     std::vector<float> reliabilities;
@@ -12,47 +11,7 @@ struct PostprocessedSymbol {
     float depuncture_time_ms{};
 };
 
-struct WorkerAllocation {
-    std::size_t resample{};
-    std::size_t symbol{};
-    std::size_t viterbi{};
-};
-
-[[nodiscard]] WorkerAllocation
-allocate_workers(const std::size_t requested_threads) noexcept {
-    const std::size_t total = requested_threads == 0
-                                  ? default_viterbi_worker_count()
-                                  : requested_threads;
-    if (total <= 2) {
-        return {1, 1, 1};
-    }
-    const std::size_t resample = std::max<std::size_t>(1, total / 4);
-    const std::size_t remaining = total - resample;
-    const std::size_t symbol = std::max<std::size_t>(1, remaining / 2);
-    return {resample, symbol, std::max<std::size_t>(1, remaining - symbol)};
-}
-
-[[nodiscard]] std::size_t
-buffered_symbol_count(const std::uint32_t bandwidth,
-                      const std::size_t symbol_samples) noexcept {
-    // Nominal DVB-T sample rate is bandwidth * 8 / 7; retain one fifth of a
-    // second at the current OFDM symbol duration.
-    const std::uint64_t numerator = static_cast<std::uint64_t>(bandwidth) * 8U;
-    const std::uint64_t denominator =
-        7U * buffer_duration_denominator * symbol_samples;
-    return std::max<std::size_t>(
-        1,
-        static_cast<std::size_t>((numerator + denominator - 1) / denominator));
-}
-
-[[nodiscard]] std::size_t
-buffered_input_samples(const std::uint32_t sample_rate) noexcept {
-    return std::max<std::size_t>(1, (static_cast<std::size_t>(sample_rate) +
-                                     buffer_duration_denominator - 1) /
-                                        buffer_duration_denominator);
-}
-
-[[nodiscard]] float
+[[nodiscard]] inline float
 duration_ms(const std::chrono::steady_clock::time_point started_at) {
     return std::chrono::duration<float, std::milli>(
                std::chrono::steady_clock::now() - started_at)
@@ -362,89 +321,4 @@ class SymbolPostprocessorPool {
     std::size_t outstanding_{};
     std::exception_ptr worker_error_;
     bool stopping_{};
-};
-
-class StreamingResampler {
-  public:
-    explicit StreamingResampler(const std::size_t worker_count)
-        : resampler_(worker_count, "dvbt-resamp-") {
-        resampler_.set_max_slew_rate(sro_slew_rate_ppm_per_second);
-    }
-
-    [[nodiscard]] std::size_t worker_count() const noexcept {
-        return resampler_.worker_count();
-    }
-
-    void reset() {
-        if (configured()) {
-            resampler_.set_ratio(resampler_.nominal_ratio());
-        }
-        resampler_.reset();
-    }
-
-    void configure(const std::uint32_t rate, const std::uint32_t bandwidth) {
-        if (configured() && rate == rate_ && bandwidth == bandwidth_) {
-            return;
-        }
-        resampler_.configure(make_resampler_config(rate, bandwidth));
-        rate_ = rate;
-        bandwidth_ = bandwidth;
-    }
-
-    [[nodiscard]] std::span<const std::complex<float>>
-    process(std::span<const std::complex<float>> input) {
-        return resampler_.process(input);
-    }
-
-    void set_sro_correction_ppm(const double correction_ppm) {
-        const double scale = 1.0 + correction_ppm * 1.0e-6;
-        if (!(scale > 0.0) || !std::isfinite(scale)) {
-            throw std::invalid_argument("invalid SRO resampler correction");
-        }
-        resampler_.set_ratio(resampler_.nominal_ratio() / scale);
-    }
-
-    void set_cfo_correction_hz(const double correction_hz) {
-        if (!std::isfinite(correction_hz)) {
-            throw std::invalid_argument("invalid CFO resampler correction");
-        }
-        // A positive measured CFO requires a negative complex translation.
-        resampler_.set_frequency_shift(-correction_hz);
-    }
-
-    [[nodiscard]] double applied_sro_correction_ppm() const noexcept {
-        const double ratio = resampler_.effective_ratio();
-        return ratio > 0.0 ? (resampler_.nominal_ratio() / ratio - 1.0) * 1.0e6
-                           : 0.0;
-    }
-
-    [[nodiscard]] double applied_cfo_correction_hz() const noexcept {
-        return -resampler_.effective_frequency_shift();
-    }
-
-    [[nodiscard]] double requested_cfo_correction_hz() const noexcept {
-        return -resampler_.requested_frequency_shift();
-    }
-
-    [[nodiscard]] double requested_ratio() const noexcept {
-        return resampler_.requested_ratio();
-    }
-
-    [[nodiscard]] double effective_ratio() const noexcept {
-        return resampler_.effective_ratio();
-    }
-
-    [[nodiscard]] bool configured() const noexcept {
-        return resampler_.configured();
-    }
-    [[nodiscard]] std::uint32_t rate() const noexcept { return rate_; }
-    [[nodiscard]] std::uint32_t bandwidth() const noexcept {
-        return bandwidth_;
-    }
-
-  private:
-    static constexpr double sro_slew_rate_ppm_per_second = 0.5;
-    solid_resampler::FrequencyTranslatingResampler resampler_;
-    std::uint32_t rate_{};
-    std::uint32_t bandwidth_{};
 };

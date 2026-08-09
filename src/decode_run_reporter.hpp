@@ -33,7 +33,8 @@ class DecodeRunReporter {
     bool start_source(ReceiverSession &session, const SourceSettings &settings,
                       const dvbt::ReceiverParameters &parameters,
                       std::string_view destination, std::string &error);
-    bool update(ReceiverSession &session, std::string &error);
+    bool update(ReceiverSession &session, std::string &error,
+                bool finish_stopped_source = true);
     bool finish_source(ReceiverSession &session, std::string &error,
                        std::string_view source_failure = {});
     bool finalize(ReceiverSession &session, std::string &error,

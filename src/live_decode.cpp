@@ -122,6 +122,7 @@ int live_decode_cli(LiveDecodeConfig config) {
     }
 
     airspy_tv::ReceiverSession session;
+    session.set_display_analysis_enabled(false);
     session.set_dvbt_parameters(config.dvbt);
     if (!session.select_standard(config.standard, config.source, false,
                                  error)) {

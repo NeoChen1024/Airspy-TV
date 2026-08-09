@@ -55,6 +55,7 @@ class ReceiverSession {
     void set_dvbt_parameters(const dvbt::ReceiverParameters &parameters);
     void set_display_smoothing(bool fft_enabled, int fft_speed,
                                bool signal_enabled, int signal_speed);
+    void set_display_analysis_enabled(bool enabled) noexcept;
     void
     set_dvbt_telemetry_enabled(bool enabled,
                                dvbt::TelemetryClock::time_point started_at =
@@ -69,6 +70,9 @@ class ReceiverSession {
                                SourceSettings &settings, std::string &error);
     bool open_iq_file_and_start(const std::filesystem::path &path,
                                 SourceSettings &settings, std::string &error);
+    bool open_iq_file_and_start(const std::filesystem::path &path,
+                                SourceSettings &settings,
+                                IqPlaybackPolicy policy, std::string &error);
     bool start_stream(const SourceSettings &settings, std::string &error);
     void finish_stream();
     void stop_stream();

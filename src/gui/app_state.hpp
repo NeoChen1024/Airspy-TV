@@ -103,7 +103,7 @@ struct AppState {
     std::shared_ptr<FileDialogState> iq_source_dialog{
         std::make_shared<FileDialogState>()};
     EpgModel epg;
-    const DeviceDescriptor *last_source_descriptor{};
+    std::uint64_t last_source_epoch{};
     bool observed_input_exhausted{};
     DecodeRunReporter decode_report;
 };

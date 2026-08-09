@@ -9,77 +9,88 @@ is in [docs/clock-tracking.md](docs/clock-tracking.md), current pipeline
 mechanics are in
 [docs/worker-pools-and-dataflow.md](docs/worker-pools-and-dataflow.md), and
 cross-cutting cleanup is in
+[docs/architecture-refactor-review-2026-08-09.md](docs/architecture-refactor-review-2026-08-09.md),
+while remaining validation gaps are maintained in
 [docs/architecture-review-2026-08-06.md](docs/architecture-review-2026-08-06.md).
 
 ## Current baseline
 
-- Airspy, SoapySDR, and CS16 file sources feed the same asynchronous
-  `Demodulator` boundary.
+- Airspy, SoapySDR, CS16 file, and stdin inputs are separated behind the
+  `IqSource` boundary and feed the same receiver pipeline. Source workers own
+  backend handles and pacing; `SdrDevice` owns timeline stamping, optional
+  spectrum analysis, demodulation, and transport outputs.
 - The DVB-T path supports 2K/8K, guard intervals 1/4 through 1/32, QPSK,
   16-QAM, 64-QAM, and all non-hierarchical convolutional code rates.
 - Continuous resampling, OFDM acquisition/tracking, symbol workers,
   ViterbiDecoderCpp workers with a portable scalar fallback, outer FEC, and
-  MPEG-TS output are integrated in `dvbt::StreamDecoder`.
+  MPEG-TS output are integrated in `dvbt::StreamDecoder`. `FecStage` now owns
+  its bounded queue, worker, decoder session, and transport counters.
+  `SampleChannel` owns the generation-aware input queue, absolute sample ring,
+  and reset handshake, while `ClockControlTimeline` owns SRO/CFO scheduling and
+  output-to-input coordinate mapping. `FrontendStage` owns conversion,
+  bootstrap acquisition, and resampling; `DemodStage` owns OFDM tracking,
+  symbol postprocessing, statistics, and telemetry. `StreamDecoder::Impl`
+  retains lifecycle and external callback wiring.
 - Playback, TS recording, service discovery, now/next EPG, and common signal
   and pipeline snapshots run in process.
-- `ReceiverSession` owns source and demodulator lifecycle. Common GUI panels
-  use standard-neutral snapshots; DVB-T-only state remains typed and separate.
+- `ReceiverSession` coordinates source and demodulator lifecycle for GUI, live
+  CLI, and offline decoding. File pacing and decoder backpressure are explicit
+  policies: live paths are realtime and may drop when busy, while offline
+  decoding is unpaced and blocks for exact output. `DecodeRunReporter` provides
+  the common source-session, telemetry-drain, and report-finalization lifecycle.
+- Common GUI panels use standard-neutral snapshots; DVB-T-only state remains
+  typed and separate.
+- GUI and CLI live decoding share bounded TS output and IPv4/IPv6 RTP/UDP
+  streaming paths.
+- Machine-readable decode reports and the validation runner cover all 480 ideal
+  DVB-T parameter combinations under portable Release and ASan/UBSan, plus a
+  deterministic all-pairs TSan set and optional real-signal corpora.
 
 The baseline is functional, not feature-complete. The remaining work is
-primarily broader regression coverage, difficult-channel validation,
-transport/playback observability, portability, and new-standard DSP.
+primarily targeted lifecycle and playback regression coverage,
+difficult-channel validation, transport/playback observability, retained
+real-signal baselines, application maintainability, and new-standard DSP.
 
 ## 1. Regression coverage
 
 ### StreamDecoder integration
 
-- Run the checked-in streaming 2K end-to-end validator routinely and extend it
-  across every guard interval, bandwidth, modulation, and code rate.
 - Cover automatic and forced transmission-mode transitions.
-- Verify continuous-resampler equivalence across random input block boundaries
-  and supported rate changes.
 - Exercise initial timing offset, positive and negative sample-clock offset,
   sample-clock drift, initial CFO, and LO drift. Keep long loop experiments in
   the AFC test set rather than slowing the default unit suite.
 - Add deep fades, MER-gate entry/exit, phase-only relock, and long-fade
   re-anchor cases.
-- Require exact TS continuity and byte identity for error-free fixtures after
-  the defined trellis warm-up.
-- Repeat block-boundary, flush, reset, retune, source-reopen, and stop sequences
-  under parallel worker load.
+- Stress concurrent submit/reset/flush/stop and repeated retune sequences under
+  parallel worker load.
 
 ### Playback, recorder, and transport
 
 - Test mpv queue hysteresis and discontinuity ordering with a fake reader. The
   current playback queue is 8 MiB, enters buffering at 1 MiB, and resumes at
   2 MiB.
-- Test recorder short writes, filesystem errors, queue overflow, and shutdown
-  while data is pending.
+- Add deterministic partial-write injection for the recorder writer loop. Open
+  failures, terminal write failures, queue overflow, and pending-data drain are
+  already covered.
 - Add PAT/PMT/SDT version-change and malformed-section regressions.
 - Add retained multi-hour file and live playback tests with bounds for A/V
   offset, queue growth, decoder stalls, and intentional drop-old recovery.
 
-### Runtime and portability
-
-- Run full ASan/UBSan/LSan validation after substantial pipeline changes.
-- Extend ThreadSanitizer lifecycle stress beyond deterministic short cases.
-- Exercise portable non-AVX builds regularly so the scalar Viterbi backend does
-  not silently regress.
-- Maintain explicit optimized-debug, assertion-debug, portable-release, and
-  sanitizer build configurations.
-
 Further cleanup and validation details are maintained in the architecture
-review rather than duplicated here.
+reviews rather than duplicated here. Report codec, GUI state, and
+transport-observer boundaries remain possible refactoring work where their
+current size or runtime behavior provides concrete justification.
 
 ## 2. DVB-T completeness and channel robustness
 
 ### Reference fixtures
 
-- Add retained 5, 7, and 8 MHz reference fixtures; the strongest current
-  regression coverage remains centered 6 MHz.
-- Add difficult 2K and short-guard fixtures, not only ideal 8K/GI-1/4 input.
+- Establish accepted per-capture thresholds for usable TS packets, RS/TEI
+  counts, and processing ratio in the existing real-signal corpus.
+- Add impaired 2K and short-guard fixtures; the ideal parameter matrix already
+  covers their configuration paths.
 - Keep weak, multipath, discontinuous, and SFN-like captures separate from the
-  clean functional baseline.
+  exact-match synthetic baseline.
 
 ### TPS and hierarchical transmission
 
@@ -117,29 +128,25 @@ the current long-capture TS continuity and queue-latency baseline.
 - Add EIT schedule table assembly (0x50-0x5F), including segment handling.
 - Add multilingual service/event descriptors, parental ratings, subtitles,
   teletext, and alternate audio/language selection as demand requires.
-- Preserve the distinction between corrupt packets (TEI), FEC-region resets,
-  retunes, and finite stream end. New sinks must not infer these events from a
-  temporarily empty byte queue.
-- Keep full-MPTS recording independent from selected-service playback.
 
 ## 4. Live hardware validation
 
 - Run long start/stop/retune/recovery sessions on Airspy R2 and Mini.
 - Select representative SoapySDR devices and verify rate negotiation, overflow
   recovery, frequency correction, gain control, and shutdown.
-- Repeat the 545 MHz full replay and 557/581 MHz multipath captures after major
-  timing, FEC, resampler, or queue changes.
-- Retain machine-readable summaries for lock, MER, BER, RS/TEI counts, TS
-  bytes, processing ratio, queue watermarks, dropped blocks, timing/SRO, and
-  CFO.
+- Run the full 545 MHz recording with `--include-long-real-signals` and repeat
+  the 557/581 MHz corpus after major timing, FEC, resampler, or queue changes.
 
 ## 5. Multi-standard expansion
 
-The application boundary is ready for another digital standard:
-`ReceiverSession` replaces a `Demodulator`, `SdrDevice` supplies I/Q and routes
-MPEG-TS, and common GUI panels consume `SignalSnapshot` and
-`PipelineSnapshot`. Standard-specific parameters and diagnostics must remain
-typed rather than growing a universal mode structure.
+The public demodulator and snapshot contracts, shared receiver lifecycle, and
+extracted `IqSource` backends are a sufficient starting point for another
+digital standard. `ReceiverSession` may keep explicit typed per-standard
+configuration and telemetry access; a small switch or variant is preferable to
+a pre-emptive plugin framework. Extract another shared boundary only after a
+second implementation reveals concrete duplication. Standard-specific
+parameters and diagnostics must remain typed rather than growing a universal
+mode structure.
 
 ### DVB-T2
 
@@ -158,14 +165,18 @@ and lifecycle APIs are stable.
 
 ## Recommended implementation order
 
-1. Add 2K, lifecycle, playback-queue, and portable-backend regressions.
-2. Complete the AFC bias-validation set and long-capture clock experiments.
-3. Validate or replace the CIR estimator on long-delay/SFN input.
-4. Add hierarchical DVB-T and remaining TPS metadata.
-5. Complete timestamp/playback diagnostics and multi-hour regressions.
-6. Finish the architecture-review cleanup without changing data-flow
-   invariants.
-7. Begin the first second-standard implementation.
+1. Separate report serialization from report lifecycle where this reduces the
+   current `decode_report.cpp` complexity.
+2. Add lifecycle, playback-queue, and SI-table regressions as gates for those
+   ownership changes.
+3. Establish real-signal thresholds and rerun the synthetic, sanitizer, and
+   retained-capture gates after each affected phase.
+4. Complete the AFC bias-validation set and long-capture clock experiments.
+5. Validate or replace the CIR estimator on long-delay/SFN input.
+6. Add hierarchical DVB-T, remaining TPS metadata, and timestamp/playback
+   diagnostics.
+7. Begin the first second-standard implementation using the existing common
+   lifecycle and extract additional shared code only where duplication appears.
 
 ## Release gates
 

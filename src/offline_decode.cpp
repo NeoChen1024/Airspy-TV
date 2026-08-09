@@ -1,11 +1,9 @@
 #include "offline_decode.hpp"
 
-#include "airspy_tv/debug.hpp"
-#include "airspy_tv/dvbt/stream_decoder.hpp"
 #include "airspy_tv/iq_file.hpp"
-#include "airspy_tv/sample_timeline.hpp"
 #include "decode_progress.hpp"
-#include "decode_report.hpp"
+#include "decode_run_reporter.hpp"
+#include "receiver_session.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -16,14 +14,41 @@
 #include <memory>
 #include <span>
 #include <string>
-#include <vector>
+#include <thread>
 
 namespace {
 
-using airspy_tv::DecodeReport;
-using airspy_tv::DecodeReportConfig;
-using airspy_tv::DecodeSourceSessionConfig;
-using airspy_tv::dvbt::StreamDecoder;
+[[nodiscard]] bool output_path_is_safe(const std::filesystem::path &source,
+                                       const airspy_tv::IqFileInfo &source_info,
+                                       const std::filesystem::path &destination,
+                                       std::string &error) {
+    try {
+        const auto output_path =
+            std::filesystem::absolute(destination).lexically_normal();
+        if (std::filesystem::absolute(source).lexically_normal() ==
+                output_path ||
+            std::filesystem::absolute(source_info.data_path)
+                    .lexically_normal() == output_path) {
+            error = "Output MPEG-TS path must differ from the I/Q source and "
+                    "data paths";
+            return false;
+        }
+    } catch (const std::filesystem::filesystem_error &exception) {
+        error = "Unable to resolve input/output paths: " +
+                std::string(exception.what());
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] std::uint64_t
+submitted_samples(const airspy_tv::InputTimelineSnapshot &initial,
+                  const airspy_tv::InputTimelineSnapshot &current) {
+    return current.delivered_samples >= initial.delivered_samples
+               ? current.delivered_samples - initial.delivered_samples
+               : current.delivered_samples;
+}
+
 } // namespace
 
 int offline_decode_cli(
@@ -34,90 +59,31 @@ int offline_decode_cli(
     const std::optional<std::filesystem::path> &report_directory) {
     const bool stdin_source = source == std::filesystem::path("-");
     const bool stdout_destination = destination == std::filesystem::path("-");
-    airspy_tv::IqFileInfo info;
+    airspy_tv::IqFileInfo source_info;
     std::string error;
     if (stdin_source && raw_sample_rate_hz == 0) {
         std::cerr << "stdin I/Q input requires a positive sample rate\n";
         return 1;
     }
     if (stdin_source) {
-        info = {.data_path = {},
-                .source = "stdin raw little-endian interleaved CS16",
-                .sample_rate_hz = raw_sample_rate_hz,
-                .center_frequency_hz = 0,
-                .file_size_bytes = 0};
-    } else if (!airspy_tv::resolve_iq_file(source, raw_sample_rate_hz, 0, info,
-                                           error)) {
+        source_info = {
+            .data_path = {},
+            .source = "stdin raw little-endian interleaved CS16",
+            .sample_rate_hz = raw_sample_rate_hz,
+            .center_frequency_hz = 0,
+            .file_size_bytes = 0,
+        };
+    } else if (!airspy_tv::resolve_iq_file(source, raw_sample_rate_hz, 0,
+                                           source_info, error)) {
+        std::cerr << error << '\n';
+        return 1;
+    }
+    if (!stdin_source && !stdout_destination &&
+        !output_path_is_safe(source, source_info, destination, error)) {
         std::cerr << error << '\n';
         return 1;
     }
 
-    if (!stdin_source && !stdout_destination) {
-        try {
-            const auto output_path =
-                std::filesystem::absolute(destination).lexically_normal();
-            if (std::filesystem::absolute(source).lexically_normal() ==
-                    output_path ||
-                std::filesystem::absolute(info.data_path).lexically_normal() ==
-                    output_path) {
-                std::cerr << "Output MPEG-TS path must differ from the I/Q "
-                             "source and data paths\n";
-                return 1;
-            }
-        } catch (const std::filesystem::filesystem_error &exception) {
-            std::cerr << "Unable to resolve input/output paths: "
-                      << exception.what() << '\n';
-            return 1;
-        }
-    }
-
-    const auto started_at = std::chrono::steady_clock::now();
-    std::unique_ptr<DecodeReport> report;
-    if (report_directory.has_value()) {
-        try {
-            report = std::make_unique<DecodeReport>(DecodeReportConfig{
-                .directory = *report_directory,
-                .context = "offline",
-            });
-        } catch (const std::exception &exception) {
-            std::cerr << "Unable to initialize performance report: "
-                      << exception.what() << '\n';
-            return 1;
-        }
-    }
-
-    StreamDecoder decoder;
-    decoder.set_parameters(parameters);
-    const bool detailed = report != nullptr || airspy_tv::is_debug_enabled();
-    decoder.set_telemetry_enabled(detailed, started_at);
-    airspy_tv::InputSampleTimeline input_timeline;
-    input_timeline.begin_stream(info.sample_rate_hz);
-    if (report) {
-        try {
-            report->begin_source(
-                DecodeSourceSessionConfig{
-                    .source = stdin_source ? "stdin" : source.string(),
-                    .destination =
-                        stdout_destination ? "stdout" : destination.string(),
-                    .sample_rate_hz = info.sample_rate_hz,
-                    .center_frequency_hz = info.center_frequency_hz,
-                    .decoder = parameters,
-                },
-                input_timeline.snapshot(), decoder.stats(), 0.0);
-        } catch (const std::exception &exception) {
-            std::cerr << "Unable to begin performance report source: "
-                      << exception.what() << '\n';
-            return 1;
-        }
-    }
-
-    std::unique_ptr<std::ifstream> input_file;
-    std::istream *input = &std::cin;
-    if (!stdin_source) {
-        input_file =
-            std::make_unique<std::ifstream>(info.data_path, std::ios::binary);
-        input = input_file.get();
-    }
     std::unique_ptr<std::ofstream> output_file;
     std::ostream *output = &std::cout;
     if (!stdout_destination) {
@@ -125,25 +91,24 @@ int offline_decode_cli(
             destination, std::ios::binary | std::ios::trunc);
         output = output_file.get();
     }
-
-    if (!*input || !*output) {
-        error = "Unable to open I/Q input or MPEG-TS output";
-        std::cerr << error << '\n';
-        if (report) {
-            try {
-                report->end_source("failed", error, decoder.stats(),
-                                   input_timeline.snapshot(), 0, 0.0);
-                report->finalize("failed", 1, error, 0.0);
-            } catch (const std::exception &exception) {
-                std::cerr << "Unable to finalize performance report: "
-                          << exception.what() << '\n';
-            }
-        }
+    if (!*output) {
+        std::cerr << "Unable to open MPEG-TS output\n";
         return 1;
     }
 
+    airspy_tv::SourceSettings settings;
+    settings.sample_rate_hz = source_info.sample_rate_hz;
+    settings.center_frequency_hz = source_info.center_frequency_hz;
+    constexpr airspy_tv::IqPlaybackPolicy playback_policy{
+        .pacing = airspy_tv::IqPlaybackPacing::unpaced,
+        .decoder_backpressure = airspy_tv::DecoderBackpressurePolicy::block,
+    };
+
+    airspy_tv::ReceiverSession session;
+    session.set_display_analysis_enabled(false);
+    session.set_dvbt_parameters(parameters);
     std::atomic_bool output_failed{};
-    decoder.set_transport_callback(
+    session.set_transport_sink(
         [output, &output_failed](const std::span<const std::uint8_t> ts) {
             output->write(reinterpret_cast<const char *>(ts.data()),
                           static_cast<std::streamsize>(ts.size()));
@@ -152,141 +117,120 @@ int offline_decode_cli(
             }
         });
 
-    const std::size_t scalar_samples =
-        StreamDecoder::chunk_samples_for(info.sample_rate_hz) * 2;
-    std::vector<std::int16_t> block(scalar_samples);
-    std::uint64_t submitted_samples = 0;
-    bool input_failed = false;
+    airspy_tv::DecodeRunReporter reporter(report_directory, "offline");
+    reporter.prepare(session);
+    const auto initial_timeline = session.input_timeline_snapshot();
+    if (!session.open_iq_file_and_start(source, settings, playback_policy,
+                                        error)) {
+        reporter.cancel_start(session);
+        session.set_transport_sink({});
+        session.close();
+        std::cerr << error << '\n';
+        return 1;
+    }
+    const std::string destination_name =
+        stdout_destination ? "stdout" : destination.string();
+    if (!reporter.start_source(session, settings, parameters, destination_name,
+                               error)) {
+        session.set_transport_sink({});
+        session.close();
+        std::cerr << "Decode report failed: " << error << '\n';
+        return 1;
+    }
+
+    const auto started_at = std::chrono::steady_clock::now();
+    auto last_progress = started_at;
     bool report_failed = false;
-    std::string report_error;
-    auto last_periodic = started_at;
-
-    const auto drain_records = [&] {
-        if (!detailed || report_failed) {
-            return;
+    while (session.is_streaming()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const std::string runtime_error = session.runtime_error();
+        if (!runtime_error.empty()) {
+            error = runtime_error;
+            break;
         }
-        auto records = decoder.drain_telemetry();
-        try {
-            if (report) {
-                report->consume(records);
-            }
-            if (airspy_tv::is_debug_enabled()) {
-                for (const auto &record : records) {
-                    airspy_tv::format_debug_telemetry(std::cerr, record);
-                }
-            }
-        } catch (const std::exception &exception) {
+        if (output_failed.load(std::memory_order_relaxed)) {
+            error = "Failed while writing MPEG-TS output";
+            break;
+        }
+        const auto stats = session.dvbt_snapshot().decoder;
+        if (stats.failed) {
+            error = stats.error;
+            break;
+        }
+        std::string report_error;
+        if (!reporter.update(session, report_error, false)) {
+            error = "Decode report failed: " + report_error;
             report_failed = true;
-            report_error = exception.what();
+            break;
         }
-    };
 
-    const auto periodic = [&](const bool final) {
         const auto now = std::chrono::steady_clock::now();
-        if (!final && now - last_periodic < std::chrono::seconds(1)) {
-            return;
+        if (now - last_progress >= std::chrono::seconds(1)) {
+            last_progress = now;
+            airspy_tv::format_decode_progress(
+                std::cerr, stats,
+                submitted_samples(initial_timeline,
+                                  session.input_timeline_snapshot()),
+                settings.sample_rate_hz,
+                std::chrono::duration<double>(now - started_at).count());
         }
-        last_periodic = now;
-        const double elapsed =
-            std::chrono::duration<double>(now - started_at).count();
-        const auto stats = decoder.stats();
-        airspy_tv::format_decode_progress(std::cerr, stats, submitted_samples,
-                                          info.sample_rate_hz, elapsed);
-        if (report && !report_failed) {
-            try {
-                report->write_pipeline(stats, submitted_samples, elapsed);
-                report->flush();
-            } catch (const std::exception &exception) {
-                report_failed = true;
-                report_error = exception.what();
-            }
-        }
-    };
-
-    while (*input && !output_failed.load(std::memory_order_relaxed) &&
-           !report_failed) {
-        input->read(
-            reinterpret_cast<char *>(block.data()),
-            static_cast<std::streamsize>(block.size() * sizeof(block.front())));
-        const std::streamsize bytes_read = input->gcount();
-        if (bytes_read <= 0) {
-            break;
-        }
-        if ((bytes_read %
-             static_cast<std::streamsize>(sizeof(std::int16_t) * 2)) != 0) {
-            input_failed = true;
-            error = "I/Q input ended with an incomplete CS16 sample";
-            break;
-        }
-        const std::size_t scalar_count =
-            static_cast<std::size_t>(bytes_read) / sizeof(block.front());
-        const std::size_t complex_count = scalar_count / 2;
-        submitted_samples += complex_count;
-        decoder.submit_blocking(
-            std::span(block).first(scalar_count), info.sample_rate_hz,
-            parameters.channel_bandwidth_hz,
-            input_timeline.stamp(complex_count, info.sample_rate_hz));
-        drain_records();
-        if (decoder.stats().failed) {
-            break;
-        }
-        periodic(false);
-    }
-    if (input->bad()) {
-        input_failed = true;
-        error = "Failed while reading I/Q input";
     }
 
-    decoder.flush();
-    drain_records();
+    session.finish_stream();
+    session.set_transport_sink({});
     output->flush();
-    periodic(true);
 
-    const auto stats = decoder.stats();
+    if (error.empty()) {
+        const std::string runtime_error = session.runtime_error();
+        if (!runtime_error.empty()) {
+            error = runtime_error;
+        } else if (output_failed.load(std::memory_order_relaxed)) {
+            error = "Failed while writing MPEG-TS output";
+        } else if (!session.input_exhausted()) {
+            error = "I/Q input stream stopped";
+        }
+    }
+
+    const auto stats = session.dvbt_snapshot().decoder;
+    const auto final_timeline = session.input_timeline_snapshot();
     const double wall_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       started_at)
             .count();
+    airspy_tv::format_decode_progress(
+        std::cerr, stats, submitted_samples(initial_timeline, final_timeline),
+        settings.sample_rate_hz, wall_seconds);
+
     int exit_code = 0;
-    std::string status = "completed";
-    if (report_failed) {
-        error = "Performance report failed: " + report_error;
-        exit_code = 1;
-        status = "failed";
-    } else if (input_failed) {
-        exit_code = 1;
-        status = "failed";
-    } else if (output_failed.load(std::memory_order_relaxed) || !*output) {
-        error = "Failed while writing MPEG-TS output";
-        exit_code = 1;
-        status = "failed";
-    } else if (stats.failed) {
+    if (error.empty() && stats.failed) {
         error = stats.error;
-        exit_code = 1;
-        status = "failed";
-    } else if (stats.dropped_blocks != 0) {
-        error = "Internal error: decoder-paced input dropped " +
+    }
+    if (error.empty() && stats.dropped_blocks != 0) {
+        error = "Internal error: blocking decoder input dropped " +
                 std::to_string(stats.dropped_blocks) + " block(s)";
-        exit_code = 1;
-        status = "failed";
-    } else if (stats.transport_bytes == 0) {
-        exit_code = 2;
-        status = "no_transport";
     }
 
+    if (report_failed || !error.empty() || !*output) {
+        if (error.empty()) {
+            error = "Failed while writing MPEG-TS output";
+        }
+        exit_code = 1;
+    } else if (stats.transport_bytes == 0) {
+        exit_code = 2;
+    }
+
+    std::string report_error;
+    if (!reporter.finalize(session, report_error, error, exit_code)) {
+        if (error.empty()) {
+            error = "Decode report failed: " + report_error;
+        } else {
+            error += "; decode report failed: " + report_error;
+        }
+        exit_code = 1;
+    }
+    session.close();
     if (!error.empty()) {
         std::cerr << error << '\n';
-    }
-    if (report) {
-        try {
-            report->end_source(status, error, stats, input_timeline.snapshot(),
-                               submitted_samples, wall_seconds);
-            report->finalize(status, exit_code, error, wall_seconds);
-        } catch (const std::exception &exception) {
-            std::cerr << "Unable to finalize performance report: "
-                      << exception.what() << '\n';
-            return 1;
-        }
     }
     return exit_code;
 }

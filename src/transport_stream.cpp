@@ -10,16 +10,6 @@
 #include <vector>
 
 namespace airspy_tv {
-namespace {
-
-struct SectionAssembler {
-    std::vector<std::uint8_t> bytes;
-    std::size_t expected{};
-    std::optional<std::uint8_t> continuity;
-};
-
-} // namespace
-
 struct TransportStreamModel::Impl {
     mutable std::mutex mutex;
     std::map<std::uint16_t, TransportService> services;

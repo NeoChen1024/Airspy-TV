@@ -26,10 +26,11 @@ constexpr float panel_width = 410.0F;
 
 void update_app_state(AppState &state) {
     state.player.set_source_active(state.session.is_streaming());
-    const DeviceDescriptor *source_descriptor = state.session.descriptor();
-    if (source_descriptor != state.last_source_descriptor) {
+    const std::uint64_t source_epoch =
+        state.session.input_timeline_snapshot().stream_epoch;
+    if (source_epoch != 0 && source_epoch != state.last_source_epoch) {
         state.epg.reset();
-        state.last_source_descriptor = source_descriptor;
+        state.last_source_epoch = source_epoch;
     }
     state.player.poll_events();
     state.spectrum = state.session.spectrum_snapshot();

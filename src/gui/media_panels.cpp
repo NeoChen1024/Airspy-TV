@@ -53,6 +53,11 @@ void draw_recorder_write_stats(ByteRateTracker &rate_tracker,
     ImGui::Text("Write rate: %.2f MiB/s", write_mib_per_second);
     ImGui::Text("Queue drops: %llu",
                 static_cast<unsigned long long>(stats.dropped_blocks));
+    ImGui::Text("Write errors: %llu",
+                static_cast<unsigned long long>(stats.write_errors));
+    if (!stats.error.empty()) {
+        ImGui::TextWrapped("Last write error: %s", stats.error.c_str());
+    }
 }
 
 } // namespace

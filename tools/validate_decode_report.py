@@ -440,6 +440,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-packets", type=int)
     parser.add_argument("--expected-sample-rate", type=int)
     parser.add_argument("--expected-bandwidth-hz", type=int)
+    parser.add_argument(
+        "--allow-no-transport",
+        action="store_true",
+        help="validate a completed or no-transport run without lock requirements",
+    )
     parser.add_argument("--expected-transmission-mode", choices=("2k", "8k"))
     parser.add_argument(
         "--expected-guard-interval", choices=("1/32", "1/16", "1/8", "1/4")
@@ -453,19 +458,38 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    result = validate_decode_report(
-        args.report_dir,
-        expected_samples=args.expected_samples,
-        expected_packets=args.expected_packets,
-        expected_sample_rate=args.expected_sample_rate,
-        expected_bandwidth_hz=args.expected_bandwidth_hz,
-        expected_transmission_mode=args.expected_transmission_mode,
-        expected_guard_interval=args.expected_guard_interval,
-        expected_constellation=args.expected_constellation,
-        expected_code_rate=args.expected_code_rate,
-    )
+    if args.allow_no_transport:
+        required = {
+            "--expected-samples": args.expected_samples,
+            "--expected-sample-rate": args.expected_sample_rate,
+            "--expected-bandwidth-hz": args.expected_bandwidth_hz,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ReportValidationError(
+                "--allow-no-transport requires " + ", ".join(missing)
+            )
+        result = validate_real_decode_report(
+            args.report_dir,
+            expected_samples=args.expected_samples,
+            expected_sample_rate=args.expected_sample_rate,
+            expected_bandwidth_hz=args.expected_bandwidth_hz,
+        )
+    else:
+        result = validate_decode_report(
+            args.report_dir,
+            expected_samples=args.expected_samples,
+            expected_packets=args.expected_packets,
+            expected_sample_rate=args.expected_sample_rate,
+            expected_bandwidth_hz=args.expected_bandwidth_hz,
+            expected_transmission_mode=args.expected_transmission_mode,
+            expected_guard_interval=args.expected_guard_interval,
+            expected_constellation=args.expected_constellation,
+            expected_code_rate=args.expected_code_rate,
+        )
     print(
-        f"valid report: {result['packets']} TS packets, "
+        f"valid report: "
+        f"{field(result['stats'], 'transport', 'emitted_packets')} TS packets, "
         f"{sum(result['stream_records'].values())} JSONL records"
     )
     return 0

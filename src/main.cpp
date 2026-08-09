@@ -5,44 +5,26 @@
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 #include "gui/app.hpp"
 #include "live_decode.hpp"
+#include "main_cli.hpp"
+#include "main_commands.hpp"
 #include "offline_decode.hpp"
 
-#include <algorithm>
-#include <array>
 #include <atomic>
-#include <cctype>
-#include <charconv>
-#include <chrono>
-#include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <getopt.h>
-#include <iomanip>
-#include <iostream>
-#include <memory>
 #include <optional>
-#include <ranges>
 #include <string>
-#include <string_view>
-#include <thread>
 
 namespace {
 
 using airspy_tv::AirspyGainMode;
-using airspy_tv::DeviceDescriptor;
-using airspy_tv::EnumerationResult;
-using airspy_tv::SdrBackend;
-using airspy_tv::SdrDevice;
 using airspy_tv::SourceSettings;
-using airspy_tv::SpectrumSnapshot;
 using airspy_tv::dvbt::ReceiverParameters;
-using airspy_tv::dvbt::SignalAnalysisSnapshot;
-using airspy_tv::dvbt::StreamDecoder;
-#include "main_commands.hpp"
+using namespace airspy_tv::cli;
 
-#include "main_cli.hpp"
+} // namespace
 
 int main(const int argc, char **argv) {
     std::optional<std::filesystem::path> inspect_iq_path;
@@ -66,7 +48,8 @@ int main(const int argc, char **argv) {
     airspy_tv::ReceiveStandard standard = airspy_tv::ReceiveStandard::DvbT;
 
     int opt = 0;
-    while ((opt = getopt_long(argc, argv, "hd", cli_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hd", cli_options(), nullptr)) !=
+           -1) {
         switch (opt) {
         case 'h':
             print_cli_usage();

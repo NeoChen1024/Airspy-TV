@@ -104,10 +104,22 @@ endif()
 
 add_library(airspy-tv-dvbt STATIC
     src/dvbt/analysis_publisher.cpp
+    src/dvbt/clock_control_timeline.cpp
     src/dvbt/decoder.cpp
+    src/dvbt/demod_dsp.cpp
+    src/dvbt/demod_stage.cpp
+    src/dvbt/demod_stage_output.cpp
+    src/dvbt/demod_stage_session.cpp
+    src/dvbt/demod_stage_symbol.cpp
+    src/dvbt/demod_stage_worker.cpp
+    src/dvbt/fec_stage.cpp
+    src/dvbt/frontend_stage.cpp
+    src/dvbt/frontend_stage_worker.cpp
     src/dvbt/inner_decoder.cpp
     src/dvbt/ofdm_acquisition.cpp
+    src/dvbt/sample_channel.cpp
     src/dvbt/stream_decoder.cpp
+    src/dvbt/streaming_resampler.cpp
     src/dvbt/signal_analyzer.cpp
     src/dvbt/soft_demapper.cpp
     src/dvbt/transport_decoder.cpp
@@ -117,24 +129,13 @@ target_include_directories(airspy-tv-dvbt PUBLIC include)
 target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F airspy-tv-common
     Threads::Threads PRIVATE solid-resampler::solid-resampler)
 
-add_executable(airspy-tv
-    src/epg.cpp
-    src/gui/app.cpp
-    src/gui/decode_reporting.cpp
-    src/gui/dvbt_panels.cpp
-    src/gui/media_panels.cpp
-    src/gui/receiver_panels.cpp
-    src/gui/source_panels.cpp
-    src/gui/spectrum_panels.cpp
-    src/gui/widgets.cpp
-    src/iq_file.cpp
-    src/live_decode.cpp
-    src/main.cpp
-    src/mpv_player.cpp
-    src/offline_decode.cpp
-    src/decode_report.cpp
+add_library(airspy-tv-runtime STATIC
     src/decode_progress.cpp
+    src/decode_report.cpp
     src/decode_run_reporter.cpp
+    src/epg.cpp
+    src/iq_file.cpp
+    src/iq_source.cpp
     src/receiver_session.cpp
     src/recorder.cpp
     src/sdr.cpp
@@ -143,9 +144,35 @@ add_executable(airspy-tv
     src/transport_router.cpp
     src/transport_stream.cpp
 )
+target_include_directories(airspy-tv-runtime PUBLIC include PRIVATE src)
+target_link_libraries(airspy-tv-runtime PUBLIC
+    airspy-tv-dvbt
+    nlohmann_json::nlohmann_json
+    PkgConfig::AIRSPY
+    PkgConfig::FFTW3F
+    SoapySDR
+    Threads::Threads
+)
+
+add_executable(airspy-tv
+    src/gui/app.cpp
+    src/gui/decode_reporting.cpp
+    src/gui/dvbt_panels.cpp
+    src/gui/media_panels.cpp
+    src/gui/receiver_panels.cpp
+    src/gui/source_panels.cpp
+    src/gui/spectrum_panels.cpp
+    src/gui/widgets.cpp
+    src/live_decode.cpp
+    src/main.cpp
+    src/main_cli.cpp
+    src/main_commands.cpp
+    src/mpv_player.cpp
+    src/offline_decode.cpp
+)
 target_include_directories(airspy-tv PRIVATE include)
 target_link_libraries(airspy-tv PRIVATE
-    airspy-tv-dvbt
+    airspy-tv-runtime
     imgui
     nlohmann_json::nlohmann_json
     tinycolormap
@@ -161,6 +188,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(airspy-tv-common PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     target_compile_options(airspy-tv-dvbt PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    target_compile_options(airspy-tv-runtime PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     target_compile_options(airspy-tv PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
@@ -179,10 +208,9 @@ if(BUILD_TESTING)
 
     add_executable(decode-report-test
         tests/decode_report_test.cpp
-        src/decode_report.cpp
     )
     target_include_directories(decode-report-test PRIVATE src)
-    target_link_libraries(decode-report-test PRIVATE airspy-tv-dvbt)
+    target_link_libraries(decode-report-test PRIVATE airspy-tv-runtime)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(decode-report-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -241,6 +269,28 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME dvbt-transport-decoder COMMAND dvbt-transport-decoder-test)
 
+    add_executable(dvbt-fec-stage-test
+        tests/dvbt_fec_stage_test.cpp
+    )
+    target_include_directories(dvbt-fec-stage-test PRIVATE src/dvbt)
+    target_link_libraries(dvbt-fec-stage-test PRIVATE airspy-tv-dvbt)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(dvbt-fec-stage-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME dvbt-fec-stage COMMAND dvbt-fec-stage-test)
+
+    add_executable(dvbt-sample-channel-test
+        tests/dvbt_sample_channel_test.cpp
+    )
+    target_include_directories(dvbt-sample-channel-test PRIVATE src/dvbt)
+    target_link_libraries(dvbt-sample-channel-test PRIVATE airspy-tv-dvbt)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(dvbt-sample-channel-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME dvbt-sample-channel COMMAND dvbt-sample-channel-test)
+
     add_executable(dvbt-stream-decoder-test
         tests/dvbt_stream_decoder_test.cpp
     )
@@ -262,10 +312,9 @@ if(BUILD_TESTING)
 
     add_executable(epg-model-test
         tests/epg_model_test.cpp
-        src/epg.cpp
-        src/si_common.cpp
     )
     target_include_directories(epg-model-test PRIVATE include src)
+    target_link_libraries(epg-model-test PRIVATE airspy-tv-runtime)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(epg-model-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -291,6 +340,26 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME byte-rate-tracker COMMAND byte-rate-tracker-test)
+
+    add_executable(recorder-test
+        tests/recorder_test.cpp
+    )
+    target_link_libraries(recorder-test PRIVATE airspy-tv-runtime)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(recorder-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME recorder COMMAND recorder-test)
+
+    add_executable(sdr-file-source-test
+        tests/sdr_file_source_test.cpp
+    )
+    target_link_libraries(sdr-file-source-test PRIVATE airspy-tv-runtime)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(sdr-file-source-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME sdr-file-source COMMAND sdr-file-source-test)
 
     add_executable(transport-output-test
         tests/transport_output_test.cpp

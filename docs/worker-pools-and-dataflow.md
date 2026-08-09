@@ -45,7 +45,7 @@ Airspy callback / Soapy worker / I/Q-file worker
          ordered symbol join and MER-region gate
              |
              v
-       bounded FEC-item queue
+       FecStage bounded item queue
              |
              v
        dvbt-fec thread
@@ -101,7 +101,7 @@ viterbi  = total - resample - symbol
 This gives the intended 2/8 resample, 3/8 symbol, and 3/8 Viterbi split when
 the budget is divisible by eight. Every pool receives at least one worker; a
 budget of one or two therefore still creates one worker for each stage and is
-not a literal cap on total decoder threads. The three coordinator threads and
+not a literal cap on total decoder threads. The three serial stage threads and
 source/recorder/UI threads are outside this DSP worker budget.
 
 ## Stage responsibilities
@@ -111,7 +111,10 @@ source/recorder/UI threads are outside this DSP worker budget.
 Airspy calls `submit()` from its callback. SoapySDR and file playback call it
 from their source workers. `submit()` copies valid CS16 blocks into a queue
 sized to roughly 0.2 seconds of input, with capacity enlarged to fit one
-incoming block.
+incoming block. `SampleChannel` owns this queue together with generation
+cancellation, the absolute sample ring, reset acknowledgement, and all
+queue/ring condition variables; synchronization is no longer split across the
+coordinator and worker methods.
 
 - Live `submit()` rejects a block when the queue is full and increments
   `dropped_blocks`.
@@ -121,8 +124,9 @@ incoming block.
 
 ### Frontend and sample ring
 
-`dvbt-frontend` converts interleaved CS16 to normalized complex samples and
-runs `StreamingResampler` at the DVB-T baseband rate (`bandwidth * 8 / 7`).
+`FrontendStage` owns the `dvbt-frontend` worker. It converts interleaved CS16
+to normalized complex samples and runs `StreamingResampler` at the DVB-T
+baseband rate (`bandwidth * 8 / 7`).
 The common arbitrary resampler retains Q32.32 phase and FIR history across
 input blocks. Caller blocks are split into bounded 50 ms processing quanta;
 parallel workers evaluate independent output ranges inside each quantum and
@@ -132,11 +136,12 @@ Nyquist edges. The Kaiser filter is automatically sized and SIMD-aligned for
 an 80 dB stopband target.
 
 The source assigns every input block a monotonic `uint64_t` sample range and a
-stream epoch. Resampler spans retain the corresponding input range, absolute
-ring output range, and applied SRO correction. The timing loop schedules each
-new ratio at a future input-sample boundary beyond the maximum generated-ahead
-lead, so queue occupancy changes wall-clock delivery time but not the
-signal-domain control delay.
+stream epoch. `ClockControlTimeline` owns resampler spans that retain the
+corresponding input range, absolute ring output range, and applied SRO/CFO
+correction. It also owns pending SRO/CFO commands and their applied snapshots.
+The timing loop schedules each new ratio at a future input-sample boundary
+beyond the maximum generated-ahead lead, so queue occupancy changes wall-clock
+delivery time but not the signal-domain control delay.
 
 Resampled data enters an `AbsoluteSampleRing`. Read and write positions are
 monotonic 64-bit stream coordinates; wrapping affects storage only. The ring
@@ -188,9 +193,12 @@ end/begin items so corrupted state does not poison later recovery.
 
 ### FEC and transport
 
-`dvbt-fec` consumes ordered region-control, symbol, statistics, and stream-end
-items. It owns the stateful `dvbt::Decoder`/`TransportDecoder` and is the only
-thread that publishes recovered TS bytes.
+`FecStage` owns the bounded item queue, capacity and synchronization, worker
+lifecycle, stateful `dvbt::Decoder`/`TransportDecoder`, session counters, and
+transport timing. Its `dvbt-fec` thread consumes ordered region-control,
+symbol, statistics, and stream-end items and is the only thread that publishes
+recovered TS bytes. `StreamDecoder::Impl` retains generation authority,
+telemetry publication, and external transport/discontinuity callback wiring.
 
 `SoftViterbi` divides the mother-code metric stream into overlapping windows
 with traceback margins. The default optimized build uses the AVX2-u16
@@ -298,10 +306,12 @@ DVB-T-specific diagnostics.
 | Session and demodulator lifecycle                     | `src/receiver_session.cpp`, `src/receiver_session.hpp`, `include/airspy_tv/demodulator.hpp`        |
 | Source fan-out and common snapshots                   | `src/sdr.cpp`, `include/airspy_tv/sdr.hpp`                                                           |
 | StreamDecoder coordination and public stats           | `src/dvbt/stream_decoder.cpp`, `include/airspy_tv/dvbt/stream_decoder.hpp`                           |
-| Frontend, demod session, tracking, and output helpers | `src/dvbt/stream_decoder_frontend.hpp`, `src/dvbt/stream_decoder_demod*.hpp`                         |
+| Input/ring generation channel and clock control       | `src/dvbt/sample_channel.*`, `src/dvbt/clock_control_timeline.*`                                    |
+| Frontend conversion, acquisition, and resampling     | `src/dvbt/frontend_stage*.cpp`, `src/dvbt/streaming_resampler.*`                                   |
+| Demod session, tracking, output, and pure DSP helpers | `src/dvbt/demod_stage*.cpp`, `src/dvbt/demod_dsp.*`, `src/dvbt/symbol_postprocessor.hpp`            |
 | OFDM acquisition and resampling                       | `src/dvbt/ofdm_acquisition.cpp`, `include/airspy_tv/dvbt/ofdm_acquisition.hpp`                       |
 | TPS and inner decoding                                | `src/dvbt/tps_decoder.cpp`, `src/dvbt/inner_decoder.cpp`, `src/dvbt/soft_demapper.cpp`             |
-| FEC queue and transport decoder                       | `src/dvbt/stream_decoder_fec.hpp`, `src/dvbt/transport_decoder.cpp`                                  |
+| FEC queue and transport decoder                       | `src/dvbt/fec_stage.cpp`, `src/dvbt/fec_stage.hpp`, `src/dvbt/transport_decoder.cpp`                 |
 | Viterbi pool/backend selection                        | `src/fec/soft_viterbi.cpp`, `include/airspy_tv/fec/soft_viterbi.hpp`                                 |
 | Outer FEC                                             | `src/fec/outer_fec.cpp`, `include/airspy_tv/fec/outer_fec.hpp`                                       |
 | Signal snapshot publication/fallback                  | `src/dvbt/analysis_publisher.cpp`, `src/dvbt/signal_analyzer.cpp`                                    |
@@ -321,4 +331,4 @@ DVB-T-specific diagnostics.
 - Keep timing/CIR/second-order-loop experiments in
   [clock-tracking.md](clock-tracking.md).
 - Preserve these ordering, generation, and backpressure invariants while
-  splitting large implementation or GUI files.
+  refactoring report, transport, or GUI ownership.

@@ -1,6 +1,10 @@
+#include "demod_stage_internal.hpp"
+
+namespace airspy_tv::dvbt {
+
 // Demod session, acquisition, and ring-coordination helpers.
 
-void StreamDecoder::Impl::demod_cold_seed(DemodRuntimeState &state) {
+void DemodStage::Impl::demod_cold_seed(DemodRuntimeState &state) {
     // DemodRuntimeState lives for the worker thread rather than for one
     // source. A new acquisition must not inherit a recovery decision from a
     // previous file / retune: before the first pilot lock, previous_phase and
@@ -28,7 +32,7 @@ void StreamDecoder::Impl::demod_cold_seed(DemodRuntimeState &state) {
     frontend.just_seeded = true;
 }
 
-void StreamDecoder::Impl::demod_build_grid(DemodRuntimeState &state) {
+void DemodStage::Impl::demod_build_grid(DemodRuntimeState &state) {
     state.maximum = frontend.fft_size == 8192 ? 6816 : 1704;
     state.fft_size = frontend.fft_size;
     state.guard_size = frontend.guard_size;
@@ -77,9 +81,9 @@ void StreamDecoder::Impl::demod_build_grid(DemodRuntimeState &state) {
         FFTW_BACKWARD, FFTW_ESTIMATE);
 }
 
-void StreamDecoder::Impl::demod_reset_timing(DemodRuntimeState &state,
-                                             const std::size_t tracker_fft_size,
-                                             const bool reset_window_cir) {
+void DemodStage::Impl::demod_reset_timing(DemodRuntimeState &state,
+                                          const std::size_t tracker_fft_size,
+                                          const bool reset_window_cir) {
     state.smoothed_sample_clock_ppm = 0.0;
     state.latest_cp_snr_db = 0.0F;
     state.latest_deepest_notch_db = 0.0F;
@@ -98,9 +102,9 @@ void StreamDecoder::Impl::demod_reset_timing(DemodRuntimeState &state,
     state.timing_tracker.reset(tracker_fft_size);
 }
 
-bool StreamDecoder::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
+bool DemodStage::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
     state.seen_sync_version = sync.version;
-    state.demod_generation = latest_generation.load();
+    state.demod_generation = sample_channel.generation();
     const auto anchored_start = [this]() -> std::uint64_t {
         return static_cast<std::uint64_t>(
             static_cast<std::int64_t>(sync.start_pos + sync.guard_size) +
@@ -127,12 +131,12 @@ bool StreamDecoder::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
         frontend.cir_symbol_count = 0;
         state.applied_cir_offset = 0;
         demod_reset_timing(state, 0, true);
+        demod_reset_stats_window(state);
         reset_frontend_state();
         stable_mode.reset();
         stable_guard.reset();
-        if (reset_requested) {
-            demod_reset_generation = state.demod_generation;
-            reset_acknowledged.notify_all();
+        if (sample_channel.snapshot().reset_requested) {
+            sample_channel.acknowledge_demod_reset(state.demod_generation);
         }
         return true;
     }
@@ -163,7 +167,7 @@ bool StreamDecoder::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
             allocate_workers(state.selected_parameters.worker_threads);
         state.symbol_queue_capacity = buffered_symbol_count(
             sync.bandwidth, state.fft_size + state.guard_size);
-        fec_queue_capacity = state.symbol_queue_capacity;
+        fec_stage.set_capacity(state.symbol_queue_capacity);
         if (state.selected_parameters.constellation.has_value() &&
             state.selected_parameters.code_rate.has_value()) {
             state.decoder_parameters = DecoderParameters{
@@ -186,7 +190,7 @@ bool StreamDecoder::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
             static_cast<int>(std::lround(frontend.cir_offset));
         demod_reset_timing(state, state.fft_size, true);
         state.have_grid = true;
-        demod_busy = true;
+        sample_channel.set_demod_busy(true);
         return true;
     }
 
@@ -203,10 +207,8 @@ bool StreamDecoder::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
     // The boundary moved, but mode and guard are unchanged, so carrier
     // tracking carries while the timing loop restarts on the new grid.
     const bool carried = frontend.valid;
-    std::uint64_t new_next = new_start;
-    while (new_next < ring_read_pos) {
-        new_next += state.period;
-    }
+    const std::uint64_t new_next =
+        sample_channel.align_at_or_after(new_start, state.period);
     state.next_symbol_start = new_next;
     state.applied_cir_offset =
         static_cast<int>(std::lround(frontend.cir_offset));
@@ -217,20 +219,17 @@ bool StreamDecoder::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
     return true;
 }
 
-float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
-                                                 const bool wait_for_data) {
+float DemodStage::Impl::demod_run_acquisition(DemodRuntimeState &state,
+                                              const bool wait_for_data) {
     if (wait_for_data) {
         // A live decoder keeps little backlog. Wait for a useful acquisition
         // window while recovering, but bound the wait so reset remains prompt.
         const auto wait_started = std::chrono::steady_clock::now();
         for (;;) {
-            bool cancel = false;
-            std::uint64_t now_available = 0;
-            {
-                const std::scoped_lock lock(mutex);
-                cancel = stopping || reset_requested || cancel_requested;
-                now_available = ring_write_pos - ring_read_pos;
-            }
+            const auto channel = sample_channel.snapshot();
+            const bool cancel = channel.stopping || channel.reset_requested ||
+                                sample_channel.cancelled();
+            const std::uint64_t now_available = channel.ring_used_samples;
             if (cancel || duration_ms(wait_started) > 1000.0F) {
                 if (!cancel && events_enabled()) {
                     emit_event(
@@ -244,57 +243,52 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
             if (now_available >= acquisition_samples) {
                 break;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+            static_cast<void>(sample_channel.wait_for_available(
+                acquisition_samples, state.demod_generation,
+                std::chrono::milliseconds(4)));
         }
     }
 
     const auto acquisition_work_started_at = std::chrono::steady_clock::now();
-    std::vector<std::complex<float>> window;
     ReceiverParameters acquisition_parameters;
-    std::uint64_t base = 0;
-    std::uint64_t acquisition_generation = 0;
+    const auto acquisition_window =
+        sample_channel.acquisition_window(acquisition_samples, 2U * 10240U);
+    if (acquisition_window.samples.empty()) {
+        return 0.0F;
+    }
     {
         const std::scoped_lock lock(mutex);
-        const std::uint64_t available = ring_write_pos - ring_read_pos;
-        const std::uint64_t window_size =
-            std::min<std::uint64_t>(available, acquisition_samples);
-        if (window_size < 2 * 10240) {
-            return 0.0F;
-        }
-        base = ring_read_pos;
-        acquisition_generation = latest_generation;
-        window.reserve(static_cast<std::size_t>(window_size));
-        for (std::uint64_t p = base; p < base + window_size; ++p) {
-            window.push_back(ring[p % ring.size()]);
-        }
         acquisition_parameters = parameters;
     }
+    const std::uint64_t base = acquisition_window.base;
+    const std::uint64_t acquisition_generation = acquisition_window.generation;
 
     const auto acquisition_started_at = std::chrono::steady_clock::now();
-    const OfdmAcquisition acquisition =
-        acquire_ofdm(std::span(window), acquisition_parameters, false);
+    const OfdmAcquisition acquisition = acquire_ofdm(
+        std::span(acquisition_window.samples), acquisition_parameters, false);
     const float acquisition_elapsed_ms = duration_ms(acquisition_started_at);
     if (state.demod_busy_active) {
         state.reacquisition_time_sum_ms +=
             duration_ms(acquisition_work_started_at);
     }
     if (acquisition.score < 0.20F) {
-        const std::scoped_lock lock(mutex);
-        if (acquisition_generation == latest_generation && !reset_requested) {
+        if (acquisition_generation == sample_channel.generation() &&
+            !sample_channel.cancelled()) {
             state.acquisition_time_ms = acquisition_elapsed_ms;
         }
         return 0.0F;
     }
 
+    std::uint64_t published_sync_version = 0;
     {
         const std::scoped_lock lock(mutex);
         // Acquisition runs without the coordinator mutex. Never publish a
         // copied window after reset or generation advance.
-        if (stopping || reset_requested || cancel_requested ||
-            acquisition_generation != latest_generation) {
+        if (sample_channel.cancelled() ||
+            acquisition_generation != sample_channel.generation()) {
             return 0.0F;
         }
-        const std::uint32_t bandwidth = current_bandwidth;
+        const std::uint32_t bandwidth = clock_control.snapshot().bandwidth_hz;
         const float resampled_rate =
             static_cast<float>(bandwidth) * (8.0F / 7.0F);
         state.acquisition_time_ms = acquisition_elapsed_ms;
@@ -311,9 +305,10 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
         sync.bandwidth = bandwidth;
         sync.resampled_rate = resampled_rate;
         latest.acquisition_score = acquisition.score;
-        ++sync.version;
+        published_sync_version = ++sync.version;
         static_cast<void>(demod_handle_sync_change(state));
     }
+    sample_channel.publish_sync_version(published_sync_version);
     if (events_enabled()) {
         emit_event("acquisition_succeeded", DecoderEventSeverity::info,
                    acquisition_generation, base + acquisition.start,
@@ -328,7 +323,7 @@ float StreamDecoder::Impl::demod_run_acquisition(DemodRuntimeState &state,
     return acquisition.score;
 }
 
-DemodFlow StreamDecoder::Impl::demod_prepare_stream(DemodRuntimeState &state) {
+DemodFlow DemodStage::Impl::demod_prepare_stream(DemodRuntimeState &state) {
     auto &have_grid = state.have_grid;
     auto &seen_sync_version = state.seen_sync_version;
     auto &decoder_parameters = state.decoder_parameters;
@@ -337,37 +332,17 @@ DemodFlow StreamDecoder::Impl::demod_prepare_stream(DemodRuntimeState &state) {
     // --- wait for first-anchor data, a reset (the front-end
     //     only invalidates the sync on retune/reset), or the
     //     resume of a flushed stream ---
-    {
-        std::unique_lock lock(mutex);
-        // While working toward a first anchor (including the wait
-        // for acquisition data), mark the demod as acquisition-
-        // pending: the front-end's push-abandon must not fire in
-        // the window between this wait waking and the acquisition
-        // marking itself busy — a ring full of fresh data with a
-        // flush arriving mid-push used to abandon the push there,
-        // dropping the first block's remainder and starving small
-        // files before the TPS could lock. It may fire only once
-        // the demod parks in the retry back-off (never-lockable
-        // streams) or the end-of-stream wait.
-        if (!have_grid) {
-            acquisition_pending = true;
-        }
-        demod_state.store(static_cast<int>(WorkerState::waiting_sync));
-        ring_data.wait(lock, [this, &seen_sync_version, &have_grid] {
-            return stopping || sync.version != seen_sync_version ||
-                   // A finite stream may close while the first
-                   // acquisition is still running. Once the grid
-                   // is published, drain the already-written
-                   // samples even though the ring is closed.
-                   (have_grid && ring_write_pos > ring_read_pos) ||
-                   (!have_grid && ring_closed) ||
-                   (!have_grid &&
-                    ring_write_pos - ring_read_pos >= acquisition_samples);
-        });
-        if (stopping) {
-            demod_state.store(static_cast<int>(WorkerState::exited));
-            return DemodFlow::stop;
-        }
+    // While working toward a first anchor, keep acquisition_pending set so a
+    // flush cannot abandon a full-ring push between wakeup and acquisition.
+    if (!have_grid) {
+        sample_channel.set_acquisition_pending(true);
+    }
+    demod_state.store(static_cast<int>(WorkerState::waiting_sync));
+    if (sample_channel.wait_for_stream(seen_sync_version, have_grid,
+                                       acquisition_samples) ==
+        SampleChannel::WaitStatus::stop) {
+        demod_state.store(static_cast<int>(WorkerState::exited));
+        return DemodFlow::stop;
     }
     bool stream_abandoned = false;
     {
@@ -398,49 +373,34 @@ DemodFlow StreamDecoder::Impl::demod_prepare_stream(DemodRuntimeState &state) {
         // wait_until_idle blocks until it finishes (bounded work),
         // while the push-abandon still sees acquisition_pending
         // and never fires mid-acquisition.
-        {
-            const std::scoped_lock lock(mutex);
-            demod_busy = true;
-        }
+        sample_channel.set_demod_busy(true);
         demod_state.store(static_cast<int>(WorkerState::processing));
         const float score = demod_run_acquisition(state);
         bool closed_without_grid = false;
         if (!have_grid) {
-            {
-                const std::scoped_lock lock(mutex);
-                demod_busy = false;
-                acquisition_pending = false;
-                closed_without_grid = ring_closed;
-                if (closed_without_grid) {
-                    // No acquisition means these samples cannot be consumed by
-                    // the symbol loop. Drop the closed stream's dead data
-                    // before parking for reset or a new source, so
-                    // wait_until_idle can observe a genuinely drained decoder.
-                    ring_read_pos = ring_write_pos;
-                }
+            sample_channel.set_demod_busy(false);
+            sample_channel.set_acquisition_pending(false);
+            closed_without_grid = sample_channel.snapshot().ring_closed;
+            if (closed_without_grid) {
+                // No acquisition means these samples cannot be consumed by
+                // the symbol loop. Drop the closed stream's dead data before
+                // parking for reset or a new source.
+                sample_channel.discard_all();
             }
-            idle.notify_all();
         }
         if (closed_without_grid) {
             // The stream ended without a signal. Stay alive for
             // the next stream: a reset bumps the sync version and
             // a reopened ring refills the data.
-            std::unique_lock lock(mutex);
             demod_state.store(static_cast<int>(WorkerState::waiting_sync));
-            ring_data.wait(lock, [this, &seen_sync_version] {
-                return stopping || sync.version != seen_sync_version ||
-                       (!ring_closed && ring_write_pos > ring_read_pos);
-            });
-            if (stopping) {
+            if (sample_channel.wait_for_reopen(seen_sync_version) ==
+                SampleChannel::WaitStatus::stop) {
                 demod_state.store(static_cast<int>(WorkerState::exited));
                 return DemodFlow::stop;
             }
         } else if (score == 0.0F) {
-            {
-                const std::scoped_lock lock(mutex);
-                demod_busy = false;
-                acquisition_pending = false;
-            }
+            sample_channel.set_demod_busy(false);
+            sample_channel.set_acquisition_pending(false);
             // No signal yet (or the acquisition can never succeed
             // for this stream): back off so the retry cannot
             // busy-loop and stall the ring in front of the
@@ -449,15 +409,11 @@ DemodFlow StreamDecoder::Impl::demod_prepare_stream(DemodRuntimeState &state) {
             // flush can abandon the front-end push (ring full)
             // and close the ring so the stream ends cleanly
             // instead of deadlocking.
-            std::unique_lock lock(mutex);
             demod_state.store(
                 static_cast<int>(WorkerState::waiting_acquisition));
-            ring_data.wait_for(lock, std::chrono::milliseconds(100),
-                               [this, &seen_sync_version] {
-                                   return stopping ||
-                                          sync.version != seen_sync_version;
-                               });
-            if (stopping) {
+            if (sample_channel.wait_for_retry(seen_sync_version,
+                                              std::chrono::milliseconds(100)) ==
+                SampleChannel::WaitStatus::stop) {
                 demod_state.store(static_cast<int>(WorkerState::exited));
                 return DemodFlow::stop;
             }
@@ -467,8 +423,7 @@ DemodFlow StreamDecoder::Impl::demod_prepare_stream(DemodRuntimeState &state) {
     return DemodFlow::proceed;
 }
 
-DemodInputFlow
-StreamDecoder::Impl::demod_read_symbol(DemodRuntimeState &state) {
+DemodInputFlow DemodStage::Impl::demod_read_symbol(DemodRuntimeState &state) {
     auto &next_symbol_start = state.next_symbol_start;
     auto &fft_size = state.fft_size;
     auto &seen_sync_version = state.seen_sync_version;
@@ -478,83 +433,36 @@ StreamDecoder::Impl::demod_read_symbol(DemodRuntimeState &state) {
     auto &latest_cp_snr_db = state.latest_cp_snr_db;
     auto &demod_busy_started_at = state.demod_busy_started_at;
 
-    const std::uint64_t needed =
-        next_symbol_start + static_cast<std::uint64_t>(fft_size);
-    const auto ring_wait_started_at = std::chrono::steady_clock::now();
-    {
-        std::unique_lock lock(mutex);
-        demod_state.store(static_cast<int>(WorkerState::waiting_ring_data));
-        ring_data.wait(lock, [this, needed, &seen_sync_version] {
-            return stopping || sync.version != seen_sync_version ||
-                   (ring_closed && ring_write_pos < needed) ||
-                   ring_write_pos >= needed;
-        });
-        if (stopping) {
-            return DemodInputFlow::stop;
-        }
-        if (sync.version != seen_sync_version) {
-            // A reset or retune landed while this thread was
-            // parked on a stale stream position: the reset
-            // path rewinds the ring to zero, so the old
-            // `needed` may never be reachable again. Re-run
-            // the loop head, which sees the new sync version
-            // and drops the grid (handle_sync_change).
-            return DemodInputFlow::end;
-        }
-        if (ring_closed && ring_write_pos < needed) {
-            return DemodInputFlow::end; // end of stream
-        }
+    demod_state.store(static_cast<int>(WorkerState::waiting_ring_data));
+    const auto read = sample_channel.read_symbol(
+        seen_sync_version, next_symbol_start, fft_size, guard_size,
+        (symbol_count % analysis_interval_symbols) == 0U, fft_in);
+    state.ring_wait_time_sum_ms += read.wait_time_ms;
+    state.ring_copy_time_sum_ms += read.copy_time_ms;
+    if (read.status == SampleChannel::WaitStatus::stop) {
+        return DemodInputFlow::stop;
     }
-    state.ring_wait_time_sum_ms += duration_ms(ring_wait_started_at);
+    if (read.status == SampleChannel::WaitStatus::sync_changed ||
+        read.status == SampleChannel::WaitStatus::closed) {
+        return DemodInputFlow::end;
+    }
     demod_busy_started_at = std::chrono::steady_clock::now();
     state.demod_busy_active = true;
-    const auto ring_copy_started_at = demod_busy_started_at;
-    {
-        const std::scoped_lock lock(mutex);
-        if (sync.version != seen_sync_version) {
-            state.ring_copy_time_sum_ms += duration_ms(ring_copy_started_at);
-            demod_busy_time_sum_ms += duration_ms(demod_busy_started_at);
-            state.demod_busy_active = false;
-            return DemodInputFlow::retry;
-        }
-        for (std::size_t i = 0; i < fft_size; ++i) {
-            const std::uint64_t position = next_symbol_start + i;
-            fft_in[i] = ring[position % ring.size()];
-        }
-        if ((symbol_count % analysis_interval_symbols) == 0U &&
-            next_symbol_start >= guard_size) {
-            const std::uint64_t prefix_start = next_symbol_start - guard_size;
-            if (prefix_start >= ring_read_pos) {
-                std::complex<float> correlation{};
-                double prefix_power = 0.0;
-                double suffix_power = 0.0;
-                for (std::size_t i = 0; i < guard_size; ++i) {
-                    const auto prefix = ring[(prefix_start + i) % ring.size()];
-                    const auto suffix =
-                        ring[(prefix_start + fft_size + i) % ring.size()];
-                    correlation += std::conj(prefix) * suffix;
-                    prefix_power += std::norm(prefix);
-                    suffix_power += std::norm(suffix);
-                }
-                const float rho =
-                    prefix_power > 0.0 && suffix_power > 0.0
-                        ? static_cast<float>(
-                              std::abs(correlation) /
-                              std::sqrt(prefix_power * suffix_power))
-                        : 0.0F;
-                latest_cp_snr_db =
-                    10.0F *
-                    std::log10(std::max(rho / std::max(1.0F - rho, 1.0e-4F),
+    state.demod_busy_time_sum_ms += read.copy_time_ms;
+    if (read.cyclic_prefix.valid) {
+        const float rho =
+            read.cyclic_prefix.prefix_power > 0.0 &&
+                    read.cyclic_prefix.suffix_power > 0.0
+                ? static_cast<float>(std::abs(read.cyclic_prefix.correlation) /
+                                     std::sqrt(read.cyclic_prefix.prefix_power *
+                                               read.cyclic_prefix.suffix_power))
+                : 0.0F;
+        latest_cp_snr_db =
+            10.0F * std::log10(std::max(rho / std::max(1.0F - rho, 1.0e-4F),
                                         minimum_power));
-            }
-        }
     }
     demod_state.store(static_cast<int>(WorkerState::processing));
-    {
-        const std::scoped_lock lock(mutex);
-        ring_read_pos = needed;
-        ring_space.notify_all();
-    }
-    state.ring_copy_time_sum_ms += duration_ms(ring_copy_started_at);
     return DemodInputFlow::ready;
 }
+
+} // namespace airspy_tv::dvbt
