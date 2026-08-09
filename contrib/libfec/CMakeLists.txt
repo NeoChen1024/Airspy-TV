@@ -1,5 +1,6 @@
 add_library(libfec-rs STATIC
     decode_rs_char.c
+    decode_rs_dvb_char.c
     encode_rs_char.c
     include/libfec_rs.h
     init_rs_char.c

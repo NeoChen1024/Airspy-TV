@@ -41,8 +41,12 @@ struct FecStageWindow {
     TransportDecoderStats session;
     TransportDecoderStats delta;
     TransportDecoderStats cumulative;
-    float fec_total_ms{};
-    float transport_nested_ms{};
+    double fec_total_ms{};
+    double transport_nested_ms{};
+    TimingMap wait_ms;
+    TimingMap nested_ms;
+    TimingMap thread_cpu_ms;
+    TimingMap aggregate_worker_work_ms;
 };
 
 class FecStage {
@@ -55,7 +59,7 @@ class FecStage {
             emit_transport;
         std::function<void(std::uint64_t, TransportDiscontinuity)>
             emit_discontinuity;
-        std::function<bool()> diagnostics_enabled;
+        std::function<bool()> telemetry_enabled;
         std::function<void(DiagnosticEvent, const FecStageDiagnosticContext &)>
             emit_diagnostic;
         std::function<void()> notify_idle;

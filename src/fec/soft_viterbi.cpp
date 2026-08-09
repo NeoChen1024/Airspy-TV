@@ -14,7 +14,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -47,6 +49,13 @@ constexpr std::size_t viterbi_output_bits =
 static_assert(viterbi_output_bits / 8 == viterbi_output_bytes);
 // Retains more than 200 ms at DVB-T's maximum useful bit rate.
 constexpr std::size_t viterbi_buffer_windows = 1024;
+
+[[nodiscard]] double
+elapsed_ms(const std::chrono::steady_clock::time_point started_at) noexcept {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - started_at)
+        .count();
+}
 
 } // namespace
 
@@ -106,10 +115,21 @@ struct SoftViterbi::Impl {
         hard_decision_errors_ = 0;
         compared_metrics_ = 0;
         worker_error_ = nullptr;
+        timing_ = {};
+        worker_work_ns_.store(0, std::memory_order_relaxed);
+    }
+
+    void set_detailed_timing_enabled(const bool enabled) noexcept {
+        detailed_timing_enabled_.store(enabled, std::memory_order_relaxed);
     }
 
     [[nodiscard]] std::vector<std::uint8_t>
     process(const std::span<const float> llrs) {
+        const bool measure =
+            detailed_timing_enabled_.load(std::memory_order_relaxed);
+        const auto started_at = measure
+                                    ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
         compact_for(llrs.size());
         const std::size_t old_size = metrics_.size();
         metrics_.resize(old_size + llrs.size());
@@ -119,15 +139,26 @@ struct SoftViterbi::Impl {
             metrics_[old_size + index] =
                 static_cast<std::uint8_t>(std::lround(soft));
         }
+        if (measure) {
+            timing_.submit_ms += elapsed_ms(started_at);
+        }
 
         return dispatch_ready_windows();
     }
 
     [[nodiscard]] std::vector<std::uint8_t>
     process_soft(const std::span<const std::uint8_t> soft_metrics) {
+        const bool measure =
+            detailed_timing_enabled_.load(std::memory_order_relaxed);
+        const auto started_at = measure
+                                    ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
         compact_for(soft_metrics.size());
         metrics_.insert(metrics_.end(), soft_metrics.begin(),
                         soft_metrics.end());
+        if (measure) {
+            timing_.submit_ms += elapsed_ms(started_at);
+        }
         return dispatch_ready_windows();
     }
 
@@ -148,17 +179,41 @@ struct SoftViterbi::Impl {
         constexpr std::size_t consumed_metrics =
             viterbi_output_bits * convolutional_rate;
         while (metrics_.size() - metric_offset_ >= window_metrics) {
+            const bool measure =
+                detailed_timing_enabled_.load(std::memory_order_relaxed);
+            auto started_at = measure ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
             Task task;
             task.metrics.assign(
                 metrics_.begin() + static_cast<std::ptrdiff_t>(metric_offset_),
                 metrics_.begin() + static_cast<std::ptrdiff_t>(metric_offset_ +
                                                                window_metrics));
+            task.measure_timing = measure;
+            if (measure) {
+                timing_.submit_ms += elapsed_ms(started_at);
+                started_at = std::chrono::steady_clock::now();
+            }
             {
                 std::unique_lock lock(mutex_);
+                if (measure) {
+                    timing_.submit_ms += elapsed_ms(started_at);
+                }
+                const bool wait_required =
+                    !stopping_ && !worker_error_ &&
+                    tasks_.size() >= maximum_queued_windows_;
+                if (measure && wait_required) {
+                    started_at = std::chrono::steady_clock::now();
+                }
                 queue_space_.wait(lock, [this] {
                     return stopping_ || worker_error_ ||
                            tasks_.size() < maximum_queued_windows_;
                 });
+                if (measure && wait_required) {
+                    timing_.queue_wait_ms += elapsed_ms(started_at);
+                }
+                if (measure) {
+                    started_at = std::chrono::steady_clock::now();
+                }
                 rethrow_worker_error();
                 if (stopping_) {
                     throw std::runtime_error("Viterbi worker pool stopped");
@@ -169,16 +224,44 @@ struct SoftViterbi::Impl {
             }
             task_ready_.notify_one();
             metric_offset_ += consumed_metrics;
+            if (measure) {
+                timing_.submit_ms += elapsed_ms(started_at);
+            }
         }
-        return take_ready();
+        const bool measure =
+            detailed_timing_enabled_.load(std::memory_order_relaxed);
+        const auto started_at = measure
+                                    ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+        auto output = take_ready();
+        if (measure) {
+            timing_.collect_ms += elapsed_ms(started_at);
+        }
+        return output;
     }
 
     [[nodiscard]] std::vector<std::uint8_t> flush() {
+        const bool measure =
+            detailed_timing_enabled_.load(std::memory_order_relaxed);
         std::unique_lock lock(mutex_);
+        const bool wait_required = outstanding_ != 0 && !worker_error_;
+        auto started_at = measure && wait_required
+                              ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
         all_finished_.wait(
             lock, [this] { return outstanding_ == 0 || worker_error_; });
+        if (measure && wait_required) {
+            timing_.flush_wait_ms += elapsed_ms(started_at);
+        }
+        if (measure) {
+            started_at = std::chrono::steady_clock::now();
+        }
         rethrow_worker_error();
-        return take_ready_locked();
+        auto output = take_ready_locked();
+        if (measure) {
+            timing_.collect_ms += elapsed_ms(started_at);
+        }
+        return output;
     }
 
     [[nodiscard]] std::size_t worker_count() const noexcept {
@@ -188,6 +271,7 @@ struct SoftViterbi::Impl {
     struct Task {
         std::uint64_t sequence{};
         std::vector<std::uint8_t> metrics;
+        bool measure_timing{};
     };
 
     struct Result {
@@ -359,7 +443,20 @@ struct SoftViterbi::Impl {
             }
             queue_space_.notify_one();
             try {
+                const auto started_at =
+                    task.measure_timing
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
                 auto output = decode(decoder.get(), task);
+                if (task.measure_timing) {
+                    worker_work_ns_.fetch_add(
+                        static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<
+                                std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - started_at)
+                                .count()),
+                        std::memory_order_relaxed);
+                }
                 const std::scoped_lock lock(mutex_);
                 completed_.emplace(task.sequence, std::move(output));
                 --outstanding_;
@@ -407,6 +504,15 @@ struct SoftViterbi::Impl {
         return {hard_decision_errors_, compared_metrics_};
     }
 
+    [[nodiscard]] SoftViterbiTiming timing() const noexcept {
+        auto result = timing_;
+        result.aggregate_worker_work_ms =
+            static_cast<double>(
+                worker_work_ns_.load(std::memory_order_relaxed)) /
+            1'000'000.0;
+        return result;
+    }
+
     std::vector<std::uint8_t> metrics_;
     std::size_t metric_offset_{};
     const std::size_t worker_count_;
@@ -425,6 +531,9 @@ struct SoftViterbi::Impl {
     std::size_t outstanding_{};
     std::exception_ptr worker_error_;
     bool stopping_{};
+    std::atomic_bool detailed_timing_enabled_{};
+    std::atomic<std::uint64_t> worker_work_ns_{};
+    SoftViterbiTiming timing_;
 };
 
 SoftViterbi::SoftViterbi(const std::size_t requested_workers)
@@ -435,6 +544,10 @@ SoftViterbi::SoftViterbi(SoftViterbi &&) noexcept = default;
 SoftViterbi &SoftViterbi::operator=(SoftViterbi &&) noexcept = default;
 
 void SoftViterbi::reset() { impl_->reset(); }
+
+void SoftViterbi::set_detailed_timing_enabled(const bool enabled) noexcept {
+    impl_->set_detailed_timing_enabled(enabled);
+}
 
 std::vector<std::uint8_t>
 SoftViterbi::process(const std::span<const float> llrs) {
@@ -454,6 +567,10 @@ std::size_t SoftViterbi::worker_count() const noexcept {
 
 std::pair<std::uint64_t, std::uint64_t> SoftViterbi::error_counts() const {
     return impl_->error_counts();
+}
+
+SoftViterbiTiming SoftViterbi::timing() const noexcept {
+    return impl_->timing();
 }
 
 } // namespace airspy_tv::fec

@@ -348,8 +348,9 @@ DVB-T-specific diagnostics.
   current fraction is a policy, not an automatically tuned optimum.
 - Retain stage telemetry that identifies overload without exposing
   implementation-specific counters through common GUI code.
-- Work through the measured serial DSP optimization and validation plan in
-  [demod-performance-todo.md](demod-performance-todo.md).
+- Work through the measured demodulator and FEC optimization and validation
+  plan in
+  [dvbt-demod-fec-performance-todo.md](dvbt-demod-fec-performance-todo.md).
 - Keep timing/CIR/second-order-loop experiments in
   [clock-tracking.md](clock-tracking.md).
 - Preserve these ordering, generation, and backpressure invariants while

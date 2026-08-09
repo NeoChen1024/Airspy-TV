@@ -66,7 +66,7 @@ bool test_ordered_sessions_and_generation_filtering() {
                  discontinuities.push_back(discontinuity);
                  changed.notify_all();
              },
-         .diagnostics_enabled = [] { return false; },
+         .telemetry_enabled = [] { return false; },
          .emit_diagnostic = [](const airspy_tv::DiagnosticEvent &,
                                const FecStageDiagnosticContext &) {},
          .notify_idle = [&] { changed.notify_all(); },

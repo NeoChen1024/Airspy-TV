@@ -35,6 +35,8 @@ struct DemodRuntimeState {
     std::size_t period{10240};
     std::vector<std::complex<float>> fft_in;
     std::vector<std::complex<float>> fft_out;
+    std::vector<std::complex<float>> channel_scratch;
+    std::array<double, 1024> timing_estimates_scratch{};
     FftwfPlan plan;
     std::vector<std::size_t> continual_indices;
     std::vector<std::size_t> tps_indices;
@@ -86,11 +88,18 @@ struct DemodRuntimeState {
     double fft_execute_time_sum_ms{};
     double cfo_track_time_sum_ms{};
     double pilot_lock_time_sum_ms{};
+    std::uint64_t pilot_expected_phase_checks{};
+    std::uint64_t pilot_expected_phase_fast_accepts{};
+    std::uint64_t pilot_expected_phase_fallbacks{};
+    double pilot_expected_confidence_sum{};
+    float pilot_expected_confidence_min{1.0F};
     double reacquisition_time_sum_ms{};
     double channel_estimate_time_sum_ms{};
     double channel_pilot_time_sum_ms{};
     double channel_notch_time_sum_ms{};
     double channel_timing_time_sum_ms{};
+    double channel_timing_generate_time_sum_ms{};
+    double channel_timing_select_time_sum_ms{};
     double channel_cir_time_sum_ms{};
     double channel_interpolate_time_sum_ms{};
     double channel_tps_extract_time_sum_ms{};
@@ -127,6 +136,7 @@ struct DemodRuntimeState {
     int applied_cir_offset{};
     double cir_confidence{};
     float acquisition_time_ms{};
+    float fft_plan_time_ms{};
 
     explicit DemodRuntimeState(const std::uint64_t generation)
         : demod_generation(generation) {}

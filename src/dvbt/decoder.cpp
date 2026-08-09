@@ -45,14 +45,14 @@ struct Decoder::Impl {
         const auto transport_started_at = std::chrono::steady_clock::now();
         auto output = transport_decoder.process(bit_metrics);
         const auto finished_at = std::chrono::steady_clock::now();
-        timing.demap_time_ms += std::chrono::duration<float, std::milli>(
+        timing.demap_time_ms += std::chrono::duration<double, std::milli>(
                                     deinterleave_started_at - demap_started_at)
                                     .count();
         timing.deinterleave_time_ms +=
-            std::chrono::duration<float, std::milli>(transport_started_at -
-                                                     deinterleave_started_at)
+            std::chrono::duration<double, std::milli>(transport_started_at -
+                                                      deinterleave_started_at)
                 .count();
-        timing.transport_time_ms += std::chrono::duration<float, std::milli>(
+        timing.transport_time_ms += std::chrono::duration<double, std::milli>(
                                         finished_at - transport_started_at)
                                         .count();
         return output;
@@ -67,7 +67,7 @@ struct Decoder::Impl {
         const auto started_at = std::chrono::steady_clock::now();
         auto output = transport_decoder.process(punctured_llrs);
         timing.transport_time_ms +=
-            std::chrono::duration<float, std::milli>(
+            std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - started_at)
                 .count();
         return output;
@@ -84,7 +84,7 @@ struct Decoder::Impl {
         const auto started_at = std::chrono::steady_clock::now();
         auto output = transport_decoder.process_soft(mother_metrics);
         timing.transport_time_ms +=
-            std::chrono::duration<float, std::milli>(
+            std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - started_at)
                 .count();
         return output;
@@ -112,6 +112,10 @@ void Decoder::reset() {
     impl_->timing = {};
 }
 
+void Decoder::set_detailed_timing_enabled(const bool enabled) noexcept {
+    impl_->transport_decoder.set_detailed_timing_enabled(enabled);
+}
+
 void Decoder::set_diagnostic_handler(DiagnosticEventHandler handler) {
     impl_->transport_decoder.set_diagnostic_handler(std::move(handler));
 }
@@ -136,7 +140,11 @@ DecoderParameters Decoder::parameters() const noexcept {
     return impl_->parameters;
 }
 
-DecoderTiming Decoder::timing() const noexcept { return impl_->timing; }
+DecoderTiming Decoder::timing() const noexcept {
+    auto result = impl_->timing;
+    result.transport = impl_->transport_decoder.timing();
+    return result;
+}
 
 TransportDecoderStats Decoder::stats() const {
     return impl_->transport_decoder.stats();
@@ -146,7 +154,7 @@ std::vector<std::uint8_t> Decoder::flush() {
     const auto started_at = std::chrono::steady_clock::now();
     auto output = impl_->transport_decoder.flush();
     impl_->timing.transport_time_ms +=
-        std::chrono::duration<float, std::milli>(
+        std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - started_at)
             .count();
     return output;

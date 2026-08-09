@@ -95,6 +95,8 @@ using nlohmann::json;
             {"post_viterbi_error_bits", stats.post_viterbi_error_bits},
             {"post_viterbi_compared_bits", stats.post_viterbi_compared_bits},
             {"rs_packets", stats.rs_packets},
+            {"rs_clean_packets", stats.rs_clean_packets},
+            {"rs_corrected_packets", stats.rs_corrected_packets},
             {"rs_uncorrectable_packets", stats.rs_uncorrectable_packets},
             {"tei_packets", stats.tei_packets},
             {"ts_packets", stats.ts_packets},
@@ -255,6 +257,16 @@ using nlohmann::json;
         {"late_samples", record.sro_late_samples},
         {"pending_commands", record.sro_pending_commands}};
     result["phase_discontinuities"] = record.phase_discontinuities;
+    result["pilot_phase_fast_path"] = {
+        {"checks", record.pilot_expected_phase_checks},
+        {"fast_accepts", record.pilot_expected_phase_fast_accepts},
+        {"fallbacks", record.pilot_expected_phase_fallbacks},
+        {"confidence_mean",
+         optional_number(record.pilot_expected_phase_confidence_mean)},
+        {"confidence_min",
+         optional_number(record.pilot_expected_phase_confidence_min)}};
+    result["setup_ms"] = {
+        {"fft_plan", json_finite_or_null(record.fft_plan_time_ms)}};
     result["timing_ms"] = {
         {"wall", json_finite_or_null(record.wall_time_ms)},
         {"serial_busy_total", json_finite_or_null(record.serial_busy_time_ms)},
@@ -277,9 +289,14 @@ using nlohmann::json;
     result["session"] = transport_stats(record.session);
     result["delta"] = transport_stats(record.delta);
     result["cumulative"] = transport_stats(record.cumulative);
+    json nested = timing_map(record.nested_ms);
+    nested["fec::transport"] = json_finite_or_null(record.transport_nested_ms);
     result["timing_ms"] = {
         {"serial_wall", {{"fec::total", record.fec_total_ms}}},
-        {"nested", {{"fec::transport", record.transport_nested_ms}}}};
+        {"wait", timing_map(record.wait_ms)},
+        {"nested", std::move(nested)},
+        {"thread_cpu", timing_map(record.thread_cpu_ms)},
+        {"aggregate_worker_work", timing_map(record.aggregate_worker_work_ms)}};
     return result;
 }
 

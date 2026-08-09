@@ -438,12 +438,13 @@ void DemodStage::publish_fec_window(const FecStageWindow &window) {
         return;
     }
     auto &latest = impl_->latest;
-    latest.fec_work_time_ms = window.fec_total_ms;
+    latest.fec_work_time_ms = static_cast<float>(window.fec_total_ms);
     latest.transport_bytes += window.output_bytes_delta;
     latest.transport = window.session;
     latest.cumulative_transport = window.cumulative;
     latest.fec_sessions = window.fec_session;
-    latest.transport_work_time_ms = window.transport_nested_ms;
+    latest.transport_work_time_ms =
+        static_cast<float>(window.transport_nested_ms);
     if (impl_->events_enabled() && window.demod_window_sequence != 0) {
         FecWindowTelemetry record;
         record.envelope = {
@@ -461,6 +462,10 @@ void DemodStage::publish_fec_window(const FecStageWindow &window) {
         record.cumulative = window.cumulative;
         record.fec_total_ms = window.fec_total_ms;
         record.transport_nested_ms = window.transport_nested_ms;
+        record.wait_ms = window.wait_ms;
+        record.nested_ms = window.nested_ms;
+        record.thread_cpu_ms = window.thread_cpu_ms;
+        record.aggregate_worker_work_ms = window.aggregate_worker_work_ms;
         impl_->telemetry_queue.emplace_back(record);
     }
 }

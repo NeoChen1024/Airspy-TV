@@ -146,6 +146,12 @@ struct DemodWindowTelemetry {
     std::uint64_t sro_late_samples{};
     std::size_t sro_pending_commands{};
     std::uint64_t phase_discontinuities{};
+    std::uint64_t pilot_expected_phase_checks{};
+    std::uint64_t pilot_expected_phase_fast_accepts{};
+    std::uint64_t pilot_expected_phase_fallbacks{};
+    std::optional<double> pilot_expected_phase_confidence_mean;
+    std::optional<double> pilot_expected_phase_confidence_min;
+    double fft_plan_time_ms{};
     double wall_time_ms{};
     double serial_busy_time_ms{};
     TimingMap serial_busy_ms;
@@ -165,6 +171,10 @@ struct FecWindowTelemetry {
     TransportDecoderStats cumulative;
     double fec_total_ms{};
     double transport_nested_ms{};
+    TimingMap wait_ms;
+    TimingMap nested_ms;
+    TimingMap thread_cpu_ms;
+    TimingMap aggregate_worker_work_ms;
 };
 
 using DecoderEventSeverity = DiagnosticEventSeverity;

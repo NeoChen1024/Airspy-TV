@@ -1,9 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <complex>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <span>
 #include <vector>
 
 // Bounded producer/consumer storage with absolute stream positions. Queue
@@ -47,6 +49,27 @@ class AbsoluteSampleRing {
     [[nodiscard]] const std::complex<float> &
     operator[](const std::size_t index) const {
         return samples_[index];
+    }
+
+    void copy_absolute(const std::uint64_t position,
+                       const std::span<std::complex<float>> output) const {
+        if (output.size() > samples_.size() || position < read_position ||
+            position > write_position ||
+            output.size() > write_position - position) {
+            throw std::out_of_range("sample ring read is outside retained data");
+        }
+        if (output.empty()) {
+            return;
+        }
+        const std::size_t read_index =
+            static_cast<std::size_t>(position % samples_.size());
+        const std::size_t first =
+            std::min(output.size(), samples_.size() - read_index);
+        std::copy_n(samples_.data() + read_index, first, output.data());
+        if (first < output.size()) {
+            std::copy_n(samples_.data(), output.size() - first,
+                        output.data() + first);
+        }
     }
 
     std::uint64_t write_position{};

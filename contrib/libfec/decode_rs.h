@@ -68,6 +68,16 @@
 #undef A0
 #define A0 (NN)
 
+#ifndef RS_DECODE_SYNDROME_DONE
+#define RS_DECODE_SYNDROME_DONE(syn_error_value) ((void)(syn_error_value))
+#endif
+#ifndef RS_DECODE_LOCATOR_DONE
+#define RS_DECODE_LOCATOR_DONE(result_value) ((void)(result_value))
+#endif
+#ifndef RS_DECODE_CORRECTION_DONE
+#define RS_DECODE_CORRECTION_DONE(result_value) ((void)(result_value))
+#endif
+
 {
   int deg_lambda, el, deg_omega;
   int i, j, r,k;
@@ -98,6 +108,7 @@
     syn_error |= s[i];
     s[i] = INDEX_OF[s[i]];
   }
+  RS_DECODE_SYNDROME_DONE(syn_error);
 
   if (!syn_error) {
     /* if syndrome is zero, data[] is a codeword and there are no
@@ -243,8 +254,10 @@
      * error detected
      */
     count = -1;
+    RS_DECODE_LOCATOR_DONE(count);
     goto finish;
   }
+  RS_DECODE_LOCATOR_DONE(count);
   /*
    * Compute err+eras evaluator poly omega(x) = s(x)*lambda(x) (modulo
    * x**NROOTS). in index form. Also find deg(omega).
@@ -289,6 +302,7 @@
       data[loc[j]-PAD] ^= ALPHA_TO[MODNN(INDEX_OF[num1] + INDEX_OF[num2] + NN - INDEX_OF[den])];
     }
   }
+  RS_DECODE_CORRECTION_DONE(count);
  finish:
   if(eras_pos != NULL){
     for(i=0;i<count;i++)
@@ -296,3 +310,7 @@
   }
   retval = count;
 }
+
+#undef RS_DECODE_SYNDROME_DONE
+#undef RS_DECODE_LOCATOR_DONE
+#undef RS_DECODE_CORRECTION_DONE

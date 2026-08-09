@@ -1,23 +1,48 @@
-/* General purpose Reed-Solomon decoder for 8-bit symbols or less
- * Copyright 2003 Phil Karn, KA9Q
- * May be used under the terms of the GNU Lesser General Public License (LGPL)
+/* DVB-T/C shortened RS(204,188) specialization of Phil Karn's generic
+ * decoder. The algorithm remains decode_rs.h; fixing the code parameters here
+ * lets the compiler fold loop bounds and field-exponent arithmetic that are
+ * runtime values in decode_rs_char().
  */
 
-#ifdef DEBUG
-#include <stdio.h>
-#endif
-
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
 
 #include "libfec_rs.h"
-#include "char.h"
+
+typedef unsigned char data_t;
 #include "rs-common.h"
 
-int decode_rs_char(void *p, data_t *data, int *eras_pos, int no_eras){
+#define NN 255
+#define NROOTS 16
+#define PAD 51
+#define FCR 0
+#define PRIM 1
+#define IPRIM 1
+#define ALPHA_TO (rs->alpha_to)
+#define INDEX_OF (rs->index_of)
+
+static inline int dvb_modnn(int value) {
+  while (value >= NN) {
+    value -= NN;
+    value = (value >> 8) + (value & NN);
+  }
+  return value;
+}
+
+#define MODNN(value) dvb_modnn(value)
+
+static int is_dvb_codec(const struct rs *rs) {
+  return rs != NULL && rs->nn == NN && rs->nroots == NROOTS &&
+         rs->pad == PAD && rs->fcr == FCR && rs->prim == PRIM;
+}
+
+int decode_rs_dvb_char(void *p, data_t *data) {
   int retval;
   struct rs *rs = (struct rs *)p;
-  if (rs == NULL || data == NULL || rs->nroots <= 0 || rs->nroots > rs->nn)
+  int *eras_pos = NULL;
+  int no_eras = 0;
+  if (!is_dvb_codec(rs) || data == NULL)
     return -1;
 
 #include "decode_rs.h"
@@ -31,14 +56,14 @@ static uint64_t rs_profile_now_ns(void) {
   return ((uint64_t)now.tv_sec * UINT64_C(1000000000)) + (uint64_t)now.tv_nsec;
 }
 
-int decode_rs_char_profiled(void *p, data_t *data, int *eras_pos, int no_eras,
-                            struct libfec_rs_decode_profile *profile){
+int decode_rs_dvb_char_profiled(void *p, data_t *data,
+                                struct libfec_rs_decode_profile *profile) {
   int retval;
   struct rs *rs = (struct rs *)p;
-  if (rs == NULL || data == NULL || profile == NULL || rs->nroots <= 0 ||
-      rs->nroots > rs->nn)
+  int *eras_pos = NULL;
+  int no_eras = 0;
+  if (!is_dvb_codec(rs) || data == NULL || profile == NULL)
     return -1;
-  const int profile_nroots = rs->nroots;
   uint64_t profile_phase_started = rs_profile_now_ns();
 
   memset(profile, 0, sizeof(*profile));
@@ -58,10 +83,18 @@ int decode_rs_char_profiled(void *p, data_t *data, int *eras_pos, int no_eras,
     (void)(result_value);                                                      \
     profile->correction_ns = rs_profile_now_ns() - profile_phase_started;     \
   } while (0)
-#undef NROOTS
-#define NROOTS profile_nroots
 
 #include "decode_rs.h"
 
   return retval;
 }
+
+#undef MODNN
+#undef INDEX_OF
+#undef ALPHA_TO
+#undef IPRIM
+#undef PRIM
+#undef FCR
+#undef PAD
+#undef NROOTS
+#undef NN

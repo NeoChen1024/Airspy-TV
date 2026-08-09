@@ -382,11 +382,38 @@ void test_prepared_soft_transport() {
                         float_tail.end());
 
     TransportDecoder soft_decoder{rate, 4};
+    soft_decoder.set_detailed_timing_enabled(true);
     auto soft_output = soft_decoder.process_soft(soft);
     const auto soft_tail = soft_decoder.flush();
     soft_output.insert(soft_output.end(), soft_tail.begin(), soft_tail.end());
     require(soft_output == float_output,
             "prepared soft metrics must match float transport path");
+    const auto disabled_timing = float_decoder.timing();
+    require(disabled_timing.viterbi_wall_ms == 0.0 &&
+                disabled_timing.viterbi_worker_work_ms == 0.0,
+            "detailed timing stays disabled by default");
+    const auto timing = soft_decoder.timing();
+    require(timing.viterbi_wall_ms > 0.0 && timing.viterbi_submit_ms > 0.0 &&
+                timing.viterbi_collect_ms > 0.0 &&
+                timing.viterbi_worker_work_ms > 0.0,
+            "Viterbi submit, collection, and worker work are measured");
+    require(timing.viterbi_queue_wait_ms == 0.0 &&
+                timing.viterbi_flush_wait_ms > 0.0,
+            "Viterbi timing separates queue and flush blocking");
+    require(timing.outer_wall_ms > 0.0 && timing.outer_alignment_ms > 0.0 &&
+                timing.outer_rs_decode_ms > 0.0 &&
+                timing.outer_rs_codeword_copy_ms > 0.0 &&
+                timing.outer_rs_syndrome_ms > 0.0 &&
+                timing.outer_rs_payload_copy_ms > 0.0 &&
+                timing.outer_byte_deinterleave_ms > 0.0 &&
+                timing.outer_energy_tei_ms > 0.0 &&
+                timing.outer_buffer_ms > 0.0 && timing.outer_output_ms > 0.0,
+            "outer-FEC stages are measured");
+    const auto stats = soft_decoder.stats();
+    require(stats.rs_clean_packets + stats.rs_corrected_packets +
+                    stats.rs_uncorrectable_packets ==
+                stats.rs_packets,
+            "RS clean, corrected, and uncorrectable distribution is complete");
 }
 
 void test_uncorrectable_packet_is_emitted_with_tei() {

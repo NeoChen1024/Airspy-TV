@@ -12,6 +12,7 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace airspy_tv::dvbt {
@@ -68,10 +69,10 @@ const char *event_code_rate_name(const CodeRate rate) {
     return "unknown";
 }
 
-std::optional<double> estimate_scattered_timing_tau(
+std::size_t generate_scattered_timing_estimates(
     const std::span<const std::complex<float>> channel, const std::size_t phase,
-    const std::size_t maximum, const std::size_t fft_size) {
-    std::array<double, 1024> estimates{};
+    const std::size_t maximum, const std::size_t fft_size,
+    const std::span<double> estimates) {
     std::size_t estimate_count = 0;
     const std::size_t first = phase * 3;
     for (std::size_t left = first; left + timing_pilot_spacing <= maximum;
@@ -91,17 +92,32 @@ std::optional<double> estimate_scattered_timing_tau(
                                           (2.0 * std::numbers::pi_v<double>);
         }
     }
-    if (estimate_count == 0) {
+    return estimate_count;
+}
+
+std::optional<double> select_exact_median(const std::span<double> values) {
+    if (values.empty()) {
         return std::nullopt;
     }
-    std::ranges::sort(estimates.begin(),
-                      estimates.begin() +
-                          static_cast<std::ptrdiff_t>(estimate_count));
-    const std::size_t middle = estimate_count / 2;
-    if (estimate_count % 2 != 0) {
-        return estimates[middle];
+    const std::size_t middle_index = values.size() / 2;
+    auto middle = values.begin() + static_cast<std::ptrdiff_t>(middle_index);
+    std::ranges::nth_element(values, middle);
+    if (values.size() % 2 != 0) {
+        return *middle;
     }
-    return 0.5 * (estimates[middle - 1] + estimates[middle]);
+    const auto lower = std::ranges::max_element(values.begin(), middle);
+    return 0.5 * (*lower + *middle);
+}
+
+float timing_measurement_confidence(
+    const std::uint64_t accepted_measurements,
+    const std::uint64_t attempted_measurements) noexcept {
+    if (attempted_measurements == 0) {
+        return 0.0F;
+    }
+    return std::clamp(static_cast<float>(accepted_measurements) /
+                          static_cast<float>(attempted_measurements),
+                      0.0F, 1.0F);
 }
 
 float estimate_channel_notch_db(
@@ -134,71 +150,93 @@ float estimate_channel_notch_db(
     return *lower - *median;
 }
 
+PilotPhaseScore score_pilot_phase_at_offset(
+    const std::span<const std::complex<float>> fft, const std::size_t maximum,
+    const int offset, const int phase,
+    const std::optional<double> timing_tau) {
+    if (phase < 0 || phase >= 4) {
+        throw std::invalid_argument("pilot phase is outside [0, 4)");
+    }
+    double dephase_slope = 0.0;
+    if (timing_tau.has_value()) {
+        dephase_slope = 2.0 * std::numbers::pi_v<double> * *timing_tau /
+                        static_cast<double>(fft.size());
+    } else {
+        double ramp_sum = 0.0;
+        std::size_t ramp_count = 0;
+        std::size_t previous_pilot = std::numeric_limits<std::size_t>::max();
+        for (auto pilot = static_cast<std::size_t>(phase) * 3U;
+             pilot <= maximum; pilot += timing_pilot_spacing) {
+            if (previous_pilot != std::numeric_limits<std::size_t>::max()) {
+                const auto left =
+                    active_carrier(fft, previous_pilot, maximum, offset);
+                const auto right = active_carrier(fft, pilot, maximum, offset);
+                const float left_value = pilot_prbs[previous_pilot] == 0U
+                                             ? 4.0F / 3.0F
+                                             : -4.0F / 3.0F;
+                const float right_value =
+                    pilot_prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+                if (std::norm(left) > 0.0F && std::norm(right) > 0.0F) {
+                    const double difference = std::arg(
+                        right * std::conj(left) *
+                        std::complex<float>(right_value * left_value, 0.0F));
+                    if (std::isfinite(difference)) {
+                        ramp_sum += difference;
+                        ++ramp_count;
+                    }
+                }
+            }
+            previous_pilot = pilot;
+        }
+        dephase_slope =
+            ramp_count != 0
+                ? -ramp_sum /
+                      static_cast<double>(ramp_count * timing_pilot_spacing)
+                : 0.0;
+    }
+
+    std::complex<float> correlation{};
+    float score = 0.0F;
+    double normalization = 0.0;
+    double chunk_power = 0.0;
+    std::size_t chunk_count = 0;
+    for (auto pilot = static_cast<std::size_t>(phase) * 3U;
+         pilot <= maximum; pilot += timing_pilot_spacing) {
+        const float value =
+            pilot_prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+        const auto dephase =
+            static_cast<float>(dephase_slope * static_cast<double>(pilot));
+        const auto sample =
+            value * std::conj(std::polar(1.0F, dephase) *
+                              active_carrier(fft, pilot, maximum, offset));
+        correlation += sample;
+        chunk_power += std::norm(sample);
+        if (++chunk_count == 8) {
+            score += std::norm(correlation);
+            normalization += static_cast<double>(chunk_count) * chunk_power;
+            correlation = {};
+            chunk_power = 0.0;
+            chunk_count = 0;
+        }
+    }
+    score += std::norm(correlation);
+    normalization += static_cast<double>(chunk_count) * chunk_power;
+    return {.score = score,
+            .confidence = normalization > 0.0
+                              ? static_cast<float>(
+                                    static_cast<double>(score) / normalization)
+                              : 0.0F};
+}
+
 int lock_phase_at_offset(const std::span<const std::complex<float>> fft,
                          const std::size_t maximum, const int offset,
                          const std::optional<double> timing_tau) {
     int best_phase = 0;
     float best_score = -1.0F;
     for (int phase = 0; phase < 4; ++phase) {
-        std::complex<float> correlation{};
-        float score = 0.0F;
-        std::size_t chunk_count = 0;
-        double dephase_slope = 0.0;
-        if (timing_tau.has_value()) {
-            dephase_slope = 2.0 * std::numbers::pi_v<double> * *timing_tau /
-                            static_cast<double>(fft.size());
-        } else {
-            double ramp_sum = 0.0;
-            std::size_t ramp_count = 0;
-            std::size_t previous_pilot =
-                std::numeric_limits<std::size_t>::max();
-            for (auto pilot = static_cast<std::size_t>(phase) * 3U;
-                 pilot <= maximum; pilot += 12) {
-                if (previous_pilot != std::numeric_limits<std::size_t>::max()) {
-                    const auto left =
-                        active_carrier(fft, previous_pilot, maximum, offset);
-                    const auto right =
-                        active_carrier(fft, pilot, maximum, offset);
-                    const float left_value = pilot_prbs[previous_pilot] == 0U
-                                                 ? 4.0F / 3.0F
-                                                 : -4.0F / 3.0F;
-                    const float right_value =
-                        pilot_prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
-                    if (std::norm(left) > 0.0F && std::norm(right) > 0.0F) {
-                        const double difference =
-                            std::arg(right * std::conj(left) *
-                                     std::complex<float>(
-                                         right_value * left_value, 0.0F));
-                        if (std::isfinite(difference)) {
-                            ramp_sum += difference;
-                            ++ramp_count;
-                        }
-                    }
-                }
-                previous_pilot = pilot;
-            }
-            dephase_slope =
-                ramp_count != 0
-                    ? -ramp_sum /
-                          static_cast<double>(ramp_count * timing_pilot_spacing)
-                    : 0.0;
-        }
-        for (auto pilot = static_cast<std::size_t>(phase) * 3U;
-             pilot <= maximum; pilot += 12) {
-            const float value =
-                pilot_prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
-            const auto dephase =
-                static_cast<float>(dephase_slope * static_cast<double>(pilot));
-            correlation +=
-                value * std::conj(std::polar(1.0F, dephase) *
-                                  active_carrier(fft, pilot, maximum, offset));
-            if (++chunk_count == 8) {
-                score += std::norm(correlation);
-                correlation = {};
-                chunk_count = 0;
-            }
-        }
-        score += std::norm(correlation);
+        const float score = score_pilot_phase_at_offset(
+                                fft, maximum, offset, phase, timing_tau)
+                                .score;
         if (score > best_score) {
             best_score = score;
             best_phase = phase;

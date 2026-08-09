@@ -66,6 +66,14 @@ fec_record(const std::uint64_t sequence, const std::uint64_t generation,
     record.delta.ts_packets = packets;
     record.delta.tei_packets = tei_packets;
     record.delta.rs_packets = packets;
+    record.delta.rs_clean_packets = packets - tei_packets;
+    record.delta.rs_uncorrectable_packets = tei_packets;
+    record.fec_total_ms = 9.0;
+    record.transport_nested_ms = 8.0;
+    record.wait_ms = {{"fec::viterbi::queue_wait", 1.0}};
+    record.nested_ms = {{"fec::outer", 5.0}};
+    record.thread_cpu_ms = {{"fec::coordinator", 6.0}};
+    record.aggregate_worker_work_ms = {{"fec::viterbi::worker", 10.0}};
     return record;
 }
 
@@ -172,6 +180,28 @@ void test_multiple_source_sessions_share_one_report() {
             "global decoded packet count is wrong");
     require(stats.at("transport").at("tei_packets") == 1,
             "global TEI packet count is wrong");
+    require(stats.at("counters").at("rs_clean_packets") == 2 &&
+                stats.at("counters").at("rs_corrected_packets") == 0 &&
+                stats.at("counters").at("rs_uncorrectable_packets") == 1,
+            "global RS outcome distribution is wrong");
+    require(stats.at("timing_ms").contains("fec::coordinator") &&
+                stats.at("timing_ms").contains("fec::viterbi::worker"),
+            "global summary omitted detailed FEC timing");
+
+    std::ifstream fec_stream(directory.path / "dvbt-fec.jsonl");
+    JsonlReader fec_records(fec_stream);
+    const auto fec = fec_records.read();
+    require(fec.has_value(), "FEC telemetry record is missing");
+    const auto &fec_timing = fec->value.at("timing_ms");
+    require(fec_timing.at("nested").at("fec::transport") == 8.0 &&
+                fec_timing.at("nested").at("fec::outer") == 5.0,
+            "FEC nested timing schema is wrong");
+    require(
+        fec_timing.at("wait").at("fec::viterbi::queue_wait") == 1.0 &&
+            fec_timing.at("thread_cpu").at("fec::coordinator") == 6.0 &&
+            fec_timing.at("aggregate_worker_work").at("fec::viterbi::worker") ==
+                10.0,
+        "FEC timing scopes are missing");
 }
 
 void test_non_empty_directory_is_rejected() {

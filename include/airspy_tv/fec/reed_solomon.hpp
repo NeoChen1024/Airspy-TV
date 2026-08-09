@@ -6,6 +6,14 @@
 
 namespace airspy_tv::fec {
 
+struct DvbReedSolomonTiming {
+    double codeword_copy_ms{};
+    double syndrome_ms{};
+    double error_locator_ms{};
+    double correction_ms{};
+    double payload_copy_ms{};
+};
+
 class DvbReedSolomon {
   public:
     static constexpr std::size_t payload_size = 188;
@@ -24,7 +32,9 @@ class DvbReedSolomon {
     [[nodiscard]] bool
     decode(std::span<const std::uint8_t> codeword,
            std::span<std::uint8_t> payload,
-           std::uint64_t *corrected_payload_bits = nullptr) const;
+           std::uint64_t *corrected_payload_bits = nullptr,
+           int *corrected_symbols = nullptr,
+           DvbReedSolomonTiming *timing = nullptr) const;
 
   private:
     void *codec_{};

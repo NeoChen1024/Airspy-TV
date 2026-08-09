@@ -151,7 +151,7 @@ struct StreamDecoder::Impl { // NOLINT(clang-analyzer-optin.performance.Padding)
                              const TransportDiscontinuity discontinuity) {
                           emit_fec_discontinuity(generation, discontinuity);
                       },
-                  .diagnostics_enabled =
+                  .telemetry_enabled =
                       [this] {
                           return demod_stage && demod_stage->events_enabled();
                       },

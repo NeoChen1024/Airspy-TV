@@ -22,6 +22,8 @@ struct OfdmTrackingState {
     int stable_carrier_offset{std::numeric_limits<int>::max()};
     int stable_phase{-1};
     std::vector<std::complex<float>> previous_continual;
+    std::vector<std::complex<float>> current_continual;
+    bool have_previous_continual{};
     int previous_phase{-1};
     std::uint64_t phase_discontinuities{0};
     // Absolute stream position of the most recent processed symbol; the
@@ -40,6 +42,7 @@ struct OfdmTrackingState {
     // latest strong tap when the delay spread leaves guard margin.
     std::vector<std::complex<float>> cir_grid;
     std::vector<std::complex<float>> cir_response;
+    std::vector<double> cir_energy;
     FftwfPlan cir_plan;
     std::size_t cir_n{0};
     float cir_offset{0.0F};

@@ -139,7 +139,7 @@ struct DemodStage::Impl { // NOLINT(clang-analyzer-optin.performance.Padding)
     void demod_execute_fft_and_measure_cfo(DemodRuntimeState &state);
     [[nodiscard]] std::optional<PilotLock>
     demod_lock_pilots(DemodRuntimeState &state);
-    [[nodiscard]] std::vector<std::complex<float>>
+    [[nodiscard]] std::span<const std::complex<float>>
     demod_estimate_channel(DemodRuntimeState &state, const PilotLock &lock);
     [[nodiscard]] DemodFlow demod_process_tps(DemodRuntimeState &state);
     [[nodiscard]] DemodFlow demod_prepare_stream(DemodRuntimeState &state);
@@ -147,7 +147,7 @@ struct DemodStage::Impl { // NOLINT(clang-analyzer-optin.performance.Padding)
     void demod_finish_stream(DemodRuntimeState &state);
     [[nodiscard]] bool
     demod_dispatch_payload(DemodRuntimeState &state, const PilotLock &lock,
-                           const std::vector<std::complex<float>> &channel);
+                           std::span<const std::complex<float>> channel);
     [[nodiscard]] static float
     demod_fec_floor(Constellation constellation) noexcept;
 

@@ -601,6 +601,12 @@ void test_8k_clean_signal() {
     require(result.stats.timing_confidence > 0.0F &&
                 result.stats.timing_confidence <= 1.0F,
             "timing confidence is outside its normalized range");
+    require(std::abs(result.stats.timing_confidence -
+                     static_cast<float>(
+                         result.stats.timing_accepted_measurements) /
+                         static_cast<float>(result.stats.timing_measurements)) <
+                1.0e-6F,
+            "timing confidence does not match measurement acceptance");
     require(result.analysis.locked &&
                 result.analysis.source == SignalAnalysisSource::demodulator,
             "GUI analysis did not switch to production demod telemetry");

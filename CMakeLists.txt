@@ -278,7 +278,7 @@ if(BUILD_TESTING)
     add_executable(reed-solomon-test
         tests/reed_solomon_test.cpp
     )
-    target_link_libraries(reed-solomon-test PRIVATE airspy-tv-common)
+    target_link_libraries(reed-solomon-test PRIVATE airspy-tv-common libfec::rs)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(reed-solomon-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -317,6 +317,17 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME dvbt-sample-channel COMMAND dvbt-sample-channel-test)
+
+    add_executable(dvbt-demod-dsp-test
+        tests/dvbt_demod_dsp_test.cpp
+    )
+    target_include_directories(dvbt-demod-dsp-test PRIVATE src/dvbt)
+    target_link_libraries(dvbt-demod-dsp-test PRIVATE airspy-tv-dvbt)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(dvbt-demod-dsp-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME dvbt-demod-dsp COMMAND dvbt-demod-dsp-test)
 
     add_executable(dvbt-stream-decoder-test
         tests/dvbt_stream_decoder_test.cpp

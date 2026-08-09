@@ -22,6 +22,7 @@ void DemodStage::Impl::demod_cold_seed(DemodRuntimeState &state) {
     frontend.residual_phase_ema = 0.0F;
     frontend.carrier_offset = 0;
     frontend.previous_continual.clear();
+    frontend.have_previous_continual = false;
     // The bootstrap acquisition FFT already established the scattered-pilot
     // phase at carrier offset zero. Seed the previous phase so the first
     // production symbol validates the predicted next phase instead of
@@ -64,16 +65,28 @@ void DemodStage::Impl::demod_build_grid(DemodRuntimeState &state) {
     state.tps_values.resize(state.tps_indices.size());
     state.fft_in.resize(state.fft_size);
     state.fft_out.resize(state.fft_size);
+    state.channel_scratch.resize(state.maximum + 1);
+    frontend.previous_continual.resize(state.continual_indices.size());
+    frontend.current_continual.resize(state.continual_indices.size());
+    frontend.have_previous_continual = false;
+    const auto fft_plan_started_at = std::chrono::steady_clock::now();
     state.plan = FftwfPlan::dft_1d(
         static_cast<int>(state.fft_size),
         reinterpret_cast<fftwf_complex *>(state.fft_in.data()),
         reinterpret_cast<fftwf_complex *>(state.fft_out.data()), FFTW_FORWARD,
-        FFTW_ESTIMATE);
+        FFTW_MEASURE);
+    state.fft_plan_time_ms = duration_ms(fft_plan_started_at);
+    // FFTW_MEASURE is allowed to overwrite both arrays while selecting a
+    // plan. Restore deterministic contents; the addresses remain stable for
+    // the entire plan lifetime and each later symbol overwrites fft_in.
+    std::ranges::fill(state.fft_in, std::complex<float>{});
+    std::ranges::fill(state.fft_out, std::complex<float>{});
 
     // One CIR tap per scattered-pilot slot. The response spans Tu/12.
     frontend.cir_n = state.fft_size == 8192 ? 1024 : 256;
     frontend.cir_grid.assign(frontend.cir_n, std::complex<float>{});
     frontend.cir_response.assign(frontend.cir_n, std::complex<float>{});
+    frontend.cir_energy.assign(frontend.cir_n, 0.0);
     frontend.cir_plan = FftwfPlan::dft_1d(
         static_cast<int>(frontend.cir_n),
         reinterpret_cast<fftwf_complex *>(frontend.cir_grid.data()),

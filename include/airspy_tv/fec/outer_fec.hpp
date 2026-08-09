@@ -12,6 +12,8 @@ namespace airspy_tv::fec {
 
 struct OuterFecStats {
     std::uint64_t rs_packets{};
+    std::uint64_t rs_clean_packets{};
+    std::uint64_t rs_corrected_packets{};
     std::uint64_t rs_uncorrectable_packets{};
     std::uint64_t tei_packets{};
     std::uint64_t ts_packets{};
@@ -28,6 +30,21 @@ struct OuterFecStats {
     std::uint32_t outer_rs_evidence{};
     bool rs_synchronized{};
     bool energy_synchronized{};
+};
+
+struct OuterFecTiming {
+    double alignment_ms{};
+    double bit_repack_ms{};
+    double byte_deinterleave_ms{};
+    double rs_decode_ms{};
+    double rs_codeword_copy_ms{};
+    double rs_syndrome_ms{};
+    double rs_error_locator_ms{};
+    double rs_correction_ms{};
+    double rs_payload_copy_ms{};
+    double energy_tei_ms{};
+    double buffer_ms{};
+    double output_ms{};
 };
 
 // Streaming DVB outer FEC: 12-branch convolutional deinterleaver with
@@ -48,10 +65,12 @@ class OuterFec {
     OuterFec &operator=(OuterFec &&) noexcept;
 
     void reset();
+    void set_detailed_timing_enabled(bool enabled) noexcept;
     void set_diagnostic_handler(DiagnosticEventHandler handler);
     [[nodiscard]] std::vector<std::uint8_t>
     process(std::span<const std::uint8_t> hard_bytes);
     [[nodiscard]] OuterFecStats stats() const;
+    [[nodiscard]] OuterFecTiming timing() const noexcept;
 
   private:
     struct Impl;

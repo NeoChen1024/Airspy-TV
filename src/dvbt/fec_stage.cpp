@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <deque>
 #include <exception>
 #include <memory>
@@ -32,6 +33,8 @@ void add_transport_counters(TransportDecoderStats &destination,
     destination.post_viterbi_error_bits += source.post_viterbi_error_bits;
     destination.post_viterbi_compared_bits += source.post_viterbi_compared_bits;
     destination.rs_packets += source.rs_packets;
+    destination.rs_clean_packets += source.rs_clean_packets;
+    destination.rs_corrected_packets += source.rs_corrected_packets;
     destination.rs_uncorrectable_packets += source.rs_uncorrectable_packets;
     destination.tei_packets += source.tei_packets;
     destination.ts_packets += source.ts_packets;
@@ -54,17 +57,134 @@ transport_counter_delta(const TransportDecoderStats &current,
     result.post_viterbi_error_bits -= previous.post_viterbi_error_bits;
     result.post_viterbi_compared_bits -= previous.post_viterbi_compared_bits;
     result.rs_packets -= previous.rs_packets;
+    result.rs_clean_packets -= previous.rs_clean_packets;
+    result.rs_corrected_packets -= previous.rs_corrected_packets;
     result.rs_uncorrectable_packets -= previous.rs_uncorrectable_packets;
     result.tei_packets -= previous.tei_packets;
     result.ts_packets -= previous.ts_packets;
     return result;
 }
 
-[[nodiscard]] float
+[[nodiscard]] double
 duration_ms(const std::chrono::steady_clock::time_point started_at) noexcept {
-    return std::chrono::duration<float, std::milli>(
+    return std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - started_at)
         .count();
+}
+
+[[nodiscard]] double counter_delta(const double current,
+                                   const double previous) noexcept {
+    return std::max(0.0, current - previous);
+}
+
+[[nodiscard]] double current_thread_cpu_ms() noexcept {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec value{};
+    if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0) {
+        return (static_cast<double>(value.tv_sec) * 1'000.0) +
+               (static_cast<double>(value.tv_nsec) / 1'000'000.0);
+    }
+#endif
+    return 0.0;
+}
+
+[[nodiscard]] TransportDecoderTiming
+timing_delta(const TransportDecoderTiming &current,
+             const TransportDecoderTiming &previous) noexcept {
+    return {
+        .viterbi_wall_ms =
+            counter_delta(current.viterbi_wall_ms, previous.viterbi_wall_ms),
+        .viterbi_submit_ms = counter_delta(current.viterbi_submit_ms,
+                                           previous.viterbi_submit_ms),
+        .viterbi_queue_wait_ms = counter_delta(current.viterbi_queue_wait_ms,
+                                               previous.viterbi_queue_wait_ms),
+        .viterbi_collect_ms = counter_delta(current.viterbi_collect_ms,
+                                            previous.viterbi_collect_ms),
+        .viterbi_flush_wait_ms = counter_delta(current.viterbi_flush_wait_ms,
+                                               previous.viterbi_flush_wait_ms),
+        .viterbi_worker_work_ms = counter_delta(
+            current.viterbi_worker_work_ms, previous.viterbi_worker_work_ms),
+        .outer_wall_ms =
+            counter_delta(current.outer_wall_ms, previous.outer_wall_ms),
+        .outer_alignment_ms = counter_delta(current.outer_alignment_ms,
+                                            previous.outer_alignment_ms),
+        .outer_bit_repack_ms = counter_delta(current.outer_bit_repack_ms,
+                                             previous.outer_bit_repack_ms),
+        .outer_byte_deinterleave_ms =
+            counter_delta(current.outer_byte_deinterleave_ms,
+                          previous.outer_byte_deinterleave_ms),
+        .outer_rs_decode_ms = counter_delta(current.outer_rs_decode_ms,
+                                            previous.outer_rs_decode_ms),
+        .outer_rs_codeword_copy_ms = counter_delta(
+            current.outer_rs_codeword_copy_ms,
+            previous.outer_rs_codeword_copy_ms),
+        .outer_rs_syndrome_ms = counter_delta(
+            current.outer_rs_syndrome_ms, previous.outer_rs_syndrome_ms),
+        .outer_rs_error_locator_ms = counter_delta(
+            current.outer_rs_error_locator_ms,
+            previous.outer_rs_error_locator_ms),
+        .outer_rs_correction_ms = counter_delta(
+            current.outer_rs_correction_ms,
+            previous.outer_rs_correction_ms),
+        .outer_rs_payload_copy_ms = counter_delta(
+            current.outer_rs_payload_copy_ms,
+            previous.outer_rs_payload_copy_ms),
+        .outer_energy_tei_ms = counter_delta(current.outer_energy_tei_ms,
+                                             previous.outer_energy_tei_ms),
+        .outer_buffer_ms =
+            counter_delta(current.outer_buffer_ms, previous.outer_buffer_ms),
+        .outer_output_ms =
+            counter_delta(current.outer_output_ms, previous.outer_output_ms),
+        .decoded_handoff_ms = counter_delta(current.decoded_handoff_ms,
+                                            previous.decoded_handoff_ms),
+        .transport_output_ms = counter_delta(current.transport_output_ms,
+                                             previous.transport_output_ms),
+    };
+}
+
+[[nodiscard]] TimingMap nested_timing(const TransportDecoderTiming &timing,
+                                      const double transport_wall_ms) {
+    const double viterbi_accounted =
+        timing.viterbi_submit_ms + timing.viterbi_queue_wait_ms +
+        timing.viterbi_collect_ms + timing.viterbi_flush_wait_ms;
+    const double outer_accounted =
+        timing.outer_alignment_ms + timing.outer_bit_repack_ms +
+        timing.outer_byte_deinterleave_ms + timing.outer_rs_decode_ms +
+        timing.outer_energy_tei_ms + timing.outer_buffer_ms +
+        timing.outer_output_ms;
+    const double transport_accounted =
+        timing.viterbi_wall_ms + timing.outer_wall_ms +
+        timing.decoded_handoff_ms + timing.transport_output_ms;
+    return {
+        {"fec::viterbi", timing.viterbi_wall_ms},
+        {"fec::viterbi::submit", timing.viterbi_submit_ms},
+        {"fec::viterbi::collect", timing.viterbi_collect_ms},
+        {"fec::viterbi::other",
+         std::max(0.0, timing.viterbi_wall_ms - viterbi_accounted)},
+        {"fec::outer", timing.outer_wall_ms},
+        {"fec::outer::alignment", timing.outer_alignment_ms},
+        {"fec::outer::bit_repack", timing.outer_bit_repack_ms},
+        {"fec::outer::deinterleave", timing.outer_byte_deinterleave_ms},
+        {"fec::outer::rs_decode", timing.outer_rs_decode_ms},
+        {"fec::outer::rs_decode::codeword_copy",
+         timing.outer_rs_codeword_copy_ms},
+        {"fec::outer::rs_decode::syndrome", timing.outer_rs_syndrome_ms},
+        {"fec::outer::rs_decode::error_locator",
+         timing.outer_rs_error_locator_ms},
+        {"fec::outer::rs_decode::correction",
+         timing.outer_rs_correction_ms},
+        {"fec::outer::rs_decode::payload_copy",
+         timing.outer_rs_payload_copy_ms},
+        {"fec::outer::energy_tei", timing.outer_energy_tei_ms},
+        {"fec::outer::buffer", timing.outer_buffer_ms},
+        {"fec::outer::output", timing.outer_output_ms},
+        {"fec::outer::other",
+         std::max(0.0, timing.outer_wall_ms - outer_accounted)},
+        {"fec::transport::decoded_handoff", timing.decoded_handoff_ms},
+        {"fec::transport::output", timing.transport_output_ms},
+        {"fec::transport::other",
+         std::max(0.0, transport_wall_ms - transport_accounted)},
+    };
 }
 
 } // namespace
@@ -75,7 +195,7 @@ struct FecStage::Impl {
           queue_capacity(std::max<std::size_t>(1, capacity)) {
         if (!callbacks.generation_current || !callbacks.publish_session ||
             !callbacks.publish_window || !callbacks.emit_transport ||
-            !callbacks.emit_discontinuity || !callbacks.diagnostics_enabled ||
+            !callbacks.emit_discontinuity || !callbacks.telemetry_enabled ||
             !callbacks.emit_diagnostic || !callbacks.notify_idle ||
             !callbacks.worker_failed) {
             throw std::invalid_argument("incomplete FEC stage callbacks");
@@ -190,17 +310,26 @@ struct FecStage::Impl {
         if (!decoder) {
             return;
         }
-        const float total_transport_time_ms =
-            decoder->timing().transport_time_ms;
-        const float window_transport_time_ms =
-            std::max(0.0F, total_transport_time_ms - decoder_transport_time_ms);
-        decoder_transport_time_ms = total_transport_time_ms;
+        const DecoderTiming current_timing = decoder->timing();
+        const double window_transport_time_ms =
+            counter_delta(current_timing.transport_time_ms,
+                          previous_decoder_timing.transport_time_ms);
+        const TransportDecoderTiming detailed_timing = timing_delta(
+            current_timing.transport, previous_decoder_timing.transport);
+        previous_decoder_timing = current_timing;
         const TransportDecoderStats current = decoder->stats();
         const TransportDecoderStats delta =
             transport_counter_delta(current, previous_marker);
         previous_marker = current;
         TransportDecoderStats cumulative = completed_sessions;
         add_transport_counters(cumulative, current);
+        double coordinator_cpu_ms = 0.0;
+        if (detailed_timing_active) {
+            const double current_cpu_ms = current_thread_cpu_ms();
+            coordinator_cpu_ms =
+                counter_delta(current_cpu_ms, previous_thread_cpu_ms);
+            previous_thread_cpu_ms = current_cpu_ms;
+        }
         callbacks.publish_window(
             {.generation = item.generation,
              .source_epoch = item.source_epoch,
@@ -211,8 +340,18 @@ struct FecStage::Impl {
              .delta = delta,
              .cumulative = cumulative,
              .fec_total_ms = fec_work_ms,
-             .transport_nested_ms = window_transport_time_ms});
-        fec_work_ms = 0.0F;
+             .transport_nested_ms = window_transport_time_ms,
+             .wait_ms = {{"fec::viterbi::queue_wait",
+                          detailed_timing.viterbi_queue_wait_ms},
+                         {"fec::viterbi::flush_wait",
+                          detailed_timing.viterbi_flush_wait_ms}},
+             .nested_ms =
+                 nested_timing(detailed_timing, window_transport_time_ms),
+             .thread_cpu_ms = {{"fec::coordinator", coordinator_cpu_ms}},
+             .aggregate_worker_work_ms = {
+                 {"fec::viterbi::worker",
+                  detailed_timing.viterbi_worker_work_ms}}});
+        fec_work_ms = 0.0;
         window_transport_bytes = 0;
     }
 
@@ -236,7 +375,7 @@ struct FecStage::Impl {
             }
             decoder = std::make_unique<Decoder>(item.parameters);
             decoder->set_diagnostic_handler(
-                {.enabled = [this] { return callbacks.diagnostics_enabled(); },
+                {.enabled = [this] { return callbacks.telemetry_enabled(); },
                  .emit =
                      [this](DiagnosticEvent event) {
                          callbacks.emit_diagnostic(std::move(event),
@@ -249,7 +388,11 @@ struct FecStage::Impl {
             }
             (*decoder).reset();
         }
-        decoder_transport_time_ms = 0.0F;
+        previous_decoder_timing = {};
+        detailed_timing_active = callbacks.telemetry_enabled();
+        decoder->set_detailed_timing_enabled(detailed_timing_active);
+        previous_thread_cpu_ms =
+            detailed_timing_active ? current_thread_cpu_ms() : 0.0;
         decoder_generation = item.generation;
         previous_marker = {};
         ++fec_session;
@@ -279,6 +422,13 @@ struct FecStage::Impl {
         }
         if (!decoder || decoder_generation != item.generation) {
             return;
+        }
+        const bool detailed_timing_enabled = callbacks.telemetry_enabled();
+        if (detailed_timing_enabled != detailed_timing_active) {
+            detailed_timing_active = detailed_timing_enabled;
+            decoder->set_detailed_timing_enabled(detailed_timing_active);
+            previous_thread_cpu_ms =
+                detailed_timing_active ? current_thread_cpu_ms() : 0.0;
         }
         if (item.kind == FecItem::Kind::symbol) {
             const auto started_at = std::chrono::steady_clock::now();
@@ -352,9 +502,11 @@ struct FecStage::Impl {
     std::uint64_t fec_session{};
     std::unique_ptr<Decoder> decoder;
     std::uint64_t decoder_generation{};
-    float fec_work_ms{};
+    double fec_work_ms{};
     std::uint64_t window_transport_bytes{};
-    float decoder_transport_time_ms{};
+    DecoderTiming previous_decoder_timing;
+    double previous_thread_cpu_ms{};
+    bool detailed_timing_active{};
     TransportDecoderStats completed_sessions;
     TransportDecoderStats previous_marker;
 };

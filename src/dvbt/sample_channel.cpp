@@ -484,11 +484,8 @@ struct SampleChannel::Impl {
         if (window_size < minimum_samples) {
             return result;
         }
-        result.samples.reserve(window_size);
-        for (std::size_t offset = 0; offset < window_size; ++offset) {
-            result.samples.push_back(
-                ring[(ring.read_position + offset) % ring.size()]);
-        }
+        result.samples.resize(window_size);
+        ring.copy_absolute(ring.read_position, result.samples);
         return result;
     }
 
@@ -530,9 +527,7 @@ struct SampleChannel::Impl {
         }
 
         const auto copy_started_at = std::chrono::steady_clock::now();
-        for (std::size_t index = 0; index < fft_size; ++index) {
-            output[index] = ring[(next_symbol_start + index) % ring.size()];
-        }
+        ring.copy_absolute(next_symbol_start, output);
         CyclicPrefixMeasurement cyclic_prefix;
         if (measure_cyclic_prefix && next_symbol_start >= guard_size) {
             const std::uint64_t prefix_start = next_symbol_start - guard_size;

@@ -159,6 +159,7 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
     auto &window_started_at = state.window_started_at;
     auto &window_symbol_count = state.window_symbol_count;
     auto &timing_count = state.timing_count;
+    auto &timing_raw_count = state.timing_raw_count;
     auto &timing_acc = state.timing_acc;
     auto &fft_size = state.fft_size;
     auto &applied_cir_offset = state.applied_cir_offset;
@@ -315,10 +316,13 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             smoothed_sample_clock_ppm, -drift_limit_ppm, drift_limit_ppm);
         smoothed_timing_drift =
             smoothed_sample_clock_ppm * window_sample_count / 1.0e6;
-        const double confidence = window_symbols == 0
-                                      ? 0.0
-                                      : static_cast<double>(timing_count) /
-                                            static_cast<double>(window_symbols);
+        // The steady estimator deliberately samples only one symbol in four.
+        // Confidence describes acceptance of the measurements that were
+        // actually attempted, not estimator coverage across all symbols.
+        // Using window_symbols as the denominator would permanently hold the
+        // cadence-4 result at 0.25 and stop all subsequent SRO commands.
+        const float confidence =
+            timing_measurement_confidence(timing_count, timing_raw_count);
         if (tau_history_count >= tau_history_min && confidence >= 0.75) {
             const std::scoped_lock lock(mutex);
             const std::uint64_t command_output_sample =
@@ -483,10 +487,7 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         static_cast<float>(clock_snapshot.sro_applied_ppm);
     latest.cir_offset_samples = static_cast<float>(window_cir_avg);
     latest.timing_confidence =
-        window_symbols == 0 ? 0.0F
-                            : std::clamp(static_cast<float>(timing_count) /
-                                             static_cast<float>(window_symbols),
-                                         0.0F, 1.0F);
+        timing_measurement_confidence(timing_count, timing_raw_count);
     latest.cir_confidence = static_cast<float>(cir_confidence);
     latest.timing_measurements = timing_raw_count;
     latest.timing_accepted_measurements = timing_count;
@@ -546,6 +547,14 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         static_cast<float>(state.channel_notch_time_sum_ms);
     latest.demod_channel_timing_time_ms =
         static_cast<float>(state.channel_timing_time_sum_ms);
+    latest.demod_channel_timing_generate_time_ms =
+        static_cast<float>(state.channel_timing_generate_time_sum_ms);
+    latest.demod_channel_timing_select_time_ms =
+        static_cast<float>(state.channel_timing_select_time_sum_ms);
+    latest.demod_channel_timing_filter_time_ms = static_cast<float>(std::max(
+        0.0, state.channel_timing_time_sum_ms -
+                 state.channel_timing_generate_time_sum_ms -
+                 state.channel_timing_select_time_sum_ms));
     latest.demod_channel_cir_time_ms =
         static_cast<float>(state.channel_cir_time_sum_ms);
     latest.demod_channel_interpolate_time_ms =
@@ -689,6 +698,20 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         record.cfo_rebootstrap_source_sample =
             latest.cfo_rebootstrap_source_sample;
         record.phase_discontinuities = latest.pilot_phase_discontinuities;
+        record.pilot_expected_phase_checks =
+            state.pilot_expected_phase_checks;
+        record.pilot_expected_phase_fast_accepts =
+            state.pilot_expected_phase_fast_accepts;
+        record.pilot_expected_phase_fallbacks =
+            state.pilot_expected_phase_fallbacks;
+        if (state.pilot_expected_phase_checks != 0) {
+            record.pilot_expected_phase_confidence_mean =
+                state.pilot_expected_confidence_sum /
+                static_cast<double>(state.pilot_expected_phase_checks);
+            record.pilot_expected_phase_confidence_min =
+                state.pilot_expected_confidence_min;
+        }
+        record.fft_plan_time_ms = state.fft_plan_time_ms;
         record.wall_time_ms = latest.demod_window_wall_time_ms;
         record.serial_busy_time_ms = latest.demod_busy_time_ms;
         record.serial_busy_ms = {
@@ -712,6 +735,12 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
             {"demod::channel::pilots", latest.demod_channel_pilot_time_ms},
             {"demod::channel::notch", latest.demod_channel_notch_time_ms},
             {"demod::channel::timing", latest.demod_channel_timing_time_ms},
+            {"demod::channel::timing::generate",
+             latest.demod_channel_timing_generate_time_ms},
+            {"demod::channel::timing::select",
+             latest.demod_channel_timing_select_time_ms},
+            {"demod::channel::timing::filter",
+             latest.demod_channel_timing_filter_time_ms},
             {"demod::channel::cir", latest.demod_channel_cir_time_ms},
             {"demod::channel::interpolate",
              latest.demod_channel_interpolate_time_ms},
@@ -728,6 +757,7 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         telemetry_queue.emplace_back(std::move(record));
     }
     acquisition_time_ms = 0.0F;
+    state.fft_plan_time_ms = 0.0F;
 }
 
 void DemodStage::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
@@ -747,11 +777,18 @@ void DemodStage::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
     state.fft_execute_time_sum_ms = 0.0;
     state.cfo_track_time_sum_ms = 0.0;
     state.pilot_lock_time_sum_ms = 0.0;
+    state.pilot_expected_phase_checks = 0;
+    state.pilot_expected_phase_fast_accepts = 0;
+    state.pilot_expected_phase_fallbacks = 0;
+    state.pilot_expected_confidence_sum = 0.0;
+    state.pilot_expected_confidence_min = 1.0F;
     state.reacquisition_time_sum_ms = 0.0;
     state.channel_estimate_time_sum_ms = 0.0;
     state.channel_pilot_time_sum_ms = 0.0;
     state.channel_notch_time_sum_ms = 0.0;
     state.channel_timing_time_sum_ms = 0.0;
+    state.channel_timing_generate_time_sum_ms = 0.0;
+    state.channel_timing_select_time_sum_ms = 0.0;
     state.channel_cir_time_sum_ms = 0.0;
     state.channel_interpolate_time_sum_ms = 0.0;
     state.channel_tps_extract_time_sum_ms = 0.0;
@@ -773,7 +810,7 @@ void DemodStage::Impl::demod_advance_symbol(DemodRuntimeState &state) {
 
 bool DemodStage::Impl::demod_dispatch_payload(
     DemodRuntimeState &state, const PilotLock &lock,
-    const std::vector<std::complex<float>> &channel) {
+    const std::span<const std::complex<float>> channel) {
     auto &payload_indices = state.payload_indices;
     auto &fft_out = state.fft_out;
     auto &maximum = state.maximum;

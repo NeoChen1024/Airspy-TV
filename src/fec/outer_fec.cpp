@@ -3,9 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -28,6 +28,33 @@ constexpr std::size_t minimum_alignment_rs_evidence = 4;
 // EnergyDescrambler::process_corrupt() to preserve TS cadence; only a much
 // longer run is treated as evidence of a false outer-phase lock.
 constexpr std::size_t uncorrectable_reset_threshold = 512;
+// Exact parent/outer-call timing stays enabled for every call. Sampling the
+// packet-local sub-stages keeps clock reads from materially changing the hot
+// Reed-Solomon loop; cumulative values scale each sample back to an estimate.
+constexpr std::uint64_t detailed_timing_sample_interval = 32;
+
+class TimingScope {
+  public:
+    explicit TimingScope(double *destination, const double scale = 1.0) noexcept
+        : destination_(destination), scale_(scale),
+          started_at_(destination == nullptr
+                          ? std::chrono::steady_clock::time_point{}
+                          : std::chrono::steady_clock::now()) {}
+
+    ~TimingScope() {
+        if (destination_ != nullptr) {
+            *destination_ += std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - started_at_)
+                                 .count() *
+                             scale_;
+        }
+    }
+
+  private:
+    double *destination_;
+    double scale_;
+    std::chrono::steady_clock::time_point started_at_;
+};
 
 class BitRepacker {
   public:
@@ -37,20 +64,24 @@ class BitRepacker {
         have_previous_ = false;
     }
 
-    [[nodiscard]] std::vector<std::uint8_t>
-    process(const std::span<const std::uint8_t> input) {
+    [[nodiscard]] std::span<const std::uint8_t>
+    process(const std::span<const std::uint8_t> input,
+            std::vector<std::uint8_t> &output) {
         if (bit_offset_ == 0) {
-            return {input.begin(), input.end()};
+            return input;
         }
 
-        std::vector<std::uint8_t> output;
-        output.reserve(input.size());
+        const std::size_t output_size =
+            input.size() - static_cast<std::size_t>(!have_previous_ &&
+                                                    !input.empty());
+        output.resize(output_size);
+        std::size_t output_index = 0;
         for (const std::uint8_t byte : input) {
             if (have_previous_) {
-                output.push_back(static_cast<std::uint8_t>(
+                output[output_index++] = static_cast<std::uint8_t>(
                     (static_cast<unsigned int>(previous_) << bit_offset_) |
                     (static_cast<unsigned int>(byte) >>
-                     (bit_alignment_phases - bit_offset_))));
+                     (bit_alignment_phases - bit_offset_)));
             }
             previous_ = byte;
             have_previous_ = true;
@@ -69,30 +100,38 @@ class ByteDeinterleaver {
     ByteDeinterleaver() { reset(0); }
 
     void reset(const std::size_t initial_branch) {
-        for (std::size_t branch = 0; branch < queues_.size(); ++branch) {
-            queues_[branch].assign((outer_interleaver_branches - 1 - branch) *
-                                       outer_interleaver_step,
-                                   0);
-        }
+        std::ranges::fill(delays_, std::array<std::uint8_t, maximum_delay>{});
+        heads_.fill(0);
         branch_ = initial_branch % outer_interleaver_branches;
     }
 
-    [[nodiscard]] std::vector<std::uint8_t>
-    process(const std::span<const std::uint8_t> input) {
-        std::vector<std::uint8_t> output;
-        output.reserve(input.size());
-        for (const std::uint8_t byte : input) {
-            auto &queue = queues_[branch_];
-            queue.push_back(byte);
-            output.push_back(queue.front());
-            queue.pop_front();
+    void process(const std::span<const std::uint8_t> input,
+                 std::vector<std::uint8_t> &output) {
+        output.resize(input.size());
+        for (std::size_t index = 0; index < input.size(); ++index) {
+            const std::uint8_t byte = input[index];
+            const std::size_t delay =
+                (outer_interleaver_branches - 1 - branch_) *
+                outer_interleaver_step;
+            if (delay == 0) {
+                output[index] = byte;
+            } else {
+                auto &head = heads_[branch_];
+                output[index] = delays_[branch_][head];
+                delays_[branch_][head] = byte;
+                head = (head + 1) % delay;
+            }
             branch_ = (branch_ + 1) % outer_interleaver_branches;
         }
-        return output;
     }
 
   private:
-    std::array<std::deque<std::uint8_t>, outer_interleaver_branches> queues_;
+    static constexpr std::size_t maximum_delay =
+        (outer_interleaver_branches - 1) * outer_interleaver_step;
+    std::array<std::array<std::uint8_t, maximum_delay>,
+               outer_interleaver_branches>
+        delays_{};
+    std::array<std::size_t, outer_interleaver_branches> heads_{};
     std::size_t branch_{};
 };
 
@@ -275,11 +314,28 @@ struct OuterFec::Impl {
     void reset() {
         reset_alignment_paths();
         energy_descrambler.reset();
+        rs_bytes.clear();
+        rs_cursor = 0;
         statistics = {};
         uncorrectable_since_sync = 0;
         alignment_search_bytes = 0;
         alignment_search_count = 0;
         alignment_search_done = false;
+        timing_packet_index = 0;
+        timing = {};
+    }
+
+    void set_detailed_timing_enabled(const bool enabled) noexcept {
+        detailed_timing_enabled = enabled;
+    }
+
+    [[nodiscard]] double *timer(double &destination) noexcept {
+        return detailed_timing_enabled ? &destination : nullptr;
+    }
+
+    [[nodiscard]] double *packet_timer(const bool sample,
+                                       double &destination) noexcept {
+        return sample ? &destination : nullptr;
     }
 
     void reset_alignment_paths() {
@@ -314,6 +370,7 @@ struct OuterFec::Impl {
     process(const std::span<const std::uint8_t> decoded) {
         constexpr std::size_t maximum_search = 32 * rs_packet_size;
         if (selected_outer_phase == outer_interleaver_branches) {
+            TimingScope alignment_timer(timer(timing.alignment_ms));
             // Searching all 8 bit offsets and 12 deinterleaver branches is
             // deliberately kept out of the steady-state hot path. A marginal
             // channel can lose an already selected RS phase for a short burst;
@@ -324,15 +381,16 @@ struct OuterFec::Impl {
             alignment_search_bytes += decoded.size();
             for (std::size_t bit_offset = 0; bit_offset < bit_alignment_phases;
                  ++bit_offset) {
-                const auto repacked =
-                    bit_repackers[bit_offset].process(decoded);
+                const auto repacked = bit_repackers[bit_offset].process(
+                    decoded, repacked_scratch);
                 for (std::size_t phase = 0; phase < outer_interleaver_branches;
                      ++phase) {
-                    auto deinterleaved =
-                        outer_interleavers[bit_offset][phase].process(repacked);
+                    outer_interleavers[bit_offset][phase].process(
+                        repacked, deinterleaved_scratch);
                     auto &candidate = outer_candidates[bit_offset][phase];
-                    candidate.insert(candidate.end(), deinterleaved.begin(),
-                                     deinterleaved.end());
+                    candidate.insert(candidate.end(),
+                                     deinterleaved_scratch.begin(),
+                                     deinterleaved_scratch.end());
                     if (candidate.size() > maximum_search) {
                         candidate.erase(
                             candidate.begin(),
@@ -487,6 +545,7 @@ struct OuterFec::Impl {
                     candidate.begin() +
                         static_cast<std::ptrdiff_t>(selected_evidence.start),
                     candidate.end());
+                rs_cursor = 0;
                 energy_descrambler.start_at_energy_phase(
                     selected_evidence.energy_phase);
                 statistics.rs_synchronized = true;
@@ -532,27 +591,79 @@ struct OuterFec::Impl {
                 return {};
             }
         } else {
-            const auto repacked =
-                bit_repackers[selected_bit_offset].process(decoded);
-            auto deinterleaved =
+            std::span<const std::uint8_t> repacked;
+            {
+                TimingScope bit_repack_timer(timer(timing.bit_repack_ms));
+                repacked = bit_repackers[selected_bit_offset].process(
+                    decoded, repacked_scratch);
+            }
+            {
+                TimingScope deinterleave_timer(
+                    timer(timing.byte_deinterleave_ms));
                 outer_interleavers[selected_bit_offset][selected_outer_phase]
-                    .process(repacked);
-            rs_bytes.insert(rs_bytes.end(), deinterleaved.begin(),
-                            deinterleaved.end());
+                    .process(repacked, deinterleaved_scratch);
+            }
+            {
+                TimingScope buffer_timer(timer(timing.buffer_ms));
+                if (rs_cursor != 0) {
+                    rs_bytes.erase(
+                        rs_bytes.begin(),
+                        rs_bytes.begin() +
+                            static_cast<std::ptrdiff_t>(rs_cursor));
+                    rs_cursor = 0;
+                }
+                rs_bytes.insert(rs_bytes.end(),
+                                deinterleaved_scratch.begin(),
+                                deinterleaved_scratch.end());
+            }
         }
 
         std::vector<std::uint8_t> transport_stream;
-        while (rs_bytes.size() >= rs_packet_size) {
-            std::array<std::uint8_t, ts_packet_size> received_randomized{};
-            std::ranges::copy_n(rs_bytes.begin(), ts_packet_size,
-                                received_randomized.begin());
+        transport_stream.reserve(((rs_bytes.size() - rs_cursor) /
+                                  rs_packet_size) *
+                                 ts_packet_size);
+        while (rs_bytes.size() - rs_cursor >= rs_packet_size) {
+            const bool sample_packet =
+                detailed_timing_enabled &&
+                (timing_packet_index++ % detailed_timing_sample_interval == 0);
+            constexpr double packet_timing_scale =
+                static_cast<double>(detailed_timing_sample_interval);
+            const std::span<const std::uint8_t> codeword{
+                rs_bytes.data() + rs_cursor, rs_packet_size};
+            const auto received_randomized =
+                codeword.first(ts_packet_size);
             std::array<std::uint8_t, ts_packet_size> randomized{};
             std::uint64_t corrected_payload_bits = 0;
-            const bool valid = reed_solomon.decode(
-                std::span<const std::uint8_t>{rs_bytes}.first(rs_packet_size),
-                randomized, &corrected_payload_bits);
-            rs_bytes.erase(rs_bytes.begin(), rs_bytes.begin() + rs_packet_size);
+            int corrected_symbols = -1;
+            bool valid = false;
+            {
+                TimingScope rs_timer(
+                    packet_timer(sample_packet, timing.rs_decode_ms),
+                    packet_timing_scale);
+                DvbReedSolomonTiming rs_timing;
+                valid = reed_solomon.decode(
+                    codeword, randomized, &corrected_payload_bits,
+                    &corrected_symbols, sample_packet ? &rs_timing : nullptr);
+                if (sample_packet) {
+                    timing.rs_codeword_copy_ms +=
+                        rs_timing.codeword_copy_ms * packet_timing_scale;
+                    timing.rs_syndrome_ms +=
+                        rs_timing.syndrome_ms * packet_timing_scale;
+                    timing.rs_error_locator_ms +=
+                        rs_timing.error_locator_ms * packet_timing_scale;
+                    timing.rs_correction_ms +=
+                        rs_timing.correction_ms * packet_timing_scale;
+                    timing.rs_payload_copy_ms +=
+                        rs_timing.payload_copy_ms * packet_timing_scale;
+                }
+            }
+            rs_cursor += rs_packet_size;
             ++statistics.rs_packets;
+            if (corrected_symbols == 0) {
+                ++statistics.rs_clean_packets;
+            } else if (corrected_symbols > 0) {
+                ++statistics.rs_corrected_packets;
+            }
             if (statistics.rs_packets <= 4 && diagnostics_enabled()) {
                 emit_diagnostic(
                     "outer_fec_rs_attempt", DiagnosticEventSeverity::info,
@@ -561,7 +672,7 @@ struct OuterFec::Impl {
                      {"received_sync_byte",
                       static_cast<std::uint64_t>(received_randomized.front())},
                      {"buffered_bytes",
-                      static_cast<std::uint64_t>(rs_bytes.size())},
+                      static_cast<std::uint64_t>(rs_bytes.size() - rs_cursor)},
                      {"energy_synchronized",
                       energy_descrambler.synchronized()}});
             }
@@ -596,7 +707,8 @@ struct OuterFec::Impl {
                          {"phase",
                           static_cast<std::uint64_t>(selected_outer_phase)},
                          {"buffered_bytes",
-                          static_cast<std::uint64_t>(rs_bytes.size())},
+                          static_cast<std::uint64_t>(rs_bytes.size() -
+                                                     rs_cursor)},
                          {"energy_synchronized",
                           energy_descrambler.synchronized()}});
                 }
@@ -611,6 +723,7 @@ struct OuterFec::Impl {
                     uncorrectable_since_sync = 0;
                     reset_alignment_paths();
                     rs_bytes.clear();
+                    rs_cursor = 0;
                     energy_descrambler.reset();
                     alignment_search_bytes = 0;
                     alignment_search_done = false;
@@ -632,10 +745,22 @@ struct OuterFec::Impl {
                     break;
                 }
                 std::array<std::uint8_t, ts_packet_size> packet{};
-                if (energy_descrambler.process_corrupt(received_randomized,
-                                                       packet)) {
-                    transport_stream.insert(transport_stream.end(),
-                                            packet.begin(), packet.end());
+                bool packet_ready = false;
+                {
+                    TimingScope energy_timer(
+                        packet_timer(sample_packet, timing.energy_tei_ms),
+                        packet_timing_scale);
+                    packet_ready = energy_descrambler.process_corrupt(
+                        received_randomized, packet);
+                }
+                if (packet_ready) {
+                    {
+                        TimingScope output_timer(
+                            packet_timer(sample_packet, timing.output_ms),
+                            packet_timing_scale);
+                        transport_stream.insert(transport_stream.end(),
+                                                packet.begin(), packet.end());
+                    }
                     ++statistics.tei_packets;
                     ++statistics.ts_packets;
                 }
@@ -653,10 +778,22 @@ struct OuterFec::Impl {
             }
             uncorrectable_since_sync = 0;
             std::array<std::uint8_t, ts_packet_size> packet{};
-            if (energy_descrambler.process(randomized, packet)) {
+            bool packet_ready = false;
+            {
+                TimingScope energy_timer(
+                    packet_timer(sample_packet, timing.energy_tei_ms),
+                    packet_timing_scale);
+                packet_ready = energy_descrambler.process(randomized, packet);
+            }
+            if (packet_ready) {
                 statistics.corrected_payload_bits += corrected_payload_bits;
-                transport_stream.insert(transport_stream.end(), packet.begin(),
-                                        packet.end());
+                {
+                    TimingScope output_timer(
+                        packet_timer(sample_packet, timing.output_ms),
+                        packet_timing_scale);
+                    transport_stream.insert(transport_stream.end(),
+                                            packet.begin(), packet.end());
+                }
                 ++statistics.ts_packets;
             }
         }
@@ -676,7 +813,10 @@ struct OuterFec::Impl {
     std::size_t selected_outer_phase{outer_interleaver_branches};
     DvbReedSolomon reed_solomon;
     EnergyDescrambler energy_descrambler;
+    std::vector<std::uint8_t> repacked_scratch;
+    std::vector<std::uint8_t> deinterleaved_scratch;
     std::vector<std::uint8_t> rs_bytes;
+    std::size_t rs_cursor{};
     OuterFecStats statistics;
     // Consecutive uncorrectable RS packets since the last selection. A false
     // sync lock (a zero-evidence phase selected from fade garbage) would
@@ -696,6 +836,9 @@ struct OuterFec::Impl {
     std::size_t pending_alignment_bit_offset{bit_alignment_phases};
     std::size_t pending_alignment_phase{outer_interleaver_branches};
     bool alignment_search_done{};
+    bool detailed_timing_enabled{};
+    std::uint64_t timing_packet_index{};
+    OuterFecTiming timing;
     DiagnosticEventHandler diagnostic_handler;
 };
 
@@ -705,6 +848,10 @@ OuterFec::OuterFec(OuterFec &&) noexcept = default;
 OuterFec &OuterFec::operator=(OuterFec &&) noexcept = default;
 
 void OuterFec::reset() { impl_->reset(); }
+
+void OuterFec::set_detailed_timing_enabled(const bool enabled) noexcept {
+    impl_->set_detailed_timing_enabled(enabled);
+}
 
 void OuterFec::set_diagnostic_handler(DiagnosticEventHandler handler) {
     impl_->diagnostic_handler = std::move(handler);
@@ -716,5 +863,7 @@ OuterFec::process(const std::span<const std::uint8_t> hard_bytes) {
 }
 
 OuterFecStats OuterFec::stats() const { return impl_->statistics; }
+
+OuterFecTiming OuterFec::timing() const noexcept { return impl_->timing; }
 
 } // namespace airspy_tv::fec

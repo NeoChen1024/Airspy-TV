@@ -96,11 +96,13 @@ void DemodStage::Impl::demod_execute_fft_and_measure_cfo(
     state.fft_execute_time_sum_ms += duration_ms(fft_stage_started_at);
 
     fft_stage_started_at = std::chrono::steady_clock::now();
-    std::vector<std::complex<float>> current_continual;
-    current_continual.reserve(continual_indices.size());
-    for (const std::size_t k : continual_indices) {
-        current_continual.push_back(
-            active_carrier(fft_out, k, maximum, frontend.carrier_offset));
+    auto &current_continual = frontend.current_continual;
+    if (current_continual.size() != continual_indices.size()) {
+        current_continual.resize(continual_indices.size());
+    }
+    for (std::size_t index = 0; index < continual_indices.size(); ++index) {
+        current_continual[index] = active_carrier(
+            fft_out, continual_indices[index], maximum, frontend.carrier_offset);
     }
     float residual_phase = 0.0F;
     fade_indicator = 1.0F; // Only update the CFO loop from a
@@ -110,7 +112,8 @@ void DemodStage::Impl::demod_execute_fft_and_measure_cfo(
     // would measure a spurious residual and overshoot; the
     // carried frequency is already converged, so skip the
     // update.
-    if (frontend.previous_continual.size() == current_continual.size() &&
+    if (frontend.have_previous_continual &&
+        frontend.previous_continual.size() == current_continual.size() &&
         start ==
             frontend.last_symbol_start + static_cast<std::uint64_t>(period)) {
         std::complex<float> temporal_correlation{};
@@ -156,7 +159,8 @@ void DemodStage::Impl::demod_execute_fft_and_measure_cfo(
         }
     }
     frontend.last_symbol_start = start;
-    frontend.previous_continual = std::move(current_continual);
+    frontend.previous_continual.swap(current_continual);
+    frontend.have_previous_continual = true;
     if (frontend.just_seeded) {
         frontend.just_seeded = false;
     }
@@ -304,10 +308,41 @@ DemodStage::Impl::demod_lock_pilots(DemodRuntimeState &state) {
             // re-established by a re-anchor after a real
             // fade, which restores the pre-fade stable
             // offset.
-            lock = PilotLock{lock_phase_at_offset(fft_out, maximum,
-                                                  frontend.carrier_offset,
-                                                  timing_tracker.filtered()),
-                             frontend.carrier_offset};
+            constexpr float expected_phase_confidence_threshold = 0.90F;
+            const int expected_phase = (frontend.previous_phase + 1) % 4;
+            const auto expected_score = score_pilot_phase_at_offset(
+                fft_out, maximum, frontend.carrier_offset, expected_phase,
+                timing_tracker.filtered());
+            ++state.pilot_expected_phase_checks;
+            state.pilot_expected_confidence_sum += expected_score.confidence;
+            state.pilot_expected_confidence_min = std::min(
+                state.pilot_expected_confidence_min, expected_score.confidence);
+            if (expected_score.confidence >=
+                expected_phase_confidence_threshold) {
+                ++state.pilot_expected_phase_fast_accepts;
+                lock = PilotLock{expected_phase, frontend.carrier_offset};
+            } else {
+                ++state.pilot_expected_phase_fallbacks;
+                lock = PilotLock{lock_phase_at_offset(
+                                     fft_out, maximum,
+                                     frontend.carrier_offset,
+                                     timing_tracker.filtered()),
+                                 frontend.carrier_offset};
+                if (events_enabled()) {
+                    emit_event(
+                        "pilot_phase_fast_path_fallback",
+                        DecoderEventSeverity::info, state.demod_generation,
+                        state.next_symbol_start, symbol_count,
+                        {{"expected_phase",
+                          static_cast<std::int64_t>(expected_phase)},
+                         {"selected_phase",
+                          static_cast<std::int64_t>(lock.phase)},
+                         {"confidence",
+                          static_cast<double>(expected_score.confidence)},
+                         {"threshold", static_cast<double>(
+                                           expected_phase_confidence_threshold)}});
+                }
+            }
         }
         if (frontend.previous_phase >= 0 &&
             lock.phase != (frontend.previous_phase + 1) % 4) {
@@ -377,7 +412,7 @@ DemodStage::Impl::demod_lock_pilots(DemodRuntimeState &state) {
     return lock;
 }
 
-std::vector<std::complex<float>>
+std::span<const std::complex<float>>
 DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
                                          const PilotLock &lock) {
     auto &maximum = state.maximum;
@@ -400,9 +435,13 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
     auto &next_symbol_start = state.next_symbol_start;
     auto &tps_indices = state.tps_indices;
     auto &tps_values = state.tps_values;
+    auto &channel = state.channel_scratch;
 
     auto channel_stage_started_at = std::chrono::steady_clock::now();
-    std::vector<std::complex<float>> channel(maximum + 1);
+    if (channel.size() != maximum + 1) {
+        channel.resize(maximum + 1);
+    }
+    std::fill(channel.begin(), channel.end(), std::complex<float>{});
     const auto &pilots = pilot_indices[static_cast<std::size_t>(lock.phase)];
     for (const std::size_t k : pilots) {
         const float sent = pilot_prbs[k] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
@@ -428,9 +467,38 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
     // before feeding either the long-term timing loop or the
     // phase verifier.
     channel_stage_started_at = std::chrono::steady_clock::now();
-    if (const auto measured_tau = estimate_scattered_timing_tau(
-            channel, static_cast<std::size_t>(lock.phase), maximum, fft_size);
-        measured_tau.has_value()) {
+    constexpr std::uint64_t steady_timing_estimator_cadence = 4;
+    const bool timing_recovery =
+        state.tau_history_count < DemodRuntimeState::tau_history_min ||
+        fade_indicator <= 0.5F || state.hopeless_window_count != 0 ||
+        state.frozen_symbol_count != 0 ||
+        state.cfo_recovery_symbol_count != 0;
+    const bool evaluate_timing =
+        timing_recovery ||
+        symbol_count % steady_timing_estimator_cadence == 0;
+    const bool measure_timing_breakdown = events_enabled();
+    std::optional<double> measured_tau;
+    if (evaluate_timing) {
+        auto timing_substage_started_at =
+            measure_timing_breakdown ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+        const std::size_t timing_estimate_count =
+            generate_scattered_timing_estimates(
+                channel, static_cast<std::size_t>(lock.phase), maximum,
+                fft_size, state.timing_estimates_scratch);
+        if (measure_timing_breakdown) {
+            state.channel_timing_generate_time_sum_ms +=
+                duration_ms(timing_substage_started_at);
+            timing_substage_started_at = std::chrono::steady_clock::now();
+        }
+        measured_tau = select_exact_median(std::span<double>{
+            state.timing_estimates_scratch.data(), timing_estimate_count});
+        if (measure_timing_breakdown) {
+            state.channel_timing_select_time_sum_ms +=
+                duration_ms(timing_substage_started_at);
+        }
+    }
+    if (measured_tau.has_value()) {
         latest_raw_timing = *measured_tau;
         ++timing_raw_count;
         const auto previous_filtered_tau = timing_tracker.filtered();
@@ -497,7 +565,10 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
             }
             frontend.cir_plan.execute();
             const std::size_t n = frontend.cir_response.size();
-            std::vector<double> energy(n, 0.0);
+            auto &energy = frontend.cir_energy;
+            if (energy.size() != n) {
+                energy.resize(n);
+            }
             double total = 0.0;
             std::size_t peak = 0;
             double peak_energy = -1.0;

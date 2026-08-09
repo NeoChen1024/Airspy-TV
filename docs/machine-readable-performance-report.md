@@ -395,7 +395,42 @@ The complete first-version metric set is:
 - aggregate symbol-worker work: `symbol::preprocess`, `symbol::demap`,
   `symbol::deinterleave`, and `symbol::depuncture`;
 - FEC serial wall: `fec::total`, with `fec::transport` explicitly marked as a
-  nested subset rather than an additive peer.
+  nested subset rather than an additive peer;
+- FEC wait: `fec::viterbi::queue_wait` and
+  `fec::viterbi::flush_wait`; these record only condition-variable blocking,
+  not worker execution or ordinary mutex acquisition;
+- FEC nested coordinator wall: `fec::viterbi`,
+  `fec::viterbi::submit`, `fec::viterbi::collect`,
+  `fec::viterbi::other`, `fec::outer`, `fec::outer::alignment`,
+  `fec::outer::bit_repack`, `fec::outer::deinterleave`,
+  `fec::outer::rs_decode`, `fec::outer::rs_decode::codeword_copy`,
+  `fec::outer::rs_decode::syndrome`,
+  `fec::outer::rs_decode::error_locator`,
+  `fec::outer::rs_decode::correction`,
+  `fec::outer::rs_decode::payload_copy`, `fec::outer::energy_tei`,
+  `fec::outer::buffer`, `fec::outer::output`, `fec::outer::other`,
+  `fec::transport::decoded_handoff`, `fec::transport::output`, and
+  `fec::transport::other`;
+- FEC thread CPU: `fec::coordinator`, measured with the FEC thread CPU clock at
+  window boundaries so queue idle time and Viterbi worker CPU are excluded;
+- aggregate Viterbi worker work: `fec::viterbi::worker`, summed across worker
+  threads and kept separate from serial wall and FEC coordinator CPU.
+
+The packet-local outer-FEC sub-stages (`rs_decode`, `energy_tei`, the
+per-packet portion of `buffer`, and `output`) are deterministic 1-in-32 sampled
+estimates. Parent `fec::outer`, `fec::transport`, and `fec::total` values,
+alignment work, bit repacking, and byte deinterleaving are measured on every
+call. This retains useful per-window attribution without clock-read overhead
+becoming a new FEC bottleneck.
+
+FEC session/delta/cumulative counters also separate `rs_clean_packets`,
+`rs_corrected_packets`, and `rs_uncorrectable_packets`; their sum equals
+`rs_packets` after outer lock. The five `fec::outer::rs_decode::*` values are
+nested sampled attribution within `rs_decode`, not additive peers of it.
+
+Demod windows include `pilot_phase_fast_path` with check, fast-accept, fallback,
+and confidence values. `setup_ms.fft_plan` records one-time FFT planning cost;
+it is zero in later windows and is not part of the window serial-busy sum.
 
 Each record also carries its applicable total wall time, sample/symbol count,
 and interval endpoints. Percentages are derived values and should not be

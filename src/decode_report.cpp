@@ -120,6 +120,13 @@ struct TelemetryAggregate {
     void add(const dvbt::FecWindowTelemetry &record) {
         timing_aggregates["fec::total"].add(record.fec_total_ms);
         timing_aggregates["fec::transport"].add(record.transport_nested_ms);
+        for (const auto *values :
+             {&record.wait_ms, &record.nested_ms, &record.thread_cpu_ms,
+              &record.aggregate_worker_work_ms}) {
+            for (const auto &[name, value] : *values) {
+                timing_aggregates[name].add(value);
+            }
+        }
         transport_bytes += record.output_bytes_delta;
         add_transport(record.delta);
     }
@@ -164,6 +171,8 @@ struct TelemetryAggregate {
         transport.post_viterbi_compared_bits +=
             value.post_viterbi_compared_bits;
         transport.rs_packets += value.rs_packets;
+        transport.rs_clean_packets += value.rs_clean_packets;
+        transport.rs_corrected_packets += value.rs_corrected_packets;
         transport.rs_uncorrectable_packets += value.rs_uncorrectable_packets;
         transport.tei_packets += value.tei_packets;
         transport.ts_packets += value.ts_packets;
@@ -735,6 +744,8 @@ struct DecodeReport::Impl {
               {"post_viterbi_error_bits", fec.post_viterbi_error_bits},
               {"post_viterbi_compared_bits", fec.post_viterbi_compared_bits},
               {"rs_packets", fec.rs_packets},
+              {"rs_clean_packets", fec.rs_clean_packets},
+              {"rs_corrected_packets", fec.rs_corrected_packets},
               {"rs_uncorrectable_packets", fec.rs_uncorrectable_packets},
               {"tei_packets", fec.tei_packets}}},
             {"windows", window_summary(global_aggregate)},
@@ -796,6 +807,8 @@ struct DecodeReport::Impl {
             {"post_viterbi_error_bits", fec.post_viterbi_error_bits},
             {"post_viterbi_compared_bits", fec.post_viterbi_compared_bits},
             {"rs_packets", fec.rs_packets},
+            {"rs_clean_packets", fec.rs_clean_packets},
+            {"rs_corrected_packets", fec.rs_corrected_packets},
             {"rs_uncorrectable_packets", fec.rs_uncorrectable_packets},
             {"tei_packets", fec.tei_packets}};
     }

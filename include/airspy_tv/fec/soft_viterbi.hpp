@@ -9,6 +9,14 @@
 
 namespace airspy_tv::fec {
 
+struct SoftViterbiTiming {
+    double submit_ms{};
+    double queue_wait_ms{};
+    double collect_ms{};
+    double flush_wait_ms{};
+    double aggregate_worker_work_ms{};
+};
+
 // Zero in user-facing configuration means this portable hardware-concurrency
 // default. std::thread reports logical processors and may return zero.
 [[nodiscard]] std::size_t default_viterbi_worker_count() noexcept;
@@ -35,6 +43,7 @@ class SoftViterbi {
     SoftViterbi &operator=(SoftViterbi &&) noexcept;
 
     void reset();
+    void set_detailed_timing_enabled(bool enabled) noexcept;
     [[nodiscard]] std::vector<std::uint8_t>
     process(std::span<const float> llrs);
     [[nodiscard]] std::vector<std::uint8_t>
@@ -42,6 +51,7 @@ class SoftViterbi {
     [[nodiscard]] std::vector<std::uint8_t> flush();
     [[nodiscard]] std::size_t worker_count() const noexcept;
     [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> error_counts() const;
+    [[nodiscard]] SoftViterbiTiming timing() const noexcept;
 
   private:
     struct Impl;

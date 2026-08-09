@@ -1,4 +1,5 @@
 #include "sample_channel.hpp"
+#include "absolute_sample_ring.hpp"
 
 #include <array>
 #include <atomic>
@@ -145,11 +146,38 @@ bool test_queue_ring_and_lifecycle() {
     return ok;
 }
 
+bool test_absolute_ring_wrapping_copy() {
+    AbsoluteSampleRing ring(6);
+    const std::array<std::complex<float>, 6> first{
+        std::complex<float>{1.0F, 0.0F}, std::complex<float>{2.0F, 0.0F},
+        std::complex<float>{3.0F, 0.0F}, std::complex<float>{4.0F, 0.0F},
+        std::complex<float>{5.0F, 0.0F}, std::complex<float>{6.0F, 0.0F}};
+    std::copy(first.begin(), first.end(), ring.data());
+    ring.write_position = first.size();
+    ring.read_position = 4;
+
+    const std::array<std::complex<float>, 2> wrapped{
+        std::complex<float>{7.0F, 0.0F}, std::complex<float>{8.0F, 0.0F}};
+    std::copy(wrapped.begin(), wrapped.end(), ring.data());
+    ring.write_position += wrapped.size();
+
+    std::array<std::complex<float>, 4> recovered{};
+    ring.copy_absolute(4, recovered);
+    const std::array<std::complex<float>, 4> expected{
+        std::complex<float>{5.0F, 0.0F}, std::complex<float>{6.0F, 0.0F},
+        std::complex<float>{7.0F, 0.0F}, std::complex<float>{8.0F, 0.0F}};
+    return require(recovered == expected,
+                   "two-span ring copy preserves wrapping sample order");
+}
+
 } // namespace
 
 int main() {
     try {
-        return test_queue_ring_and_lifecycle() ? 0 : 1;
+        return test_queue_ring_and_lifecycle() &&
+                       test_absolute_ring_wrapping_copy()
+                   ? 0
+                   : 1;
     } catch (const std::exception &exception) {
         std::cerr << "Sample channel test failed: " << exception.what() << '\n';
         return 1;

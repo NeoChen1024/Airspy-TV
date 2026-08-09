@@ -25,9 +25,10 @@ struct DecoderParameters {
 };
 
 struct DecoderTiming {
-    float demap_time_ms{};
-    float deinterleave_time_ms{};
-    float transport_time_ms{};
+    double demap_time_ms{};
+    double deinterleave_time_ms{};
+    double transport_time_ms{};
+    TransportDecoderTiming transport;
 };
 
 // Native DVB-T data path beginning at the equalized payload-carrier boundary.
@@ -45,6 +46,7 @@ class Decoder {
     Decoder &operator=(Decoder &&) noexcept;
 
     void reset();
+    void set_detailed_timing_enabled(bool enabled) noexcept;
     void set_diagnostic_handler(DiagnosticEventHandler handler);
     [[nodiscard]] std::vector<std::uint8_t>
     process_symbol(std::span<const std::complex<float>> equalized_carriers,
