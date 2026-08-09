@@ -28,6 +28,7 @@ enum CliOption : int {
     opt_dvbt_modulation,
     opt_dvbt_code_rate,
     opt_decoder_threads,
+    opt_offline_queue_multiplier,
     opt_record_first,
     opt_duration,
     opt_frequency,

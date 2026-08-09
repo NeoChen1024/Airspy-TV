@@ -6,6 +6,7 @@
 #include "decode_run_reporter.hpp"
 #include "receiver_session.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -56,7 +57,8 @@ int offline_decode_cli(
     const std::filesystem::path &destination,
     const std::uint32_t raw_sample_rate_hz,
     const airspy_tv::dvbt::ReceiverParameters &parameters,
-    const std::optional<std::filesystem::path> &report_directory) {
+    const std::optional<std::filesystem::path> &report_directory,
+    const std::size_t queue_capacity_multiplier) {
     const bool stdin_source = source == std::filesystem::path("-");
     const bool stdout_destination = destination == std::filesystem::path("-");
     airspy_tv::IqFileInfo source_info;
@@ -112,7 +114,10 @@ int offline_decode_cli(
     airspy_tv::ReceiverSession session(
         airspy_tv::TransportPipelineConfig::headless());
     session.set_display_analysis_enabled(false);
-    session.set_dvbt_parameters(parameters);
+    auto offline_parameters = parameters;
+    offline_parameters.queue_capacity_multiplier =
+        std::clamp<std::size_t>(queue_capacity_multiplier, 1, 16);
+    session.set_dvbt_parameters(offline_parameters);
     session.set_transport_sink(
         [&output](const std::span<const std::uint8_t> ts) {
             static_cast<void>(output.submit(ts));
@@ -136,8 +141,8 @@ int offline_decode_cli(
     }
     const std::string destination_name =
         stdout_destination ? "stdout" : destination.string();
-    if (!reporter.start_source(session, settings, parameters, destination_name,
-                               error)) {
+    if (!reporter.start_source(session, settings, offline_parameters,
+                               destination_name, error)) {
         session.set_transport_sink({});
         session.close();
         std::cerr << "Decode report failed: " << error << '\n';

@@ -339,8 +339,8 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     foreach(STREAM_CASE clean cfo-centering cfo-drift cfo-rebootstrap
-                        worker-parity reset-new reset-hopeless reset-live
-                        reset-wait no-acq)
+                        worker-parity queue-capacity reset-new reset-hopeless
+                        reset-live reset-wait no-acq)
         add_test(NAME dvbt-stream-decoder-${STREAM_CASE}
                  COMMAND dvbt-stream-decoder-test)
         set_tests_properties(dvbt-stream-decoder-${STREAM_CASE} PROPERTIES

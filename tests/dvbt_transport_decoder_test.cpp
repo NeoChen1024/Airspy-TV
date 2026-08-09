@@ -381,7 +381,7 @@ void test_prepared_soft_transport() {
     float_output.insert(float_output.end(), float_tail.begin(),
                         float_tail.end());
 
-    TransportDecoder soft_decoder{rate, 4};
+    TransportDecoder soft_decoder{rate, 1};
     soft_decoder.set_detailed_timing_enabled(true);
     auto soft_output = soft_decoder.process_soft(soft);
     const auto soft_tail = soft_decoder.flush();

@@ -56,7 +56,10 @@ class Decoder {
     process_metrics(std::span<const float> punctured_llrs);
     [[nodiscard]] std::vector<std::uint8_t>
     process_soft_metrics(std::span<const std::uint8_t> mother_metrics);
+    void process_soft_metrics(std::span<const std::uint8_t> mother_metrics,
+                              std::vector<std::uint8_t> &output);
     [[nodiscard]] std::vector<std::uint8_t> flush();
+    void flush(std::vector<std::uint8_t> &output);
     [[nodiscard]] DecoderParameters parameters() const noexcept;
     [[nodiscard]] DecoderTiming timing() const noexcept;
     [[nodiscard]] TransportDecoderStats stats() const;

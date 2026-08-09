@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace airspy_tv::dvbt {
 
@@ -21,6 +22,16 @@ struct WorkerAllocation {
     std::size_t symbol{};
     std::size_t viterbi{};
 };
+
+[[nodiscard]] inline std::size_t
+scale_queue_capacity(const std::size_t capacity,
+                     const std::size_t multiplier) noexcept {
+    const std::size_t factor = std::max<std::size_t>(1, multiplier);
+    if (capacity > std::numeric_limits<std::size_t>::max() / factor) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    return capacity * factor;
+}
 
 [[nodiscard]] inline WorkerAllocation
 allocate_workers(const std::size_t requested_threads) noexcept {
@@ -38,13 +49,15 @@ allocate_workers(const std::size_t requested_threads) noexcept {
 
 [[nodiscard]] inline std::size_t
 buffered_symbol_count(const std::uint32_t bandwidth,
-                      const std::size_t symbol_samples) noexcept {
+                      const std::size_t symbol_samples,
+                      const std::size_t capacity_multiplier = 1) noexcept {
     const std::uint64_t numerator = static_cast<std::uint64_t>(bandwidth) * 8U;
     const std::uint64_t denominator =
         7U * buffer_duration_denominator * symbol_samples;
-    return std::max<std::size_t>(
+    const std::size_t capacity = std::max<std::size_t>(
         1,
         static_cast<std::size_t>((numerator + denominator - 1) / denominator));
+    return scale_queue_capacity(capacity, capacity_multiplier);
 }
 
 [[nodiscard]] inline std::size_t

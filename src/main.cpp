@@ -45,6 +45,7 @@ int main(const int argc, char **argv) {
     AirspyGainMode airspy_gain_mode = AirspyGainMode::Sensitivity;
     bool bias_tee = false;
     ReceiverParameters dvbt_parameters;
+    std::optional<std::size_t> offline_queue_multiplier;
     airspy_tv::ReceiveStandard standard = airspy_tv::ReceiveStandard::DvbT;
 
     int opt = 0;
@@ -116,6 +117,15 @@ int main(const int argc, char **argv) {
                 cli_usage_error("decoder thread count must be 0..256");
             }
             break;
+        case opt_offline_queue_multiplier: {
+            const std::uint64_t multiplier =
+                parse_u64(optarg, "offline queue multiplier");
+            if (multiplier < 1 || multiplier > 16) {
+                cli_usage_error("offline queue multiplier must be 1..16");
+            }
+            offline_queue_multiplier = static_cast<std::size_t>(multiplier);
+            break;
+        }
         case opt_record_first:
             record_path = optarg;
             break;
@@ -181,6 +191,10 @@ int main(const int argc, char **argv) {
     if (rtp_output_text.has_value() && !decode_live) {
         cli_usage_error("--rtp-output is valid only with --decode-live");
     }
+    if (offline_queue_multiplier.has_value() && !decode_iq_path.has_value()) {
+        cli_usage_error(
+            "--offline-queue-multiplier is valid only with --decode-iq");
+    }
 
     if (inspect_iq_path.has_value()) {
         return inspect_iq_cli(*inspect_iq_path, sample_rate_hz,
@@ -194,9 +208,9 @@ int main(const int argc, char **argv) {
             !sample_rate_supplied) {
             cli_usage_error("--decode-iq - requires an explicit --sample-rate");
         }
-        return offline_decode_cli(*decode_iq_path, *ts_output_path,
-                                  sample_rate_hz, dvbt_parameters,
-                                  report_directory);
+        return offline_decode_cli(
+            *decode_iq_path, *ts_output_path, sample_rate_hz, dvbt_parameters,
+            report_directory, offline_queue_multiplier.value_or(4));
     }
     if (decode_live) {
         if (!ts_output_path.has_value() && !rtp_output_text.has_value()) {

@@ -13,7 +13,7 @@ namespace airspy_tv::cli {
 
 namespace {
 
-constexpr std::array<option, 27> cli_option_table{{
+constexpr std::array<option, 28> cli_option_table{{
     {"help", no_argument, nullptr, 'h'},
     {"enumerate", no_argument, nullptr, opt_enumerate},
     {"inspect-iq", required_argument, nullptr, opt_inspect_iq},
@@ -32,6 +32,8 @@ constexpr std::array<option, 27> cli_option_table{{
     {"dvbt-modulation", required_argument, nullptr, opt_dvbt_modulation},
     {"dvbt-code-rate", required_argument, nullptr, opt_dvbt_code_rate},
     {"decoder-threads", required_argument, nullptr, opt_decoder_threads},
+    {"offline-queue-multiplier", required_argument, nullptr,
+     opt_offline_queue_multiplier},
     {"record-first", required_argument, nullptr, opt_record_first},
     {"duration", required_argument, nullptr, opt_duration},
     {"frequency", required_argument, nullptr, opt_frequency},
@@ -79,6 +81,9 @@ void print_cli_usage() {
            "10000000)\n"
         << "      --decoder-threads N       Worker budget 0..256 "
            "(default 0 = auto)\n"
+        << "      --offline-queue-multiplier N\n"
+           "                                 Scale demod/FEC queues 1..16 "
+           "(default 4)\n"
         << "\n"
         << "Live MPEG-TS decoding (SDR or real-time I/Q replay):\n"
         << "      --decode-live             Decode continuously until "

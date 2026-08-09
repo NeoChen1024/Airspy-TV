@@ -75,6 +75,14 @@ struct Decoder::Impl {
 
     [[nodiscard]] std::vector<std::uint8_t>
     process_soft_metrics(const std::span<const std::uint8_t> mother_metrics) {
+        std::vector<std::uint8_t> output;
+        process_soft_metrics(mother_metrics, output);
+        return output;
+    }
+
+    void
+    process_soft_metrics(const std::span<const std::uint8_t> mother_metrics,
+                         std::vector<std::uint8_t> &output) {
         const std::size_t expected =
             depunctured_size(bit_metrics.size(), parameters.code_rate);
         if (mother_metrics.size() != expected) {
@@ -82,12 +90,20 @@ struct Decoder::Impl {
                 "DVB-T mother-code metric count mismatch");
         }
         const auto started_at = std::chrono::steady_clock::now();
-        auto output = transport_decoder.process_soft(mother_metrics);
+        transport_decoder.process_soft(mother_metrics, output);
         timing.transport_time_ms +=
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - started_at)
                 .count();
-        return output;
+    }
+
+    void flush(std::vector<std::uint8_t> &output) {
+        const auto started_at = std::chrono::steady_clock::now();
+        transport_decoder.flush(output);
+        timing.transport_time_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started_at)
+                .count();
     }
 
     DecoderParameters parameters;
@@ -136,6 +152,12 @@ std::vector<std::uint8_t> Decoder::process_soft_metrics(
     return impl_->process_soft_metrics(mother_metrics);
 }
 
+void Decoder::process_soft_metrics(
+    const std::span<const std::uint8_t> mother_metrics,
+    std::vector<std::uint8_t> &output) {
+    impl_->process_soft_metrics(mother_metrics, output);
+}
+
 DecoderParameters Decoder::parameters() const noexcept {
     return impl_->parameters;
 }
@@ -151,13 +173,11 @@ TransportDecoderStats Decoder::stats() const {
 }
 
 std::vector<std::uint8_t> Decoder::flush() {
-    const auto started_at = std::chrono::steady_clock::now();
-    auto output = impl_->transport_decoder.flush();
-    impl_->timing.transport_time_ms +=
-        std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - started_at)
-            .count();
+    std::vector<std::uint8_t> output;
+    impl_->flush(output);
     return output;
 }
+
+void Decoder::flush(std::vector<std::uint8_t> &output) { impl_->flush(output); }
 
 } // namespace airspy_tv::dvbt

@@ -69,6 +69,10 @@ class OuterFec {
     void set_diagnostic_handler(DiagnosticEventHandler handler);
     [[nodiscard]] std::vector<std::uint8_t>
     process(std::span<const std::uint8_t> hard_bytes);
+    // Appends recovered packets to output. The caller may retain output
+    // capacity across calls; existing bytes are preserved.
+    void process(std::span<const std::uint8_t> hard_bytes,
+                 std::vector<std::uint8_t> &output);
     [[nodiscard]] OuterFecStats stats() const;
     [[nodiscard]] OuterFecTiming timing() const noexcept;
 

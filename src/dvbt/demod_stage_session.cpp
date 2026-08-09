@@ -179,7 +179,8 @@ bool DemodStage::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
         state.workers =
             allocate_workers(state.selected_parameters.worker_threads);
         state.symbol_queue_capacity = buffered_symbol_count(
-            sync.bandwidth, state.fft_size + state.guard_size);
+            sync.bandwidth, state.fft_size + state.guard_size,
+            state.selected_parameters.queue_capacity_multiplier);
         fec_stage.set_capacity(state.symbol_queue_capacity);
         if (state.selected_parameters.constellation.has_value() &&
             state.selected_parameters.code_rate.has_value()) {

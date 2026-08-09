@@ -432,17 +432,17 @@ struct FecStage::Impl {
         }
         if (item.kind == FecItem::Kind::symbol) {
             const auto started_at = std::chrono::steady_clock::now();
-            auto output = decoder->process_soft_metrics(item.mother_metrics);
+            decoder->process_soft_metrics(item.mother_metrics, output_scratch);
             fec_work_ms += duration_ms(started_at);
-            emit_output(item.generation, output);
+            emit_output(item.generation, output_scratch);
             return;
         }
         if (item.kind == FecItem::Kind::end ||
             item.kind == FecItem::Kind::stream_end) {
             const auto started_at = std::chrono::steady_clock::now();
-            auto output = decoder->flush();
+            decoder->flush(output_scratch);
             fec_work_ms += duration_ms(started_at);
-            emit_output(item.generation, output);
+            emit_output(item.generation, output_scratch);
             const bool stream_end =
                 item.kind == FecItem::Kind::stream_end &&
                 callbacks.generation_current(item.generation);
@@ -501,6 +501,7 @@ struct FecStage::Impl {
     FecStageDiagnosticContext diagnostic_context;
     std::uint64_t fec_session{};
     std::unique_ptr<Decoder> decoder;
+    std::vector<std::uint8_t> output_scratch;
     std::uint64_t decoder_generation{};
     double fec_work_ms{};
     std::uint64_t window_transport_bytes{};

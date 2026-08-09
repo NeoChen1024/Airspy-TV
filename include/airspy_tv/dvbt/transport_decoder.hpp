@@ -82,9 +82,14 @@ class TransportDecoder {
     void set_diagnostic_handler(DiagnosticEventHandler handler);
     [[nodiscard]] std::vector<std::uint8_t>
     process(std::span<const float> punctured_llrs);
+    void process(std::span<const float> punctured_llrs,
+                 std::vector<std::uint8_t> &output);
     [[nodiscard]] std::vector<std::uint8_t>
     process_soft(std::span<const std::uint8_t> mother_metrics);
+    void process_soft(std::span<const std::uint8_t> mother_metrics,
+                      std::vector<std::uint8_t> &output);
     [[nodiscard]] std::vector<std::uint8_t> flush();
+    void flush(std::vector<std::uint8_t> &output);
     [[nodiscard]] TransportDecoderStats stats() const;
     [[nodiscard]] TransportDecoderTiming timing() const noexcept;
 

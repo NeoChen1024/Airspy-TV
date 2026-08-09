@@ -46,9 +46,14 @@ class SoftViterbi {
     void set_detailed_timing_enabled(bool enabled) noexcept;
     [[nodiscard]] std::vector<std::uint8_t>
     process(std::span<const float> llrs);
+    void process(std::span<const float> llrs,
+                 std::vector<std::uint8_t> &output);
     [[nodiscard]] std::vector<std::uint8_t>
     process_soft(std::span<const std::uint8_t> soft_metrics);
+    void process_soft(std::span<const std::uint8_t> soft_metrics,
+                      std::vector<std::uint8_t> &output);
     [[nodiscard]] std::vector<std::uint8_t> flush();
+    void flush(std::vector<std::uint8_t> &output);
     [[nodiscard]] std::size_t worker_count() const noexcept;
     [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> error_counts() const;
     [[nodiscard]] SoftViterbiTiming timing() const noexcept;

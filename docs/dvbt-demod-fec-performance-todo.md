@@ -398,12 +398,204 @@ is not repeated per symbol or ordinary re-anchor.
 
 - evaluate incremental complex channel interpolation to avoid repeated
   division and integer-to-float conversion;
-- evaluate a bounded payload/equalizer buffer pool only after allocation cost
-  is measured independently;
+- profile the remaining allocation sites before implementing a bounded
+  payload/equalizer buffer pool. A process-wide allocator A/B measured a small
+  CPU cost but no critical-path throughput gain, as detailed below;
 - tune symbol and Viterbi worker allocation only after serial demod and RS
-  costs fall enough for worker waits to dominate;
-- revisit demod/FEC queue capacity only for bounded burst tolerance, not as a
-  throughput optimization.
+  costs fall enough for worker waits to dominate.
+
+### Offline queue-capacity multiplier
+
+The earlier conclusion that the demod-to-FEC queue could only improve burst
+tolerance was revisited after the allocation work made the two stages more
+closely matched. The current 10 MS/s, 6 MHz, 8K, guard-1/4 pipeline has these
+buffer boundaries at the default 1x setting:
+
+| Boundary | Capacity | Approximate duration | Multiplied offline |
+| --- | ---: | ---: | --- |
+| File/source to frontend IQ queue | 2,000,000 complex samples | 0.200 s at 10 MS/s | no |
+| Frontend to demod resampled ring | 2,000,000 complex samples | 0.292 s at 48/7 MS/s | no |
+| Demod symbol-worker outstanding work | 134 symbols | 0.200 s | yes |
+| Demod to serial FEC queue | 134 items/symbols | 0.200 s | yes |
+| FEC to Viterbi worker queue | 1,024 windows | more than 0.200 s at maximum useful bitrate | no |
+| Offline asynchronous TS output | 24 MiB | output-rate dependent | no |
+
+The resampled ring is intentionally excluded: increasing it changes the safe
+application delay for sample-clock and carrier-frequency corrections, so it is
+not merely queue tuning. The source IQ queue is also excluded after an
+isolation test showed that extra file prefetch was not needed for the gain. The
+already-large Viterbi and exact-output queues were not implicated by the
+observed backpressure either.
+
+`--offline-queue-multiplier N`, limited to 1 through 16, scales the symbol
+worker and FEC capacities. It is rejected unless `--decode-iq` is selected, so
+GUI and CLI live decoding remain at 1x. Offline decoding defaults to 4x;
+passing 1 restores the previous capacities.
+
+An initial capacity-range experiment scaled the IQ and symbol/FEC queues
+together. The complete 150.283-second `557mhz-horizontal` capture was measured
+in three interleaved runs per setting after one warm-up:
+
+| Multiplier | Wall mean / sample SD | Realtime | User + system CPU | Mean maximum RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 1x | 12.633 / 0.172 s | 11.896x | 122.830 s | 167.9 MiB |
+| 2x | 12.277 / 0.586 s | 12.241x | 123.993 s | 187.1 MiB |
+| 4x | 11.850 / 0.079 s | 12.682x | 123.453 s | 224.3 MiB |
+| 8x | 11.800 / 0.115 s | 12.736x | 123.320 s | 273.8 MiB |
+
+Four times was the useful range: 8x saved only another 0.4% and used about
+49.5 MiB more memory. Two times crossed the burst-size threshold inconsistently
+and had much higher run-to-run variation. A follow-up held the IQ queue at 1x
+and scaled only the symbol/FEC queues, with five runs at each endpoint:
+
+| Final scope | Wall mean / sample SD | Realtime | User + system CPU | Mean maximum RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 1x | 12.626 / 0.147 s | 11.903x | 122.702 s | 167.9 MiB |
+| FEC 4x | 11.976 / 0.165 s | 12.549x | 123.590 s | 192.8 MiB |
+
+FEC-only 4x is therefore the default tradeoff. It reduced wall time by 5.15%,
+at a 24.9 MiB RSS cost. Total CPU increased by 0.72%, confirming that the wall
+gain comes from greater stage overlap rather than less computation. Compared
+with scaling both queues, it recovered about 31.5 MiB with no material loss of
+throughput.
+
+The final reporting-enabled pair observed the FEC capacity change from 134 to
+536 symbols, while both the IQ queue and resampled ring stayed at 2,000,000
+samples. The FEC queue was completely full in 5 of 13 one-second snapshots at
+1x versus 0 of 12 at 4x; mean occupancy changed from 72.4% to 60.1%. Complete
+1x and FEC-only 4x transport outputs were byte-identical
+(`bb23ce20e8263b92f772320e9919fcfb1a2c09d3a84470c15272114712b2ca28`).
+
+This does not make an arbitrarily large queue a sustained-throughput fix. The
+gain is specific to preventing the current gate-window and FEC work bursts
+from repeatedly synchronizing two near-equal stages; capacity should be
+remeasured after either stage's service-time distribution changes.
+
+### Process allocator A/B
+
+The allocation-cost screening test used the Release build at `95894ed`, the
+complete 150.283-second `557mhz-horizontal.cs16` capture, automatic worker
+selection, reporting disabled, and transport output to `/dev/null`. Each
+allocator received one warm-up followed by five timed runs in an interleaved
+order. Only `LD_PRELOAD` changed. The alternatives were gperftools 2.18.1
+`libtcmalloc_minimal.so.4` and jemalloc 5.3.1 `libjemalloc.so.2`; glibc 2.44 was
+the baseline.
+
+| Allocator | Wall mean / sample SD | Realtime | User CPU mean | System CPU mean | User + system mean | Median RSS | Median minor faults |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| glibc | 12.586 / 0.103 s | 11.940x | 121.894 s | 2.590 s | 124.484 s | 167.8 MiB | 22,719 |
+| tcmalloc minimal | 12.574 / 0.061 s | 11.952x | 120.610 s | 2.530 s | 123.140 s | 161.9 MiB | 12,395 |
+| jemalloc | 12.680 / 0.084 s | 11.852x | 122.198 s | 2.756 s | 124.954 s | 242.7 MiB | 36,052 |
+
+tcmalloc reduced total process CPU by 1.08%, minor faults by 45.4%, and median
+RSS by 3.5%, but its 0.095% realtime improvement is much smaller than the
+run-to-run wall variation. The CPU saving therefore did not shorten the
+serial demod/FEC critical path in this workload. Default jemalloc was 0.75%
+slower than glibc and increased median RSS by 44.6%.
+
+Do not add an allocator dependency or change the default based on this result.
+The tcmalloc CPU reduction is useful evidence that allocation churn still
+exists, but a payload/equalizer pool needs allocation-site profiling and a
+measured reduction in the relevant demod timing bucket before implementation.
+
+### Allocation count and call-site profile
+
+Allocation counts were measured separately from the allocator A/B. A temporary
+glibc interposer counted `malloc`, `calloc`, `realloc`, aligned allocation, and
+C++ `new` calls by thread without taking stack traces. Two complete
+150.283-second decodes took 12.66 and 12.46 seconds, so the counter did not add
+visible wall overhead relative to the 12.586-second uninstrumented mean. The
+two runs made 2,882,864 and 2,890,862 allocation requests; the mean is
+2,886,863 requests, or 19,210 requests per second of input signal. They also
+requested 101.70 GB cumulatively. This is requested-size churn, not resident
+memory or proof that every byte is touched.
+
+| Thread group | Mean requests | Share | Requested bytes | Mean requested size |
+| --- | ---: | ---: | ---: | ---: |
+| Six symbol workers | 1,004,240 | 34.79% | 80.19 GB | 79,848 bytes |
+| Serial FEC coordinator | 919,575 | 31.85% | 7.59 GB | 8,259 bytes |
+| Six Viterbi workers | 632,701 | 21.92% | 329.58 MB | 521 bytes |
+| Serial demodulator | 327,385 | 11.34% | 7.45 GB | 22,764 bytes |
+| Other threads | 2,962 | 0.10% | 6.14 GB | 2.07 MB |
+
+The "other" bytes are dominated by the file-source input blocks, which are
+large but rare. Symbol and Viterbi worker counts are deterministic in these
+runs. FEC request count varied by 0.74% with scheduler-dependent handoff batch
+sizes; demod varied by 0.36%, mainly in startup/planning work.
+
+A gperftools cumulative heap profile of the 20-second prefix attributed
+441,828 requests versus 443,680 from the exact counter in a separate decode,
+covering 99.58% of requests. The leading application call sites were:
+
+| Allocation call site | Requests | Requested bytes | Interpretation |
+| --- | ---: | ---: | --- |
+| `SymbolPostprocessorPool::process` | 120,456 | 10.68 GB | Nine work vectors for each of 13,384 symbols |
+| `SoftViterbi::Impl::run_worker` | 84,350 | 44.44 MB | Per-window decoder result allocation |
+| `SoftViterbi::Impl::dispatch_ready_windows` | 45,672 | 692.42 MB | Ordered Viterbi input/window assembly |
+| `OuterFec::Impl::process` | 42,624 | 39.33 MB | Outer-FEC intermediate/output vectors |
+| `DemodStage::Impl::demod_dispatch_payload` | 26,775 | 971.36 MB | Payload and equalizer-power vectors; normally two per symbol |
+| `TransportDecoder::Impl::process_viterbi_output` | 16,282 | 98.95 MB | Per-window packet and aggregate output vectors |
+| `SoftViterbi::Impl::take_ready_locked` | 15,878 | 106.72 MB | Ordered decoded-byte collection |
+| `SymbolPostprocessorPool::run_worker` | 13,384 | 1.93 MB | One completed-map node per symbol |
+| `DemodStage::Impl::demod_process_batch` | 3,346 | 1.39 MB | Ordered batch aggregation |
+| `FecStage::enqueue` | 2,684 | 1.18 MB | Queue-node allocation |
+| `AsyncTransportOutput::submit` | 1,709 | 77.89 MB | Required offline output block copy |
+
+The 62,910 requests not attributed to an application frame were predominantly
+the one-time FFTW `MEASURE` plan and accounted for 109.81 MB. They do not recur
+per symbol or ordinary re-anchor and are not a buffer-pool target.
+
+Seven of the nine allocations in `SymbolPostprocessorPool::process` are pure
+scratch. The reliability and mother-metric vectors leave the worker and require
+an ownership-transfer design; they cannot use the same worker scratch safely.
+The two payload vectors allocated by the demod thread also leave that thread.
+
+### Implemented allocation-churn reduction
+
+Allocation status (2026-08-09): the low-risk worker-local and FEC-owned reuse
+paths are implemented. Each symbol worker now owns pre-sized nearest-point,
+error, equalizer-order, demap, deinterleave, bit-order, and depuncture scratch.
+The reliability and mother-metric outputs retain their existing move ownership.
+This reduced `SymbolPostprocessorPool::process` from 120,456 to 26,768
+allocations on the 20-second profile: exactly seven removals for each of 13,384
+symbols. The six workers perform 42 scratch allocations during startup.
+
+The FEC data path now supports caller-retained output capacity while preserving
+the original return-by-value APIs for existing callers and tests. `FecStage`
+owns the reusable callback buffer, `TransportDecoder` owns its decoded Viterbi
+scratch, and `OuterFec` appends directly to the final buffer. Soft-Viterbi task
+metric and result-byte vectors are recycled inside the bounded worker pool.
+Buffer ownership does not cross the GUI/CLI boundary; both continue to use the
+same `FecStage` and synchronous transport callback.
+
+| 20-second cumulative heap profile | Requests | Requested bytes | Request reduction |
+| --- | ---: | ---: | ---: |
+| Before churn work | 441,828 | 13.78 GB | -- |
+| Symbol worker scratch | 351,863 | 4.06 GB | 20.36% |
+| Direct/reusable FEC output | 274,129 | 3.82 GB | 37.95% |
+| Viterbi task/result recycling | 192,396 | 3.10 GB | 56.45% |
+
+The final profile reduced cumulative requested bytes by 77.48%. The remaining
+leading steady call sites are two required symbol outputs per OFDM symbol, one
+completed-map node per symbol and Viterbi window, the two demod payload vectors,
+and the required asynchronous output copy. Replacing the out-of-order completed
+maps with custom rings or recycling buffers across the demod/FEC callback
+boundary would change backpressure or ownership semantics and is deferred until
+the smaller measured gain justifies that complexity.
+
+Five complete non-reporting Release runs of `557mhz-horizontal` averaged
+12.524 seconds with a 0.179-second sample standard deviation, or 12.000x
+realtime. The pre-change allocator baseline was 12.586 / 0.103 seconds and
+11.940x. Mean user-plus-system CPU fell from 124.484 to 122.422 seconds (1.66%)
+while wall time improved 0.49%. The 20-second TS was byte-identical to the
+pre-change binary.
+
+The reporting-enabled 180-second `545M-DVB-T-公視-3` prefix completed at
+12.014x realtime with the expected 711-packet marginal burst, two initial
+alignment searches, no alignment miss or outer-FEC reset, and final RS/energy
+synchronization. Timing confidence remained 1.0; near 155 seconds the estimated,
+commanded, and applied SRO were 0.1810, 0.1810, and 0.1808 ppm. This preserves
+the long-prefix cadence regression guard.
 
 ## Validation requirements
 
@@ -435,7 +627,8 @@ pressure, and deterministic recovery boundaries.
 Do not prioritize the following based on the current evidence:
 
 - splitting the serial demod ownership loop into another stage;
-- increasing FEC queue capacity as a throughput fix;
+- increasing the offline queue multiplier beyond the measured 4x default
+  without a workload-specific A/B;
 - adding Viterbi workers before separating Viterbi wait from RS coordinator
   time;
 - TPS, CIR-analysis, CFO-tracking, or reacquisition optimization;

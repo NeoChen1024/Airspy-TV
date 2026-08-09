@@ -526,16 +526,19 @@ void submit_in_blocks(StreamDecoder &decoder,
 [[nodiscard]] DecodeResult
 decode_in_blocks(const std::span<const std::int16_t> iq,
                  const std::span<const std::size_t> block_sizes,
-                 const std::size_t worker_threads = 8) {
+                 const std::size_t worker_threads = 8,
+                 const std::size_t queue_capacity_multiplier = 1) {
     DecodeResult result;
     std::mutex callback_mutex;
     StreamDecoder decoder;
-    decoder.set_parameters({.channel_bandwidth_hz = channel_bandwidth,
-                            .mode = TransmissionMode::k8,
-                            .guard_interval = GuardInterval::gi_1_4,
-                            .constellation = Constellation::qpsk,
-                            .code_rate = CodeRate::rate_1_2,
-                            .worker_threads = worker_threads});
+    decoder.set_parameters(
+        {.channel_bandwidth_hz = channel_bandwidth,
+         .mode = TransmissionMode::k8,
+         .guard_interval = GuardInterval::gi_1_4,
+         .constellation = Constellation::qpsk,
+         .code_rate = CodeRate::rate_1_2,
+         .worker_threads = worker_threads,
+         .queue_capacity_multiplier = queue_capacity_multiplier});
     decoder.set_transport_callback(
         [&result, &callback_mutex](const std::span<const std::uint8_t> output) {
             const std::scoped_lock lock(callback_mutex);
@@ -558,6 +561,26 @@ decode_in_blocks(const std::span<const std::int16_t> iq,
         result.pipeline = decoder.pipeline_snapshot();
     }
     return result;
+}
+
+void test_8k_queue_capacity_multiplier() {
+    const auto encoded = encode_transport();
+    const auto iq = make_iq(encoded.metrics);
+    constexpr std::array<std::size_t, 5> block_sizes{4097, 12345, 8191, 777,
+                                                     16384};
+    const auto baseline = decode_in_blocks(iq, block_sizes, 4, 1);
+    const auto scaled = decode_in_blocks(iq, block_sizes, 4, 4);
+    require(scaled.stats.input_queue_capacity_samples ==
+                baseline.stats.input_queue_capacity_samples,
+            "offline multiplier unexpectedly changed the IQ queue");
+    require(scaled.stats.symbol_queue_capacity ==
+                baseline.stats.symbol_queue_capacity * 4,
+            "offline multiplier did not scale the FEC queue");
+    require(scaled.stats.ring_capacity_samples ==
+                baseline.stats.ring_capacity_samples,
+            "offline multiplier unexpectedly changed the resampled ring");
+    require(scaled.transport == baseline.transport,
+            "queue capacity changed decoded transport bytes");
 }
 
 void test_8k_worker_count_parity() {
@@ -1045,6 +1068,7 @@ int main() {
         run("cfo-drift", test_8k_frontend_cfo_drift_tracking);
         run("cfo-rebootstrap", test_8k_frontend_abrupt_cfo_rebootstrap);
         run("worker-parity", test_8k_worker_count_parity);
+        run("queue-capacity", test_8k_queue_capacity_multiplier);
         run("reset-new", test_8k_reset_then_new_stream);
         run("reset-hopeless", test_8k_reset_after_hopeless_stream);
         run("reset-live", test_8k_reset_live_resume);

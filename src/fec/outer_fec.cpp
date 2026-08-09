@@ -366,8 +366,8 @@ struct OuterFec::Impl {
                                  .fields = std::move(fields)});
     }
 
-    [[nodiscard]] std::vector<std::uint8_t>
-    process(const std::span<const std::uint8_t> decoded) {
+    void process(const std::span<const std::uint8_t> decoded,
+                 std::vector<std::uint8_t> &transport_stream) {
         constexpr std::size_t maximum_search = 32 * rs_packet_size;
         if (selected_outer_phase == outer_interleaver_branches) {
             TimingScope alignment_timer(timer(timing.alignment_ms));
@@ -420,7 +420,7 @@ struct OuterFec::Impl {
                 (!alignment_search_done ||
                  alignment_search_bytes >= next_search_interval);
             if (!search_requested) {
-                return {};
+                return;
             }
             alignment_search_done = true;
             alignment_search_bytes = 0;
@@ -529,7 +529,7 @@ struct OuterFec::Impl {
                               static_cast<std::uint64_t>(
                                   selected_evidence.rs_successes)}});
                     }
-                    return {};
+                    return;
                 }
                 pending_alignment_bit_offset = bit_alignment_phases;
                 pending_alignment_phase = outer_interleaver_branches;
@@ -588,7 +588,7 @@ struct OuterFec::Impl {
                 }
             }
             if (!statistics.rs_synchronized) {
-                return {};
+                return;
             }
         } else {
             std::span<const std::uint8_t> repacked;
@@ -606,22 +606,20 @@ struct OuterFec::Impl {
             {
                 TimingScope buffer_timer(timer(timing.buffer_ms));
                 if (rs_cursor != 0) {
-                    rs_bytes.erase(
-                        rs_bytes.begin(),
-                        rs_bytes.begin() +
-                            static_cast<std::ptrdiff_t>(rs_cursor));
+                    rs_bytes.erase(rs_bytes.begin(),
+                                   rs_bytes.begin() +
+                                       static_cast<std::ptrdiff_t>(rs_cursor));
                     rs_cursor = 0;
                 }
-                rs_bytes.insert(rs_bytes.end(),
-                                deinterleaved_scratch.begin(),
+                rs_bytes.insert(rs_bytes.end(), deinterleaved_scratch.begin(),
                                 deinterleaved_scratch.end());
             }
         }
 
-        std::vector<std::uint8_t> transport_stream;
-        transport_stream.reserve(((rs_bytes.size() - rs_cursor) /
-                                  rs_packet_size) *
-                                 ts_packet_size);
+        transport_stream.reserve(
+            transport_stream.size() +
+            (((rs_bytes.size() - rs_cursor) / rs_packet_size) *
+             ts_packet_size));
         while (rs_bytes.size() - rs_cursor >= rs_packet_size) {
             const bool sample_packet =
                 detailed_timing_enabled &&
@@ -630,8 +628,7 @@ struct OuterFec::Impl {
                 static_cast<double>(detailed_timing_sample_interval);
             const std::span<const std::uint8_t> codeword{
                 rs_bytes.data() + rs_cursor, rs_packet_size};
-            const auto received_randomized =
-                codeword.first(ts_packet_size);
+            const auto received_randomized = codeword.first(ts_packet_size);
             std::array<std::uint8_t, ts_packet_size> randomized{};
             std::uint64_t corrected_payload_bits = 0;
             int corrected_symbols = -1;
@@ -798,7 +795,6 @@ struct OuterFec::Impl {
             }
         }
         statistics.energy_synchronized = energy_descrambler.synchronized();
-        return transport_stream;
     }
 
     std::array<BitRepacker, bit_alignment_phases> bit_repackers;
@@ -859,7 +855,14 @@ void OuterFec::set_diagnostic_handler(DiagnosticEventHandler handler) {
 
 std::vector<std::uint8_t>
 OuterFec::process(const std::span<const std::uint8_t> hard_bytes) {
-    return impl_->process(hard_bytes);
+    std::vector<std::uint8_t> output;
+    impl_->process(hard_bytes, output);
+    return output;
+}
+
+void OuterFec::process(const std::span<const std::uint8_t> hard_bytes,
+                       std::vector<std::uint8_t> &output) {
+    impl_->process(hard_bytes, output);
 }
 
 OuterFecStats OuterFec::stats() const { return impl_->statistics; }

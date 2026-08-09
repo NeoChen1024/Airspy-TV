@@ -118,16 +118,35 @@ class SymbolPostprocessorPool {
         std::size_t symbol_index{};
     };
 
-    [[nodiscard]] PostprocessedSymbol process(Task task) const {
+    struct WorkerScratch {
+        WorkerScratch(const std::size_t carrier_count,
+                      const std::size_t bits_per_carrier,
+                      const CodeRate code_rate)
+            : nearest(carrier_count), errors(carrier_count),
+              equalizer_power_order(carrier_count),
+              demapped(carrier_count * bits_per_carrier),
+              symbol_metrics(demapped.size()), bit_metrics(demapped.size()),
+              depunctured(depunctured_size(bit_metrics.size(), code_rate)) {}
+
+        std::vector<std::complex<float>> nearest;
+        std::vector<float> errors;
+        std::vector<float> equalizer_power_order;
+        std::vector<float> demapped;
+        std::vector<float> symbol_metrics;
+        std::vector<float> bit_metrics;
+        std::vector<float> depunctured;
+    };
+
+    [[nodiscard]] PostprocessedSymbol process(Task task,
+                                              WorkerScratch &scratch) const {
         const auto preprocess_started_at = std::chrono::steady_clock::now();
-        std::vector<std::complex<float>> nearest(task.carriers.size());
         for (int iteration = 0; iteration < 2; ++iteration) {
-            reference_.slice_nearest(task.carriers, nearest);
+            reference_.slice_nearest(task.carriers, scratch.nearest);
             std::complex<double> numerator{};
             double denominator = 0.0;
             for (std::size_t index = 0; index < task.carriers.size(); ++index) {
                 const auto value = task.carriers[index];
-                const auto reference = nearest[index];
+                const auto reference = scratch.nearest[index];
                 numerator +=
                     std::conj(static_cast<std::complex<double>>(reference)) *
                     static_cast<std::complex<double>>(value);
@@ -143,26 +162,27 @@ class SymbolPostprocessorPool {
             }
         }
 
-        std::vector<float> errors;
-        errors.reserve(task.carriers.size());
-        reference_.slice_nearest(task.carriers, nearest);
+        reference_.slice_nearest(task.carriers, scratch.nearest);
         for (std::size_t index = 0; index < task.carriers.size(); ++index) {
-            errors.push_back(std::norm(task.carriers[index] - nearest[index]));
+            scratch.errors[index] =
+                std::norm(task.carriers[index] - scratch.nearest[index]);
         }
         const double mean_error =
-            std::accumulate(errors.begin(), errors.end(), 0.0) /
-            static_cast<double>(errors.size());
-        auto middle =
-            errors.begin() + static_cast<std::ptrdiff_t>(errors.size() / 2);
-        std::ranges::nth_element(errors, middle);
+            std::accumulate(scratch.errors.begin(), scratch.errors.end(), 0.0) /
+            static_cast<double>(scratch.errors.size());
+        auto middle = scratch.errors.begin() +
+                      static_cast<std::ptrdiff_t>(scratch.errors.size() / 2);
+        std::ranges::nth_element(scratch.errors, middle);
         const float reliability =
             1.0F / std::max(*middle / std::log(2.0F), 1.0e-4F);
 
-        auto equalizer_power_order = task.equalizer_power;
-        auto equalizer_middle =
-            equalizer_power_order.begin() +
-            static_cast<std::ptrdiff_t>(equalizer_power_order.size() / 2);
-        std::ranges::nth_element(equalizer_power_order, equalizer_middle);
+        std::ranges::copy(task.equalizer_power,
+                          scratch.equalizer_power_order.begin());
+        auto equalizer_middle = scratch.equalizer_power_order.begin() +
+                                static_cast<std::ptrdiff_t>(
+                                    scratch.equalizer_power_order.size() / 2);
+        std::ranges::nth_element(scratch.equalizer_power_order,
+                                 equalizer_middle);
         const float median_equalizer_power =
             std::max(*equalizer_middle, minimum_power);
         std::vector<float> reliabilities(task.carriers.size());
@@ -174,25 +194,21 @@ class SymbolPostprocessorPool {
                 reliability * std::clamp(relative_channel_power, 0.01F, 16.0F);
         }
 
-        const std::size_t metric_count =
-            task.carriers.size() * bits_per_carrier_;
-        std::vector<float> demapped(metric_count);
-        std::vector<float> symbol_metrics(metric_count);
-        std::vector<float> bit_metrics(metric_count);
         const auto demap_started_at = std::chrono::steady_clock::now();
-        reference_.demap(task.carriers, reliabilities, demapped);
+        reference_.demap(task.carriers, reliabilities, scratch.demapped);
         const auto deinterleave_started_at = std::chrono::steady_clock::now();
-        symbol_deinterleaver_.process(demapped, bits_per_carrier_,
-                                      task.symbol_index, symbol_metrics);
-        bit_deinterleave(symbol_metrics, bits_per_carrier_, bit_metrics);
+        symbol_deinterleaver_.process(scratch.demapped, bits_per_carrier_,
+                                      task.symbol_index,
+                                      scratch.symbol_metrics);
+        bit_deinterleave(scratch.symbol_metrics, bits_per_carrier_,
+                         scratch.bit_metrics);
         const auto depuncture_started_at = std::chrono::steady_clock::now();
-        std::vector<float> depunctured(
-            depunctured_size(bit_metrics.size(), code_rate_));
-        depuncture(bit_metrics, code_rate_, depunctured);
-        std::vector<std::uint8_t> mother_metrics(depunctured.size());
-        for (std::size_t index = 0; index < depunctured.size(); ++index) {
-            const float soft =
-                std::clamp(127.5F + (depunctured[index] * 8.0F), 0.0F, 255.0F);
+        depuncture(scratch.bit_metrics, code_rate_, scratch.depunctured);
+        std::vector<std::uint8_t> mother_metrics(scratch.depunctured.size());
+        for (std::size_t index = 0; index < scratch.depunctured.size();
+             ++index) {
+            const float soft = std::clamp(
+                127.5F + (scratch.depunctured[index] * 8.0F), 0.0F, 255.0F);
             mother_metrics[index] = static_cast<std::uint8_t>(soft + 0.5F);
         }
         const auto finished_at = std::chrono::steady_clock::now();
@@ -219,6 +235,8 @@ class SymbolPostprocessorPool {
     }
 
     void run_worker() {
+        WorkerScratch scratch(payload_carrier_count(mode_), bits_per_carrier_,
+                              code_rate_);
         while (true) {
             Task task;
             {
@@ -234,7 +252,7 @@ class SymbolPostprocessorPool {
             space_available_.notify_one();
             try {
                 const std::uint64_t sequence = task.sequence;
-                auto result = process(std::move(task));
+                auto result = process(std::move(task), scratch);
                 const std::scoped_lock lock(mutex_);
                 completed_.emplace(sequence, std::move(result));
             } catch (...) {

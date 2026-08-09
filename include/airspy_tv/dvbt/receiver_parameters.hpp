@@ -21,6 +21,10 @@ struct ReceiverParameters {
     // symbol postprocessor and Viterbi pools and is fixed before opening a
     // source because changing it reconstructs both pools.
     std::size_t worker_threads{};
+    // Capacity multiplier for the demod symbol-worker and FEC queues. Live and
+    // GUI receivers leave this at one; decoder-paced offline input may
+    // increase it to absorb stage-to-stage bursts.
+    std::size_t queue_capacity_multiplier{1};
 };
 
 } // namespace airspy_tv::dvbt

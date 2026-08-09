@@ -357,8 +357,11 @@ void StreamDecoder::reset() {
 }
 
 void StreamDecoder::set_parameters(const ReceiverParameters &parameters) {
-    impl_->analyzer.set_parameters(parameters);
-    impl_->demod_stage->set_parameters(parameters);
+    auto normalized = parameters;
+    normalized.queue_capacity_multiplier =
+        std::max<std::size_t>(1, normalized.queue_capacity_multiplier);
+    impl_->analyzer.set_parameters(normalized);
+    impl_->demod_stage->set_parameters(normalized);
 
     // A live SDR producer never becomes globally idle: it may keep filling the
     // input queue/ring while the GUI changes a demodulator setting. Wait only

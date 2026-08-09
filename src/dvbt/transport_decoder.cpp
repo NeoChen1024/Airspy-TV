@@ -46,6 +46,8 @@ struct TransportDecoder::Impl {
 
     void reset() {
         punctured_metrics.clear();
+        mother_scratch.clear();
+        decoded_scratch.clear();
         viterbi.reset();
         outer.reset();
         statistics = {};
@@ -65,6 +67,13 @@ struct TransportDecoder::Impl {
 
     [[nodiscard]] std::vector<std::uint8_t>
     process(const std::span<const float> input) {
+        std::vector<std::uint8_t> output;
+        process(input, output);
+        return output;
+    }
+
+    void process(const std::span<const float> input,
+                 std::vector<std::uint8_t> &output) {
         punctured_metrics.insert(punctured_metrics.end(), input.begin(),
                                  input.end());
         const std::size_t period = [&] {
@@ -85,45 +94,56 @@ struct TransportDecoder::Impl {
         const std::size_t aligned =
             punctured_metrics.size() - (punctured_metrics.size() % period);
         if (aligned == 0) {
-            return {};
+            output.clear();
+            return;
         }
 
-        std::vector<float> mother(depunctured_size(aligned, code_rate));
+        mother_scratch.resize(depunctured_size(aligned, code_rate));
         depuncture(std::span<const float>{punctured_metrics}.first(aligned),
-                   code_rate, mother);
+                   code_rate, mother_scratch);
         punctured_metrics.erase(punctured_metrics.begin(),
                                 punctured_metrics.begin() +
                                     static_cast<std::ptrdiff_t>(aligned));
 
-        std::vector<std::uint8_t> decoded;
         {
             TimingScope viterbi_timer(timer(timing.viterbi_wall_ms));
-            decoded = viterbi.process(mother);
+            viterbi.process(mother_scratch, decoded_scratch);
         }
-        return process_viterbi_output(decoded);
+        process_viterbi_output(decoded_scratch, output);
     }
 
     [[nodiscard]] std::vector<std::uint8_t>
     process_soft(const std::span<const std::uint8_t> mother_metrics) {
-        std::vector<std::uint8_t> decoded;
+        std::vector<std::uint8_t> output;
+        process_soft(mother_metrics, output);
+        return output;
+    }
+
+    void process_soft(const std::span<const std::uint8_t> mother_metrics,
+                      std::vector<std::uint8_t> &output) {
         {
             TimingScope viterbi_timer(timer(timing.viterbi_wall_ms));
-            decoded = viterbi.process_soft(mother_metrics);
+            viterbi.process_soft(mother_metrics, decoded_scratch);
         }
-        return process_viterbi_output(decoded);
+        process_viterbi_output(decoded_scratch, output);
     }
 
     [[nodiscard]] std::vector<std::uint8_t> flush() {
-        std::vector<std::uint8_t> decoded;
-        {
-            TimingScope viterbi_timer(timer(timing.viterbi_wall_ms));
-            decoded = viterbi.flush();
-        }
-        return process_viterbi_output(decoded);
+        std::vector<std::uint8_t> output;
+        flush(output);
+        return output;
     }
 
-    [[nodiscard]] std::vector<std::uint8_t>
-    process_viterbi_output(const std::span<const std::uint8_t> decoded) {
+    void flush(std::vector<std::uint8_t> &output) {
+        {
+            TimingScope viterbi_timer(timer(timing.viterbi_wall_ms));
+            viterbi.flush(decoded_scratch);
+        }
+        process_viterbi_output(decoded_scratch, output);
+    }
+
+    void process_viterbi_output(const std::span<const std::uint8_t> decoded,
+                                std::vector<std::uint8_t> &transport_stream) {
         constexpr std::size_t output_bytes = fec::viterbi_output_bytes;
         if (decoded.size() % output_bytes != 0) {
             throw std::runtime_error("misaligned Viterbi window output");
@@ -133,19 +153,15 @@ struct TransportDecoder::Impl {
                                     : std::chrono::steady_clock::time_point{};
         const double outer_started_ms = timing.outer_wall_ms;
         const double output_started_ms = timing.transport_output_ms;
-        std::vector<std::uint8_t> transport_stream;
+        transport_stream.clear();
+        transport_stream.reserve(decoded.size());
         for (std::size_t offset = 0; offset < decoded.size();
              offset += output_bytes) {
             statistics.viterbi_bits += output_bytes * 8;
-            std::vector<std::uint8_t> packets;
             {
                 TimingScope outer_timer(timer(timing.outer_wall_ms));
-                packets = outer.process(decoded.subspan(offset, output_bytes));
-            }
-            {
-                TimingScope output_timer(timer(timing.transport_output_ms));
-                transport_stream.insert(transport_stream.end(), packets.begin(),
-                                        packets.end());
+                outer.process(decoded.subspan(offset, output_bytes),
+                              transport_stream);
             }
         }
         if (detailed_timing_enabled) {
@@ -157,7 +173,6 @@ struct TransportDecoder::Impl {
                 0.0, elapsed - (timing.outer_wall_ms - outer_started_ms) -
                          (timing.transport_output_ms - output_started_ms));
         }
-        return transport_stream;
     }
 
     [[nodiscard]] TransportDecoderTiming current_timing() const noexcept {
@@ -173,8 +188,7 @@ struct TransportDecoder::Impl {
         result.outer_bit_repack_ms = outer_timing.bit_repack_ms;
         result.outer_byte_deinterleave_ms = outer_timing.byte_deinterleave_ms;
         result.outer_rs_decode_ms = outer_timing.rs_decode_ms;
-        result.outer_rs_codeword_copy_ms =
-            outer_timing.rs_codeword_copy_ms;
+        result.outer_rs_codeword_copy_ms = outer_timing.rs_codeword_copy_ms;
         result.outer_rs_syndrome_ms = outer_timing.rs_syndrome_ms;
         result.outer_rs_error_locator_ms = outer_timing.rs_error_locator_ms;
         result.outer_rs_correction_ms = outer_timing.rs_correction_ms;
@@ -189,6 +203,8 @@ struct TransportDecoder::Impl {
     fec::SoftViterbi viterbi;
     fec::OuterFec outer;
     std::vector<float> punctured_metrics;
+    std::vector<float> mother_scratch;
+    std::vector<std::uint8_t> decoded_scratch;
     TransportDecoderStats statistics;
     bool detailed_timing_enabled{};
     TransportDecoderTiming timing;
@@ -219,12 +235,27 @@ TransportDecoder::process(const std::span<const float> punctured_llrs) {
     return impl_->process(punctured_llrs);
 }
 
+void TransportDecoder::process(const std::span<const float> punctured_llrs,
+                               std::vector<std::uint8_t> &output) {
+    impl_->process(punctured_llrs, output);
+}
+
 std::vector<std::uint8_t> TransportDecoder::process_soft(
     const std::span<const std::uint8_t> mother_metrics) {
     return impl_->process_soft(mother_metrics);
 }
 
+void TransportDecoder::process_soft(
+    const std::span<const std::uint8_t> mother_metrics,
+    std::vector<std::uint8_t> &output) {
+    impl_->process_soft(mother_metrics, output);
+}
+
 std::vector<std::uint8_t> TransportDecoder::flush() { return impl_->flush(); }
+
+void TransportDecoder::flush(std::vector<std::uint8_t> &output) {
+    impl_->flush(output);
+}
 
 TransportDecoderStats TransportDecoder::stats() const {
     auto statistics = impl_->statistics;

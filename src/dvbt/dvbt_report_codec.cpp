@@ -397,7 +397,8 @@ encode_dvbt_decoder_config(const dvbt::ReceiverParameters &parameters) {
         {"constellation",
          optional_parameter(parameters.constellation, constellation_name)},
         {"code_rate", optional_parameter(parameters.code_rate, code_rate_name)},
-        {"worker_threads", parameters.worker_threads}};
+        {"worker_threads", parameters.worker_threads},
+        {"queue_capacity_multiplier", parameters.queue_capacity_multiplier}};
 }
 
 void format_debug_telemetry(std::ostream &stream,
