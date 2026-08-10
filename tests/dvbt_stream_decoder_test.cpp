@@ -1,15 +1,19 @@
 #include "airspy_tv/dvbt/stream_decoder.hpp"
 
 #include "airspy_tv/dvbt/inner_decoder.hpp"
+#include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 #include "airspy_tv/dvbt/soft_demapper.hpp"
 #include "airspy_tv/fec/reed_solomon.hpp"
 #include <fftw3.h>
 
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -96,7 +100,7 @@ void require(const bool condition, const std::string_view message) {
 }
 
 [[nodiscard]] std::vector<std::uint8_t>
-make_transport_stream(const std::size_t count) {
+make_transport_stream(const std::size_t count, const std::uint8_t salt = 0) {
     std::vector<std::uint8_t> stream(count * ts_packet_size);
     for (std::size_t packet = 0; packet < count; ++packet) {
         const std::size_t offset = packet * ts_packet_size;
@@ -107,7 +111,7 @@ make_transport_stream(const std::size_t count) {
             0x10U | static_cast<std::uint8_t>(packet & 0x0FU));
         for (std::size_t byte = 4; byte < ts_packet_size; ++byte) {
             stream[offset + byte] = static_cast<std::uint8_t>(
-                ((packet * 29U) + (byte * 17U) + 3U) & 0xFFU);
+                ((packet * 29U) + (byte * 17U) + 3U + salt) & 0xFFU);
         }
     }
     return stream;
@@ -254,9 +258,9 @@ struct EncodedStream {
     std::vector<float> metrics;
 };
 
-[[nodiscard]] EncodedStream encode_transport() {
+[[nodiscard]] EncodedStream encode_transport(const std::uint8_t salt = 0) {
     EncodedStream result;
-    result.transport = make_transport_stream(packet_count);
+    result.transport = make_transport_stream(packet_count, salt);
     const auto randomized = energy_scramble(result.transport);
     const auto rs = rs_encode(randomized);
     const auto interleaved = outer_interleave(rs);
@@ -297,8 +301,52 @@ payload_indices(const std::size_t phase) {
                                : std::complex<float>{-4.0F / 3.0F, 0.0F};
 }
 
+[[nodiscard]] constexpr std::array<std::uint8_t, 68> make_tps_frame() {
+    std::array<std::uint8_t, 68> bits{};
+    constexpr std::array<std::uint8_t, 16> sync_even{
+        0, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0};
+    for (std::size_t index = 0; index < sync_even.size(); ++index) {
+        bits[1 + index] = sync_even[index];
+    }
+    // QPSK, non-hierarchical, HP/LP 1/2, guard 1/4, 8K. Frame number,
+    // cell ID, and reserved fields stay zero.
+    bits[36] = 1;
+    bits[37] = 1;
+    bits[39] = 1;
+
+    unsigned int reg = 0;
+    for (std::size_t input = 0; input < 113; ++input) {
+        const unsigned int data = input < 60 ? 0U : bits[1 + input - 60];
+        const unsigned int feedback = (data ^ reg) & 1U;
+        reg >>= 1U;
+        reg |= feedback << 13U;
+        reg ^= (feedback << 12U) ^ (feedback << 11U) ^
+               (feedback << 9U) ^ (feedback << 8U) ^
+               (feedback << 7U) ^ (feedback << 5U) ^ (feedback << 4U);
+    }
+    for (std::size_t bit = 0; bit < 14; ++bit) {
+        bits[54 + bit] = static_cast<std::uint8_t>((reg >> bit) & 1U);
+    }
+    return bits;
+}
+
+constexpr auto tps_frame = make_tps_frame();
+
+[[nodiscard]] constexpr float tps_sign(const std::size_t symbol) {
+    float sign = 1.0F;
+    for (std::size_t index = 0; index < symbol; ++index) {
+        if (tps_frame[index % tps_frame.size()] != 0U) {
+            sign = -sign;
+        }
+    }
+    return sign;
+}
+
 [[nodiscard]] std::vector<std::int16_t>
-make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F) {
+make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F,
+        const bool valid_tps = false,
+        const std::size_t total_symbols = symbols,
+        const std::size_t tps_start_symbol = 0) {
     const MaxLogDemapper demapper{Constellation::qpsk};
     const SymbolDeinterleaver symbol_permutation{TransmissionMode::k8};
     const auto points = demapper.constellation_points();
@@ -312,14 +360,15 @@ make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F) {
     require(plan != nullptr, "create OFDM IFFT");
 
     std::vector<std::int16_t> result;
-    result.reserve(symbols * symbol_size * 2);
-    for (std::size_t symbol = 0; symbol < symbols; ++symbol) {
+    result.reserve(total_symbols * symbol_size * 2);
+    for (std::size_t symbol = 0; symbol < total_symbols; ++symbol) {
         std::fill(reinterpret_cast<float *>(frequency),
                   reinterpret_cast<float *>(frequency) + (2 * fft_size), 0.0F);
         const std::size_t phase = symbol % 4;
         const auto payload = payload_indices(phase);
         const auto symbol_metrics =
-            metrics.subspan(symbol * payload_carriers * bits_per_carrier,
+            metrics.subspan((symbol % symbols) * payload_carriers *
+                                bits_per_carrier,
                             payload_carriers * bits_per_carrier);
         const auto bit_metrics = bit_interleave(symbol_metrics);
         const auto transmitted =
@@ -334,6 +383,9 @@ make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F) {
             std::complex<float> value{};
             if (continual || scattered) {
                 value = pilot_value(carrier);
+            } else if (tps && valid_tps && symbol >= tps_start_symbol) {
+                value = pilot_value(carrier) *
+                        tps_sign(symbol - tps_start_symbol);
             } else if (!tps) {
                 std::size_t label = 0;
                 for (std::size_t bit = 0; bit < bits_per_carrier; ++bit) {
@@ -364,7 +416,8 @@ make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F) {
             // A small, CP-only impairment on later prefixes makes the
             // acquisition score prefer that anchor instead of choosing an
             // arbitrary equal-score symbol at the end of an ideal capture.
-            if (symbol != 0) {
+            if (symbol != 0 &&
+                (!valid_tps || symbol < tps_start_symbol)) {
                 const float noise =
                     0.002F * std::sin((static_cast<float>(index) * 0.071F) +
                                       static_cast<float>(symbol));
@@ -926,6 +979,220 @@ void test_8k_reset_after_hopeless_stream() {
             "8K reset after a hopeless stream did not recover cleanly");
 }
 
+void test_8k_automatic_manual_transitions() {
+    constexpr std::array<std::size_t, 5> block_sizes{4097, 8191, 12345, 777,
+                                                     16384};
+    constexpr std::size_t tps_preamble_symbols = 40;
+    constexpr std::size_t transition_symbols = tps_preamble_symbols +
+                                                (2 * symbols);
+    constexpr std::array<std::uint8_t, 4> salts{0x11, 0x43, 0x79, 0xB5};
+
+    std::vector<std::uint8_t> output;
+    std::vector<TransportDiscontinuity> discontinuities;
+    std::mutex callback_mutex;
+    std::condition_variable callback_changed;
+    StreamDecoder decoder;
+    decoder.set_transport_callback(
+        [&output, &callback_mutex,
+         &callback_changed](const std::span<const std::uint8_t> bytes) {
+            {
+                const std::scoped_lock lock(callback_mutex);
+                output.insert(output.end(), bytes.begin(), bytes.end());
+            }
+            callback_changed.notify_all();
+        });
+    decoder.set_discontinuity_callback(
+        [&discontinuities, &callback_mutex,
+         &callback_changed](const TransportDiscontinuity discontinuity) {
+            {
+                const std::scoped_lock lock(callback_mutex);
+                discontinuities.push_back(discontinuity);
+            }
+            callback_changed.notify_all();
+        });
+
+    const auto parameters_for = [](const std::size_t phase) {
+        airspy_tv::dvbt::ReceiverParameters parameters;
+        parameters.channel_bandwidth_hz = channel_bandwidth;
+        parameters.worker_threads = 8;
+        if (phase == 1) {
+            parameters.mode = TransmissionMode::k8;
+            parameters.guard_interval = GuardInterval::gi_1_4;
+            parameters.constellation = Constellation::qpsk;
+            parameters.code_rate = CodeRate::rate_1_2;
+        } else if (phase == 2) {
+            parameters.mode = TransmissionMode::k8;
+            parameters.guard_interval = GuardInterval::gi_1_4;
+        }
+        return parameters;
+    };
+
+    std::vector<std::uint8_t> previous_transport;
+    std::uint64_t previous_generation = decoder.stats().decoder_generation;
+    for (std::size_t phase = 0; phase < salts.size(); ++phase) {
+        decoder.set_parameters(parameters_for(phase));
+        const auto generation = decoder.stats().decoder_generation;
+        require(generation > previous_generation,
+                "parameter transition did not advance decoder generation");
+        previous_generation = generation;
+
+        std::size_t boundary = 0;
+        {
+            const std::scoped_lock lock(callback_mutex);
+            boundary = output.size();
+        }
+        const auto encoded = encode_transport(salts[phase]);
+        const auto iq =
+            make_iq(encoded.metrics, 1.0F, true, transition_symbols,
+                    tps_preamble_symbols);
+        if (phase == 0) {
+            const auto resampled = airspy_tv::dvbt::resample_cs16(
+                iq, sample_rate, channel_bandwidth, 2);
+            const auto acquisition = airspy_tv::dvbt::acquire_ofdm(
+                std::span<const std::complex<float>>{resampled}.first(
+                    std::min<std::size_t>(350'000, resampled.size())),
+                parameters_for(phase), true);
+            if (acquisition.carrier_offset != 0) {
+                std::cerr << "valid-TPS acquisition carrier offset: "
+                          << acquisition.carrier_offset << '\n';
+            }
+            require(acquisition.score >= 0.20F &&
+                        acquisition.mode == TransmissionMode::k8 &&
+                        acquisition.guard == GuardInterval::gi_1_4 &&
+                        acquisition.carrier_offset == 0,
+                    "valid-TPS helper is not robustly auto-acquirable");
+        }
+        submit_in_blocks(decoder, iq, block_sizes);
+
+        std::unique_lock lock(callback_mutex);
+        const bool decoded = callback_changed.wait_for(
+            lock, std::chrono::seconds(30), [&] {
+                return has_known_run(std::span<const std::uint8_t>{output}
+                                         .subspan(boundary),
+                                     encoded.transport);
+            });
+        if (!decoded) {
+            const auto stats = decoder.stats();
+            std::cerr << "transition phase " << phase
+                      << " timed out: output=" << output.size()
+                      << " generation=" << stats.decoder_generation
+                      << " ofdm=" << stats.ofdm_locked
+                      << " tps=" << stats.tps_locked
+                      << " tps-ever=" << stats.tps_ever_locked
+                      << " attempts=" << stats.bootstrap_attempts
+                      << " input=" << stats.processed_input_samples
+                      << " queued-input=" << stats.queued_input_samples
+                      << " ring=" << stats.ring_used_samples
+                      << " queued-symbols=" << stats.queued_symbols << '\n';
+        }
+        require(decoded,
+                "automatic/manual transition did not resume correct TS");
+        const auto current =
+            std::span<const std::uint8_t>{output}.subspan(boundary);
+        if (!previous_transport.empty()) {
+            require(!has_known_run(current, previous_transport),
+                    "stale generation TS crossed a reset boundary");
+        }
+        require(std::count(discontinuities.begin(), discontinuities.end(),
+                           TransportDiscontinuity::retune) >=
+                    static_cast<std::ptrdiff_t>(phase + 1),
+                "parameter transition did not publish retune discontinuity");
+        previous_transport = encoded.transport;
+    }
+
+    decoder.flush();
+    decoder.wait_until_idle();
+    const auto stats = decoder.stats();
+    require(stats.tps_ever_locked && stats.tps_locked,
+            "valid synthetic TPS did not lock automatic parameters");
+    require(stats.tps_mode == TransmissionMode::k8 &&
+                stats.tps_guard_interval == GuardInterval::gi_1_4 &&
+                stats.tps_constellation == Constellation::qpsk &&
+                stats.tps_code_rate == CodeRate::rate_1_2,
+            "automatic parameters did not match synthetic TPS");
+    require(std::count(discontinuities.begin(), discontinuities.end(),
+                       TransportDiscontinuity::stream_end) == 1,
+            "transition stream did not finish exactly once");
+}
+
+void test_8k_submit_reset_stress() {
+    const auto encoded = encode_transport(0xD3);
+    const auto iq = make_iq(encoded.metrics);
+    constexpr std::array<std::size_t, 5> block_sizes{4097, 8191, 12345, 777,
+                                                     16384};
+    constexpr std::size_t iterations = 24;
+
+    std::vector<std::uint8_t> output;
+    std::mutex callback_mutex;
+    StreamDecoder decoder;
+    airspy_tv::dvbt::ReceiverParameters parameters;
+    parameters.channel_bandwidth_hz = channel_bandwidth;
+    parameters.mode = TransmissionMode::k8;
+    parameters.guard_interval = GuardInterval::gi_1_4;
+    parameters.constellation = Constellation::qpsk;
+    parameters.code_rate = CodeRate::rate_1_2;
+    parameters.worker_threads = 4;
+    decoder.set_parameters(parameters);
+    decoder.set_transport_callback(
+        [&output, &callback_mutex](const std::span<const std::uint8_t> bytes) {
+            const std::scoped_lock lock(callback_mutex);
+            output.insert(output.end(), bytes.begin(), bytes.end());
+        });
+
+    std::barrier operation_start{2};
+    std::barrier operation_done{2};
+    std::thread producer([&] {
+        std::uint32_t state = 0xC001D00DU;
+        for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
+            operation_start.arrive_and_wait();
+            state = state * 1664525U + 1013904223U;
+            const std::size_t begin =
+                (static_cast<std::size_t>(state) %
+                 (iq.size() / 2U - symbol_size)) *
+                2U;
+            decoder.submit(std::span<const std::int16_t>{iq}.subspan(
+                               begin, symbol_size * 2U),
+                           sample_rate, channel_bandwidth);
+            operation_done.arrive_and_wait();
+        }
+    });
+    std::thread controller([&] {
+        for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
+            operation_start.arrive_and_wait();
+            if ((iteration & 1U) == 0U) {
+                decoder.request_reset();
+            } else {
+                decoder.reset();
+            }
+            operation_done.arrive_and_wait();
+        }
+    });
+    producer.join();
+    controller.join();
+
+    // Establish a clean generation, then model a finite source: its producer
+    // is joined before flush is allowed to close and drain the stream.
+    decoder.reset();
+    std::size_t boundary = 0;
+    {
+        const std::scoped_lock lock(callback_mutex);
+        boundary = output.size();
+    }
+    std::thread finite_producer(
+        [&] { submit_in_blocks(decoder, iq, block_sizes); });
+    finite_producer.join();
+    decoder.flush();
+    decoder.wait_until_idle();
+
+    const std::scoped_lock lock(callback_mutex);
+    require(has_known_run(
+                std::span<const std::uint8_t>{output}.subspan(boundary),
+                encoded.transport),
+            "decoder did not recover after submit/reset stress");
+    require(decoder.stats().queued_blocks == 0,
+            "finite producer did not drain before lifecycle completion");
+}
+
 void test_8k_non_acquirable_stream_drains() {
     const std::vector<std::int16_t> silence(symbols * symbol_size * 2, 0);
     constexpr std::array<std::size_t, 3> block_sizes{7001, 12003, 4099};
@@ -1071,6 +1338,8 @@ int main() {
         run("queue-capacity", test_8k_queue_capacity_multiplier);
         run("reset-new", test_8k_reset_then_new_stream);
         run("reset-hopeless", test_8k_reset_after_hopeless_stream);
+        run("mode-transition", test_8k_automatic_manual_transitions);
+        run("lifecycle-stress", test_8k_submit_reset_stress);
         run("reset-live", test_8k_reset_live_resume);
         run("reset-wait", test_8k_reset_while_demod_waiting);
         run("no-acq", test_8k_non_acquirable_stream_drains);

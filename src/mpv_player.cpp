@@ -1,4 +1,5 @@
 #include "airspy_tv/mpv_player.hpp"
+#include "playback_stream_buffer.hpp"
 
 #define GL_GLEXT_PROTOTYPES 1
 #include <SDL3/SDL.h>
@@ -10,12 +11,8 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <deque>
 #include <format>
 #include <limits>
 #include <memory>
@@ -32,10 +29,6 @@ namespace airspy_tv {
 namespace {
 
 constexpr std::size_t transport_packet_size = 188;
-constexpr std::size_t playback_queue_capacity = 8U << 20U;
-constexpr std::size_t playback_queue_low_watermark = 1U << 20U;
-constexpr std::size_t playback_queue_resume_watermark = 2U << 20U;
-
 [[nodiscard]] std::string mpv_error(const std::string_view operation,
                                     const int code) {
     return std::format("{}: {} ({})", operation, mpv_error_string(code), code);
@@ -51,8 +44,7 @@ constexpr std::size_t playback_queue_resume_watermark = 2U << 20U;
 struct MpvPlayer::Impl {
     struct StreamCookie {
         Impl *owner{};
-        std::uint64_t generation{};
-        std::atomic<bool> canceled;
+        PlaybackStreamBuffer::Reader reader;
     };
 
     mpv_handle *handle{};
@@ -63,26 +55,8 @@ struct MpvPlayer::Impl {
     int texture_height{};
 
     mutable std::mutex mutex;
-    std::condition_variable data_ready;
-    std::deque<std::vector<std::uint8_t>> queue;
-    std::size_t front_offset{};
-    std::size_t queued_bytes{};
-    std::uint64_t blocks_accepted{};
-    std::uint64_t bytes_accepted{};
-    std::uint64_t blocks_processed{};
-    std::uint64_t bytes_processed{};
-    std::uint64_t dropped_blocks{};
-    std::uint64_t dropped_bytes{};
-    // Do not let libmpv consume a short tail immediately after startup or a
-    // dropout.  The hysteresis avoids repeatedly entering/leaving buffering
-    // at the same threshold while preserving a bounded live latency.
-    bool buffering{true};
-    std::uint64_t generation{};
-    bool source_active{};
+    PlaybackStreamBuffer stream;
     std::optional<TransportService> selected_service;
-    // Stream-level seams reported by the decoder (fec_region_reset,
-    // stream_end, retune). Monotonic; read by telemetry().
-    std::uint64_t discontinuity_count{};
 
     bool file_loaded{};
     float current_volume{100.0F};
@@ -104,7 +78,7 @@ struct MpvPlayer::Impl {
         {
             const std::scoped_lock lock(self->mutex);
             cookie->owner = self;
-            cookie->generation = self->generation;
+            cookie->reader = self->stream.open_reader();
         }
         info->cookie = cookie;
         info->read_fn = &read_stream;
@@ -118,48 +92,19 @@ struct MpvPlayer::Impl {
     static std::int64_t read_stream(void *opaque, char *output,
                                     const std::uint64_t requested) {
         auto *cookie = static_cast<StreamCookie *>(opaque);
-        Impl &self = *cookie->owner;
-        std::unique_lock lock(self.mutex);
-        self.data_ready.wait(lock, [&] {
-            return cookie->canceled.load() || !self.source_active ||
-                   cookie->generation != self.generation ||
-                   (!self.buffering && !self.queue.empty());
-        });
-        if (cookie->canceled.load() || !self.source_active ||
-            cookie->generation != self.generation) {
-            return 0;
-        }
-
         const auto maximum = static_cast<std::size_t>(std::min<std::uint64_t>(
             requested, static_cast<std::uint64_t>(
                            std::numeric_limits<std::size_t>::max())));
-        std::size_t copied = 0;
-        while (copied < maximum && !self.queue.empty()) {
-            const auto &block = self.queue.front();
-            const std::size_t count =
-                std::min(maximum - copied, block.size() - self.front_offset);
-            std::memcpy(output + copied, block.data() + self.front_offset,
-                        count);
-            copied += count;
-            self.front_offset += count;
-            self.queued_bytes -= count;
-            if (self.front_offset == block.size()) {
-                self.queue.pop_front();
-                self.front_offset = 0;
-                ++self.blocks_processed;
-            }
-        }
-        self.bytes_processed += copied;
-        if (self.queued_bytes <= playback_queue_low_watermark) {
-            self.buffering = true;
-        }
+        const std::size_t copied = cookie->owner->stream.read(
+            cookie->reader,
+            std::span<std::uint8_t>{reinterpret_cast<std::uint8_t *>(output),
+                                    maximum});
         return static_cast<std::int64_t>(copied);
     }
 
     static void cancel_stream(void *opaque) {
         auto *cookie = static_cast<StreamCookie *>(opaque);
-        cookie->canceled = true;
-        cookie->owner->data_ready.notify_all();
+        cookie->owner->stream.cancel(cookie->reader);
     }
 
     static void close_stream(void *opaque) {
@@ -167,30 +112,19 @@ struct MpvPlayer::Impl {
         delete static_cast<StreamCookie *>(opaque);
     }
 
-    void clear_queue_locked() {
-        dropped_blocks += queue.size();
-        dropped_bytes += queued_bytes;
-        queue.clear();
-        front_offset = 0;
-        queued_bytes = 0;
-        buffering = true;
-    }
-
-    void restart_playback() {
+    void apply_playback_action(const PlaybackBufferAction action) {
         if (handle == nullptr) {
             return;
         }
-        bool active = false;
-        {
-            const std::scoped_lock lock(mutex);
-            ++generation;
-            clear_queue_locked();
-            file_loaded = false;
-            active = source_active;
-            message = active ? "Waiting for MPEG-TS" : "Player idle";
+        if (action == PlaybackBufferAction::none) {
+            return;
         }
-        data_ready.notify_all();
-        if (active) {
+        if (action == PlaybackBufferAction::load) {
+            {
+                const std::scoped_lock lock(mutex);
+                file_loaded = false;
+                message = "Waiting for MPEG-TS";
+            }
             std::array command{"loadfile", "airspytv://live", "replace",
                                static_cast<const char *>(nullptr)};
             const int result = mpv_command_async(handle, 0, command.data());
@@ -198,7 +132,12 @@ struct MpvPlayer::Impl {
                 const std::scoped_lock lock(mutex);
                 message = mpv_error("mpv loadfile", result);
             }
-        } else {
+        } else if (action == PlaybackBufferAction::stop) {
+            {
+                const std::scoped_lock lock(mutex);
+                file_loaded = false;
+                message = "Player idle";
+            }
             std::array command{"stop", static_cast<const char *>(nullptr)};
             static_cast<void>(mpv_command_async(handle, 0, command.data()));
         }
@@ -335,13 +274,7 @@ void MpvPlayer::shutdown() {
     if (impl_ == nullptr) {
         return;
     }
-    {
-        const std::scoped_lock lock(impl_->mutex);
-        impl_->source_active = false;
-        ++impl_->generation;
-        impl_->clear_queue_locked();
-    }
-    impl_->data_ready.notify_all();
+    impl_->stream.shutdown();
     if (impl_->render_context != nullptr) {
         mpv_render_context_set_update_callback(impl_->render_context, nullptr,
                                                nullptr);
@@ -356,14 +289,7 @@ void MpvPlayer::shutdown() {
 }
 
 void MpvPlayer::set_source_active(const bool active) {
-    {
-        const std::scoped_lock lock(impl_->mutex);
-        if (impl_->source_active == active) {
-            return;
-        }
-        impl_->source_active = active;
-    }
-    impl_->restart_playback();
+    impl_->apply_playback_action(impl_->stream.set_source_active(active));
 }
 
 void MpvPlayer::submit(const std::span<const std::uint8_t> transport_stream) {
@@ -374,9 +300,6 @@ void MpvPlayer::submit(const std::span<const std::uint8_t> transport_stream) {
     filtered.reserve(transport_stream.size());
     {
         const std::scoped_lock lock(impl_->mutex);
-        if (!impl_->source_active) {
-            return;
-        }
         for (std::size_t offset = 0;
              offset + transport_packet_size <= transport_stream.size();
              offset += transport_packet_size) {
@@ -389,35 +312,8 @@ void MpvPlayer::submit(const std::span<const std::uint8_t> transport_stream) {
         if (filtered.empty()) {
             return;
         }
-        while (!impl_->queue.empty() && impl_->queued_bytes + filtered.size() >
-                                            playback_queue_capacity) {
-            const std::size_t dropped =
-                impl_->queue.front().size() - impl_->front_offset;
-            ++impl_->dropped_blocks;
-            impl_->dropped_bytes += dropped;
-            impl_->queued_bytes -= dropped;
-            impl_->queue.pop_front();
-            impl_->front_offset = 0;
-        }
-        if (filtered.size() > playback_queue_capacity) {
-            const std::size_t keep =
-                playback_queue_capacity -
-                (playback_queue_capacity % transport_packet_size);
-            ++impl_->dropped_blocks;
-            impl_->dropped_bytes += filtered.size() - keep;
-            filtered.erase(filtered.begin(),
-                           filtered.end() - static_cast<std::ptrdiff_t>(keep));
-        }
-        ++impl_->blocks_accepted;
-        impl_->bytes_accepted += filtered.size();
-        impl_->queued_bytes += filtered.size();
-        impl_->queue.push_back(std::move(filtered));
-        if (impl_->buffering &&
-            impl_->queued_bytes >= playback_queue_resume_watermark) {
-            impl_->buffering = false;
-        }
     }
-    impl_->data_ready.notify_all();
+    impl_->stream.submit(filtered);
 }
 
 void MpvPlayer::on_discontinuity(const TransportDiscontinuity discontinuity) {
@@ -426,19 +322,13 @@ void MpvPlayer::on_discontinuity(const TransportDiscontinuity discontinuity) {
         // A gated region was dropped and the FEC re-seeded: the demuxer sees
         // a continuity jump and error-conceals it. The stream continues — no
         // restart, no queue drop (the pre-seam bytes are still valid).
-        {
-            const std::scoped_lock lock(impl_->mutex);
-            ++impl_->discontinuity_count;
-        }
+        impl_->stream.fec_region_reset();
         break;
     case TransportDiscontinuity::stream_end:
         // The input ended: the queued tail is still valid and plays out; the
         // next read returns EOF and the demuxer ends cleanly instead of
         // grinding through data that no longer has a source.
-        {
-            const std::scoped_lock lock(impl_->mutex);
-            ++impl_->discontinuity_count;
-        }
+        impl_->stream.stream_end();
         break;
     case TransportDiscontinuity::retune:
         // The content may have changed entirely (retune, source switch, or
@@ -446,11 +336,7 @@ void MpvPlayer::on_discontinuity(const TransportDiscontinuity discontinuity) {
         // channel's PAT/PMT instead of concatenating two unrelated streams
         // (which the per-frame source-active toggle alone misses — a live
         // retune keeps streaming).
-        {
-            const std::scoped_lock lock(impl_->mutex);
-            ++impl_->discontinuity_count;
-        }
-        impl_->restart_playback();
+        impl_->apply_playback_action(impl_->stream.retune());
         break;
     }
 }
@@ -467,7 +353,7 @@ void MpvPlayer::select_service(const TransportService &service) {
         }
         impl_->selected_service = service;
     }
-    impl_->restart_playback();
+    impl_->apply_playback_action(impl_->stream.restart());
 }
 
 void MpvPlayer::clear_service() {
@@ -478,7 +364,7 @@ void MpvPlayer::clear_service() {
         }
         impl_->selected_service.reset();
     }
-    impl_->restart_playback();
+    impl_->apply_playback_action(impl_->stream.restart());
 }
 
 void MpvPlayer::set_volume(const float volume) {
@@ -534,20 +420,18 @@ bool MpvPlayer::ready() const {
 
 PlaybackTelemetry MpvPlayer::telemetry() const {
     PlaybackTelemetry result;
-    {
-        const std::scoped_lock lock(impl_->mutex);
-        result.queued_bytes = impl_->queued_bytes;
-        result.queue_capacity = playback_queue_capacity;
-        result.active = impl_->source_active;
-        result.blocks_accepted = impl_->blocks_accepted;
-        result.bytes_accepted = impl_->bytes_accepted;
-        result.blocks_processed = impl_->blocks_processed;
-        result.bytes_processed = impl_->bytes_processed;
-        result.dropped_blocks = impl_->dropped_blocks;
-        result.dropped_bytes = impl_->dropped_bytes;
-        result.buffering = impl_->source_active && impl_->buffering;
-        result.discontinuities = impl_->discontinuity_count;
-    }
+    const auto stream = impl_->stream.snapshot();
+    result.queued_bytes = stream.queued_bytes;
+    result.queue_capacity = stream.queue_capacity;
+    result.active = stream.source_active;
+    result.blocks_accepted = stream.blocks_accepted;
+    result.bytes_accepted = stream.bytes_accepted;
+    result.blocks_processed = stream.blocks_processed;
+    result.bytes_processed = stream.bytes_processed;
+    result.dropped_blocks = stream.dropped_blocks;
+    result.dropped_bytes = stream.dropped_bytes;
+    result.buffering = stream.buffering;
+    result.discontinuities = stream.discontinuities;
     if (impl_->handle == nullptr) {
         return result;
     }

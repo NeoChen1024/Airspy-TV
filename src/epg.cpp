@@ -71,7 +71,8 @@ struct EpgModel::Impl {
     std::map<std::uint16_t, std::vector<EpgEvent>> events;
     std::optional<std::uint64_t> utc_time;
     std::chrono::steady_clock::time_point utc_time_received;
-    si::SectionFeed feed{[this](const std::span<const std::uint8_t> section) {
+    si::SectionFeed feed{[this](const std::uint16_t,
+                               const std::span<const std::uint8_t> section) {
         dispatch(section);
     }};
 

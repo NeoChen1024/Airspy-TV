@@ -36,12 +36,26 @@ Use the following as the reference before changing timing control:
   - `tools/validate_dvbt_clock_drift.py`
 - Independently configurable fixture impairments:
   - initial sample-clock offset and ppm/minute drift;
-  - initial LO offset and Hz/minute drift.
+  - initial LO offset and Hz/minute drift;
+  - piecewise-linear sample-clock and tuned-frequency LO ppm knots with
+    continuous LO phase.
+
+The retained opt-in matrix is run with
+`scripts/run_validation.py --profiles portable-release --clock-regressions`.
+It keeps 60-second 2K/8K sample-clock-only, LO-only, ramp, reversal, in-phase,
+inverted, and fixed-seed out-of-phase cases outside the routine matrix while
+recording their results in `fixtures.jsonl`. These cases use QPSK 1/2 and a
+1/4 guard interval so the result isolates clock tracking from the synthetic
+fixture's linear-interpolation MER penalty; the routine 480-case matrix still
+covers every modulation, code rate, and guard interval. Constant cases retain
+the 0.5--1, 5, and 20 ppm operating points; ramps, reversals, and relative-phase
+cases use physically smoother 0.5--1 ppm trajectories.
 
 The short synthetic regression proves fixture generation, independent SRO/CFO
 measurement, and continuous TS output. It is not long enough to characterize
-loop convergence: the SRO estimator needs roughly ten seconds of history, so
-control-loop experiments require longer retained fixtures.
+steady loop convergence, so control-loop experiments require the retained
+60-second fixtures. Large startup SRO uses a tightly gated early estimate;
+normal small-error tracking continues to use the longer robust history.
 
 ## Input clock-error operating envelope
 
@@ -68,13 +82,15 @@ it is not the normal tuning target. Running a device such as HackRF without an
 appropriate TCXO or manual calibration does not require the receiver to accept
 errors beyond the 20 ppm contract.
 
-The 20 ppm input envelope is separate from actuator and ambiguity limits. A
-controller may need a much narrower output clamp because its estimator cannot
-move safely by 20 ppm after lock. Abrupt jumps still return to acquisition, and
-an out-of-envelope estimate must not be integrated into SRO or CFO state.
-Measurement confidence also remains channel-dependent: the hardware envelope
-defines plausible clock values, but does not establish the confidence expected
-during fades, multipath changes, or low MER.
+The production controller accepts this full 20 ppm envelope. A consistent
+large startup estimate takes a fast path, the variable-rate actuator slews to
+it, and a bounded guard-window recenter removes timing phase accumulated during
+convergence. Normal small estimates retain the longer robust median path.
+Abrupt discontinuities still return to acquisition, and an out-of-envelope
+estimate must not be integrated into SRO or CFO state. Measurement confidence
+also remains channel-dependent: the hardware envelope defines plausible clock
+values, but does not establish the confidence expected during fades, multipath
+changes, or low MER.
 
 ## Open validation work
 
@@ -143,8 +159,8 @@ worker-count equivalence, reset, steady-state gain, ratio quantization, bounded
 rate changes, and end-to-end stopband tone sweeps for DVB-T 5/6/7/8 MHz
 configurations at 10 MS/s.
 
-The DVB-T controller uses a 0.5 ppm/second slew and a confidence gate of 0.75.
-Once the timing history is ready, the demod thread schedules source SRO as
+The DVB-T controller uses a 20 ppm/second slew and a confidence gate of 0.75.
+Once the timing estimate is ready, the demod thread schedules source SRO as
 `nominal_output_per_input / (1 + sro_ppm * 1e-6)`. Commands are stamped with
 the demod read position at which the completed timing-window estimate becomes
 available, mapped back to the corresponding source input position, and
@@ -448,7 +464,7 @@ residual_cfo = source_cfo - applied_cfo + measurement_noise
 
 The fixed sample-domain command horizon removes queue-occupancy-dependent
 delay, but it remains a substantial control delay. The SRO actuator also has a
-0.5 ppm/second slew limit. Candidate controllers must therefore include output
+20 ppm/second slew limit. Candidate controllers must therefore include output
 limits, slew-aware anti-windup, confidence/fade gating, and bumpless reset on
 stream epoch changes, retunes, and frontend rebootstrap.
 

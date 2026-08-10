@@ -7,9 +7,11 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -117,7 +119,10 @@ class StdinPipe {
 class ProbeDemodulator final : public airspy_tv::Demodulator {
   public:
     void request_reset() override { ++requested_resets; }
-    void reset() override { ++resets; }
+    void reset() override {
+        ++resets;
+        last_reset_sequence = sequence.fetch_add(1) + 1;
+    }
 
     void submit(const std::span<const std::int16_t> interleaved_iq,
                 const std::uint32_t sample_rate_hz,
@@ -141,11 +146,21 @@ class ProbeDemodulator final : public airspy_tv::Demodulator {
                        const std::uint32_t sample_rate_hz,
                        const std::uint32_t channel_bandwidth_hz,
                        const airspy_tv::InputSampleStamp stamp) {
+        {
+            std::unique_lock gate_lock(gate_mutex);
+            if (gate_enabled) {
+                submit_entered = true;
+                gate_changed.notify_all();
+                gate_changed.wait(gate_lock,
+                                  [this] { return submit_released; });
+            }
+        }
         static_cast<void>(sample_rate_hz);
         static_cast<void>(channel_bandwidth_hz);
         const std::scoped_lock lock(mutex);
         samples += interleaved_iq.size() / 2;
         stamps.push_back(stamp);
+        last_submit_sequence = sequence.fetch_add(1) + 1;
     }
 
     void flush() override { ++flushes; }
@@ -179,14 +194,43 @@ class ProbeDemodulator final : public airspy_tv::Demodulator {
         return samples;
     }
 
+    void enable_submit_gate() {
+        const std::scoped_lock lock(gate_mutex);
+        gate_enabled = true;
+        submit_entered = false;
+        submit_released = false;
+    }
+
+    [[nodiscard]] bool wait_for_submit_entry() {
+        std::unique_lock lock(gate_mutex);
+        return gate_changed.wait_for(lock, std::chrono::seconds(1),
+                                     [this] { return submit_entered; });
+    }
+
+    void release_submit() {
+        {
+            const std::scoped_lock lock(gate_mutex);
+            submit_released = true;
+        }
+        gate_changed.notify_all();
+    }
+
     mutable std::mutex mutex;
     std::size_t samples{};
     std::vector<airspy_tv::InputSampleStamp> stamps;
-    std::atomic<std::uint64_t> requested_resets;
-    std::atomic<std::uint64_t> resets;
-    std::atomic<std::uint64_t> flushes;
-    std::atomic<std::uint64_t> nonblocking_submits;
-    std::atomic<std::uint64_t> blocking_submits;
+    std::atomic<std::uint64_t> requested_resets{};
+    std::atomic<std::uint64_t> resets{};
+    std::atomic<std::uint64_t> flushes{};
+    std::atomic<std::uint64_t> nonblocking_submits{};
+    std::atomic<std::uint64_t> blocking_submits{};
+    std::atomic<std::uint64_t> sequence{};
+    std::atomic<std::uint64_t> last_submit_sequence{};
+    std::atomic<std::uint64_t> last_reset_sequence{};
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool gate_enabled{};
+    bool submit_entered{};
+    bool submit_released{};
     TransportCallback transport_callback;
     DiscontinuityCallback discontinuity_callback;
 };
@@ -565,6 +609,79 @@ bool test_unpaced_blocking_playback_policy() {
     return result;
 }
 
+bool test_stop_joins_active_source_callback_before_reset() {
+    const TemporaryDirectory directory;
+    const auto path = directory.path / "blocking-submit.cs16";
+    constexpr std::size_t sample_rate = 1'000'000;
+    const std::vector<std::int16_t> iq((sample_rate / 5U) * 2U, 3);
+    {
+        std::ofstream output(path, std::ios::binary);
+        output.write(
+            reinterpret_cast<const char *>(iq.data()),
+            static_cast<std::streamsize>(iq.size() * sizeof(iq.front())));
+    }
+
+    airspy_tv::TransportPipeline transport;
+    airspy_tv::ReceiverPipeline device(transport);
+    auto demodulator = std::make_unique<ProbeDemodulator>();
+    auto *probe = demodulator.get();
+    probe->enable_submit_gate();
+    device.set_demodulator(std::move(demodulator));
+    device.set_display_analysis_enabled(false);
+
+    airspy_tv::SourceSettings settings;
+    settings.sample_rate_hz = sample_rate;
+    std::string error;
+    if (!require(device.open_iq_file(
+                     path, settings,
+                     {.pacing = airspy_tv::IqPlaybackPacing::unpaced,
+                      .decoder_backpressure =
+                          airspy_tv::DecoderBackpressurePolicy::drop_when_busy},
+                     error),
+                 "blocking-callback source opens: " + error) ||
+        !require(device.start_stream(settings, error),
+                 "blocking-callback source starts: " + error) ||
+        !require(probe->wait_for_submit_entry(),
+                 "source callback reaches the demodulator gate")) {
+        probe->release_submit();
+        return false;
+    }
+
+    std::promise<void> stop_started;
+    auto stop_entered = stop_started.get_future();
+    auto stopped = std::async(std::launch::async, [&device, &stop_started] {
+        stop_started.set_value();
+        device.stop_stream();
+    });
+    if (!require(stop_entered.wait_for(std::chrono::seconds(1)) ==
+                     std::future_status::ready,
+                 "stop thread reaches stop_stream") ||
+        !require(stopped.wait_for(std::chrono::milliseconds(20)) ==
+                     std::future_status::timeout,
+                 "stop waits for the active source callback to return")) {
+        probe->release_submit();
+        static_cast<void>(stopped.wait_for(std::chrono::seconds(1)));
+        return false;
+    }
+    probe->release_submit();
+    if (!require(stopped.wait_for(std::chrono::seconds(1)) ==
+                     std::future_status::ready,
+                 "stop completes after the callback is released")) {
+        return false;
+    }
+    stopped.get();
+    const auto samples_after_stop = probe->sample_count();
+    const auto submit_sequence = probe->last_submit_sequence.load();
+    const auto reset_sequence = probe->last_reset_sequence.load();
+    device.close();
+    return require(samples_after_stop == sample_rate / 5U,
+                   "the in-flight callback completes exactly once") &&
+           require(reset_sequence > submit_sequence,
+                   "decoder reset occurs after the final source submit") &&
+           require(probe->sample_count() == samples_after_stop,
+                   "close cannot submit after source stop");
+}
+
 } // namespace
 
 int main() {
@@ -575,7 +692,8 @@ int main() {
                        test_stdin_source_pipeline() &&
                        test_file_runtime_failure_is_restartable() &&
                        test_stop_interrupts_file_pacing() &&
-                       test_unpaced_blocking_playback_policy()
+                       test_unpaced_blocking_playback_policy() &&
+                       test_stop_joins_active_source_callback_before_reset()
                    ? 0
                    : 1;
     } catch (const std::exception &exception) {

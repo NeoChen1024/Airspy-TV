@@ -36,7 +36,8 @@ struct SectionAssembler {
 // section so a dropped packet never yields a corrupt payload.
 class SectionFeed {
   public:
-    using Handler = std::function<void(std::span<const std::uint8_t>)>;
+    using Handler =
+        std::function<void(std::uint16_t, std::span<const std::uint8_t>)>;
 
     explicit SectionFeed(Handler handler) : handler_(std::move(handler)) {}
 
@@ -86,7 +87,7 @@ class SectionFeed {
                 assembler.bytes.size() == assembler.expected) {
                 const std::span<const std::uint8_t> section(assembler.bytes);
                 if (section.size() >= 8 && crc32_mpeg(section) == 0U) {
-                    handler_(section);
+                    handler_(pid, section);
                 }
                 assembler.bytes.clear();
                 assembler.expected = 0;

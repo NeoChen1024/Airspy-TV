@@ -67,18 +67,93 @@ class FixtureCase:
         )
 
 
+@dataclass(frozen=True, order=True)
+class ClockRegressionCase:
+    name: str
+    mode: str
+    bandwidth: str
+    guard: str
+    modulation: str
+    code_rate: str
+    sample_clock_knots: tuple[tuple[float, float], ...] = ()
+    lo_knots: tuple[tuple[float, float], ...] = ()
+    seed: int | None = None
+
+    @property
+    def slug(self) -> str:
+        return "clock-" + self.name
+
+
 @dataclass(frozen=True)
 class ProfileSpec:
     name: str
     duration: float
     timeout: float
-    cases: tuple[FixtureCase, ...]
+    cases: tuple[FixtureCase | ClockRegressionCase, ...]
 
 
 def full_matrix() -> tuple[FixtureCase, ...]:
     return tuple(
         FixtureCase(*values)
         for values in product(MODES, BANDWIDTHS, GUARDS, MODULATIONS, CODE_RATES)
+    )
+
+
+def clock_regression_cases() -> tuple[ClockRegressionCase, ...]:
+    # Keep the clock matrix focused on synchronization rather than the linear
+    # fixture interpolator's 64-QAM MER penalty. Routine coverage still runs
+    # every modulation/code-rate pair; these retained cases use the most
+    # robust payload while exercising the full clock contract.
+    base_2k = ("2k", "6M", "1/4", "qpsk", "1/2")
+    base_8k = ("8k", "6M", "1/4", "qpsk", "1/2")
+    return (
+        ClockRegressionCase("sro-plus-0_5", *base_2k, ((0.0, 0.5),)),
+        ClockRegressionCase("sro-minus-1", *base_8k, ((0.0, -1.0),)),
+        ClockRegressionCase("sro-plus-5", *base_2k, ((0.0, 5.0),)),
+        ClockRegressionCase("sro-minus-20", *base_8k, ((0.0, -20.0),)),
+        ClockRegressionCase(
+            "sro-ramp", *base_2k, ((0.0, -0.5), (60.0, 0.5))
+        ),
+        ClockRegressionCase(
+            "sro-reversal",
+            *base_8k,
+            ((0.0, -1.0), (30.0, 1.0), (60.0, -1.0)),
+        ),
+        ClockRegressionCase(
+            "lo-plus-0_5", *base_2k, lo_knots=((0.0, 0.5),)
+        ),
+        ClockRegressionCase("lo-minus-1", *base_8k, lo_knots=((0.0, -1.0),)),
+        ClockRegressionCase("lo-plus-5", *base_2k, lo_knots=((0.0, 5.0),)),
+        ClockRegressionCase("lo-minus-20", *base_8k, lo_knots=((0.0, -20.0),)),
+        ClockRegressionCase(
+            "lo-ramp",
+            *base_2k,
+            lo_knots=((0.0, -0.5), (60.0, 0.5)),
+        ),
+        ClockRegressionCase(
+            "lo-reversal",
+            *base_8k,
+            lo_knots=((0.0, 1.0), (30.0, -1.0), (60.0, 1.0)),
+        ),
+        ClockRegressionCase(
+            "in-phase",
+            *base_2k,
+            ((0.0, -0.5), (30.0, 0.5), (60.0, -0.5)),
+            ((0.0, -0.5), (30.0, 0.5), (60.0, -0.5)),
+        ),
+        ClockRegressionCase(
+            "inverted",
+            *base_8k,
+            ((0.0, -0.5), (30.0, 0.5), (60.0, -0.5)),
+            ((0.0, 0.5), (30.0, -0.5), (60.0, 0.5)),
+        ),
+        ClockRegressionCase(
+            "random-out-of-phase",
+            *base_8k,
+            ((0.0, -1.0), (17.0, 0.5), (39.0, -0.25), (60.0, 1.0)),
+            ((0.0, 0.5), (11.0, -1.0), (37.0, 1.0), (60.0, -0.5)),
+            0xA175EED,
+        ),
     )
 
 
@@ -142,6 +217,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--smoke", action="store_true", help="run one 1-second fixture per profile"
     )
+    parser.add_argument(
+        "--clock-regressions",
+        action="store_true",
+        help="run the opt-in 60-second SRO/LO regression matrix",
+    )
     parser.add_argument("--list-cases", action="store_true")
     parser.add_argument(
         "--bootstrap",
@@ -178,6 +258,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("decoder threads must be between 0 and 256")
     if args.list_real_signals and args.real_signals_dir is None:
         parser.error("--list-real-signals requires --real-signals-dir")
+    if args.clock_regressions and args.skip_fixtures:
+        parser.error("--clock-regressions cannot be combined with --skip-fixtures")
+    if args.clock_regressions and "portable-release" not in args.profiles:
+        parser.error("--clock-regressions requires the portable-release profile")
     if (
         args.real_signals_dir is not None
         and not args.list_real_signals
@@ -345,7 +429,7 @@ def run_fixture(
     report: ValidationReport,
     spec: ProfileSpec,
     case_index: int,
-    case: FixtureCase,
+    case: FixtureCase | ClockRegressionCase,
     decoder_threads: int,
 ) -> dict[str, Any]:
     artifact_root = report.failures_dir / spec.name / case.slug
@@ -377,6 +461,12 @@ def run_fixture(
         "--dvbt-code-rate",
         case.code_rate,
     ]
+    if isinstance(case, ClockRegressionCase):
+        for seconds, ppm in case.sample_clock_knots:
+            command.extend(("--sample-clock-knot", f"{seconds:g}:{ppm:g}"))
+        for seconds, ppm in case.lo_knots:
+            command.extend(("--lo-ppm-knot", f"{seconds:g}:{ppm:g}"))
+        command.append("--require-no-rebootstrap")
     started_at = utc_now()
     started = time.monotonic()
     try:
@@ -426,6 +516,11 @@ def run_fixture(
     )
     record: dict[str, Any] = {
         "profile": spec.name,
+        "case_type": (
+            "clock_regression"
+            if isinstance(case, ClockRegressionCase)
+            else "routine_fixture"
+        ),
         "case_index": case_index,
         "case_id": case.slug,
         "case": asdict(case),
@@ -454,6 +549,7 @@ def run_fixture_matrix(
     spec: ProfileSpec,
     fixture_jobs: int,
     decoder_threads: int,
+    case_index_offset: int = 0,
 ) -> int:
     total = len(spec.cases)
     failures = 0
@@ -473,7 +569,9 @@ def run_fixture_matrix(
                 case,
                 decoder_threads,
             ): (case_index, case)
-            for case_index, case in enumerate(spec.cases)
+            for case_index, case in enumerate(
+                spec.cases, start=case_index_offset
+            )
         }
         for completed_count, future in enumerate(as_completed(futures), start=1):
             case_index, case = futures[future]
@@ -519,10 +617,15 @@ def initial_summary(
     configuration: dict[str, Any],
     real_signal_count: int,
 ) -> dict[str, Any]:
+    clock_count = (
+        len(clock_regression_cases())
+        if configuration["clock_regressions"]
+        else 0
+    )
     planned_fixtures = (
         0
         if configuration["skip_fixtures"]
-        else sum(len(specs[profile].cases) for profile in profiles)
+        else sum(len(specs[profile].cases) for profile in profiles) + clock_count
     )
     return {
         "schema_version": 0,
@@ -561,6 +664,7 @@ def initial_summary(
                         0
                         if configuration["skip_fixtures"]
                         else len(specs[profile].cases)
+                        + (clock_count if profile == "portable-release" else 0)
                     ),
                     "completed": 0,
                     "passed": 0,
@@ -652,10 +756,19 @@ def run_required_stage(
     return result
 
 
-def print_cases(profiles: Iterable[str], specs: dict[str, ProfileSpec]) -> None:
+def print_cases(
+    profiles: Iterable[str],
+    specs: dict[str, ProfileSpec],
+    include_clock_regressions: bool,
+) -> None:
     for profile in profiles:
         print(f"{profile}: {len(specs[profile].cases)} cases")
         for case in specs[profile].cases:
+            print(f"  {case.slug}")
+    if include_clock_regressions:
+        cases = clock_regression_cases()
+        print(f"clock-regressions: {len(cases)} cases x 60 seconds")
+        for case in cases:
             print(f"  {case.slug}")
 
 
@@ -697,7 +810,7 @@ def main() -> int:
 
     specs = profile_specs(args.smoke)
     if args.list_cases:
-        print_cases(args.profiles, specs)
+        print_cases(args.profiles, specs, args.clock_regressions)
         return 0
     real_corpus = (
         discover_real_signal_corpus(
@@ -736,6 +849,7 @@ def main() -> int:
     configuration = {
         "profiles": args.profiles,
         "smoke": args.smoke,
+        "clock_regressions": args.clock_regressions,
         "build_jobs": build_jobs,
         "ctest_jobs": ctest_jobs,
         "fixture_jobs": fixture_jobs,
@@ -844,6 +958,22 @@ def main() -> int:
                     args.decoder_threads,
                 )
                 failed = failed or fixture_failures != 0
+                if args.clock_regressions and profile == "portable-release":
+                    clock_failures = run_fixture_matrix(
+                        root,
+                        report,
+                        summary,
+                        ProfileSpec(
+                            profile,
+                            60.0,
+                            900.0,
+                            clock_regression_cases(),
+                        ),
+                        fixture_jobs,
+                        args.decoder_threads,
+                        len(specs[profile].cases),
+                    )
+                    failed = failed or clock_failures != 0
             if real_corpus is not None and profile == args.real_profile:
                 real_failures = run_real_signal_matrix(
                     root,

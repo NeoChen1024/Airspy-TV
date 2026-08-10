@@ -107,7 +107,9 @@ void DemodStage::Impl::demod_reset_timing(DemodRuntimeState &state,
     state.tau_interval_correction_history.fill(0.0);
     state.tau_history_head = 0;
     state.tau_history_count = 0;
+    state.sro_estimator_ready = false;
     state.last_timing_sample_position.reset();
+    state.applied_timing_offset = 0;
     if (reset_window_cir) {
         state.window_cir_offset_sum = 0.0;
     }
@@ -215,6 +217,12 @@ bool DemodStage::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
     const std::uint64_t aligned_distance =
         std::min(delta % state.period, state.period - delta % state.period);
     if (aligned_distance < 64) {
+        // A re-anchor request can consume the current symbol without running
+        // the normal advance step. Even when acquisition returns the same
+        // grid, resume at the first retained occurrence rather than rereading
+        // the already released FFT window.
+        state.next_symbol_start = sample_channel.align_at_or_after(
+            state.next_symbol_start, state.period);
         return false;
     }
 

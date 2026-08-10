@@ -7,26 +7,10 @@ Maintained against: current worktree
 
 This maintained copy lists only unresolved work. Findings corrected after the
 original review are removed rather than retained as implementation history.
-The remaining work is lifecycle and playback regression coverage, retained
-long-run baselines, and hardware validation rather than a known unsafe
-data-flow design.
+The remaining work is extended runtime baselines and hardware validation
+rather than a known unsafe data-flow design.
 
 ## Remaining findings
-
-### High: lifecycle and output coverage remains incomplete
-
-Important lifecycle and output contracts still outside routine coverage are:
-
-- automatic/manual mode transitions;
-- repeated concurrent submit/reset/flush/stop stress;
-- analyzer reset/submit stress under ThreadSanitizer;
-- mpv queue hysteresis and discontinuity ordering with a fake reader;
-- deterministic partial-write injection for the recorder writer loop;
-- PAT/PMT/SDT version changes and malformed-section handling;
-- long synthetic SRO/CFO fixtures as retained opt-in regressions.
-
-Priority should go to lifecycle stress and fake-reader playback tests because
-these protect the broadest behavior during further refactoring.
 
 ### Medium: extended runtime and hardware validation remains incomplete
 
@@ -46,9 +30,8 @@ Long-capture timing requirements remain in
 
 ## Recommended order
 
-1. Add lifecycle, playback, recorder partial-write, and SI-table regressions.
-2. Establish real-signal thresholds and retain long SRO/CFO fixtures.
-3. Perform full-capture and live-hardware validation after major DSP or source
+1. Establish real-signal thresholds for the retained capture corpus.
+2. Perform full-capture and live-hardware validation after major DSP or source
    changes.
 
 ## Refactoring acceptance criteria

@@ -121,6 +121,7 @@ struct DemodRuntimeState {
 
     // Sample-clock estimator and variable-rate resampler actuator.
     static constexpr std::size_t tau_history_n = 24;
+    static constexpr std::size_t tau_history_fast_min = 2;
     static constexpr std::size_t tau_history_min = 16;
     TimingSlopeTracker timing_tracker;
     double last_windowed_timing{};
@@ -130,10 +131,12 @@ struct DemodRuntimeState {
     std::array<double, tau_history_n> tau_interval_correction_history{};
     std::size_t tau_history_head{};
     std::size_t tau_history_count{};
+    bool sro_estimator_ready{};
     std::optional<std::uint64_t> last_timing_sample_position;
     double last_windowed_cir_avg{};
     double window_cir_offset_sum{};
     int applied_cir_offset{};
+    int applied_timing_offset{};
     double cir_confidence{};
     float acquisition_time_ms{};
     float fft_plan_time_ms{};

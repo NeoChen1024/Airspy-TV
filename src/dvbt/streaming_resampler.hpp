@@ -30,7 +30,10 @@ class StreamingResampler {
     [[nodiscard]] std::uint32_t bandwidth() const noexcept;
 
   private:
-    static constexpr double sro_slew_rate_ppm_per_second = 0.5;
+    // Reach the documented +/-20 ppm receiver sanity bound before an 8K
+    // acquisition can walk out of its timing ambiguity, while still slewing
+    // over multiple input blocks rather than stepping the sample timeline.
+    static constexpr double sro_slew_rate_ppm_per_second = 20.0;
     solid_resampler::FrequencyTranslatingResampler resampler_;
     std::uint32_t rate_{};
     std::uint32_t bandwidth_{};

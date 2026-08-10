@@ -162,6 +162,8 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
     auto &timing_raw_count = state.timing_raw_count;
     auto &timing_acc = state.timing_acc;
     auto &fft_size = state.fft_size;
+    auto &guard_size = state.guard_size;
+    auto &next_symbol_start = state.next_symbol_start;
     auto &applied_cir_offset = state.applied_cir_offset;
     auto &window_cir_offset_sum = state.window_cir_offset_sum;
     auto &smoothed_sample_clock_ppm = state.smoothed_sample_clock_ppm;
@@ -169,6 +171,8 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
     auto &last_windowed_cir_avg = state.last_windowed_cir_avg;
     const float fade_indicator = state.fade_indicator;
     constexpr std::size_t tau_history_n = DemodRuntimeState::tau_history_n;
+    constexpr std::size_t tau_history_fast_min =
+        DemodRuntimeState::tau_history_fast_min;
     constexpr std::size_t tau_history_min = DemodRuntimeState::tau_history_min;
     auto &tau_history = state.tau_history;
     auto &tau_sample_history = state.tau_sample_history;
@@ -176,6 +180,7 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
         state.tau_interval_correction_history;
     auto &tau_history_head = state.tau_history_head;
     auto &tau_history_count = state.tau_history_count;
+    auto &sro_estimator_ready = state.sro_estimator_ready;
 
     const float window_wall = duration_ms(window_started_at);
     const std::uint64_t window_symbols = window_symbol_count;
@@ -266,7 +271,7 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
         if (tau_history_count < tau_history_n) {
             ++tau_history_count;
         }
-        if (tau_history_count >= tau_history_min) {
+        if (tau_history_count >= tau_history_fast_min) {
             // Robust drift estimate: the least-squares slope is
             // wrecked by a single outlier window. A multipath
             // group-delay jump can flip the per-pair pilot phase
@@ -305,13 +310,32 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                 diffs_count % 2 != 0 ? diffs[diffs_count / 2]
                                      : 0.5 * (diffs[diffs_count / 2 - 1] +
                                               diffs[diffs_count / 2]);
-            smoothed_sample_clock_ppm =
-                0.1 * source_sro_estimate_ppm + 0.9 * smoothed_sample_clock_ppm;
+            if (tau_history_count >= tau_history_min) {
+                smoothed_sample_clock_ppm =
+                    0.1 * source_sro_estimate_ppm +
+                    0.9 * smoothed_sample_clock_ppm;
+                sro_estimator_ready = true;
+            } else {
+                // A receiver may begin as far as 20 ppm from nominal. Waiting
+                // for the full robust history would let an 8K FFT boundary
+                // move by hundreds of samples before the actuator starts. A
+                // startup estimate accepts one interval only for an obviously
+                // large error, otherwise it requires the early differences to
+                // form a tight, non-trivial cluster. Normal noisy/multipath
+                // captures keep using the 16-window median.
+                const double spread = diffs[diffs_count - 1] - diffs[0];
+                const bool fast_consistent =
+                    std::abs(source_sro_estimate_ppm) >=
+                        (diffs_count == 1 ? 5.0 : 1.0) &&
+                    spread <=
+                        std::max(0.5, 0.25 * std::abs(source_sro_estimate_ppm));
+                if (fast_consistent) {
+                    smoothed_sample_clock_ppm = source_sro_estimate_ppm;
+                    sro_estimator_ready = true;
+                }
+            }
         }
-        const double drift_limit_ppm =
-            4.0 * 1.0e6 /
-            (static_cast<double>(stats_window_symbols) *
-             static_cast<double>(period));
+        constexpr double drift_limit_ppm = 20.0;
         smoothed_sample_clock_ppm = std::clamp(
             smoothed_sample_clock_ppm, -drift_limit_ppm, drift_limit_ppm);
         smoothed_timing_drift =
@@ -323,7 +347,7 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
         // cadence-4 result at 0.25 and stop all subsequent SRO commands.
         const float confidence =
             timing_measurement_confidence(timing_count, timing_raw_count);
-        if (tau_history_count >= tau_history_min && confidence >= 0.75) {
+        if (sro_estimator_ready && confidence >= 0.75) {
             const std::scoped_lock lock(mutex);
             const std::uint64_t command_output_sample =
                 sample_channel.read_position();
@@ -353,6 +377,29 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                 latest.sro_input_sample_rate_hz = mapped->input_rate_hz;
                 latest.sro_pending_commands = scheduled.pending_sro;
             }
+        }
+        if (sro_estimator_ready &&
+            std::abs(smoothed_sample_clock_ppm) >= 5.0 &&
+            std::abs(timing_offset) > timing_outlier_limit_samples &&
+            guard_size != 0) {
+            // Frequency correction stops further timing drift but cannot undo
+            // the FFT displacement accumulated while a large startup SRO was
+            // being estimated and slewed. Recenter by at most one guard
+            // interval per statistics window. SampleChannel retains that
+            // bounded history, and applied_timing_offset rebases subsequent
+            // drift measurements so the step is not mistaken for new SRO.
+            const int limit = static_cast<int>(std::min<std::size_t>(
+                guard_size,
+                static_cast<std::size_t>(std::numeric_limits<int>::max())));
+            const int shift = std::clamp(
+                static_cast<int>(std::lround(timing_offset)), -limit, limit);
+            if (shift < 0) {
+                next_symbol_start -= static_cast<std::uint64_t>(-shift);
+            } else {
+                next_symbol_start += static_cast<std::uint64_t>(shift);
+            }
+            state.applied_timing_offset += shift;
+            state.timing_tracker.rebase_window(static_cast<double>(shift));
         }
     }
     const double residual_cfo_hz =
@@ -423,8 +470,6 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     auto &period = state.period;
     auto &timing_count = state.timing_count;
     auto &fft_size = state.fft_size;
-    constexpr std::size_t tau_history_min = DemodRuntimeState::tau_history_min;
-    auto &tau_history_count = state.tau_history_count;
     auto &smoothed_sample_clock_ppm = state.smoothed_sample_clock_ppm;
     auto &latest_raw_timing = state.latest_raw_timing;
     auto &cir_confidence = state.cir_confidence;
@@ -492,7 +537,7 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     latest.timing_measurements = timing_raw_count;
     latest.timing_accepted_measurements = timing_count;
     latest.timing_rejected_measurements = timing_rejected_count;
-    latest.timing_drift_ready = tau_history_count >= tau_history_min;
+    latest.timing_drift_ready = state.sro_estimator_ready;
     latest.fade_indicator = fade_indicator;
     latest.mer_db =
         mer_sum == 0.0 && window_symbols == 0

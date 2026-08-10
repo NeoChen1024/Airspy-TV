@@ -59,6 +59,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--decoder-threads", type=int, default=0)
     parser.add_argument("--result-json", type=Path)
+    parser.add_argument("--center-frequency", type=int, default=557_000_000)
+    parser.add_argument("--sample-clock-ppm", type=float, default=0.0)
+    parser.add_argument(
+        "--sample-clock-drift-ppm-per-minute", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--sample-clock-knot", action="append", metavar="SECONDS:PPM"
+    )
+    parser.add_argument("--lo-offset-hz", type=float, default=0.0)
+    parser.add_argument("--lo-drift-hz-per-minute", type=float, default=0.0)
+    parser.add_argument("--lo-ppm-knot", action="append", metavar="SECONDS:PPM")
+    parser.add_argument("--require-no-rebootstrap", action="store_true")
     parser.add_argument("--dvbt-mode", choices=("2k", "8k"), default="2k")
     parser.add_argument(
         "--dvbt-channel-bandwidth",
@@ -110,6 +122,8 @@ def run_validation(args: argparse.Namespace, work_dir: Path) -> dict[str, Any]:
         "-",
         "--duration",
         str(args.duration),
+        "--center-frequency",
+        str(args.center_frequency),
         "--expected-ts",
         str(expected_ts),
         "--dvbt-mode",
@@ -123,6 +137,21 @@ def run_validation(args: argparse.Namespace, work_dir: Path) -> dict[str, Any]:
         "--dvbt-code-rate",
         args.dvbt_code_rate,
     ]
+    for option, value in (
+        ("--sample-clock-ppm", args.sample_clock_ppm),
+        (
+            "--sample-clock-drift-ppm-per-minute",
+            args.sample_clock_drift_ppm_per_minute,
+        ),
+        ("--lo-offset-hz", args.lo_offset_hz),
+        ("--lo-drift-hz-per-minute", args.lo_drift_hz_per_minute),
+    ):
+        if value != 0.0:
+            generator_command.extend((option, str(value)))
+    for knot in args.sample_clock_knot or ():
+        generator_command.extend(("--sample-clock-knot", knot))
+    for knot in args.lo_ppm_knot or ():
+        generator_command.extend(("--lo-ppm-knot", knot))
     decoder_command = [
         str(decoder),
         "--decode-iq",
@@ -198,6 +227,13 @@ def run_validation(args: argparse.Namespace, work_dir: Path) -> dict[str, Any]:
         expected_constellation=args.dvbt_modulation,
         expected_code_rate=args.dvbt_code_rate,
     )
+    if args.require_no_rebootstrap:
+        rebootstrap = report["stats"]["counters"]["cfo_rebootstrap_count"]
+        if rebootstrap != 0:
+            raise RuntimeError(
+                "smooth clock profile triggered "
+                f"{rebootstrap} unnecessary frontend rebootstrap(s)"
+            )
     print(
         f"passed: {args.dvbt_mode.upper()} GI {args.dvbt_guard}, "
         f"{len(recovered)} exact TS packets, source offset {source_offset}, "
@@ -216,6 +252,9 @@ def run_validation(args: argparse.Namespace, work_dir: Path) -> dict[str, Any]:
             "guard_interval": args.dvbt_guard,
             "constellation": args.dvbt_modulation,
             "code_rate": args.dvbt_code_rate,
+            "center_frequency_hz": args.center_frequency,
+            "sample_clock_knots_ppm": args.sample_clock_knot or [],
+            "lo_knots_ppm": args.lo_ppm_knot or [],
         },
         "transport_validation": {
             "source_cycle_packets": len(expected),
@@ -281,6 +320,9 @@ def main() -> int:
                         "guard_interval": args.dvbt_guard,
                         "constellation": args.dvbt_modulation,
                         "code_rate": args.dvbt_code_rate,
+                        "center_frequency_hz": args.center_frequency,
+                        "sample_clock_knots_ppm": args.sample_clock_knot or [],
+                        "lo_knots_ppm": args.lo_ppm_knot or [],
                     },
                     "error": {
                         "type": type(exception).__name__,

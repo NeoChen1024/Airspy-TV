@@ -93,6 +93,7 @@ add_library(airspy-tv-common STATIC
     src/jsonl.cpp
     src/rtp_udp_output.cpp
     src/transport_output.cpp
+    src/transport_write_all.cpp
 )
 target_include_directories(airspy-tv-common PUBLIC include)
 target_link_libraries(airspy-tv-common PUBLIC Threads::Threads
@@ -173,6 +174,7 @@ add_executable(airspy-tv
     src/main_cli.cpp
     src/main_commands.cpp
     src/mpv_player.cpp
+    src/playback_stream_buffer.cpp
     src/offline_decode.cpp
 )
 target_include_directories(airspy-tv PRIVATE include)
@@ -329,6 +331,17 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME dvbt-demod-dsp COMMAND dvbt-demod-dsp-test)
 
+    add_executable(dvbt-signal-analyzer-test
+        tests/dvbt_signal_analyzer_test.cpp
+    )
+    target_link_libraries(dvbt-signal-analyzer-test PRIVATE airspy-tv-dvbt)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(dvbt-signal-analyzer-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME dvbt-signal-analyzer COMMAND dvbt-signal-analyzer-test)
+    set_tests_properties(dvbt-signal-analyzer PROPERTIES TIMEOUT 30)
+
     add_executable(dvbt-stream-decoder-test
         tests/dvbt_stream_decoder_test.cpp
     )
@@ -340,7 +353,8 @@ if(BUILD_TESTING)
     endif()
     foreach(STREAM_CASE clean cfo-centering cfo-drift cfo-rebootstrap
                         worker-parity queue-capacity reset-new reset-hopeless
-                        reset-live reset-wait no-acq)
+                        mode-transition lifecycle-stress reset-live reset-wait
+                        no-acq)
         add_test(NAME dvbt-stream-decoder-${STREAM_CASE}
                  COMMAND dvbt-stream-decoder-test)
         set_tests_properties(dvbt-stream-decoder-${STREAM_CASE} PROPERTIES
@@ -399,16 +413,32 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME sdr-file-source COMMAND sdr-file-source-test)
+    set_tests_properties(sdr-file-source PROPERTIES TIMEOUT 30)
 
     add_executable(transport-output-test
         tests/transport_output_test.cpp
     )
+    target_include_directories(transport-output-test PRIVATE src)
     target_link_libraries(transport-output-test PRIVATE airspy-tv-common)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(transport-output-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME transport-output COMMAND transport-output-test)
+    set_tests_properties(transport-output PROPERTIES TIMEOUT 30)
+
+    add_executable(playback-stream-buffer-test
+        tests/playback_stream_buffer_test.cpp
+        src/playback_stream_buffer.cpp
+    )
+    target_include_directories(playback-stream-buffer-test PRIVATE src)
+    target_link_libraries(playback-stream-buffer-test PRIVATE Threads::Threads)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(playback-stream-buffer-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME playback-stream-buffer COMMAND playback-stream-buffer-test)
+    set_tests_properties(playback-stream-buffer PROPERTIES TIMEOUT 30)
 
     add_executable(transport-observer-test
         tests/transport_observer_test.cpp
@@ -429,6 +459,17 @@ if(BUILD_TESTING)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     endif()
     add_test(NAME transport-pipeline COMMAND transport-pipeline-test)
+
+    add_executable(transport-stream-model-test
+        tests/transport_stream_model_test.cpp
+    )
+    target_link_libraries(transport-stream-model-test PRIVATE airspy-tv-runtime)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(transport-stream-model-test PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    add_test(NAME transport-stream-model COMMAND transport-stream-model-test)
+    set_tests_properties(transport-stream-model PROPERTIES TIMEOUT 30)
 
     add_executable(rtp-udp-output-test
         tests/rtp_udp_output_test.cpp

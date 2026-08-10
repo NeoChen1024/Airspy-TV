@@ -51,7 +51,8 @@ The JSONL files use one schema each:
 - `ctest.jsonl`: one parsed JUnit record per CTest case, including duration,
   pass/fail/skip state, properties, failure detail, and captured output;
 - `fixtures.jsonl`: one record per completed matrix case, written immediately
-  in completion order and carrying a stable `case_index`.
+  in completion order and carrying a stable `case_index`; opt-in clock cases
+  are distinguished by `case_type: clock_regression`.
 - `real-signals.jsonl`: one record per real recording, with execution status,
   decode outcome, regression status, complete bounded decode aggregates, and a
   stable corpus index. Synthetic exact-match rules do not apply to this stream.
@@ -127,6 +128,22 @@ Select profiles or inspect the deterministic case sets without running them:
 python3 scripts/run_validation.py --profiles portable-release asan-ubsan
 python3 scripts/run_validation.py --profiles tsan --list-cases
 ```
+
+Run the retained 60-second 2K/8K clock matrix separately from routine CI. It
+covers sample-clock-only, LO-only, linear ramp, reversal, in-phase, inverted,
+and fixed-seed out-of-phase profiles through the portable build. Clock cases
+use robust QPSK 1/2 payloads to isolate tracking from fixture-interpolation
+MER; the routine matrix retains full modulation/code-rate coverage:
+
+```sh
+python3 scripts/run_validation.py --bootstrap \
+  --profiles portable-release --clock-regressions
+```
+
+Use `--clock-regressions --list-cases` to inspect the case set. Every clock
+case requires exact cyclic TS identity, zero input drops, TEI and uncorrectable
+RS packets, final lock, exact sample accounting, and no frontend rebootstrap
+for the smooth ramp/reversal profile.
 
 `--jobs N` sets build, CTest, and fixture-case concurrency together. Each can
 be tuned independently with `--build-jobs`, `--ctest-jobs`, and

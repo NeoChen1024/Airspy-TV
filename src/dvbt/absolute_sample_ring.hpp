@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <span>
+#include <string>
 #include <vector>
 
 // Bounded producer/consumer storage with absolute stream positions. Queue
@@ -56,7 +57,12 @@ class AbsoluteSampleRing {
         if (output.size() > samples_.size() || position < read_position ||
             position > write_position ||
             output.size() > write_position - position) {
-            throw std::out_of_range("sample ring read is outside retained data");
+            throw std::out_of_range(
+                "sample ring read is outside retained data: position=" +
+                std::to_string(position) + ", size=" +
+                std::to_string(output.size()) + ", retained=[" +
+                std::to_string(read_position) + ", " +
+                std::to_string(write_position) + ")");
         }
         if (output.empty()) {
             return;

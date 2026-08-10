@@ -1,4 +1,5 @@
 #include "airspy_tv/transport_output.hpp"
+#include "transport_write_all.hpp"
 
 #include <algorithm>
 #include <array>
@@ -8,6 +9,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <span>
@@ -173,7 +175,203 @@ bool test_write_failure_is_reported() {
     output.stop(true);
     const auto stats = output.stats();
     return require(stats.failed, "worker write failure is reported") &&
-           require(!stats.error.empty(), "write failure includes an error");
+           require(!stats.error.empty(), "write failure includes an error") &&
+           require(stats.blocks_accepted == 1 && stats.blocks_written == 0 &&
+                       stats.dropped_blocks == 1 &&
+                       stats.dropped_bytes == block.size(),
+                   "failed in-flight block is accounted exactly once") &&
+           require(stats.queued_bytes == 0,
+                   "failed in-flight accounting is cleared");
+}
+
+bool test_deterministic_partial_write_sequence() {
+    enum class ScriptStep { partial_three, eintr, partial_two, eagain, finish };
+    const std::vector<std::uint8_t> input{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    std::vector<std::uint8_t> written;
+    std::size_t call = 0;
+    constexpr std::array script{ScriptStep::partial_three, ScriptStep::eintr,
+                                ScriptStep::partial_two, ScriptStep::eagain,
+                                ScriptStep::finish};
+    std::atomic<bool> abort_requested{false};
+    std::string error;
+    const bool ok = airspy_tv::detail::transport_write_all(
+        input, abort_requested,
+        [&](const std::span<const std::uint8_t> remaining) {
+            const auto step = script.at(call++);
+            if (step == ScriptStep::eintr || step == ScriptStep::eagain) {
+                return airspy_tv::detail::TransportWriteStepResult{
+                    .kind =
+                        airspy_tv::detail::TransportWriteStepKind::retry,
+                    .bytes = 0,
+                    .error = {}};
+            }
+            const std::size_t count =
+                step == ScriptStep::partial_three
+                    ? 3U
+                    : step == ScriptStep::partial_two ? 2U : remaining.size();
+            written.insert(written.end(), remaining.begin(),
+                           remaining.begin() +
+                               static_cast<std::ptrdiff_t>(count));
+            return airspy_tv::detail::TransportWriteStepResult{
+                .kind = airspy_tv::detail::TransportWriteStepKind::progress,
+                .bytes = count,
+                .error = {}};
+        },
+        error);
+    return require(ok && error.empty(),
+                   "partial writes and retries complete successfully") &&
+           require(written == input,
+                   "partial-write loop neither duplicates nor loses bytes") &&
+           require(call == script.size(),
+                   "partial/EINTR/EAGAIN sequence is consumed exactly once");
+}
+
+bool test_deterministic_write_failure_and_cancel() {
+    const std::vector<std::uint8_t> input{0, 1, 2, 3};
+    std::atomic<bool> abort_requested{false};
+    std::string error;
+    std::size_t call = 0;
+    const bool failed = airspy_tv::detail::transport_write_all(
+        input, abort_requested,
+        [&](const std::span<const std::uint8_t>) {
+            if (call++ == 0) {
+                return airspy_tv::detail::TransportWriteStepResult{
+                    .kind =
+                        airspy_tv::detail::TransportWriteStepKind::progress,
+                    .bytes = 2,
+                    .error = {}};
+            }
+            return airspy_tv::detail::TransportWriteStepResult{
+                .kind = airspy_tv::detail::TransportWriteStepKind::failure,
+                .bytes = 0,
+                .error = "injected ENOSPC"};
+        },
+        error);
+    if (!require(!failed && error == "injected ENOSPC",
+                 "deterministic terminal error is preserved")) {
+        return false;
+    }
+
+    abort_requested = true;
+    error.clear();
+    bool called = false;
+    const bool canceled = airspy_tv::detail::transport_write_all(
+        input, abort_requested,
+        [&](const std::span<const std::uint8_t>) {
+            called = true;
+            return airspy_tv::detail::TransportWriteStepResult{};
+        },
+        error);
+    return require(!canceled && error.empty(),
+                   "cancellation is distinct from writer failure") &&
+           require(!called, "preexisting cancellation performs no write");
+}
+
+bool test_scripted_writer_core_drain_failure_and_abort() {
+    const std::vector<std::uint8_t> first{0, 1, 2, 3};
+    const std::vector<std::uint8_t> second{4, 5, 6};
+    std::vector<std::uint8_t> written;
+    std::size_t calls = 0;
+    airspy_tv::detail::TransportWriterCore draining(
+        {.queue_capacity_bytes = 64, .thread_name = "ts-core-test"},
+        [&](const std::span<const std::uint8_t> remaining) {
+            ++calls;
+            if (calls == 2 || calls == 5) {
+                return airspy_tv::detail::TransportWriteStepResult{
+                    .kind = airspy_tv::detail::TransportWriteStepKind::retry,
+                    .bytes = 0,
+                    .error = {}};
+            }
+            const std::size_t count = std::min<std::size_t>(2, remaining.size());
+            written.insert(written.end(), remaining.begin(),
+                           remaining.begin() +
+                               static_cast<std::ptrdiff_t>(count));
+            return airspy_tv::detail::TransportWriteStepResult{
+                .kind = airspy_tv::detail::TransportWriteStepKind::progress,
+                .bytes = count,
+                .error = {}};
+        });
+    std::string error;
+    if (!require(draining.start(error), "scripted drain core starts: " + error) ||
+        !require(draining.submit(first) && draining.submit(second),
+                 "scripted drain accepts both blocks")) {
+        return false;
+    }
+    draining.stop(true);
+    const auto drained = draining.stats();
+    const std::vector<std::uint8_t> expected{0, 1, 2, 3, 4, 5, 6};
+    if (!require(written == expected,
+                 "drain stop preserves scripted partial-write ordering") ||
+        !require(drained.blocks_accepted == 2 && drained.blocks_written == 2 &&
+                     drained.bytes_written == expected.size() &&
+                     drained.dropped_blocks == 0,
+                 "drain counters count each logical block once")) {
+        return false;
+    }
+
+    std::promise<void> failure_seen;
+    auto failure_ready = failure_seen.get_future();
+    bool failure_signaled = false;
+    airspy_tv::detail::TransportWriterCore failing(
+        {.queue_capacity_bytes = 64, .thread_name = "ts-core-test"},
+        [&](const std::span<const std::uint8_t>) {
+            if (!failure_signaled) {
+                failure_signaled = true;
+                failure_seen.set_value();
+            }
+            return airspy_tv::detail::TransportWriteStepResult{
+                .kind = airspy_tv::detail::TransportWriteStepKind::failure,
+                .error = "injected ENOSPC"};
+        });
+    error.clear();
+    if (!require(failing.start(error), "scripted failure core starts: " + error) ||
+        !require(failing.submit(first), "scripted failure block is accepted") ||
+        !require(failure_ready.wait_for(std::chrono::seconds(1)) ==
+                     std::future_status::ready,
+                 "scripted failure reaches the writer")) {
+        return false;
+    }
+    failing.stop(true);
+    const auto failed = failing.stats();
+    if (!require(failed.failed && failed.error == "injected ENOSPC" &&
+                     failed.blocks_accepted == 1 && failed.blocks_written == 0 &&
+                     failed.dropped_blocks == 1 &&
+                     failed.dropped_bytes == first.size(),
+                 "terminal scripted failure has exact accounting")) {
+        return false;
+    }
+
+    std::promise<void> retry_seen;
+    auto retry_ready = retry_seen.get_future();
+    std::atomic_bool retry_signaled{};
+    airspy_tv::detail::TransportWriterCore aborting(
+        {.queue_capacity_bytes = 64, .thread_name = "ts-core-test"},
+        [&](const std::span<const std::uint8_t>) {
+            if (!retry_signaled.exchange(true)) {
+                retry_seen.set_value();
+            }
+            return airspy_tv::detail::TransportWriteStepResult{
+                .kind = airspy_tv::detail::TransportWriteStepKind::retry,
+                .bytes = 0,
+                .error = {}};
+        });
+    error.clear();
+    if (!require(aborting.start(error), "scripted abort core starts: " + error) ||
+        !require(aborting.submit(first) && aborting.submit(second),
+                 "scripted abort accepts queued blocks") ||
+        !require(retry_ready.wait_for(std::chrono::seconds(1)) ==
+                     std::future_status::ready,
+                 "scripted abort reaches an in-flight retry")) {
+        return false;
+    }
+    aborting.stop(false);
+    const auto aborted = aborting.stats();
+    return require(!aborted.failed && aborted.blocks_written == 0,
+                   "abort is not reported as a writer failure") &&
+           require(aborted.blocks_accepted == 2 && aborted.dropped_blocks == 2 &&
+                       aborted.dropped_bytes == first.size() + second.size() &&
+                       aborted.queued_bytes == 0,
+                   "abort accounts in-flight and queued blocks exactly once");
 }
 
 bool test_blocked_output_drops_and_remains_cancellable() {
@@ -227,7 +425,11 @@ bool test_blocked_output_drops_and_remains_cancellable() {
            require(blocked_stats.dropped_blocks != 0,
                    "blocked output drops queued blocks") &&
            require(stop_elapsed < std::chrono::seconds(1),
-                   "blocked output cancellation does not hang");
+                   "blocked output cancellation does not hang") &&
+           require(output.stats().blocks_accepted ==
+                       output.stats().blocks_written +
+                           output.stats().dropped_blocks,
+                   "abort stop accounts every accepted logical block");
 }
 
 bool test_blocking_output_applies_backpressure() {
@@ -349,6 +551,9 @@ int main() {
                     test_required_overflow_fails_sink() &&
                     test_optional_overflow_is_sink_local() &&
                     test_write_failure_is_reported() &&
+                    test_deterministic_partial_write_sequence() &&
+                    test_deterministic_write_failure_and_cancel() &&
+                    test_scripted_writer_core_drain_failure_and_abort() &&
                     test_blocked_output_drops_and_remains_cancellable() &&
                     test_blocking_output_applies_backpressure() &&
                     test_discard_queued_is_sink_local();

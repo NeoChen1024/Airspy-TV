@@ -51,6 +51,19 @@ struct TimingSlopeTracker {
         return filtered_tau;
     }
 
+    void rebase_window(const double applied_shift_samples) noexcept {
+        if (!initialized || !std::isfinite(applied_shift_samples)) {
+            return;
+        }
+        // Moving the FFT start by d changes the measured pilot slope by -d.
+        // Preserve the same physical timing branch across intentional window
+        // recentering so the outlier gate does not reject every later symbol.
+        for (double &sample : history) {
+            sample -= applied_shift_samples;
+        }
+        filtered_tau -= applied_shift_samples;
+    }
+
     [[nodiscard]] std::optional<double> filtered() const noexcept {
         // A few accepted symbols make the shared verify ramp independent of
         // the first noisy pilot observation after acquisition.

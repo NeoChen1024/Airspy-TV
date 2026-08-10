@@ -429,6 +429,7 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
     auto &fft_size = state.fft_size;
     auto &window_cir_offset_sum = state.window_cir_offset_sum;
     auto &applied_cir_offset = state.applied_cir_offset;
+    auto &applied_timing_offset = state.applied_timing_offset;
     auto &fade_indicator = state.fade_indicator;
     auto &cir_confidence = state.cir_confidence;
     auto &guard_size = state.guard_size;
@@ -539,7 +540,8 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
     // Accumulate the exact applied position before the CIR
     // update below can move the anchor for the next symbol.
     channel_stage_started_at = std::chrono::steady_clock::now();
-    window_cir_offset_sum += static_cast<double>(applied_cir_offset);
+    window_cir_offset_sum +=
+        static_cast<double>(applied_cir_offset + applied_timing_offset);
     // CIR / delay-spread estimate (scattered pilots -> IFFT ->
     // impulse response) for adaptive FFT-window placement.
     // Once per TPS frame: negligible cost. When the measured

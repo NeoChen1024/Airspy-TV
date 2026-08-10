@@ -392,6 +392,20 @@ XDG_CACHE_HOME=/tmp/airspy-tv-gnuradio-cache \
 The JSON sidecar records all four impairment parameters while retaining the
 nominal 10 MS/s sample rate expected by the decoder.
 
+For reversals and other non-monotonic profiles, repeat
+`--sample-clock-knot SECONDS:PPM` and `--lo-ppm-knot SECONDS:PPM`. The first
+knot must be at zero seconds. LO ppm is converted using `--center-frequency`,
+and the generator integrates each piecewise-linear segment so carrier phase is
+continuous across every knot:
+
+```sh
+python3 tools/generate_dvbt_fixture.py /tmp/airspy-tv-reversal.cs16 \
+  --duration 60 --center-frequency 557000000 \
+  --sample-clock-knot 0:-5 --sample-clock-knot 30:5 \
+  --sample-clock-knot 60:-5 \
+  --lo-ppm-knot 0:5 --lo-ppm-knot 30:-5 --lo-ppm-knot 60:5
+```
+
 Run the end-to-end clock regression to generate and decode sample-clock-only,
 LO-only, and independent sample/LO drift fixtures:
 
@@ -412,3 +426,13 @@ temporary directory that is removed after the run. Pass `--work-dir PATH` to
 retain those artifacts for inspection. The validator checks the recovered SRO
 and CFO independently, requires non-empty TS output, and rejects timing/FEC
 failure events.
+
+The retained 60-second 2K/8K SRO/LO matrix is opt-in and writes its results to
+the normal machine-readable validation report. It uses QPSK 1/2 to isolate
+clock-loop correctness; the routine matrix separately covers all modulation
+and code-rate combinations:
+
+```sh
+python3 scripts/run_validation.py --bootstrap \
+  --profiles portable-release --clock-regressions
+```

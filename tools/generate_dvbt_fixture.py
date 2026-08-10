@@ -67,6 +67,72 @@ class DvbtConfig:
         return CHANNEL_BANDWIDTHS[self.channel_bandwidth]
 
 
+@dataclass(frozen=True)
+class PpmProfile:
+    """Piecewise-linear ppm values with an exact continuous-time integral."""
+
+    knots: tuple[tuple[float, float], ...]
+
+    def values(self, seconds: np.ndarray) -> np.ndarray:
+        times = np.asarray([knot[0] for knot in self.knots], dtype=np.float64)
+        values = np.asarray([knot[1] for knot in self.knots], dtype=np.float64)
+        return np.interp(seconds, times, values)
+
+    def integral(self, seconds: np.ndarray) -> np.ndarray:
+        """Integrate ppm-seconds from t=0 without phase discontinuities."""
+
+        result = np.zeros_like(seconds, dtype=np.float64)
+        for index, (begin, begin_value) in enumerate(self.knots):
+            end = (
+                self.knots[index + 1][0]
+                if index + 1 < len(self.knots)
+                else math.inf
+            )
+            end_value = (
+                self.knots[index + 1][1]
+                if index + 1 < len(self.knots)
+                else begin_value
+            )
+            span = np.clip(seconds - begin, 0.0, end - begin)
+            if math.isfinite(end):
+                slope = (end_value - begin_value) / (end - begin)
+                result += begin_value * span + 0.5 * slope * span * span
+            else:
+                result += begin_value * span
+        return result
+
+    @property
+    def minimum(self) -> float:
+        return min(value for _, value in self.knots)
+
+
+def parse_ppm_knots(
+    parser: argparse.ArgumentParser,
+    values: list[str] | None,
+    option: str,
+    duration: float,
+) -> PpmProfile | None:
+    if not values:
+        return None
+    knots: list[tuple[float, float]] = []
+    for value in values:
+        try:
+            seconds_text, ppm_text = value.split(":", 1)
+            knot = (float(seconds_text), float(ppm_text))
+        except (ValueError, TypeError):
+            parser.error(f"{option} must use SECONDS:PPM")
+        if not all(math.isfinite(component) for component in knot):
+            parser.error(f"{option} values must be finite")
+        knots.append(knot)
+    if knots[0][0] != 0.0:
+        parser.error(f"the first {option} must start at 0 seconds")
+    if any(seconds < 0.0 or seconds > duration for seconds, _ in knots):
+        parser.error(f"{option} times must be within the fixture duration")
+    if any(right[0] <= left[0] for left, right in zip(knots, knots[1:])):
+        parser.error(f"{option} times must be strictly increasing")
+    return PpmProfile(tuple(knots))
+
+
 class StreamingCs16Sink(gr.sync_block):
     """Apply independent SRO/CFO impairments and emit bounded CS16 chunks."""
 
@@ -78,6 +144,9 @@ class StreamingCs16Sink(gr.sync_block):
         sample_clock_drift_ppm_per_minute: float,
         lo_offset_hz: float,
         lo_drift_hz_per_minute: float,
+        sample_clock_profile: PpmProfile | None = None,
+        lo_ppm_profile: PpmProfile | None = None,
+        center_frequency_hz: float = 0.0,
     ) -> None:
         super().__init__(
             name="DVB-T streaming CS16 sink",
@@ -90,12 +159,20 @@ class StreamingCs16Sink(gr.sync_block):
         self._sample_clock_drift_ppm_per_minute = sample_clock_drift_ppm_per_minute
         self._lo_offset_hz = lo_offset_hz
         self._lo_drift_hz_per_minute = lo_drift_hz_per_minute
+        self._sample_clock_profile = sample_clock_profile
+        self._lo_ppm_profile = lo_ppm_profile
+        self._center_frequency_hz = center_frequency_hz
         duration_seconds = output_samples / OUTPUT_SAMPLE_RATE
         final_clock_ppm = (
             sample_clock_ppm
             + sample_clock_drift_ppm_per_minute * duration_seconds / 60.0
         )
-        self._max_clock_scale = 1.0 + max(sample_clock_ppm, final_clock_ppm) * 1.0e-6
+        maximum_clock_ppm = (
+            max(value for _, value in sample_clock_profile.knots)
+            if sample_clock_profile is not None
+            else max(sample_clock_ppm, final_clock_ppm)
+        )
+        self._max_clock_scale = 1.0 + maximum_clock_ppm * 1.0e-6
 
         self._pending = np.empty(0, dtype=np.complex64)
         self._pending_start = 0
@@ -170,8 +247,12 @@ class StreamingCs16Sink(gr.sync_block):
             )
             time_seconds = sample_numbers / float(OUTPUT_SAMPLE_RATE)
             clock_ppm = (
-                self._sample_clock_ppm
-                + self._sample_clock_drift_ppm_per_minute * time_seconds / 60.0
+                self._sample_clock_profile.values(time_seconds)
+                if self._sample_clock_profile is not None
+                else self._sample_clock_ppm
+                + self._sample_clock_drift_ppm_per_minute
+                * time_seconds
+                / 60.0
             )
             clock_scale = 1.0 + clock_ppm * 1.0e-6
             if np.any(clock_scale <= 0.0):
@@ -200,7 +281,16 @@ class StreamingCs16Sink(gr.sync_block):
                 + self._pending[left + 1] * fraction
             ).astype(np.complex64)
 
-            if self._lo_offset_hz != 0.0 or self._lo_drift_hz_per_minute != 0.0:
+            if self._lo_ppm_profile is not None:
+                phase = (
+                    2.0
+                    * np.pi
+                    * self._center_frequency_hz
+                    * self._lo_ppm_profile.integral(time_seconds)
+                    * 1.0e-6
+                )
+                impaired *= np.exp(1j * phase).astype(np.complex64)
+            elif self._lo_offset_hz != 0.0 or self._lo_drift_hz_per_minute != 0.0:
                 drift_hz_per_second = self._lo_drift_hz_per_minute / 60.0
                 phase = (
                     2.0
@@ -388,6 +478,7 @@ def required_transmitter_samples(
     output_samples: int,
     sample_clock_ppm: float,
     sample_clock_drift_ppm_per_minute: float,
+    sample_clock_profile: PpmProfile | None = None,
 ) -> int:
     """Return enough ideal samples to cover the receiver-clock time warp."""
 
@@ -395,7 +486,12 @@ def required_transmitter_samples(
     final_ppm = (
         sample_clock_ppm + sample_clock_drift_ppm_per_minute * duration_seconds / 60.0
     )
-    minimum_clock_scale = 1.0 + min(sample_clock_ppm, final_ppm) * 1.0e-6
+    minimum_ppm = (
+        sample_clock_profile.minimum
+        if sample_clock_profile is not None
+        else min(sample_clock_ppm, final_ppm)
+    )
+    minimum_clock_scale = 1.0 + minimum_ppm * 1.0e-6
     if minimum_clock_scale <= 0.0:
         raise ValueError("sample-clock impairment makes the clock non-positive")
     return math.ceil(output_samples / minimum_clock_scale) + 8
@@ -436,6 +532,15 @@ def parse_args() -> argparse.Namespace:
         help="linear change of sample-clock offset in ppm per minute",
     )
     parser.add_argument(
+        "--sample-clock-knot",
+        action="append",
+        metavar="SECONDS:PPM",
+        help=(
+            "piecewise-linear sample-clock profile; repeat for each knot, "
+            "starting at 0 seconds"
+        ),
+    )
+    parser.add_argument(
         "--lo-offset-hz",
         type=float,
         default=0.0,
@@ -446,6 +551,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="linear change of LO offset in Hz per minute",
+    )
+    parser.add_argument(
+        "--lo-ppm-knot",
+        action="append",
+        metavar="SECONDS:PPM",
+        help=(
+            "piecewise-linear LO error relative to --center-frequency; "
+            "repeat for each knot, starting at 0 seconds"
+        ),
     )
     args = parser.parse_args()
     if args.duration <= 0.0:
@@ -458,12 +572,40 @@ def parse_args() -> argparse.Namespace:
     )
     if not all(math.isfinite(value) for value in impairment_values):
         parser.error("clock impairment values must be finite")
-    duration_seconds = args.duration
-    final_clock_ppm = (
-        args.sample_clock_ppm
-        + args.sample_clock_drift_ppm_per_minute * duration_seconds / 60.0
+    args.sample_clock_profile = parse_ppm_knots(
+        parser,
+        args.sample_clock_knot,
+        "--sample-clock-knot",
+        args.duration,
     )
-    if 1.0 + min(args.sample_clock_ppm, final_clock_ppm) * 1.0e-6 <= 0.0:
+    args.lo_ppm_profile = parse_ppm_knots(
+        parser, args.lo_ppm_knot, "--lo-ppm-knot", args.duration
+    )
+    if args.sample_clock_profile is not None and (
+        args.sample_clock_ppm != 0.0
+        or args.sample_clock_drift_ppm_per_minute != 0.0
+    ):
+        parser.error(
+            "sample-clock knots cannot be combined with the legacy "
+            "constant/linear sample-clock options"
+        )
+    if args.lo_ppm_profile is not None and (
+        args.lo_offset_hz != 0.0 or args.lo_drift_hz_per_minute != 0.0
+    ):
+        parser.error(
+            "LO ppm knots cannot be combined with the legacy constant/linear "
+            "LO options"
+        )
+    duration_seconds = args.duration
+    final_clock_ppm = args.sample_clock_ppm + (
+        args.sample_clock_drift_ppm_per_minute * duration_seconds / 60.0
+    )
+    minimum_clock_ppm = (
+        args.sample_clock_profile.minimum
+        if args.sample_clock_profile is not None
+        else min(args.sample_clock_ppm, final_clock_ppm)
+    )
+    if 1.0 + minimum_clock_ppm * 1.0e-6 <= 0.0:
         parser.error("sample-clock impairment makes the clock non-positive")
     return args
 
@@ -482,6 +624,7 @@ def run_generator(
         sample_count,
         args.sample_clock_ppm,
         args.sample_clock_drift_ppm_per_minute,
+        args.sample_clock_profile,
     )
     sink = StreamingCs16Sink(
         output,
@@ -490,6 +633,9 @@ def run_generator(
         args.sample_clock_drift_ppm_per_minute,
         args.lo_offset_hz,
         args.lo_drift_hz_per_minute,
+        args.sample_clock_profile,
+        args.lo_ppm_profile,
+        args.center_frequency,
     )
     DvbtTransmitter(expected_ts, sink, transmitter_sample_count, config).run()
     sink.finish()
@@ -528,6 +674,16 @@ def write_metadata(
             ),
             "lo_offset_hz": args.lo_offset_hz,
             "lo_drift_hz_per_minute": args.lo_drift_hz_per_minute,
+            "sample_clock_knots_ppm": (
+                [list(knot) for knot in args.sample_clock_profile.knots]
+                if args.sample_clock_profile is not None
+                else None
+            ),
+            "lo_knots_ppm": (
+                [list(knot) for knot in args.lo_ppm_profile.knots]
+                if args.lo_ppm_profile is not None
+                else None
+            ),
         },
         "quantization": {
             "cs16_scale": CS16_SCALE,
@@ -560,13 +716,21 @@ def report_result(
         f"clipped components={sink.clipped_components}",
         file=sys.stderr,
     )
+    sample_clock_description = (
+        f"knots={args.sample_clock_profile.knots}"
+        if args.sample_clock_profile is not None
+        else f"{args.sample_clock_ppm:+g} ppm, "
+        f"drift={args.sample_clock_drift_ppm_per_minute:+g} ppm/min"
+    )
+    lo_description = (
+        f"knots={args.lo_ppm_profile.knots} ppm at {args.center_frequency} Hz"
+        if args.lo_ppm_profile is not None
+        else f"{args.lo_offset_hz:+g} Hz, "
+        f"drift={args.lo_drift_hz_per_minute:+g} Hz/min"
+    )
     print(
-        "impairments: "
-        f"sample clock={args.sample_clock_ppm:+g} ppm, "
-        f"sample drift={args.sample_clock_drift_ppm_per_minute:+g} "
-        "ppm/min, "
-        f"LO={args.lo_offset_hz:+g} Hz, "
-        f"LO drift={args.lo_drift_hz_per_minute:+g} Hz/min",
+        f"impairments: sample clock {sample_clock_description}; "
+        f"LO {lo_description}",
         file=sys.stderr,
     )
     print(f"source transport stream: {expected_ts}", file=sys.stderr)
