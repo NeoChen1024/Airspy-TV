@@ -50,7 +50,6 @@ class ReceiverSession {
     [[nodiscard]] SpectrumSnapshot spectrum_snapshot() const;
     [[nodiscard]] std::vector<TransportService> transport_services() const;
     [[nodiscard]] EpgSnapshot epg_snapshot(std::uint16_t service_id) const;
-    [[nodiscard]] TransportPipelineSnapshot transport_snapshot() const;
     [[nodiscard]] std::vector<TransportOutputTelemetry>
     transport_output_telemetry() const;
     [[nodiscard]] std::string runtime_error() const;

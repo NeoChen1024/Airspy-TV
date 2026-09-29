@@ -82,12 +82,7 @@ bool SdrDevice::start_stream(const SourceSettings &settings,
     if (!configure(settings, error)) {
         return false;
     }
-    return impl_->source->start(
-        {.samples = std::move(callbacks.samples),
-         .discontinuity = std::move(callbacks.discontinuity),
-         .finite_input_complete = std::move(callbacks.finite_input_complete),
-         .unexpected_stop = std::move(callbacks.unexpected_stop)},
-        error);
+    return impl_->source->start(std::move(callbacks), error);
 }
 
 void SdrDevice::stop_stream() noexcept {

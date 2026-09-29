@@ -45,8 +45,6 @@ class DecodeRunReporter {
     bool finalize(ReceiverSession &session, std::string &error,
                   std::string_view run_failure = {}, int exit_code = 0);
 
-    [[nodiscard]] bool enabled() const noexcept;
-    [[nodiscard]] bool source_active() const noexcept;
     void set_transport_output_provider(TransportOutputProvider provider);
 
   private:

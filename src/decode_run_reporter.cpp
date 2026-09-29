@@ -18,14 +18,6 @@ DecodeRunReporter::DecodeRunReporter(
 
 DecodeRunReporter::~DecodeRunReporter() = default;
 
-bool DecodeRunReporter::enabled() const noexcept {
-    return directory_.has_value();
-}
-
-bool DecodeRunReporter::source_active() const noexcept {
-    return source_active_;
-}
-
 void DecodeRunReporter::set_transport_output_provider(
     TransportOutputProvider provider) {
     transport_output_provider_ = std::move(provider);

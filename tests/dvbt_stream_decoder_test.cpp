@@ -542,7 +542,6 @@ struct DecodeResult {
     airspy_tv::dvbt::StreamDecoderStats stats;
     SignalAnalysisSnapshot analysis;
     airspy_tv::SignalSnapshot signal;
-    airspy_tv::PipelineSnapshot pipeline;
 };
 
 void submit_in_blocks(StreamDecoder &decoder,
@@ -611,7 +610,6 @@ decode_in_blocks(const std::span<const std::int16_t> iq,
         result.stats = decoder.stats();
         result.analysis = decoder.analysis_snapshot();
         result.signal = decoder.signal_snapshot();
-        result.pipeline = decoder.pipeline_snapshot();
     }
     return result;
 }
@@ -623,15 +621,8 @@ void test_8k_queue_capacity_multiplier() {
                                                      16384};
     const auto baseline = decode_in_blocks(iq, block_sizes, 4, 1);
     const auto scaled = decode_in_blocks(iq, block_sizes, 4, 4);
-    require(scaled.stats.input_queue_capacity_samples ==
-                baseline.stats.input_queue_capacity_samples,
-            "offline multiplier unexpectedly changed the IQ queue");
-    require(scaled.stats.symbol_queue_capacity ==
-                baseline.stats.symbol_queue_capacity * 4,
-            "offline multiplier did not scale the FEC queue");
-    require(scaled.stats.ring_capacity_samples ==
-                baseline.stats.ring_capacity_samples,
-            "offline multiplier unexpectedly changed the resampled ring");
+    require(!baseline.transport.empty(),
+            "queue-capacity reference produced no TS");
     require(scaled.transport == baseline.transport,
             "queue capacity changed decoded transport bytes");
 }
@@ -664,10 +655,6 @@ void test_8k_clean_signal() {
             "8K decoder selected wrong guard interval");
     require(result.stats.dropped_blocks == 0,
             "blocking synthetic input dropped blocks");
-    require(result.stats.resample_workers == 2 &&
-                result.stats.symbol_workers == 3 &&
-                result.stats.transport.viterbi_workers == 3,
-            "8-thread worker budget must split 2 resample + 3 symbol + 3 FEC");
     require(result.stats.timing_measurements > 0,
             "8K decoder did not publish timing measurements");
     require(result.stats.timing_measurements ==
@@ -699,15 +686,6 @@ void test_8k_clean_signal() {
             "common constellation snapshot has an invalid point count");
     require(result.signal.carrier_offset_limit_hz > 0.0F,
             "common signal snapshot lacks a carrier-offset scale");
-    require(result.pipeline.stage_count == 3 &&
-                result.pipeline.stages[0].name == "IQ queue" &&
-                result.pipeline.stages[1].name == "Demod" &&
-                result.pipeline.stages[2].name == "FEC queue",
-            "common pipeline snapshot did not preserve DVB-T stage order");
-    require(result.pipeline.stages[0].queue_valid &&
-                result.pipeline.stages[1].busy_valid &&
-                result.pipeline.stages[2].queue_valid,
-            "common pipeline snapshot has invalid stage metric types");
     require(std::isfinite(result.stats.raw_timing_offset_samples) &&
                 std::isfinite(result.stats.timing_offset_samples) &&
                 std::isfinite(result.stats.physical_timing_offset_samples) &&

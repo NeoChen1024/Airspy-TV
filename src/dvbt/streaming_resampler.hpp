@@ -22,7 +22,6 @@ class StreamingResampler {
     void set_cfo_correction_hz(double correction_hz);
     [[nodiscard]] double applied_sro_correction_ppm() const noexcept;
     [[nodiscard]] double applied_cfo_correction_hz() const noexcept;
-    [[nodiscard]] double requested_cfo_correction_hz() const noexcept;
     [[nodiscard]] double requested_ratio() const noexcept;
     [[nodiscard]] double effective_ratio() const noexcept;
     [[nodiscard]] bool configured() const noexcept;

@@ -63,10 +63,6 @@ double StreamingResampler::applied_cfo_correction_hz() const noexcept {
     return -resampler_.effective_frequency_shift();
 }
 
-double StreamingResampler::requested_cfo_correction_hz() const noexcept {
-    return -resampler_.requested_frequency_shift();
-}
-
 double StreamingResampler::requested_ratio() const noexcept {
     return resampler_.requested_ratio();
 }

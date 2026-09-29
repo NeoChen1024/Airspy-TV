@@ -559,8 +559,6 @@ struct DecodeReport::Impl {
             {"transport_bytes", stats.transport_bytes},
             {"dropped_blocks", stats.dropped_blocks},
             {"phase_discontinuities", stats.pilot_phase_discontinuities},
-            {"overlap_packets", stats.ts_overlap_packets},
-            {"overlap_join_failures", stats.ts_overlap_join_failures},
         };
         record["quality"] = {
             {"ofdm_locked", stats.ofdm_locked},
@@ -683,11 +681,6 @@ struct DecodeReport::Impl {
         phase_discontinuities_total +=
             counter_delta(stats.pilot_phase_discontinuities,
                           source.initial_stats.pilot_phase_discontinuities);
-        overlap_packets_total += counter_delta(
-            stats.ts_overlap_packets, source.initial_stats.ts_overlap_packets);
-        overlap_join_failures_total +=
-            counter_delta(stats.ts_overlap_join_failures,
-                          source.initial_stats.ts_overlap_join_failures);
         fec_sessions_total += counter_delta(stats.fec_sessions,
                                             source.initial_stats.fec_sessions);
         bootstrap_attempts_total += counter_delta(
@@ -733,8 +726,6 @@ struct DecodeReport::Impl {
              {{"dropped_blocks", dropped_blocks_total},
               {"ofdm_symbols", global_aggregate.ofdm_symbols},
               {"phase_discontinuities", phase_discontinuities_total},
-              {"overlap_packets", overlap_packets_total},
-              {"overlap_join_failures", overlap_join_failures_total},
               {"fec_sessions", fec_sessions_total},
               {"bootstrap_attempts", bootstrap_attempts_total},
               {"cfo_rebootstrap_requests", cfo_rebootstrap_requests_total},
@@ -785,12 +776,6 @@ struct DecodeReport::Impl {
             {"phase_discontinuities",
              counter_delta(stats.pilot_phase_discontinuities,
                            source.initial_stats.pilot_phase_discontinuities)},
-            {"overlap_packets",
-             counter_delta(stats.ts_overlap_packets,
-                           source.initial_stats.ts_overlap_packets)},
-            {"overlap_join_failures",
-             counter_delta(stats.ts_overlap_join_failures,
-                           source.initial_stats.ts_overlap_join_failures)},
             {"fec_sessions", counter_delta(stats.fec_sessions,
                                            source.initial_stats.fec_sessions)},
             {"bootstrap_attempts",
@@ -905,8 +890,6 @@ struct DecodeReport::Impl {
     std::uint64_t processed_samples_total{};
     std::uint64_t dropped_blocks_total{};
     std::uint64_t phase_discontinuities_total{};
-    std::uint64_t overlap_packets_total{};
-    std::uint64_t overlap_join_failures_total{};
     std::uint64_t fec_sessions_total{};
     std::uint64_t bootstrap_attempts_total{};
     std::uint64_t cfo_rebootstrap_requests_total{};

@@ -46,19 +46,8 @@ target_include_directories(viterbi-decoder SYSTEM INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/contrib/viterbi-decoder-cpp/include")
 target_compile_features(viterbi-decoder INTERFACE cxx_std_17)
 
-# Migrate the old AVX2-specific option when reusing an existing build tree.
-set(_airspy_tv_simd_viterbi_default ON)
-if(DEFINED AIRSPY_TV_USE_AVX2_VITERBI AND
-   NOT DEFINED AIRSPY_TV_USE_SIMD_VITERBI)
-    set(_airspy_tv_simd_viterbi_default
-        "${AIRSPY_TV_USE_AVX2_VITERBI}")
-    message(DEPRECATION "AIRSPY_TV_USE_AVX2_VITERBI is deprecated; use "
-                        "AIRSPY_TV_USE_SIMD_VITERBI")
-endif()
 option(AIRSPY_TV_USE_SIMD_VITERBI
-       "Use available ViterbiDecoderCpp SIMD for soft Viterbi"
-       "${_airspy_tv_simd_viterbi_default}")
-unset(_airspy_tv_simd_viterbi_default)
+       "Use available ViterbiDecoderCpp SIMD for soft Viterbi" ON)
 
 set(TINYCOLORMAP_BUILD_TOOLS OFF CACHE INTERNAL
     "Disable tinycolormap optional tools")
@@ -203,150 +192,36 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(jsonl-test
-        tests/jsonl_test.cpp
-    )
-    target_link_libraries(jsonl-test PRIVATE airspy-tv-common)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(jsonl-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME jsonl COMMAND jsonl-test)
+    function(airspy_tv_test name library)
+        string(REPLACE "-" "_" source "${name}")
+        add_executable(${name}-test tests/${source}_test.cpp ${ARGN})
+        target_include_directories(${name}-test PRIVATE include src)
+        if(library)
+            target_link_libraries(${name}-test PRIVATE ${library})
+        endif()
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(${name}-test PRIVATE
+                -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+        endif()
+        add_test(NAME ${name} COMMAND ${name}-test)
+    endfunction()
 
-    add_executable(decode-report-test
-        tests/decode_report_test.cpp
-    )
-    target_include_directories(decode-report-test PRIVATE src)
-    target_link_libraries(decode-report-test PRIVATE airspy-tv-runtime)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(decode-report-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME decode-report COMMAND decode-report-test)
+    foreach(name jsonl sample-timeline transport-output rtp-udp-output)
+        airspy_tv_test(${name} airspy-tv-common)
+    endforeach()
+    airspy_tv_test(reed-solomon "airspy-tv-common;libfec::rs")
+    airspy_tv_test(frequency-translating-resampler solid-resampler::solid-resampler)
 
-    add_executable(receiver-controller-test
-        tests/receiver_controller_test.cpp
-    )
-    target_include_directories(receiver-controller-test PRIVATE src)
-    target_link_libraries(receiver-controller-test PRIVATE airspy-tv-runtime)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(receiver-controller-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME receiver-controller COMMAND receiver-controller-test)
+    foreach(name dvbt-inner-decoder dvbt-transport-decoder dvbt-fec-stage
+                 dvbt-sample-channel dvbt-demod-dsp dvbt-signal-analyzer)
+        airspy_tv_test(${name} airspy-tv-dvbt)
+    endforeach()
+    foreach(name dvbt-fec-stage dvbt-sample-channel dvbt-demod-dsp)
+        target_include_directories(${name}-test PRIVATE src/dvbt)
+    endforeach()
 
-    add_executable(telemetry-stream-router-test
-        tests/telemetry_stream_router_test.cpp
-    )
-    target_include_directories(telemetry-stream-router-test PRIVATE src)
-    target_link_libraries(telemetry-stream-router-test PRIVATE airspy-tv-runtime)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(telemetry-stream-router-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME telemetry-stream-router COMMAND telemetry-stream-router-test)
-
-    add_executable(sample-timeline-test
-        tests/sample_timeline_test.cpp
-    )
-    target_link_libraries(sample-timeline-test PRIVATE airspy-tv-common)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(sample-timeline-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME sample-timeline COMMAND sample-timeline-test)
-
-    add_executable(frequency-translating-resampler-test
-        tests/frequency_translating_resampler_test.cpp
-    )
-    target_link_libraries(frequency-translating-resampler-test PRIVATE
-        solid-resampler::solid-resampler)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(frequency-translating-resampler-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME frequency-translating-resampler COMMAND frequency-translating-resampler-test)
-
-    add_executable(dvbt-inner-decoder-test
-        tests/dvbt_inner_decoder_test.cpp
-    )
-    target_link_libraries(dvbt-inner-decoder-test PRIVATE airspy-tv-dvbt)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(dvbt-inner-decoder-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME dvbt-inner-decoder COMMAND dvbt-inner-decoder-test)
-
-    add_executable(reed-solomon-test
-        tests/reed_solomon_test.cpp
-    )
-    target_link_libraries(reed-solomon-test PRIVATE airspy-tv-common libfec::rs)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(reed-solomon-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME reed-solomon COMMAND reed-solomon-test)
-
-    add_executable(dvbt-transport-decoder-test
-        tests/dvbt_transport_decoder_test.cpp
-    )
-    target_link_libraries(dvbt-transport-decoder-test PRIVATE
-        airspy-tv-dvbt)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(dvbt-transport-decoder-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME dvbt-transport-decoder COMMAND dvbt-transport-decoder-test)
-
-    add_executable(dvbt-fec-stage-test
-        tests/dvbt_fec_stage_test.cpp
-    )
-    target_include_directories(dvbt-fec-stage-test PRIVATE src/dvbt)
-    target_link_libraries(dvbt-fec-stage-test PRIVATE airspy-tv-dvbt)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(dvbt-fec-stage-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME dvbt-fec-stage COMMAND dvbt-fec-stage-test)
-
-    add_executable(dvbt-sample-channel-test
-        tests/dvbt_sample_channel_test.cpp
-    )
-    target_include_directories(dvbt-sample-channel-test PRIVATE src/dvbt)
-    target_link_libraries(dvbt-sample-channel-test PRIVATE airspy-tv-dvbt)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(dvbt-sample-channel-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME dvbt-sample-channel COMMAND dvbt-sample-channel-test)
-
-    add_executable(dvbt-demod-dsp-test
-        tests/dvbt_demod_dsp_test.cpp
-    )
-    target_include_directories(dvbt-demod-dsp-test PRIVATE src/dvbt)
-    target_link_libraries(dvbt-demod-dsp-test PRIVATE airspy-tv-dvbt)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(dvbt-demod-dsp-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME dvbt-demod-dsp COMMAND dvbt-demod-dsp-test)
-
-    add_executable(dvbt-signal-analyzer-test
-        tests/dvbt_signal_analyzer_test.cpp
-    )
-    target_link_libraries(dvbt-signal-analyzer-test PRIVATE airspy-tv-dvbt)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(dvbt-signal-analyzer-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME dvbt-signal-analyzer COMMAND dvbt-signal-analyzer-test)
-    set_tests_properties(dvbt-signal-analyzer PROPERTIES TIMEOUT 30)
-
-    add_executable(dvbt-stream-decoder-test
-        tests/dvbt_stream_decoder_test.cpp
-    )
-    target_link_libraries(dvbt-stream-decoder-test PRIVATE
-        airspy-tv-dvbt)
+    add_executable(dvbt-stream-decoder-test tests/dvbt_stream_decoder_test.cpp)
+    target_link_libraries(dvbt-stream-decoder-test PRIVATE airspy-tv-dvbt)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(dvbt-stream-decoder-test PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -362,134 +237,17 @@ if(BUILD_TESTING)
             TIMEOUT 90)
     endforeach()
 
-    add_executable(epg-model-test
-        tests/epg_model_test.cpp
-    )
-    target_include_directories(epg-model-test PRIVATE include src)
-    target_link_libraries(epg-model-test PRIVATE airspy-tv-runtime)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(epg-model-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME epg-model COMMAND epg-model-test)
-
-    add_executable(pipeline-load-monitor-test
-        tests/pipeline_load_monitor_test.cpp
-    )
-    target_include_directories(pipeline-load-monitor-test PRIVATE src)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(pipeline-load-monitor-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME pipeline-load-monitor COMMAND pipeline-load-monitor-test)
-
-    add_executable(byte-rate-tracker-test
-        tests/byte_rate_tracker_test.cpp
-    )
-    target_include_directories(byte-rate-tracker-test PRIVATE src)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(byte-rate-tracker-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME byte-rate-tracker COMMAND byte-rate-tracker-test)
-
-    add_executable(recorder-test
-        tests/recorder_test.cpp
-    )
-    target_link_libraries(recorder-test PRIVATE airspy-tv-runtime)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(recorder-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME recorder COMMAND recorder-test)
-
-    add_executable(sdr-file-source-test
-        tests/sdr_file_source_test.cpp
-    )
-    target_link_libraries(sdr-file-source-test PRIVATE airspy-tv-runtime)
-    target_include_directories(sdr-file-source-test PRIVATE src)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(sdr-file-source-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME sdr-file-source COMMAND sdr-file-source-test)
-    set_tests_properties(sdr-file-source PROPERTIES TIMEOUT 30)
-
-    add_executable(transport-output-test
-        tests/transport_output_test.cpp
-    )
-    target_include_directories(transport-output-test PRIVATE src)
-    target_link_libraries(transport-output-test PRIVATE airspy-tv-common)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(transport-output-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME transport-output COMMAND transport-output-test)
-    set_tests_properties(transport-output PROPERTIES TIMEOUT 30)
-
-    add_executable(playback-stream-buffer-test
-        tests/playback_stream_buffer_test.cpp
-        src/playback_stream_buffer.cpp
-    )
-    target_include_directories(playback-stream-buffer-test PRIVATE src)
-    target_link_libraries(playback-stream-buffer-test PRIVATE Threads::Threads)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(playback-stream-buffer-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME playback-stream-buffer COMMAND playback-stream-buffer-test)
-    set_tests_properties(playback-stream-buffer PROPERTIES TIMEOUT 30)
-
-    add_executable(transport-observer-test
-        tests/transport_observer_test.cpp
-    )
-    target_link_libraries(transport-observer-test PRIVATE airspy-tv-runtime)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(transport-observer-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME transport-observer COMMAND transport-observer-test)
-
-    add_executable(transport-pipeline-test
-        tests/transport_pipeline_test.cpp
-    )
-    target_link_libraries(transport-pipeline-test PRIVATE airspy-tv-runtime)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(transport-pipeline-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME transport-pipeline COMMAND transport-pipeline-test)
-
-    add_executable(transport-stream-model-test
-        tests/transport_stream_model_test.cpp
-    )
-    target_link_libraries(transport-stream-model-test PRIVATE airspy-tv-runtime)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(transport-stream-model-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME transport-stream-model COMMAND transport-stream-model-test)
-    set_tests_properties(transport-stream-model PROPERTIES TIMEOUT 30)
-
-    add_executable(rtp-udp-output-test
-        tests/rtp_udp_output_test.cpp
-    )
-    target_link_libraries(rtp-udp-output-test PRIVATE airspy-tv-common)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(rtp-udp-output-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME rtp-udp-output COMMAND rtp-udp-output-test)
-
-    add_executable(vector-ops-test
-        tests/vector_ops_test.cpp
-    )
-    target_include_directories(vector-ops-test PRIVATE include)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(vector-ops-test PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-    endif()
-    add_test(NAME vector-ops COMMAND vector-ops-test)
+    foreach(name decode-report receiver-controller telemetry-stream-router epg-model recorder
+                 sdr-file-source transport-observer transport-pipeline
+                 transport-stream-model)
+        airspy_tv_test(${name} airspy-tv-runtime)
+    endforeach()
+    airspy_tv_test(byte-rate-tracker "")
+    airspy_tv_test(vector-ops "")
+    airspy_tv_test(playback-stream-buffer Threads::Threads src/playback_stream_buffer.cpp)
+    set_tests_properties(dvbt-signal-analyzer sdr-file-source transport-output
+                         playback-stream-buffer transport-stream-model
+                         PROPERTIES TIMEOUT 30)
 endif()
 
 install(TARGETS airspy-tv RUNTIME DESTINATION bin)

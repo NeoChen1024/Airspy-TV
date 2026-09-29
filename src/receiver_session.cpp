@@ -70,10 +70,6 @@ ReceiverSession::epg_snapshot(const std::uint16_t service_id) const {
     return transport_.epg_snapshot(service_id);
 }
 
-TransportPipelineSnapshot ReceiverSession::transport_snapshot() const {
-    return transport_.snapshot();
-}
-
 std::vector<TransportOutputTelemetry>
 ReceiverSession::transport_output_telemetry() const {
     return transport_.output_telemetry();

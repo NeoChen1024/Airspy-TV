@@ -108,7 +108,6 @@ def require_zero_counters(value: dict[str, Any], location: str) -> None:
     counters = field(value, "counters")
     for name in (
         "dropped_blocks",
-        "overlap_join_failures",
         "phase_discontinuities",
         "rs_uncorrectable_packets",
         "tei_packets",

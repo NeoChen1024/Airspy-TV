@@ -4,21 +4,12 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <vector>
 
 namespace airspy_tv {
-
-struct IqSourceCallbacks {
-    std::function<void(std::span<const std::int16_t>)> samples;
-    std::function<void(std::uint64_t)> discontinuity;
-    std::function<void()> finite_input_complete;
-    std::function<void()> unexpected_stop;
-};
 
 // Private source-backend contract. Sources own hardware/file handles, pacing,
 // and source workers; the receiver pipeline owns timeline stamping, display
@@ -45,7 +36,7 @@ class IqSource {
 
     virtual bool configure(const SourceSettings &settings,
                            std::string &error) = 0;
-    virtual bool start(IqSourceCallbacks callbacks, std::string &error) = 0;
+    virtual bool start(SdrSourceCallbacks callbacks, std::string &error) = 0;
     virtual void stop() noexcept = 0;
     virtual bool retune(std::uint64_t frequency_hz, double correction_ppm,
                         std::string &error) = 0;

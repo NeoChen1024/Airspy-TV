@@ -464,7 +464,7 @@ it is valid:
   filtered and physical timing, observed/smoothed drift, timing/CIR confidence,
   and accepted/rejected measurement counts;
 - pipeline: queue occupancy and capacity, worker state/count, dropped blocks,
-  FEC gating state, overlap joins/failures, and cumulative TS bytes;
+  FEC gating state and cumulative TS bytes;
 - FEC: session ID, pre/post-Viterbi error and compared bits, RS packets and
   uncorrectable packets, TEI and TS packets, outer-deinterleaver phase/evidence,
   and RS/energy synchronization.
@@ -505,7 +505,7 @@ contains:
 - output bytes, actual emitted 188-byte packet count, emitted partial bytes,
   and usable packet count after TEI when that cumulative counter is available;
 - cumulative dropped blocks, OFDM symbols, lock-weighted window counts, phase
-  discontinuities, overlap joins/failures, FEC resets/sessions, Viterbi bit
+  discontinuities, FEC resets/sessions, Viterbi bit
   errors, RS packets/failures, and TEI packets;
 - MER and SRO/CFO/timing count/min/mean/max over valid demod windows;
 - for each timing key, sample count, total, mean, and maximum milliseconds;

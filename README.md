@@ -17,8 +17,9 @@ processing path used by the command-line I/Q-to-TS tool.
 Airspy TV's goal is a standalone terrestrial broadcast decoder with the Airspy
 R2 as a first-class SDR: one application that turns the R2's I/Q stream into
 watchable television without external demodulators or signal-processing tools.
-DVB-T is the implemented standard; DVB-T2, ATSC, and analog
-(NTSC/PAL/SECAM) are documented long-term targets in the [ROADMAP](ROADMAP.md).
+DVB-T is the implemented standard; DVB-T2 is the next planned decoder. ATSC
+and analog (NTSC/PAL/SECAM) remain longer-term targets in the
+[ROADMAP](ROADMAP.md).
 Decoding, TS/PSI/SI/EPG parsing, recording, and playback all run in-process,
 so GNU Radio appears only as an offline test fixture.
 

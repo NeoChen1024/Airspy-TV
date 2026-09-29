@@ -123,7 +123,7 @@ class SourceBase : public IqSource {
         : descriptor_(std::move(descriptor)), sample_rates_(std::move(rates)),
           gain_range_(std::move(gain_range)) {}
 
-    void begin(IqSourceCallbacks callbacks) {
+    void begin(SdrSourceCallbacks callbacks) {
         callbacks_ = std::move(callbacks);
         input_exhausted_.store(false, std::memory_order_relaxed);
         streaming_.store(true, std::memory_order_relaxed);
@@ -136,7 +136,7 @@ class SourceBase : public IqSource {
         runtime_error_ = std::move(message);
     }
 
-    [[nodiscard]] IqSourceCallbacks &callbacks() noexcept { return callbacks_; }
+    [[nodiscard]] SdrSourceCallbacks &callbacks() noexcept { return callbacks_; }
 
     void mark_input_exhausted() noexcept {
         input_exhausted_.store(true, std::memory_order_relaxed);
@@ -150,7 +150,7 @@ class SourceBase : public IqSource {
     DeviceDescriptor descriptor_;
     std::vector<std::uint32_t> sample_rates_;
     std::optional<std::pair<double, double>> gain_range_;
-    IqSourceCallbacks callbacks_;
+    SdrSourceCallbacks callbacks_;
     std::atomic<bool> streaming_{false};
     std::atomic<bool> input_exhausted_{false};
     mutable std::mutex error_mutex_;
@@ -208,7 +208,7 @@ class AirspySource final : public SourceBase {
                set_gain(settings, error);
     }
 
-    bool start(IqSourceCallbacks callbacks, std::string &error) override {
+    bool start(SdrSourceCallbacks callbacks, std::string &error) override {
         begin(std::move(callbacks));
         const int result =
             airspy_start_rx(device_, &AirspySource::receive, this);
@@ -328,7 +328,7 @@ class SoapySource final : public SourceBase {
         }
     }
 
-    bool start(IqSourceCallbacks callbacks, std::string &error) override {
+    bool start(SdrSourceCallbacks callbacks, std::string &error) override {
         try {
             stream_ = device_->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16);
             if (stream_ == nullptr) {
@@ -490,7 +490,7 @@ class FileIqSource final : public SourceBase {
         return true;
     }
 
-    bool start(IqSourceCallbacks callbacks, std::string &error) override {
+    bool start(SdrSourceCallbacks callbacks, std::string &error) override {
         begin(std::move(callbacks));
         try {
             worker_ = std::thread([this] {

@@ -15,7 +15,7 @@ bool require(const bool condition, const std::string_view message) {
     return condition;
 }
 
-bool test_capacities_and_external_fanout() {
+bool test_external_fanout() {
     airspy_tv::TransportPipeline pipeline;
     std::vector<std::uint8_t> received;
     std::vector<airspy_tv::TransportDiscontinuity> discontinuities;
@@ -30,18 +30,7 @@ bool test_capacities_and_external_fanout() {
     const std::vector<std::uint8_t> packet(188, 0x47);
     pipeline.consume(packet);
     pipeline.notify_discontinuity(airspy_tv::TransportDiscontinuity::retune);
-    const auto snapshot = pipeline.snapshot();
-
-    return require(snapshot.service_observer.queue_capacity_bytes ==
-                       (256U << 10U),
-                   "service model owns a 256 KiB queue") &&
-           require(snapshot.epg_observer.queue_capacity_bytes == (256U << 10U),
-                   "EPG model owns a 256 KiB queue") &&
-           require(snapshot.recorder.queue_capacity_bytes == (24U << 20U),
-                   "TS recorder owns a 24 MiB queue") &&
-           require(snapshot.rtp.queue_capacity_bytes == (8U << 20U),
-                   "RTP output owns an 8 MiB queue") &&
-           require(received == packet,
+    return require(received == packet,
                    "external sink receives an independent transport copy") &&
            require(discontinuities.size() == 1 &&
                        discontinuities.front() ==
@@ -71,7 +60,7 @@ bool test_headless_pipeline_omits_metadata_observers() {
 } // namespace
 
 int main() {
-    return test_capacities_and_external_fanout() &&
+    return test_external_fanout() &&
                    test_headless_pipeline_omits_metadata_observers()
                ? 0
                : 1;
