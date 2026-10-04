@@ -6,7 +6,6 @@
 #include <cctype>
 #include <cstdint>
 #include <fstream>
-#include <limits>
 #include <string>
 #include <utility>
 
@@ -70,8 +69,7 @@ bool resolve_iq_file(const std::filesystem::path &path,
 
             const auto sample_rate =
                 metadata.at("sample_rate").get<std::uint64_t>();
-            if (sample_rate == 0 ||
-                sample_rate > std::numeric_limits<std::uint32_t>::max()) {
+            if (sample_rate == 0 || sample_rate > max_iq_sample_rate_hz) {
                 error = "I/Q metadata sample_rate is out of range";
                 return false;
             }
@@ -80,8 +78,10 @@ bool resolve_iq_file(const std::filesystem::path &path,
                 metadata.value("center_frequency", std::uint64_t{});
             resolved.source =
                 metadata.value("source", std::string{"Recorded I/Q"});
-        } else if (resolved.sample_rate_hz == 0) {
-            error = "A positive sample rate is required for raw INT16_IQ";
+        } else if (resolved.sample_rate_hz == 0 ||
+                   resolved.sample_rate_hz > max_iq_sample_rate_hz) {
+            error = "A positive sample rate of at most 100 MS/s is required "
+                    "for raw INT16_IQ";
             return false;
         }
 

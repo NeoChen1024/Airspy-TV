@@ -48,7 +48,10 @@ namespace {
     }
 
     try {
-        return value.dump();
+        // File names and other host strings are not guaranteed to be UTF-8;
+        // replace invalid sequences instead of losing the whole report.
+        return value.dump(-1, ' ', false,
+                          nlohmann::json::error_handler_t::replace);
     } catch (const nlohmann::json::exception &exception) {
         throw JsonlError(std::string{"Unable to serialize JSON: "} +
                              exception.what(),

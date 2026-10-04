@@ -6,6 +6,10 @@
 
 namespace airspy_tv {
 
+// Decoder buffers scale with the sample rate, so an implausible rate from a
+// sidecar or the command line must not be allowed to size them.
+inline constexpr std::uint32_t max_iq_sample_rate_hz = 100'000'000;
+
 struct IqFileInfo {
     std::filesystem::path data_path;
     std::string source;

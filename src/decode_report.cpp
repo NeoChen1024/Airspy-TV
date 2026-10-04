@@ -193,7 +193,8 @@ void write_json_atomic(const std::filesystem::path &path, const json &value) {
             throw std::runtime_error("Unable to open report summary: " +
                                      temporary.string());
         }
-        stream << value.dump(2) << '\n';
+        stream << value.dump(2, ' ', false, json::error_handler_t::replace)
+               << '\n';
         stream.flush();
         if (!stream) {
             throw std::runtime_error("Unable to write report summary: " +
@@ -426,7 +427,9 @@ struct DecodeReport::Impl {
         if (!manifest_stream) {
             throw std::runtime_error("Unable to create report manifest");
         }
-        manifest_stream << manifest.dump(2) << '\n';
+        manifest_stream << manifest.dump(2, ' ', false,
+                                         json::error_handler_t::replace)
+                        << '\n';
         manifest_stream.flush();
         if (!manifest_stream) {
             throw std::runtime_error("Unable to write report manifest");

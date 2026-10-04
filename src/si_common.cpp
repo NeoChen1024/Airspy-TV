@@ -10,12 +10,17 @@
 namespace airspy_tv::si {
 namespace {
 
+// Broadcast text must not carry control characters into a UI, terminal or
+// report. Every decoding path replaces them; tab is the only one kept.
+[[nodiscard]] constexpr bool is_control(const std::uint32_t value) noexcept {
+    return value < 0x20U && value != '\t';
+}
+
 std::string passthrough_text(const std::span<const std::uint8_t> bytes) {
     std::string text;
     text.reserve(bytes.size());
     for (const std::uint8_t byte : bytes) {
-        text.push_back(byte < 0x20U && byte != '\t' ? '?'
-                                                    : static_cast<char>(byte));
+        text.push_back(is_control(byte) ? '?' : static_cast<char>(byte));
     }
     return text;
 }
@@ -28,7 +33,12 @@ std::string utf16_text(const std::span<const std::uint8_t> bytes) {
         const std::uint32_t codepoint =
             (static_cast<std::uint32_t>(bytes[offset]) << 8U) |
             bytes[offset + 1];
-        if (codepoint < 0x80U) {
+        // Surrogate code units are outside the Basic Multilingual Plane and
+        // have no valid UTF-8 form.
+        if (is_control(codepoint) ||
+            (codepoint >= 0xD800U && codepoint <= 0xDFFFU)) {
+            text.push_back('?');
+        } else if (codepoint < 0x80U) {
             text.push_back(static_cast<char>(codepoint));
         } else if (codepoint < 0x800U) {
             text.push_back(static_cast<char>(0xC0U | (codepoint >> 6U)));
@@ -70,6 +80,11 @@ std::string iconv_text(const char *codeset,
         return {}; // EILSEQ/E2BIG: fall back to passthrough.
     }
     output.resize(static_cast<std::size_t>(cursor - output.data()));
+    for (char &value : output) {
+        if (is_control(static_cast<unsigned char>(value))) {
+            value = '?';
+        }
+    }
     return output;
 }
 

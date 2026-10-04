@@ -115,7 +115,10 @@ struct RawIqRecorder::Impl {
                 {"failed", failed},
                 {"error", error},
             };
-            sidecar << metadata_json.dump(2) << '\n';
+            sidecar << metadata_json.dump(
+                           2, ' ', false,
+                           nlohmann::json::error_handler_t::replace)
+                    << '\n';
         } catch (...) { // NOLINT(bugprone-empty-catch)
             // Recording shutdown must remain noexcept if metadata allocation
             // fails.

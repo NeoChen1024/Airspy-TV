@@ -16,6 +16,12 @@ namespace {
 
 constexpr std::int64_t mjd_unix_epoch = 40587; // MJD of 1970-01-01
 
+// Present/following needs two events per service. The bounds leave room for
+// programme changes while keeping a corrupt or hostile stream from growing the
+// model without limit.
+constexpr std::size_t max_epg_services = 1024;
+constexpr std::size_t max_events_per_service = 32;
+
 [[nodiscard]] std::uint32_t bcd_seconds(const std::uint32_t value) noexcept {
     const auto digit = [](const std::uint32_t nibble) {
         return ((nibble >> 4U) * 10U) + (nibble & 0x0FU);
@@ -72,7 +78,7 @@ struct EpgModel::Impl {
     std::optional<std::uint64_t> utc_time;
     std::chrono::steady_clock::time_point utc_time_received;
     si::SectionFeed feed{[this](const std::uint16_t,
-                               const std::span<const std::uint8_t> section) {
+                                const std::span<const std::uint8_t> section) {
         dispatch(section);
     }};
 
@@ -97,7 +103,14 @@ struct EpgModel::Impl {
         }
         const auto service_id = static_cast<std::uint16_t>(
             (static_cast<unsigned int>(section[3]) << 8U) | section[4]);
-        auto &target = events[service_id];
+        auto service = events.find(service_id);
+        if (service == events.end()) {
+            if (events.size() >= max_epg_services) {
+                return;
+            }
+            service = events.try_emplace(service_id).first;
+        }
+        auto &target = service->second;
 
         std::size_t offset = 14;
         while (offset + 12 <= section.size() - 4) {
@@ -169,6 +182,11 @@ struct EpgModel::Impl {
                 });
             if (existing == target.end()) {
                 target.push_back(event);
+                if (target.size() > max_events_per_service) {
+                    // Evict the oldest programme first.
+                    target.erase(std::ranges::min_element(
+                        target, {}, &EpgEvent::start_time_utc));
+                }
             } else {
                 *existing = event;
             }

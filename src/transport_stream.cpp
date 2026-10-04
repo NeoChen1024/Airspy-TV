@@ -14,6 +14,13 @@
 namespace airspy_tv {
 namespace {
 
+// Bounds on table-assembly state, so a corrupt or hostile stream cannot grow
+// memory without limit. A real multiplex carries a handful of tables, a few
+// kilobytes of pending sections and far fewer services.
+constexpr std::size_t max_collector_tables = 1024;
+constexpr std::size_t max_pending_section_bytes = std::size_t{1} << 20U;
+constexpr std::size_t max_services = 1024;
+
 struct CompletedTable {
     std::uint32_t key{};
     std::uint8_t version{};
@@ -30,8 +37,7 @@ struct CompletedTable {
 class VersionedSectionCollector {
   public:
     [[nodiscard]] std::optional<CompletedTable>
-    add(const std::uint32_t key,
-        const std::span<const std::uint8_t> section) {
+    add(const std::uint32_t key, const std::span<const std::uint8_t> section) {
         if (section.size() < 12 || (section[5] & 1U) == 0U) {
             return std::nullopt;
         }
@@ -41,24 +47,36 @@ class VersionedSectionCollector {
         if (number > last) {
             return std::nullopt;
         }
-        auto &state = states_[key];
+        auto found_state = states_.find(key);
+        if (found_state == states_.end()) {
+            if (states_.size() >= max_collector_tables) {
+                reset();
+            }
+            found_state = states_.try_emplace(key).first;
+        }
+        auto &state = found_state->second;
         if (state.active_version.has_value()) {
             if (version == *state.active_version ||
                 !newer_version(version, *state.active_version)) {
                 return std::nullopt;
             }
         }
+        if (pending_bytes_ + section.size() > max_pending_section_bytes) {
+            discard_pending();
+        }
         if (!state.pending_version.has_value() ||
             *state.pending_version != version) {
+            clear_pending(state);
             state.pending_version = version;
             state.last_section = last;
-            state.sections.clear();
         } else if (state.last_section != last) {
-            state.pending_version.reset();
-            state.sections.clear();
+            clear_pending(state);
             return std::nullopt;
         }
-        state.sections[number] = {section.begin(), section.end()};
+        auto &stored = state.sections[number];
+        pending_bytes_ -= stored.size();
+        stored.assign(section.begin(), section.end());
+        pending_bytes_ += stored.size();
         if (state.sections.size() !=
             static_cast<std::size_t>(state.last_section) + 1U) {
             return std::nullopt;
@@ -67,7 +85,8 @@ class VersionedSectionCollector {
             .key = key, .version = version, .sections = {}};
         completed.sections.reserve(state.sections.size());
         for (std::uint16_t index = 0; index <= state.last_section; ++index) {
-            const auto found = state.sections.find(static_cast<std::uint8_t>(index));
+            const auto found =
+                state.sections.find(static_cast<std::uint8_t>(index));
             if (found == state.sections.end()) {
                 return std::nullopt;
             }
@@ -83,30 +102,35 @@ class VersionedSectionCollector {
             return;
         }
         found->second.active_version = version;
-        found->second.pending_version.reset();
-        found->second.sections.clear();
+        clear_pending(found->second);
     }
 
     void reject(const std::uint32_t key, const std::uint8_t version) {
         auto found = states_.find(key);
         if (found != states_.end() &&
             found->second.pending_version == version) {
-            found->second.pending_version.reset();
-            found->second.sections.clear();
+            clear_pending(found->second);
         }
     }
 
     void discard_pending() {
         for (auto &[key, state] : states_) {
             static_cast<void>(key);
-            state.pending_version.reset();
-            state.sections.clear();
+            clear_pending(state);
         }
     }
 
-    void erase(const std::uint32_t key) { states_.erase(key); }
+    void erase(const std::uint32_t key) {
+        if (const auto found = states_.find(key); found != states_.end()) {
+            clear_pending(found->second);
+            states_.erase(found);
+        }
+    }
 
-    void reset() { states_.clear(); }
+    void reset() {
+        states_.clear();
+        pending_bytes_ = 0;
+    }
 
   private:
     struct State {
@@ -115,17 +139,29 @@ class VersionedSectionCollector {
         std::uint8_t last_section{};
         std::map<std::uint8_t, std::vector<std::uint8_t>> sections;
     };
+
+    void clear_pending(State &state) {
+        for (const auto &[number, bytes] : state.sections) {
+            static_cast<void>(number);
+            pending_bytes_ -= bytes.size();
+        }
+        state.sections.clear();
+        state.pending_version.reset();
+    }
+
     std::map<std::uint32_t, State> states_;
+    std::size_t pending_bytes_{};
 };
 
-[[nodiscard]] std::uint16_t extension(
-    const std::span<const std::uint8_t> section) {
+[[nodiscard]] std::uint16_t
+extension(const std::span<const std::uint8_t> section) {
     return static_cast<std::uint16_t>(
         (static_cast<unsigned int>(section[3]) << 8U) | section[4]);
 }
 
-[[nodiscard]] std::uint32_t table_key(
-    const std::uint16_t pid, const std::span<const std::uint8_t> section) {
+[[nodiscard]] std::uint32_t
+table_key(const std::uint16_t pid,
+          const std::span<const std::uint8_t> section) {
     return (static_cast<std::uint32_t>(pid) << 16U) | extension(section);
 }
 
@@ -137,11 +173,10 @@ struct TransportStreamModel::Impl {
     VersionedSectionCollector pat_tables;
     VersionedSectionCollector pmt_tables;
     VersionedSectionCollector sdt_tables;
-    si::SectionFeed feed{
-        [this](const std::uint16_t pid,
-               const std::span<const std::uint8_t> section) {
-            dispatch(pid, section);
-        }};
+    si::SectionFeed feed{[this](const std::uint16_t pid,
+                                const std::span<const std::uint8_t> section) {
+        dispatch(pid, section);
+    }};
 
     void dispatch(const std::uint16_t pid,
                   const std::span<const std::uint8_t> section) {
@@ -185,7 +220,7 @@ struct TransportStreamModel::Impl {
                     part[offset + 3]);
             }
         }
-        if (!valid) {
+        if (!valid || programs.size() > max_services) {
             pat_tables.reject(completed->key, completed->version);
             return;
         }
@@ -212,9 +247,9 @@ struct TransportStreamModel::Impl {
             const auto replacement = programs.find(service_id);
             if (replacement == programs.end() ||
                 replacement->second != old.pmt_pid) {
-                pmt_tables.erase((static_cast<std::uint32_t>(old.pmt_pid)
-                                  << 16U) |
-                                 service_id);
+                pmt_tables.erase(
+                    (static_cast<std::uint32_t>(old.pmt_pid) << 16U) |
+                    service_id);
             }
         }
         services = std::move(updated);
@@ -223,6 +258,10 @@ struct TransportStreamModel::Impl {
 
     void collect_pmt(const std::uint16_t pid,
                      const std::span<const std::uint8_t> section) {
+        // ISO/IEC 13818-1: a program map table is always a single section.
+        if (section[6] != 0U || section[7] != 0U) {
+            return;
+        }
         const std::uint16_t service_id = extension(section);
         const auto service = services.find(service_id);
         if (service == services.end() || service->second.pmt_pid != pid) {
@@ -242,12 +281,10 @@ struct TransportStreamModel::Impl {
                 break;
             }
             pcr_pid = static_cast<std::uint16_t>(
-                ((static_cast<unsigned int>(part[8]) & 0x1FU) << 8U) |
-                part[9]);
+                ((static_cast<unsigned int>(part[8]) & 0x1FU) << 8U) | part[9]);
             const std::size_t body_end = part.size() - 4;
             const std::size_t program_info_length =
-                ((static_cast<std::size_t>(part[10]) & 0x0FU) << 8U) |
-                part[11];
+                ((static_cast<std::size_t>(part[10]) & 0x0FU) << 8U) | part[11];
             std::size_t offset = 12 + program_info_length;
             if (offset > body_end) {
                 valid = false;
@@ -351,8 +388,8 @@ struct TransportStreamModel::Impl {
                         }
                         names[service_id] = {
                             si::dvb_text(payload.subspan(2, provider_length)),
-                            si::dvb_text(payload.subspan(
-                                3 + provider_length, name_length))};
+                            si::dvb_text(payload.subspan(3 + provider_length,
+                                                         name_length))};
                     }
                     descriptor += 2 + length;
                 }

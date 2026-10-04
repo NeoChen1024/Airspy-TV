@@ -32,8 +32,10 @@ struct SectionAssembler {
 };
 
 // Consumes full 188-byte transport packets and invokes a handler with each
-// complete, CRC-valid section. Continuity mismatches discard the partial
-// section so a dropped packet never yields a corrupt payload.
+// complete, CRC-valid section. The time and date table is the one accepted
+// exception: EN 300 468 defines it without a CRC. Continuity mismatches
+// discard the partial section so a dropped packet never yields a corrupt
+// payload.
 class SectionFeed {
   public:
     using Handler =
@@ -86,7 +88,9 @@ class SectionFeed {
             if (assembler.expected != 0 &&
                 assembler.bytes.size() == assembler.expected) {
                 const std::span<const std::uint8_t> section(assembler.bytes);
-                if (section.size() >= 8 && crc32_mpeg(section) == 0U) {
+                const bool tdt = pid == 0x0014U && section.size() == 8 &&
+                                 section[0] == 0x70U;
+                if (section.size() >= 8 && (tdt || crc32_mpeg(section) == 0U)) {
                     handler_(pid, section);
                 }
                 assembler.bytes.clear();

@@ -136,7 +136,9 @@ class SourceBase : public IqSource {
         runtime_error_ = std::move(message);
     }
 
-    [[nodiscard]] SdrSourceCallbacks &callbacks() noexcept { return callbacks_; }
+    [[nodiscard]] SdrSourceCallbacks &callbacks() noexcept {
+        return callbacks_;
+    }
 
     void mark_input_exhausted() noexcept {
         input_exhausted_.store(true, std::memory_order_relaxed);
@@ -840,8 +842,10 @@ std::unique_ptr<IqSource> open_file_iq_source(const std::filesystem::path &path,
     IqFileInfo info;
     const bool stdin_source = path == std::filesystem::path("-");
     if (stdin_source) {
-        if (settings.sample_rate_hz == 0) {
-            error = "A positive sample rate is required for stdin I/Q";
+        if (settings.sample_rate_hz == 0 ||
+            settings.sample_rate_hz > max_iq_sample_rate_hz) {
+            error = "A positive sample rate of at most 100 MS/s is required "
+                    "for stdin I/Q";
             return {};
         }
         info = {.data_path = {},
