@@ -495,6 +495,8 @@ PipelineSnapshot StreamDecoder::pipeline_snapshot() const {
     result.processing_realtime_ratio = statistics.processing_realtime_ratio;
     result.dropped_blocks = statistics.dropped_blocks;
     result.transport_bytes = statistics.transport_bytes;
+    result.transport_error_packets =
+        statistics.cumulative_transport.tei_packets;
     result.sequence = statistics.processed_chunks;
     result.processing = statistics.processing;
     result.failed = statistics.failed;

@@ -14,16 +14,14 @@ void append_report_error(std::string &message, const bool report_ok,
 
 } // namespace
 
-ReceiverController::ReceiverController(
-    ReceiverSession &session, DecodeRunReporter &reporter,
-    SourceSettings &settings, dvbt::ReceiverParameters &dvbt_parameters)
-    : session_(session), reporter_(reporter), settings_(settings),
-      dvbt_parameters_(dvbt_parameters) {}
+ReceiverController::ReceiverController(ReceiverSession &session,
+                                       DecodeRunReporter &reporter,
+                                       SourceSettings &settings)
+    : session_(session), reporter_(reporter), settings_(settings) {}
 
 ReceiverCommandResult ReceiverController::start_report(std::string message) {
     std::string report_error;
-    if (!reporter_.start_source(session_, settings_, dvbt_parameters_, "",
-                                report_error)) {
+    if (!reporter_.start_source(session_, settings_, "", report_error)) {
         message += "; report unavailable: " + report_error;
     }
     return {.success = true, .message = std::move(message)};

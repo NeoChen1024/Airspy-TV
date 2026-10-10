@@ -1,4 +1,4 @@
-#include "decode_report.hpp"
+#include "dvbt/dvbt_report_writer.hpp"
 
 #include "airspy_tv/jsonl.hpp"
 
@@ -14,9 +14,9 @@
 
 namespace {
 
-using airspy_tv::DecodeReport;
 using airspy_tv::DecodeReportConfig;
-using airspy_tv::DecodeSourceSessionConfig;
+using airspy_tv::DvbTReportWriter;
+using airspy_tv::DvbTSourceSessionConfig;
 using airspy_tv::InputTimelineSnapshot;
 using airspy_tv::JsonlReader;
 using airspy_tv::TransportOutputTelemetry;
@@ -79,17 +79,17 @@ fec_record(const std::uint64_t sequence, const std::uint64_t generation,
 
 void test_multiple_source_sessions_share_one_report() {
     TemporaryDirectory directory;
-    DecodeReport report({.directory = directory.path, .context = "test"});
+    DvbTReportWriter report({.directory = directory.path, .context = "test"});
 
     StreamDecoderStats initial_one;
     initial_one.decoder_generation = 1;
     initial_one.source_epoch = 1;
     report.begin_source(
-        DecodeSourceSessionConfig{.source = "first.cs16",
-                                  .destination = "first.ts",
-                                  .sample_rate_hz = 10'000'000,
-                                  .center_frequency_hz = 545'000'000,
-                                  .decoder = {}},
+        DvbTSourceSessionConfig{.source = "first.cs16",
+                                .destination = "first.ts",
+                                .sample_rate_hz = 10'000'000,
+                                .center_frequency_hz = 545'000'000,
+                                .decoder = {}},
         InputTimelineSnapshot{.stream_epoch = 1,
                               .source_head_sample = 0,
                               .delivered_samples = 0,
@@ -114,11 +114,11 @@ void test_multiple_source_sessions_share_one_report() {
     initial_two.decoder_generation = 3;
     initial_two.source_epoch = 3;
     report.begin_source(
-        DecodeSourceSessionConfig{.source = "second.cs16",
-                                  .destination = "second.ts",
-                                  .sample_rate_hz = 8'000'000,
-                                  .center_frequency_hz = 557'000'000,
-                                  .decoder = {}},
+        DvbTSourceSessionConfig{.source = "second.cs16",
+                                .destination = "second.ts",
+                                .sample_rate_hz = 8'000'000,
+                                .center_frequency_hz = 557'000'000,
+                                .decoder = {}},
         InputTimelineSnapshot{.stream_epoch = 3,
                               .source_head_sample = 1'000,
                               .delivered_samples = 1'000,
@@ -209,7 +209,8 @@ void test_non_empty_directory_is_rejected() {
     std::filesystem::create_directories(directory.path);
     std::ofstream(directory.path / "existing") << "occupied\n";
     try {
-        DecodeReport report({.directory = directory.path, .context = "test"});
+        DvbTReportWriter report(
+            {.directory = directory.path, .context = "test"});
     } catch (const std::runtime_error &) {
         return;
     }
@@ -218,7 +219,7 @@ void test_non_empty_directory_is_rejected() {
 
 void test_transport_output_stream_and_totals() {
     TemporaryDirectory directory;
-    DecodeReport report({.directory = directory.path, .context = "test"});
+    DvbTReportWriter report({.directory = directory.path, .context = "test"});
     StreamDecoderStats stats;
     stats.decoder_generation = 4;
     stats.source_epoch = 7;
@@ -235,10 +236,10 @@ void test_transport_output_stream_and_totals() {
          .error = {}},
     }};
     report.begin_source(
-        DecodeSourceSessionConfig{.source = "stdin",
-                                  .destination = "stdout",
-                                  .sample_rate_hz = 10'000'000,
-                                  .decoder = {}},
+        DvbTSourceSessionConfig{.source = "stdin",
+                                .destination = "stdout",
+                                .sample_rate_hz = 10'000'000,
+                                .decoder = {}},
         InputTimelineSnapshot{.stream_epoch = 7, .sample_rate_hz = 10'000'000},
         stats, 0.0, baseline);
     const std::array<TransportOutputTelemetry, 1> sample{{

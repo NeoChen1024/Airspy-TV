@@ -121,8 +121,9 @@ target_link_libraries(airspy-tv-dvbt PUBLIC PkgConfig::FFTW3F airspy-tv-common
 
 add_library(airspy-tv-runtime STATIC
     src/decode_progress.cpp
-    src/decode_report.cpp
+    src/dvbt/dvbt_decode_report.cpp
     src/dvbt/dvbt_report_codec.cpp
+    src/dvbt/dvbt_report_writer.cpp
     src/decode_run_reporter.cpp
     src/epg.cpp
     src/iq_file.cpp

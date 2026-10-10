@@ -179,8 +179,7 @@ int live_decode_cli(LiveDecodeConfig config) {
         destination +=
             "rtp://" + airspy_tv::format_rtp_udp_endpoint(*config.rtp_output);
     }
-    if (!reporter.start_source(session, config.source, config.dvbt, destination,
-                               error)) {
+    if (!reporter.start_source(session, config.source, destination, error)) {
         std::cerr << "Decode report failed: " << error << '\n';
         session.close();
         return 1;
@@ -266,9 +265,9 @@ int live_decode_cli(LiveDecodeConfig config) {
             exit_code = 1;
             break;
         }
-        const auto decoder_stats = session.dvbt_snapshot().decoder;
-        if (decoder_stats.failed) {
-            error = decoder_stats.error;
+        const auto pipeline = session.pipeline_snapshot();
+        if (pipeline.failed) {
+            error = pipeline.error;
             exit_code = 1;
             break;
         }
@@ -284,7 +283,7 @@ int live_decode_cli(LiveDecodeConfig config) {
             const double elapsed =
                 std::chrono::duration<double>(now - started_at).count();
             airspy_tv::format_decode_progress(
-                std::cerr, decoder_stats,
+                std::cerr, pipeline, session.decoder_status_text(),
                 submitted_samples(initial_timeline,
                                   session.input_timeline_snapshot()),
                 config.source.sample_rate_hz, elapsed);
@@ -308,8 +307,7 @@ int live_decode_cli(LiveDecodeConfig config) {
         }
     }
     session.stop_rtp_streaming();
-    if (exit_code == 0 &&
-        session.dvbt_snapshot().decoder.transport_bytes == 0) {
+    if (exit_code == 0 && session.pipeline_snapshot().transport_bytes == 0) {
         exit_code = 2;
     }
     std::string report_error;

@@ -1,5 +1,7 @@
 #include "receiver_session.hpp"
 
+#include "dvbt/dvbt_report_codec.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 #include <ranges>
@@ -93,8 +95,7 @@ void ReceiverSession::install_demodulator(
     std::unique_ptr<Demodulator> demodulator, const ReceiveStandard standard) {
     dvbt_ = dynamic_cast<dvbt::StreamDecoder *>(demodulator.get());
     if (dvbt_ != nullptr) {
-        dvbt_->set_telemetry_enabled(dvbt_telemetry_enabled_,
-                                     dvbt_telemetry_started_at_);
+        dvbt_->set_telemetry_enabled(telemetry_enabled_, telemetry_started_at_);
     }
     receiver_.set_demodulator(std::move(demodulator));
     standard_ = standard;
@@ -155,10 +156,16 @@ void ReceiverSession::set_display_analysis_enabled(
     receiver_.set_display_analysis_enabled(enabled);
 }
 
-void ReceiverSession::set_dvbt_telemetry_enabled(
-    const bool enabled, const dvbt::TelemetryClock::time_point started_at) {
-    dvbt_telemetry_enabled_ = enabled;
-    dvbt_telemetry_started_at_ = started_at;
+const dvbt::ReceiverParameters &
+ReceiverSession::dvbt_parameters() const noexcept {
+    return dvbt_parameters_;
+}
+
+void ReceiverSession::set_telemetry_enabled(
+    const bool enabled,
+    const std::chrono::steady_clock::time_point started_at) {
+    telemetry_enabled_ = enabled;
+    telemetry_started_at_ = started_at;
     if (dvbt_ != nullptr) {
         dvbt_->set_telemetry_enabled(enabled, started_at);
     }
@@ -174,6 +181,11 @@ DvbTSessionSnapshot ReceiverSession::dvbt_snapshot() const {
         return {};
     }
     return {.signal = dvbt_->analysis_snapshot(), .decoder = dvbt_->stats()};
+}
+
+std::string ReceiverSession::decoder_status_text() const {
+    return dvbt_ != nullptr ? format_dvbt_status(dvbt_->stats())
+                            : std::string{};
 }
 
 SignalSnapshot ReceiverSession::signal_snapshot() const {

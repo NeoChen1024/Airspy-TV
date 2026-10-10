@@ -50,6 +50,8 @@ struct PipelineSnapshot {
     float processing_realtime_ratio{};
     std::uint64_t dropped_blocks{};
     std::uint64_t transport_bytes{};
+    // Emitted TS packets flagged with transport_error_indicator.
+    std::uint64_t transport_error_packets{};
     std::uint64_t sequence{};
     bool processing{};
     bool failed{};

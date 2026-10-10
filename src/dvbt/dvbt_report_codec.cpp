@@ -401,6 +401,14 @@ encode_dvbt_decoder_config(const dvbt::ReceiverParameters &parameters) {
         {"queue_capacity_multiplier", parameters.queue_capacity_multiplier}};
 }
 
+std::string format_dvbt_status(const dvbt::StreamDecoderStats &stats) {
+    return std::format("MER={} OFDM={} TPS={}",
+                       stats.ofdm_locked ? std::format("{:.1f}dB", stats.mer_db)
+                                         : "--",
+                       stats.ofdm_locked ? "lock" : "search",
+                       stats.tps_locked ? "lock" : "search");
+}
+
 void format_debug_telemetry(std::ostream &stream,
                             const dvbt::TelemetryRecord &record) {
     std::visit(

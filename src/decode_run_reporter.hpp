@@ -1,6 +1,6 @@
 #pragma once
 
-#include "airspy_tv/dvbt/stream_decoder.hpp"
+#include "airspy_tv/sample_timeline.hpp"
 #include "airspy_tv/sdr.hpp"
 #include "airspy_tv/transport_telemetry.hpp"
 
@@ -36,7 +36,6 @@ class DecodeRunReporter {
     void prepare(ReceiverSession &session);
     void cancel_start(ReceiverSession &session);
     bool start_source(ReceiverSession &session, const SourceSettings &settings,
-                      const dvbt::ReceiverParameters &parameters,
                       std::string_view destination, std::string &error);
     bool update(ReceiverSession &session, std::string &error,
                 bool finish_stopped_source = true);
@@ -60,12 +59,15 @@ class DecodeRunReporter {
 
     std::optional<std::filesystem::path> directory_;
     std::string context_;
-    std::unique_ptr<DecodeReport> writer_;
+    // Bound to the standard that is active when the run first needs it.
+    [[nodiscard]] DecodeReport &report(const ReceiverSession &session);
+
+    std::unique_ptr<DecodeReport> report_;
     TransportOutputProvider transport_output_provider_;
     std::chrono::steady_clock::time_point started_at_{};
     std::chrono::steady_clock::time_point last_periodic_{};
     InputTimelineSnapshot source_timeline_baseline_;
-    dvbt::StreamDecoderStats source_stats_baseline_;
+    std::uint64_t source_transport_bytes_baseline_{};
     bool prepared_{};
     bool source_active_{};
     bool completed_{};

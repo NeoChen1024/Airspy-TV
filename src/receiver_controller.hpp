@@ -18,8 +18,7 @@ struct ReceiverCommandResult {
 class ReceiverController {
   public:
     ReceiverController(ReceiverSession &session, DecodeRunReporter &reporter,
-                       SourceSettings &settings,
-                       dvbt::ReceiverParameters &dvbt_parameters);
+                       SourceSettings &settings);
 
     [[nodiscard]] ReceiverCommandResult
     open_device(const DeviceDescriptor &descriptor);
@@ -44,7 +43,6 @@ class ReceiverController {
     ReceiverSession &session_;
     DecodeRunReporter &reporter_;
     SourceSettings &settings_;
-    dvbt::ReceiverParameters &dvbt_parameters_;
 };
 
 } // namespace airspy_tv

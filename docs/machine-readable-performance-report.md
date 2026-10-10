@@ -166,7 +166,7 @@ records for predictable redirected logs.
 Example:
 
 ```text
-wall=12.0s input=111.6s speed=9.3x MER=23.6dB OFDM=lock TPS=lock TS=207.0MiB TEI=0 IQ= 42% Demod= 98% FEC=  3%
+wall=12.0s input=111.6s speed=9.3x MER=23.6dB OFDM=lock TPS=lock TS=207.0MiB TEI=0 IQ queue= 42% Demod= 98% FEC queue=  3%
 ```
 
 The three pipeline percentages retain the GUI order and fixed-width format:

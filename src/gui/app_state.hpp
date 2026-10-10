@@ -130,10 +130,9 @@ struct UiShellState {
 
 struct ReportingUiState {
     ReportingUiState(ReceiverSession &session, SourceSettings &settings,
-                     dvbt::ReceiverParameters &parameters,
                      std::optional<std::filesystem::path> directory)
         : decode_report(std::move(directory), "gui"),
-          controller(session, decode_report, settings, parameters) {}
+          controller(session, decode_report, settings) {}
 
     DecodeRunReporter decode_report;
     ReceiverController controller;
@@ -142,8 +141,7 @@ struct ReportingUiState {
 struct AppState {
     explicit AppState(
         std::optional<std::filesystem::path> report_directory = std::nullopt)
-        : reporting(session, source.settings, standard.dvbt.parameters,
-                    std::move(report_directory)) {}
+        : reporting(session, source.settings, std::move(report_directory)) {}
 
     ReceiverSession session;
     SourceUiState source;

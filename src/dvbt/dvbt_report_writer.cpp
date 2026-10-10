@@ -1,5 +1,5 @@
-#include "decode_report.hpp"
-#include "dvbt/dvbt_report_codec.hpp"
+#include "dvbt_report_writer.hpp"
+#include "dvbt_report_codec.hpp"
 #include "telemetry_stream_router.hpp"
 
 #include "airspy_tv/jsonl.hpp"
@@ -350,9 +350,9 @@ struct TransportOutputAggregate {
 
 } // namespace
 
-struct DecodeReport::Impl {
+struct DvbTReportWriter::Impl {
     struct ActiveSource {
-        DecodeSourceSessionConfig config;
+        DvbTSourceSessionConfig config;
         dvbt::StreamDecoderStats initial_stats;
         InputTimelineSnapshot initial_timeline;
         TelemetryAggregate aggregate;
@@ -474,7 +474,7 @@ struct DecodeReport::Impl {
         router->write_batch("events", events);
     }
 
-    void begin_source(DecodeSourceSessionConfig selected,
+    void begin_source(DvbTSourceSessionConfig selected,
                       const InputTimelineSnapshot &timeline,
                       const dvbt::StreamDecoderStats &stats,
                       const double wall_elapsed_seconds,
@@ -902,20 +902,20 @@ struct DecodeReport::Impl {
     bool global_transport_outputs_initialized{};
 };
 
-DecodeReport::DecodeReport(DecodeReportConfig config)
+DvbTReportWriter::DvbTReportWriter(DecodeReportConfig config)
     : impl_(std::make_unique<Impl>(std::move(config))) {}
 
-DecodeReport::~DecodeReport() noexcept = default;
+DvbTReportWriter::~DvbTReportWriter() noexcept = default;
 
-void DecodeReport::begin_source(
-    DecodeSourceSessionConfig config, const InputTimelineSnapshot &timeline,
+void DvbTReportWriter::begin_source(
+    DvbTSourceSessionConfig config, const InputTimelineSnapshot &timeline,
     const dvbt::StreamDecoderStats &stats, const double wall_elapsed_seconds,
     const std::span<const TransportOutputTelemetry> outputs) {
     impl_->begin_source(std::move(config), timeline, stats,
                         wall_elapsed_seconds, outputs);
 }
 
-void DecodeReport::write_transport_outputs(
+void DvbTReportWriter::write_transport_outputs(
     const std::span<const TransportOutputTelemetry> outputs,
     const std::uint64_t decoder_generation, const std::uint64_t source_epoch,
     const double wall_elapsed_seconds) {
@@ -923,32 +923,33 @@ void DecodeReport::write_transport_outputs(
                                    wall_elapsed_seconds);
 }
 
-void DecodeReport::consume(
+void DvbTReportWriter::consume(
     const std::span<const dvbt::TelemetryRecord> records) {
     impl_->consume(records);
 }
 
-void DecodeReport::write_pipeline(const dvbt::StreamDecoderStats &stats,
-                                  const std::uint64_t submitted_samples,
-                                  const double wall_elapsed_seconds) {
+void DvbTReportWriter::write_pipeline(const dvbt::StreamDecoderStats &stats,
+                                      const std::uint64_t submitted_samples,
+                                      const double wall_elapsed_seconds) {
     impl_->write_pipeline(stats, submitted_samples, wall_elapsed_seconds);
 }
 
-void DecodeReport::end_source(const std::string_view status,
-                              const std::string_view error,
-                              const dvbt::StreamDecoderStats &stats,
-                              const InputTimelineSnapshot &timeline,
-                              const std::uint64_t submitted_samples,
-                              const double wall_elapsed_seconds) {
+void DvbTReportWriter::end_source(const std::string_view status,
+                                  const std::string_view error,
+                                  const dvbt::StreamDecoderStats &stats,
+                                  const InputTimelineSnapshot &timeline,
+                                  const std::uint64_t submitted_samples,
+                                  const double wall_elapsed_seconds) {
     impl_->end_source(status, error, stats, timeline, submitted_samples,
                       wall_elapsed_seconds);
 }
 
-void DecodeReport::flush() { impl_->flush(); }
+void DvbTReportWriter::flush() { impl_->flush(); }
 
-void DecodeReport::finalize(const std::string_view status, const int exit_code,
-                            const std::string_view error,
-                            const double wall_elapsed_seconds) {
+void DvbTReportWriter::finalize(const std::string_view status,
+                                const int exit_code,
+                                const std::string_view error,
+                                const double wall_elapsed_seconds) {
     if (impl_->active_source) {
         throw std::logic_error(
             "Cannot finalize a decode report with an active source session");

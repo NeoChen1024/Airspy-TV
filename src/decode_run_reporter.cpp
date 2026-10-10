@@ -2,12 +2,13 @@
 
 #include "airspy_tv/debug.hpp"
 #include "decode_report.hpp"
+#include "dvbt/dvbt_decode_report.hpp"
 #include "receiver_session.hpp"
 
 #include <algorithm>
 #include <exception>
-#include <iostream>
 #include <iterator>
+#include <stdexcept>
 #include <utility>
 
 namespace airspy_tv {
@@ -17,6 +18,17 @@ DecodeRunReporter::DecodeRunReporter(
     : directory_(std::move(directory)), context_(std::move(context)) {}
 
 DecodeRunReporter::~DecodeRunReporter() = default;
+
+DecodeReport &DecodeRunReporter::report(const ReceiverSession &session) {
+    if (report_ == nullptr) {
+        if (session.standard() != ReceiveStandard::DvbT) {
+            throw std::logic_error(
+                "The active television standard has no decode report");
+        }
+        report_ = make_dvbt_decode_report();
+    }
+    return *report_;
+}
 
 void DecodeRunReporter::set_transport_output_provider(
     TransportOutputProvider provider) {
@@ -49,15 +61,15 @@ double DecodeRunReporter::elapsed_seconds() const {
 }
 
 void DecodeRunReporter::restore_telemetry_selection(ReceiverSession &session) {
-    session.set_dvbt_telemetry_enabled(is_debug_enabled(),
-                                       std::chrono::steady_clock::now());
+    session.set_telemetry_enabled(is_debug_enabled(),
+                                  std::chrono::steady_clock::now());
 }
 
 bool DecodeRunReporter::abandon(ReceiverSession &session,
                                 const std::string_view message,
                                 std::string &error) {
     error = std::string(message);
-    writer_.reset();
+    report(session).close();
     prepared_ = false;
     source_active_ = false;
     completed_ = true;
@@ -67,22 +79,14 @@ bool DecodeRunReporter::abandon(ReceiverSession &session,
 
 bool DecodeRunReporter::drain_telemetry(ReceiverSession &session,
                                         std::string &error) {
-    if (writer_ == nullptr && !is_debug_enabled()) {
+    auto &writer = report(session);
+    if (!writer.is_open() && !is_debug_enabled()) {
         return true;
     }
-
-    auto records = session.drain_dvbt_telemetry();
-    if (writer_ != nullptr) {
-        try {
-            writer_->consume(records);
-        } catch (const std::exception &exception) {
-            return abandon(session, exception.what(), error);
-        }
-    }
-    if (is_debug_enabled()) {
-        for (const auto &record : records) {
-            format_debug_telemetry(std::cerr, record);
-        }
+    try {
+        writer.drain_telemetry(session, is_debug_enabled());
+    } catch (const std::exception &exception) {
+        return abandon(session, exception.what(), error);
     }
     return true;
 }
@@ -92,17 +96,19 @@ void DecodeRunReporter::prepare(ReceiverSession &session) {
         return;
     }
     if (!directory_.has_value()) {
-        session.set_dvbt_telemetry_enabled(is_debug_enabled(),
-                                           std::chrono::steady_clock::now());
+        session.set_telemetry_enabled(is_debug_enabled(),
+                                      std::chrono::steady_clock::now());
         return;
     }
-    if (writer_ == nullptr) {
+    auto &writer = report(session);
+    if (!writer.is_open()) {
         started_at_ = std::chrono::steady_clock::now();
-        session.set_dvbt_telemetry_enabled(true, started_at_);
+        session.set_telemetry_enabled(true, started_at_);
     }
     last_periodic_ = std::chrono::steady_clock::now();
     source_timeline_baseline_ = session.input_timeline_snapshot();
-    source_stats_baseline_ = session.dvbt_snapshot().decoder;
+    source_transport_bytes_baseline_ =
+        writer.capture_baseline(session).transport_bytes;
     prepared_ = true;
     saw_streaming_ = false;
 }
@@ -112,14 +118,13 @@ void DecodeRunReporter::cancel_start(ReceiverSession &session) {
         return;
     }
     prepared_ = false;
-    if (writer_ == nullptr) {
+    if (!report(session).is_open()) {
         restore_telemetry_selection(session);
     }
 }
 
 bool DecodeRunReporter::start_source(ReceiverSession &session,
                                      const SourceSettings &settings,
-                                     const dvbt::ReceiverParameters &parameters,
                                      const std::string_view destination,
                                      std::string &error) {
     if (!prepared_) {
@@ -138,9 +143,10 @@ bool DecodeRunReporter::start_source(ReceiverSession &session,
         return false;
     }
 
+    auto &writer = report(session);
     try {
-        if (writer_ == nullptr) {
-            writer_ = std::make_unique<DecodeReport>(DecodeReportConfig{
+        if (!writer.is_open()) {
+            writer.open(DecodeReportConfig{
                 .directory = report_directory.value(),
                 .context = context_,
             });
@@ -150,21 +156,17 @@ bool DecodeRunReporter::start_source(ReceiverSession &session,
             source_timeline_baseline_.source_head_sample;
         timeline.delivered_samples =
             source_timeline_baseline_.delivered_samples;
-        const auto current_stats = session.dvbt_snapshot().decoder;
-        auto initial_stats = source_stats_baseline_;
-        initial_stats.decoder_generation = current_stats.decoder_generation;
-        initial_stats.source_epoch = current_stats.source_epoch;
         const auto outputs = transport_outputs(session);
-        writer_->begin_source(
+        writer.begin_source(
+            session,
             DecodeSourceSessionConfig{
                 .source = descriptor->id.empty() ? descriptor->display_name
                                                  : descriptor->id,
                 .destination = std::string(destination),
                 .sample_rate_hz = settings.sample_rate_hz,
                 .center_frequency_hz = settings.center_frequency_hz,
-                .decoder = parameters,
             },
-            timeline, initial_stats, elapsed_seconds(), outputs);
+            timeline, elapsed_seconds(), outputs);
     } catch (const std::exception &exception) {
         return abandon(session, exception.what(), error);
     }
@@ -177,7 +179,8 @@ bool DecodeRunReporter::start_source(ReceiverSession &session,
 
 bool DecodeRunReporter::update(ReceiverSession &session, std::string &error,
                                const bool finish_stopped_source) {
-    if (!drain_telemetry(session, error) || writer_ == nullptr ||
+    auto &writer = report(session);
+    if (!drain_telemetry(session, error) || !writer.is_open() ||
         !source_active_) {
         return error.empty();
     }
@@ -187,13 +190,10 @@ bool DecodeRunReporter::update(ReceiverSession &session, std::string &error,
     if (now - last_periodic_ >= std::chrono::seconds(1)) {
         last_periodic_ = now;
         try {
-            const auto stats = session.dvbt_snapshot().decoder;
-            const double elapsed = elapsed_seconds();
-            writer_->write_pipeline(stats, submitted_samples(session), elapsed);
-            writer_->write_transport_outputs(transport_outputs(session),
-                                             stats.decoder_generation,
-                                             stats.source_epoch, elapsed);
-            writer_->flush();
+            static_cast<void>(writer.sample(session));
+            writer.write_sample(submitted_samples(session), elapsed_seconds(),
+                                transport_outputs(session));
+            writer.flush();
         } catch (const std::exception &exception) {
             return abandon(session, exception.what(), error);
         }
@@ -208,7 +208,8 @@ bool DecodeRunReporter::update(ReceiverSession &session, std::string &error,
 bool DecodeRunReporter::finish_source(ReceiverSession &session,
                                       std::string &error,
                                       const std::string_view source_failure) {
-    if (writer_ == nullptr) {
+    auto &writer = report(session);
+    if (!writer.is_open()) {
         cancel_start(session);
         return true;
     }
@@ -216,12 +217,12 @@ bool DecodeRunReporter::finish_source(ReceiverSession &session,
         return error.empty();
     }
 
-    const auto stats = session.dvbt_snapshot().decoder;
+    const auto stats = writer.sample(session);
     const std::uint64_t samples = submitted_samples(session);
     const double elapsed = elapsed_seconds();
     const std::uint64_t transport_bytes =
-        stats.transport_bytes >= source_stats_baseline_.transport_bytes
-            ? stats.transport_bytes - source_stats_baseline_.transport_bytes
+        stats.transport_bytes >= source_transport_bytes_baseline_
+            ? stats.transport_bytes - source_transport_bytes_baseline_
             : stats.transport_bytes;
     const bool source_failed = stats.failed || !source_failure.empty();
     std::string status = "completed";
@@ -240,14 +241,10 @@ bool DecodeRunReporter::finish_source(ReceiverSession &session,
         source_error = stats.error;
     }
     try {
-        writer_->write_pipeline(stats, samples, elapsed);
-        writer_->write_transport_outputs(transport_outputs(session),
-                                         stats.decoder_generation,
-                                         stats.source_epoch, elapsed);
-        writer_->end_source(status, source_error, stats,
-                            session.input_timeline_snapshot(), samples,
-                            elapsed);
-        writer_->flush();
+        writer.write_sample(samples, elapsed, transport_outputs(session));
+        writer.end_source(status, source_error,
+                          session.input_timeline_snapshot(), samples, elapsed);
+        writer.flush();
         source_active_ = false;
         saw_streaming_ = false;
         any_transport_ |= exit_code == 0;
@@ -263,10 +260,11 @@ bool DecodeRunReporter::finalize(ReceiverSession &session, std::string &error,
                                  const std::string_view run_failure,
                                  const int exit_code) {
     cancel_start(session);
-    if (writer_ == nullptr) {
+    auto &writer = report(session);
+    if (!writer.is_open()) {
         return drain_telemetry(session, error);
     }
-    if (!finish_source(session, error, run_failure) || writer_ == nullptr) {
+    if (!finish_source(session, error, run_failure) || !writer.is_open()) {
         return error.empty();
     }
 
@@ -284,10 +282,9 @@ bool DecodeRunReporter::finalize(ReceiverSession &session, std::string &error,
         run_error = "one or more source sessions failed";
     }
     try {
-        writer_->finalize(status,
-                          run_failed ? std::max(exit_code, 1) : exit_code,
-                          run_error, elapsed_seconds());
-        writer_.reset();
+        writer.finalize(status, run_failed ? std::max(exit_code, 1) : exit_code,
+                        run_error, elapsed_seconds());
+        writer.close();
         completed_ = true;
         restore_telemetry_selection(session);
     } catch (const std::exception &exception) {

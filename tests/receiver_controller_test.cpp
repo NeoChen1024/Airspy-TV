@@ -57,9 +57,7 @@ bool test_source_report_lifecycle_across_replay_and_failed_retune() {
     airspy_tv::DecodeRunReporter reporter(directory.path / "report", "test");
     airspy_tv::SourceSettings settings;
     settings.sample_rate_hz = 10'000'000;
-    airspy_tv::dvbt::ReceiverParameters parameters;
-    airspy_tv::ReceiverController controller(session, reporter, settings,
-                                             parameters);
+    airspy_tv::ReceiverController controller(session, reporter, settings);
 
     const auto opened = controller.open_iq_file(source_path);
     if (!require(opened.success, "controller opens an I/Q source") ||
@@ -100,7 +98,6 @@ bool test_source_report_lifecycle_across_replay_and_failed_retune() {
 } // namespace
 
 int main() {
-    return test_source_report_lifecycle_across_replay_and_failed_retune()
-               ? 0
-               : 1;
+    return test_source_report_lifecycle_across_replay_and_failed_retune() ? 0
+                                                                          : 1;
 }

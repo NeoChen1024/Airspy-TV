@@ -141,8 +141,7 @@ int offline_decode_cli(
     }
     const std::string destination_name =
         stdout_destination ? "stdout" : destination.string();
-    if (!reporter.start_source(session, settings, offline_parameters,
-                               destination_name, error)) {
+    if (!reporter.start_source(session, settings, destination_name, error)) {
         session.set_transport_sink({});
         session.close();
         std::cerr << "Decode report failed: " << error << '\n';
@@ -164,9 +163,9 @@ int offline_decode_cli(
             error = output_stats.error;
             break;
         }
-        const auto stats = session.dvbt_snapshot().decoder;
-        if (stats.failed) {
-            error = stats.error;
+        const auto pipeline = session.pipeline_snapshot();
+        if (pipeline.failed) {
+            error = pipeline.error;
             break;
         }
         std::string report_error;
@@ -180,7 +179,7 @@ int offline_decode_cli(
         if (now - last_progress >= std::chrono::seconds(1)) {
             last_progress = now;
             airspy_tv::format_decode_progress(
-                std::cerr, stats,
+                std::cerr, pipeline, session.decoder_status_text(),
                 submitted_samples(initial_timeline,
                                   session.input_timeline_snapshot()),
                 settings.sample_rate_hz,
@@ -203,14 +202,15 @@ int offline_decode_cli(
         }
     }
 
-    const auto stats = session.dvbt_snapshot().decoder;
+    const auto stats = session.pipeline_snapshot();
     const auto final_timeline = session.input_timeline_snapshot();
     const double wall_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       started_at)
             .count();
     airspy_tv::format_decode_progress(
-        std::cerr, stats, submitted_samples(initial_timeline, final_timeline),
+        std::cerr, stats, session.decoder_status_text(),
+        submitted_samples(initial_timeline, final_timeline),
         settings.sample_rate_hz, wall_seconds);
 
     int exit_code = 0;
