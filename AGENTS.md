@@ -1,7 +1,8 @@
 # Airspy TV — Agent guide
 
 Airspy R2 is the primary hardware target for this C++20 terrestrial television
-receiver. DVB-T is implemented; DVB-T2 is the next planned decoder.
+receiver. DVB-T is implemented. DVB-T2 is the next digital standard but is on
+hold until off-air T2 recordings are available for validation.
 
 ## Scope and ownership
 

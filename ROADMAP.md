@@ -157,6 +157,10 @@ mode structure.
 
 ### DVB-T2
 
+On hold until off-air DVB-T2 recordings are available. The DVB V&V reference
+streams are noiseless and only a few frames long, so they can check bit
+exactness but not synchronisation on real reception.
+
 DVB-T2 requires a separate OFDM/signalling chain and LDPC+BCH FEC. Reuse should
 stop at source/session infrastructure, common telemetry contracts, MPEG-TS
 routing, SI/EPG, recording, and playback. Do not add T2 branches inside the
