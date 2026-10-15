@@ -139,6 +139,7 @@ add_library(airspy-tv-runtime STATIC
     src/si_common.cpp
     src/spectrum.cpp
     src/telemetry_stream_router.cpp
+    src/transport_clock_monitor.cpp
     src/transport_observer.cpp
     src/transport_pipeline.cpp
     src/transport_stream.cpp
@@ -249,6 +250,7 @@ if(BUILD_TESTING)
     airspy_tv_test(byte-rate-tracker "")
     airspy_tv_test(vector-ops "")
     airspy_tv_test(playback-stream-buffer Threads::Threads src/playback_stream_buffer.cpp)
+    airspy_tv_test(transport-clock-monitor Threads::Threads src/transport_clock_monitor.cpp)
     set_tests_properties(dvbt-signal-analyzer sdr-file-source transport-output
                          playback-stream-buffer transport-stream-model
                          PROPERTIES TIMEOUT 30)

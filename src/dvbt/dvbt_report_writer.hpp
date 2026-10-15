@@ -1,6 +1,7 @@
 #pragma once
 
 #include "airspy_tv/dvbt/stream_decoder.hpp"
+#include "airspy_tv/transport_clock_monitor.hpp"
 #include "airspy_tv/transport_telemetry.hpp"
 #include "decode_report.hpp"
 
@@ -39,6 +40,7 @@ class DvbTReportWriter {
                       std::span<const TransportOutputTelemetry> outputs = {});
     void consume(std::span<const dvbt::TelemetryRecord> records);
     void write_pipeline(const dvbt::StreamDecoderStats &stats,
+                        const TransportClockSnapshot &clock,
                         std::uint64_t submitted_samples,
                         double wall_elapsed_seconds);
     void

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 
 namespace airspy_tv::dvbt {
@@ -17,7 +18,13 @@ struct TpsParameters {
     GuardInterval guard_interval{GuardInterval::gi_1_32};
     TransmissionMode mode{TransmissionMode::k2};
     std::uint8_t hierarchy{};
+    // Position of the frame within the super-frame (0..3).
     std::uint8_t frame_number{};
+    // The TPS length indicator says whether the cell identifier is
+    // transmitted (31 or 33 bits) or the field is reserved zero (23 bits).
+    bool cell_id_present{};
+    // Frames 0 and 2 carry the high byte of the cell identifier, frames 1
+    // and 3 the low byte.
     std::uint8_t cell_id_byte{};
 };
 
@@ -30,6 +37,10 @@ struct TpsSnapshot {
     bool currently_valid{};
     std::size_t symbol_index{};
     TpsParameters parameters{};
+    // Complete 16-bit cell identifier once both halves have been received
+    // from consecutive valid frames; empty until then and when the
+    // identifier is not transmitted.
+    std::optional<std::uint16_t> cell_id;
 };
 
 class TpsDecoder {

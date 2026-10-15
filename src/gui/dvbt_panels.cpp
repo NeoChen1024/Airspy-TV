@@ -613,6 +613,29 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
         ImGui::Text("Guard          %s", guard);
         ImGui::Text("Modulation     %s", modulation);
         ImGui::Text("Code rate      %s", code_rate);
+        {
+            const auto &decoder = state.frame.dvbt.decoder;
+            std::string cell_id = "--";
+            if (decoder.tps_locked) {
+                if (!decoder.tps_cell_id_present) {
+                    cell_id = "not transmitted";
+                } else if (decoder.tps_cell_id.has_value()) {
+                    cell_id = std::format("0x{:04X} ({})", *decoder.tps_cell_id,
+                                          *decoder.tps_cell_id);
+                } else {
+                    cell_id = "assembling";
+                }
+            }
+            ImGui::Text("Cell ID        %s", cell_id.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip(
+                    "16-bit DVB-T cell identifier assembled from the TPS "
+                    "of two consecutive frames (frame %u of 4 at the last "
+                    "window). It names the SFN cell or network, not an "
+                    "individual transmitter.",
+                    static_cast<unsigned>(decoder.tps_frame_number) + 1U);
+            }
+        }
         draw_disabled_wrapped(
             state.frame.dvbt.decoder.tps_locked
                 ? "TPS synchronization and BCH are valid; auto decoder "

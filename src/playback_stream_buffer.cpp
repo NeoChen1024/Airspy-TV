@@ -29,6 +29,7 @@ struct PlaybackStreamBuffer::Impl {
     std::uint64_t dropped_blocks{};
     std::uint64_t dropped_bytes{};
     std::uint64_t discontinuities{};
+    std::uint64_t buffering_stalls{};
 
     void clear_locked() {
         dropped_blocks += queue.size();
@@ -93,9 +94,10 @@ std::size_t PlaybackStreamBuffer::read(Reader &reader,
         }
     }
     impl_->bytes_processed += copied;
-    if (!impl_->end_of_stream &&
+    if (!impl_->end_of_stream && !impl_->buffering &&
         impl_->queued_bytes <= PlaybackStreamBuffer::low_watermark) {
         impl_->buffering = true;
+        ++impl_->buffering_stalls;
     }
     return copied;
 }
@@ -220,7 +222,8 @@ PlaybackBufferSnapshot PlaybackStreamBuffer::snapshot() const {
             .bytes_processed = impl_->bytes_processed,
             .dropped_blocks = impl_->dropped_blocks,
             .dropped_bytes = impl_->dropped_bytes,
-            .discontinuities = impl_->discontinuities};
+            .discontinuities = impl_->discontinuities,
+            .buffering_stalls = impl_->buffering_stalls};
 }
 
 } // namespace airspy_tv

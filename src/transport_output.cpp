@@ -211,7 +211,8 @@ transport_output_telemetry(std::string name, std::string type,
             .errors = stats.write_errors,
             .queued_bytes = stats.queued_bytes,
             .queue_capacity_bytes = stats.queue_capacity_bytes,
-            .error = stats.error};
+            .error = stats.error,
+            .pacing = {}};
 }
 
 } // namespace airspy_tv

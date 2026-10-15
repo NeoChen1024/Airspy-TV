@@ -2,9 +2,19 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace airspy_tv {
+
+// A sink that paces its own consumption (playback) and steers that pace from
+// its queue level.
+struct TransportOutputPacing {
+    double rate{1.0};
+    std::optional<double> queued_seconds;
+    std::uint64_t stalls{};
+    std::optional<double> clock_offset_ppm;
+};
 
 struct TransportOutputTelemetry {
     std::string name;
@@ -22,6 +32,7 @@ struct TransportOutputTelemetry {
     std::size_t queued_bytes{};
     std::size_t queue_capacity_bytes{};
     std::string error;
+    std::optional<TransportOutputPacing> pacing;
 };
 
 } // namespace airspy_tv

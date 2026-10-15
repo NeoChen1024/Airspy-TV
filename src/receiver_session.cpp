@@ -77,6 +77,10 @@ ReceiverSession::transport_output_telemetry() const {
     return transport_.output_telemetry();
 }
 
+TransportClockSnapshot ReceiverSession::transport_clock_snapshot() const {
+    return transport_.snapshot().clock;
+}
+
 std::string ReceiverSession::runtime_error() const {
     return receiver_.runtime_error();
 }

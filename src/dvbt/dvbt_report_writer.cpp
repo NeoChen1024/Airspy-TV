@@ -322,6 +322,19 @@ struct TransportOutputAggregate {
     const TransportOutputTelemetry &output, const std::uint64_t sequence,
     const std::uint64_t decoder_generation, const std::uint64_t source_epoch,
     const double wall_elapsed_seconds) {
+    const auto optional_number = [](const std::optional<double> value) {
+        return value.has_value() ? json_finite_or_null(*value) : json(nullptr);
+    };
+    json pacing(nullptr);
+    if (output.pacing.has_value()) {
+        pacing = {
+            {"rate", output.pacing->rate},
+            {"queued_seconds", optional_number(output.pacing->queued_seconds)},
+            {"stalls", output.pacing->stalls},
+            {"clock_offset_ppm",
+             optional_number(output.pacing->clock_offset_ppm)},
+        };
+    }
     return {
         {"schema_version", 0},
         {"record_type", "transport_output_sample"},
@@ -347,6 +360,7 @@ struct TransportOutputAggregate {
          {{"used_bytes", output.queued_bytes},
           {"capacity_bytes", output.queue_capacity_bytes}}},
         {"error", output.error.empty() ? json(nullptr) : json(output.error)},
+        {"pacing", pacing},
     };
 }
 
@@ -543,6 +557,7 @@ struct DvbTReportWriter::Impl {
     }
 
     void write_pipeline(const dvbt::StreamDecoderStats &stats,
+                        const TransportClockSnapshot &clock,
                         const std::uint64_t submitted_samples,
                         const double wall_elapsed_seconds) {
         if (!active_source) {
@@ -614,6 +629,24 @@ struct DvbTReportWriter::Impl {
             {"realtime_ratio",
              json_finite_or_null(stats.processing_realtime_ratio)},
             {"fec_gated", stats.fec_skipped},
+        };
+        const auto optional_number = [](const std::optional<double> value) {
+            return value.has_value() ? json_finite_or_null(*value)
+                                     : json(nullptr);
+        };
+        record["transport_clock"] = {
+            {"packets", clock.packets},
+            {"pcr_count", clock.pcr_count},
+            {"pts_count", clock.pts_count},
+            {"dts_count", clock.dts_count},
+            {"pcr_pids", clock.pcr_pids},
+            {"pcr_flagged_discontinuities", clock.pcr_flagged_discontinuities},
+            {"pcr_unflagged_discontinuities",
+             clock.pcr_unflagged_discontinuities},
+            {"pcr_interval_max_ms", clock.pcr_interval_max_ms},
+            {"bitrate_bps", optional_number(clock.bitrate_bps)},
+            {"clock_offset_ppm", optional_number(clock.clock_offset_ppm)},
+            {"clock_span_s", clock.clock_span_s},
         };
         router->write("pipeline", record);
     }
@@ -945,9 +978,11 @@ void DvbTReportWriter::consume(
 }
 
 void DvbTReportWriter::write_pipeline(const dvbt::StreamDecoderStats &stats,
+                                      const TransportClockSnapshot &clock,
                                       const std::uint64_t submitted_samples,
                                       const double wall_elapsed_seconds) {
-    impl_->write_pipeline(stats, submitted_samples, wall_elapsed_seconds);
+    impl_->write_pipeline(stats, clock, submitted_samples,
+                          wall_elapsed_seconds);
 }
 
 void DvbTReportWriter::end_source(const std::string_view status,

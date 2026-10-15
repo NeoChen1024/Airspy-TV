@@ -291,7 +291,13 @@ are not affected by that option.
 | EPG model                    |  256 KiB | drop oldest plus local parser reset | latest-state observer                   |
 | offline exact TS file/stdout |   24 MiB | block producer                      | required exact sink                     |
 
-mpv retains its 1 MiB low and 2 MiB resume watermarks. No transport queue
+mpv retains its 1 MiB low and 2 MiB resume watermarks. Between them the
+player slaves its rate to the queue level (proportional, ±0.5 % at most) so
+a broadcast-versus-playback clock mismatch settles at a small queue offset
+instead of walking the queue into a stall or the hard capacity; every stall
+is counted. `TransportClockMonitor` parses PCR/PTS/DTS inline at the
+pipeline fan-out (full multiplex, for the report and GUI) and again inside the
+player on the filtered service (queue depth in seconds). No transport queue
 uses shared blocks; independent ownership keeps failure, overload, and lifetime
 rules local to each consumer.
 
@@ -374,7 +380,7 @@ DVB-T-specific diagnostics.
 | Viterbi pool/backend selection                        | `src/fec/soft_viterbi.cpp`, `include/airspy_tv/fec/soft_viterbi.hpp`                                 |
 | Outer FEC                                             | `src/fec/outer_fec.cpp`, `include/airspy_tv/fec/outer_fec.hpp`                                       |
 | Signal snapshot publication/fallback                  | `src/dvbt/analysis_publisher.cpp`, `src/dvbt/signal_analyzer.cpp`                                    |
-| Playback and discontinuities                          | `src/mpv_player.cpp`, `include/airspy_tv/mpv_player.hpp`, `include/airspy_tv/transport_stream.hpp` |
+| Playback and discontinuities                          | `src/mpv_player.cpp`, `include/airspy_tv/mpv_player.hpp`, `include/airspy_tv/transport_stream.hpp`, `src/transport_clock_monitor.cpp` |
 | Raw/TS recording                                      | `src/recorder.cpp`, `include/airspy_tv/recorder.hpp`                                                 |
 
 ## Performance changes

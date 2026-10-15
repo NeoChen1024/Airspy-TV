@@ -1,4 +1,5 @@
 #include "airspy_tv/mpv_player.hpp"
+#include "airspy_tv/transport_clock_monitor.hpp"
 #include "playback_stream_buffer.hpp"
 
 #define GL_GLEXT_PROTOTYPES 1
@@ -11,6 +12,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -29,6 +32,20 @@ namespace airspy_tv {
 namespace {
 
 constexpr std::size_t transport_packet_size = 188;
+
+// Queue level the playback rate steers towards: above the resume watermark
+// by enough margin that ordinary arrival jitter does not touch the low
+// watermark. The proportional gain and the limit keep the rate change well
+// below what is audible; a clock mismatch of a few hundred ppm is held with
+// a steady-state queue error of a few tens of KiB.
+constexpr double playback_target_bytes =
+    static_cast<double>(PlaybackStreamBuffer::resume_watermark) +
+    static_cast<double>(1U << 19U);
+constexpr double playback_speed_gain_per_mib = 0.005;
+constexpr double playback_speed_limit = 0.005;
+constexpr double playback_speed_resolution = 1e-4;
+constexpr auto playback_speed_interval = std::chrono::milliseconds(250);
+
 [[nodiscard]] std::string mpv_error(const std::string_view operation,
                                     const int code) {
     return std::format("{}: {} ({})", operation, mpv_error_string(code), code);
@@ -56,7 +73,10 @@ struct MpvPlayer::Impl {
 
     mutable std::mutex mutex;
     PlaybackStreamBuffer stream;
+    TransportClockMonitor clock;
     std::optional<TransportService> selected_service;
+    double applied_speed{1.0};
+    std::chrono::steady_clock::time_point last_speed_update;
 
     bool file_loaded{};
     float current_volume{100.0F};
@@ -119,6 +139,7 @@ struct MpvPlayer::Impl {
         if (action == PlaybackBufferAction::none) {
             return;
         }
+        clock.reset();
         if (action == PlaybackBufferAction::load) {
             {
                 const std::scoped_lock lock(mutex);
@@ -160,6 +181,39 @@ struct MpvPlayer::Impl {
             [pid](const TransportStreamComponent &component) {
                 return component.pid == pid;
             });
+    }
+
+    // Slave the playback rate to the queue level (see the constants above).
+    // Runs on the UI thread with the player's event polling.
+    void update_speed() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_speed_update < playback_speed_interval) {
+            return;
+        }
+        last_speed_update = now;
+        const auto snapshot = stream.snapshot();
+        double speed = 1.0;
+        bool loaded = false;
+        {
+            const std::scoped_lock lock(mutex);
+            loaded = file_loaded;
+        }
+        if (loaded && snapshot.source_active && !snapshot.buffering) {
+            const double error_mib =
+                (static_cast<double>(snapshot.queued_bytes) -
+                 playback_target_bytes) /
+                static_cast<double>(1U << 20U);
+            speed = 1.0 + std::clamp(playback_speed_gain_per_mib * error_mib,
+                                     -playback_speed_limit,
+                                     playback_speed_limit);
+        }
+        if (std::abs(speed - applied_speed) < playback_speed_resolution &&
+            (speed != 1.0 || applied_speed == 1.0)) {
+            return;
+        }
+        applied_speed = speed;
+        static_cast<void>(mpv_set_property_async(
+            handle, 0, "speed", MPV_FORMAT_DOUBLE, &applied_speed));
     }
 
     void destroy_gl_objects() {
@@ -232,7 +286,10 @@ bool MpvPlayer::initialize(std::string &error) {
     if (!set_option("config", "no") || !set_option("terminal", "no") ||
         !set_option("vo", "libmpv") || !set_option("cache", "no") ||
         !set_option("keep-open", "yes") ||
-        !set_option("demuxer-lavf-format", "mpegts")) {
+        !set_option("demuxer-lavf-format", "mpegts") ||
+        // The rate is steered by fractions of a percent: plain resampling
+        // is cleaner than time-stretching for that.
+        !set_option("audio-pitch-correction", "no")) {
         shutdown();
         return false;
     }
@@ -313,6 +370,7 @@ void MpvPlayer::submit(const std::span<const std::uint8_t> transport_stream) {
             return;
         }
     }
+    impl_->clock.consume(filtered);
     impl_->stream.submit(filtered);
 }
 
@@ -393,6 +451,7 @@ void MpvPlayer::poll_events() {
     if (impl_->handle == nullptr) {
         return;
     }
+    impl_->update_speed();
     while (true) {
         const mpv_event *event = mpv_wait_event(impl_->handle, 0.0);
         if (event == nullptr || event->event_id == MPV_EVENT_NONE) {
@@ -431,7 +490,15 @@ PlaybackTelemetry MpvPlayer::telemetry() const {
     result.dropped_blocks = stream.dropped_blocks;
     result.dropped_bytes = stream.dropped_bytes;
     result.buffering = stream.buffering;
+    result.buffering_stalls = stream.buffering_stalls;
     result.discontinuities = stream.discontinuities;
+    result.playback_speed = impl_->applied_speed;
+    const auto clock = impl_->clock.snapshot();
+    result.clock_offset_ppm = clock.clock_offset_ppm;
+    if (clock.bitrate_bps.has_value() && *clock.bitrate_bps > 0.0) {
+        result.queued_seconds =
+            static_cast<double>(stream.queued_bytes) * 8.0 / *clock.bitrate_bps;
+    }
     if (impl_->handle == nullptr) {
         return result;
     }

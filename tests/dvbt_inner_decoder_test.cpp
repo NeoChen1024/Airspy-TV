@@ -331,19 +331,22 @@ void test_tps_decoder() {
     set(38, 2, 1U); // 8K
     set(40, 8, 0x5AU);
 
-    unsigned int reg = 0;
-    for (std::size_t input = 0; input < 113; ++input) {
-        const unsigned int data = input < 60 ? 0U : bits[1 + input - 60];
-        const unsigned int feedback = (data ^ reg) & 1U;
-        reg >>= 1U;
-        reg |= feedback << 13U;
-        reg ^= (feedback << 12U) ^ (feedback << 11U) ^ (feedback << 9U) ^
-               (feedback << 8U) ^ (feedback << 7U) ^ (feedback << 5U) ^
-               (feedback << 4U);
-    }
-    for (std::size_t bit = 0; bit < 14; ++bit) {
-        bits[54 + bit] = static_cast<std::uint8_t>((reg >> bit) & 1U);
-    }
+    const auto append_bch = [&bits] {
+        unsigned int reg = 0;
+        for (std::size_t input = 0; input < 113; ++input) {
+            const unsigned int data = input < 60 ? 0U : bits[1 + input - 60];
+            const unsigned int feedback = (data ^ reg) & 1U;
+            reg >>= 1U;
+            reg |= feedback << 13U;
+            reg ^= (feedback << 12U) ^ (feedback << 11U) ^ (feedback << 9U) ^
+                   (feedback << 8U) ^ (feedback << 7U) ^ (feedback << 5U) ^
+                   (feedback << 4U);
+        }
+        for (std::size_t bit = 0; bit < 14; ++bit) {
+            bits[54 + bit] = static_cast<std::uint8_t>((reg >> bit) & 1U);
+        }
+    };
+    append_bch();
 
     TpsDecoder decoder;
     std::vector<std::complex<float>> carriers(17, {1.0F, 0.0F});
@@ -402,6 +405,41 @@ void test_tps_decoder() {
     }
     require(snapshot.currently_valid && snapshot.symbol_index == 67,
             "TPS sliding reacquisition after a bad frame");
+    require(snapshot.parameters.frame_number == 2 &&
+                !snapshot.parameters.cell_id_present &&
+                !snapshot.cell_id.has_value(),
+            "23-bit TPS carries no cell identifier");
+
+    // Cell identifier 0xA55A over frames 3 and 4 of the super-frame: the
+    // high byte arrives with frame 3 and the low byte with frame 4.
+    const auto send_frame = [&](const unsigned int frame_number,
+                                const unsigned int cell_id_byte) {
+        set(17, 6, 0x1FU);
+        set(23, 2, frame_number);
+        set(40, 8, cell_id_byte);
+        append_bch();
+        for (const std::uint8_t bit : bits) {
+            snapshot = process_bit(bit);
+        }
+        require(snapshot.currently_valid && snapshot.symbol_index == 67,
+                "31-bit TPS frame validates");
+    };
+    send_frame(2U, 0xA5U);
+    require(snapshot.parameters.cell_id_present && !snapshot.cell_id,
+            "cell identifier waits for its low byte");
+    send_frame(3U, 0x5AU);
+    require(snapshot.cell_id == std::uint16_t{0xA55A},
+            "cell identifier assembled across consecutive frames");
+    send_frame(0U, 0x12U);
+    require(snapshot.cell_id == std::uint16_t{0xA55A},
+            "a pending high byte keeps the previous identifier");
+    send_frame(3U, 0x34U);
+    require(snapshot.cell_id == std::uint16_t{0xA55A},
+            "non-consecutive halves are not combined");
+    send_frame(2U, 0x12U);
+    send_frame(3U, 0x34U);
+    require(snapshot.cell_id == std::uint16_t{0x1234},
+            "cell identifier follows the newest complete pair");
 }
 
 } // namespace

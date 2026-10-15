@@ -36,6 +36,7 @@ struct TransportPipeline::Impl {
     std::unique_ptr<AsyncTransportObserver> epg_observer;
     TransportStreamRecorder recorder;
     RtpUdpTransportOutput rtp;
+    TransportClockMonitor clock;
     mutable std::mutex sink_mutex;
     Sink sink;
     DiscontinuitySink discontinuity_sink;
@@ -56,6 +57,7 @@ void TransportPipeline::consume(
     }
     impl_->recorder.submit(transport_stream);
     impl_->rtp.submit(transport_stream);
+    impl_->clock.consume(transport_stream);
 
     Sink sink;
     {
@@ -78,6 +80,7 @@ void TransportPipeline::notify_discontinuity(
     if (discontinuity == TransportDiscontinuity::retune) {
         impl_->recorder.discard_queued();
         impl_->rtp.discard_queued();
+        impl_->clock.reset();
     }
 
     DiscontinuitySink sink;
@@ -145,7 +148,8 @@ TransportPipelineSnapshot TransportPipeline::snapshot() const {
                                 ? impl_->epg_observer->stats()
                                 : TransportObserverStats{},
             .recorder = impl_->recorder.stats(),
-            .rtp = impl_->rtp.stats()};
+            .rtp = impl_->rtp.stats(),
+            .clock = impl_->clock.snapshot()};
 }
 
 std::vector<TransportOutputTelemetry>
@@ -168,7 +172,8 @@ TransportPipeline::output_telemetry() const {
              .queued_bytes = current.service_observer.queued_bytes,
              .queue_capacity_bytes =
                  current.service_observer.queue_capacity_bytes,
-             .error = current.service_observer.error});
+             .error = current.service_observer.error,
+             .pacing = {}});
     }
     if (impl_->epg_observer) {
         result.push_back(
@@ -184,7 +189,8 @@ TransportPipeline::output_telemetry() const {
              .dropped_bytes = current.epg_observer.dropped_bytes,
              .queued_bytes = current.epg_observer.queued_bytes,
              .queue_capacity_bytes = current.epg_observer.queue_capacity_bytes,
-             .error = current.epg_observer.error});
+             .error = current.epg_observer.error,
+             .pacing = {}});
     }
     result.push_back(
         {.name = "ts-recorder",
@@ -200,7 +206,8 @@ TransportPipeline::output_telemetry() const {
          .errors = current.recorder.write_errors,
          .queued_bytes = current.recorder.queued_bytes,
          .queue_capacity_bytes = current.recorder.queue_capacity_bytes,
-         .error = current.recorder.error});
+         .error = current.recorder.error,
+         .pacing = {}});
     result.push_back(
         {.name = "rtp-udp",
          .type = "network",
@@ -215,7 +222,8 @@ TransportPipeline::output_telemetry() const {
          .errors = current.rtp.write_errors,
          .queued_bytes = current.rtp.queued_bytes,
          .queue_capacity_bytes = current.rtp.queue_capacity_bytes,
-         .error = current.rtp.last_error});
+         .error = current.rtp.last_error,
+         .pacing = {}});
     return result;
 }
 

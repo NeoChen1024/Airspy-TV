@@ -22,6 +22,9 @@ struct PlaybackBufferSnapshot {
     std::uint64_t dropped_blocks{};
     std::uint64_t dropped_bytes{};
     std::uint64_t discontinuities{};
+    // Times the reader drained the queue to the low watermark and playback
+    // had to wait for the resume watermark again (an audible gap).
+    std::uint64_t buffering_stalls{};
 };
 
 // Internal byte-stream queue behind MpvPlayer's libmpv callback. Keeping the

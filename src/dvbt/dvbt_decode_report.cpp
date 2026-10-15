@@ -28,6 +28,7 @@ class DvbTDecodeReport final : public DecodeReport {
 
     DecodeReportSample sample(const ReceiverSession &session) override {
         stats_ = session.dvbt_snapshot().decoder;
+        clock_ = session.transport_clock_snapshot();
         return report_sample(stats_);
     }
 
@@ -77,7 +78,7 @@ class DvbTDecodeReport final : public DecodeReport {
         const std::uint64_t submitted_samples,
         const double wall_elapsed_seconds,
         const std::span<const TransportOutputTelemetry> outputs) override {
-        writer().write_pipeline(stats_, submitted_samples,
+        writer().write_pipeline(stats_, clock_, submitted_samples,
                                 wall_elapsed_seconds);
         writer().write_transport_outputs(outputs, stats_.decoder_generation,
                                          stats_.source_epoch,
@@ -111,6 +112,7 @@ class DvbTDecodeReport final : public DecodeReport {
     std::unique_ptr<DvbTReportWriter> writer_;
     dvbt::StreamDecoderStats baseline_;
     dvbt::StreamDecoderStats stats_;
+    TransportClockSnapshot clock_;
 };
 
 } // namespace

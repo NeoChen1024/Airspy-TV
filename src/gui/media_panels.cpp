@@ -402,10 +402,62 @@ void draw_playback_panel(AppState &state) {
         ImVec4(0.52F, 0.82F, 1.0F, 1.0F));
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         ImGui::SetTooltip(
-            "Decoded TS bytes queued for libmpv vs the queue capacity; growth "
-            "here means playback is not keeping up (stalled audio device or a "
-            "paused player). Playback buffers to 2 MiB at startup/recovery, "
-            "and re-enters buffering below 1 MiB.");
+            "Decoded TS bytes of the selected service queued for libmpv vs "
+            "the queue capacity. Playback buffers to 2 MiB at startup and "
+            "after a stall, re-enters buffering below 1 MiB, and the "
+            "playback rate is steered by a fraction of a percent to hold the "
+            "queue near 2.5 MiB so clock mismatch cannot drain or overflow "
+            "it over a long session.");
+    }
+    const std::string buffered =
+        telemetry.queued_seconds.has_value()
+            ? std::format("{:.2f} s", *telemetry.queued_seconds)
+            : std::string("-- s");
+    ImGui::Text("Buffered        %s   speed %.4fx   stalls %llu",
+                buffered.c_str(), telemetry.playback_speed,
+                static_cast<unsigned long long>(telemetry.buffering_stalls));
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip(
+            "Queue depth in stream seconds at the service's PCR-measured bit "
+            "rate, the playback rate currently requested from libmpv, and "
+            "how many times playback drained the queue and had to wait for "
+            "it to refill (each one is a gap).");
+    }
+    const auto &clock = state.frame.transport_clock;
+    const std::string mux_rate =
+        clock.bitrate_bps.has_value()
+            ? std::format("{:.3f} Mbit/s", *clock.bitrate_bps / 1e6)
+            : std::string("--");
+    const std::string clock_offset =
+        clock.clock_offset_ppm.has_value()
+            ? std::format("{:+.1f} ppm over {:.0f} s", *clock.clock_offset_ppm,
+                          clock.clock_span_s)
+            : std::string("--");
+    ImGui::Text("Mux rate        %s", mux_rate.c_str());
+    ImGui::Text("PCR clock       %s", clock_offset.c_str());
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip(
+            "Broadcast clock (PCR) against this computer's clock at the "
+            "decoder output: positive means the broadcast runs fast relative "
+            "to the system clock. Only meaningful for live reception; for a "
+            "recording it reflects the processing speed.");
+    }
+    ImGui::Text("PCR/PTS/DTS     %llu / %llu / %llu   seams %llu+%llu   "
+                "max %.0f ms",
+                static_cast<unsigned long long>(clock.pcr_count),
+                static_cast<unsigned long long>(clock.pts_count),
+                static_cast<unsigned long long>(clock.dts_count),
+                static_cast<unsigned long long>(
+                    clock.pcr_flagged_discontinuities),
+                static_cast<unsigned long long>(
+                    clock.pcr_unflagged_discontinuities),
+                clock.pcr_interval_max_ms);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip(
+            "Timestamps seen in the full multiplex, PCR seams announced by "
+            "the discontinuity indicator + unannounced jumps, and the longest "
+            "gap between consecutive PCRs of one PID (DVB bounds it at "
+            "100 ms).");
     }
     ImGui::Text("Dropped frames  %lld   (VO %lld)",
                 static_cast<long long>(telemetry.dropped_frames),

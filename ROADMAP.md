@@ -104,8 +104,6 @@ measured regressions or a concrete second receiver implementation.
 - Validate TPS loss and sliding reacquisition under isolated bit errors,
   bursts, phase slips, and mode changes. Add hysteresis only if those tests
   show unstable user-visible lock state.
-- Assemble the complete superframe/cell-ID information instead of exposing
-  only the currently decoded cell-ID byte.
 - Implement hierarchical QAM alpha 1/2/4, independent HP/LP code rates, and an
   explicit HP/LP stream-selection policy.
 
@@ -131,9 +129,10 @@ the current long-capture TS continuity and queue-latency baseline.
 
 ## 3. Transport stream and playback
 
-- Track PCR, PTS, and DTS monotonicity and discontinuities, including timestamp
-  wrap handling, so RF loss, decoder stalls, and A/V clock drift can be
-  distinguished automatically.
+- Extend the transport clock monitor (PCR seams, wrap, bit rate and
+  broadcast-versus-system clock offset are reported) with per-PID PTS/DTS
+  monotonicity and PTS-to-PCR lead, so RF loss, decoder stalls, and A/V clock
+  drift can be distinguished automatically.
 - Add EIT schedule table assembly (0x50-0x5F), including segment handling.
 - Add multilingual service/event descriptors, parental ratings, subtitles,
   teletext, and alternate audio/language selection as demand requires.
@@ -184,8 +183,7 @@ and lifecycle APIs are stable.
    retained-capture gates after each affected phase.
 3. Complete the AFC bias-validation set and long-capture clock experiments.
 4. Validate or replace the CIR estimator on long-delay/SFN input.
-5. Add hierarchical DVB-T, remaining TPS metadata, and timestamp/playback
-   diagnostics.
+5. Add hierarchical DVB-T and DVB-H TPS signalling.
 6. Begin the first second-standard implementation using the existing common
    lifecycle and extract additional shared code only where duplication appears.
 

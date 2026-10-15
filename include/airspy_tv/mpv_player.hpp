@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -31,10 +32,23 @@ struct PlaybackTelemetry {
     // True while the player's own queue is below its recovery watermark.
     // Playback starts/resumes at 2 MiB and re-enters buffering at 1 MiB.
     bool buffering{};
+    // Times playback drained the queue to the low watermark and had to wait
+    // for it to refill: each one is an audible gap.
+    std::uint64_t buffering_stalls{};
     // Stream-level seams received from the decoder (fec_region_reset,
     // stream_end, retune) — distinct from per-packet TEI corruption.
     std::uint64_t discontinuities{};
     bool paused{};
+    // Playback rate the player is currently asked for. It is slaved to the
+    // queue level so the broadcast clock and the playback clock cannot drift
+    // the queue into a stall or an overflow over a long session.
+    double playback_speed{1.0};
+    // Queue depth in stream seconds at the selected service's bit rate
+    // (measured from its PCR), once a PCR span is available.
+    std::optional<double> queued_seconds;
+    // Broadcast clock against the arrival clock of the selected service's
+    // packets, in parts per million, once enough span has accumulated.
+    std::optional<double> clock_offset_ppm;
 };
 
 class MpvPlayer {

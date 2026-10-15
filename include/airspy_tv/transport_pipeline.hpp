@@ -3,6 +3,7 @@
 #include "airspy_tv/epg.hpp"
 #include "airspy_tv/recorder.hpp"
 #include "airspy_tv/rtp_udp_output.hpp"
+#include "airspy_tv/transport_clock_monitor.hpp"
 #include "airspy_tv/transport_observer.hpp"
 #include "airspy_tv/transport_stream.hpp"
 #include "airspy_tv/transport_telemetry.hpp"
@@ -28,6 +29,7 @@ struct TransportPipelineSnapshot {
     TransportObserverStats epg_observer;
     TransportRecordingStats recorder;
     RtpUdpStats rtp;
+    TransportClockSnapshot clock;
 };
 
 class TransportPipeline {

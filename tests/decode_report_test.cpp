@@ -102,7 +102,8 @@ void test_multiple_source_sessions_share_one_report() {
     final_one.decoder_generation = 2;
     final_one.source_epoch = 2;
     final_one.processed_input_samples = 1'000;
-    report.write_pipeline(final_one, 1'000, 1.0);
+    report.write_pipeline(final_one, airspy_tv::TransportClockSnapshot{}, 1'000,
+                          1.0);
     report.end_source("completed", "", final_one,
                       InputTimelineSnapshot{.stream_epoch = 2,
                                             .source_head_sample = 1'000,
@@ -233,7 +234,8 @@ void test_transport_output_stream_and_totals() {
          .blocks_processed = 8,
          .bytes_processed = 1'504,
          .queue_capacity_bytes = 24U << 20U,
-         .error = {}},
+         .error = {},
+         .pacing = {}},
     }};
     report.begin_source(
         DvbTSourceSessionConfig{.source = "stdin",
@@ -255,7 +257,8 @@ void test_transport_output_stream_and_totals() {
          .dropped_bytes = 376,
          .queued_bytes = 376,
          .queue_capacity_bytes = 24U << 20U,
-         .error = {}},
+         .error = {},
+         .pacing = {}},
     }};
     report.write_transport_outputs(sample, 4, 7, 1.0);
     report.end_source("completed", "", stats,

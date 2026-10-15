@@ -53,6 +53,7 @@ class ReceiverSession {
     [[nodiscard]] EpgSnapshot epg_snapshot(std::uint16_t service_id) const;
     [[nodiscard]] std::vector<TransportOutputTelemetry>
     transport_output_telemetry() const;
+    [[nodiscard]] TransportClockSnapshot transport_clock_snapshot() const;
     [[nodiscard]] std::string runtime_error() const;
 
     bool select_standard(ReceiveStandard standard,

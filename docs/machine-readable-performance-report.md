@@ -241,7 +241,7 @@ The first report version uses these homogeneous streams:
 | --- | --- | --- | --- |
 | `source-sessions.jsonl` | `source_session` | one source session ends | Source/destination/configuration, correlation ranges, per-source totals, outcome, and final decoder state |
 | `frontend.jsonl` | `frontend_block` | one input block completes | CS16 conversion, resampling, SRO actuator, and source/output sample spans |
-| `pipeline.jsonl` | `pipeline_sample` | once per wall-clock second | Queue occupancy, worker states, latest locks/quality, and cumulative progress |
+| `pipeline.jsonl` | `pipeline_sample` | once per wall-clock second | Queue occupancy, worker states, latest locks/quality, transport clock facts, and cumulative progress |
 | `transport-outputs.jsonl` | `transport_output_sample` | once per wall-clock second for each active/used sink | Per-sink activity, required/failure state, accepted/processed/drop/error counters, and queue occupancy/capacity |
 | `dvbt-demod.jsonl` | `demod_window` | one stats window completes | Lock, RF/OFDM quality, CFO/SRO/timing state, and demod/symbol timing |
 | `dvbt-fec.jsonl` | `fec_window` | a numbered stats marker reaches FEC | FEC timing, session identity, output deltas, BER, RS, TEI, and sync state |
@@ -281,9 +281,21 @@ The common fields are:
   "dropped": {"blocks": 0, "bytes": 0},
   "errors": 0,
   "queue": {"used_bytes": 262144, "capacity_bytes": 25165824},
-  "error": null
+  "error": null,
+  "pacing": null
 }
 ```
+
+`pacing` is set only for a sink that paces its own consumption, today
+`mpv-playback`: the playback `rate` currently requested (steered within
+±0.5 % by the queue level), the queue depth in `queued_seconds` at the
+selected service's PCR-measured bit rate, the cumulative number of `stalls`
+(the queue drained to the low watermark and playback waited for the resume
+watermark: an audible gap), and the broadcast-versus-arrival
+`clock_offset_ppm` of the selected service. A long live session with a
+stable `rate` away from 1.0 and no stall growth is a clock mismatch being
+absorbed; stall growth with a rate pinned at the limit is a pace the player
+cannot absorb (decoder dropouts or a mismatch beyond the limit).
 
 Every event record has the same envelope: `event`, `severity`, nullable source,
 resampled-sample and OFDM-symbol positions, and a `fields` object containing
@@ -460,8 +472,11 @@ it is valid:
   commanded/applied SRO, command/effective/applied input positions, fixed
   delay, late samples, and pending commands;
 - OFDM/TPS: lock state, ever-locked state, FFT/guard size, constellation, code
-  rate, hierarchy, carrier-bin offset, acquisition score/start, and whether a
-  re-anchor carried state;
+  rate, hierarchy, super-frame position (`tps_frame_number`, 0..3), whether
+  the TPS length indicator announces a cell identifier and the 16-bit
+  `cell_id` once both halves arrived in consecutive frames (`null` while
+  incomplete or not transmitted), carrier-bin offset, acquisition score/start,
+  and whether a re-anchor carried state;
 - signal and tracking: MER, fade indicator, tracked and residual CFO, raw,
   filtered and physical timing, observed/smoothed drift, timing/CIR confidence,
   and accepted/rejected measurement counts. The MER is the decision error of
@@ -470,7 +485,16 @@ it is valid:
   selective channel is judged by the carriers the decoder relies on rather
   than by the few in deep notches;
 - pipeline: queue occupancy and capacity, worker state/count, dropped blocks,
-  FEC gating state and cumulative TS bytes;
+  FEC gating state, cumulative TS bytes, and the `transport_clock` object:
+  packets and PCR/PTS/DTS counts seen at the decoder output, PCR seams
+  (announced by the discontinuity indicator, or unannounced backward or
+  > 1 s forward steps), the longest PCR spacing of one PID in ms, the
+  multiplex `bitrate_bps` measured as stream bytes per PCR second, and
+  `clock_offset_ppm`, the broadcast clock against the arrival wall clock over
+  `clock_span_s` seconds (positive: the broadcast runs fast; `null` until a
+  few seconds of span exist). Arrival is paced by the broadcast only in live
+  reception, so for offline decoding the offset reports the processing speed
+  rather than a clock mismatch;
 - FEC: session ID, pre/post-Viterbi error and compared bits, RS packets and
   uncorrectable packets, TEI and TS packets, outer-deinterleaver phase/evidence,
   and RS/energy synchronization.

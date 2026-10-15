@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -51,6 +52,12 @@ struct StreamDecoderStats { // NOLINT(clang-analyzer-optin.performance.Padding)
     GuardInterval tps_guard_interval{GuardInterval::gi_1_32};
     TransmissionMode tps_mode{TransmissionMode::k2};
     std::uint8_t tps_hierarchy{};
+    // Super-frame position of the latest valid TPS frame and the cell
+    // identifier assembled across frames (empty when not transmitted or not
+    // yet complete).
+    std::uint8_t tps_frame_number{};
+    bool tps_cell_id_present{};
+    std::optional<std::uint16_t> tps_cell_id;
     float acquisition_score{};
     std::uint32_t fft_size{};
     std::uint32_t guard_size{};

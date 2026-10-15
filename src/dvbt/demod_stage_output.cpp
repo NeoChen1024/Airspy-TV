@@ -489,6 +489,10 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     latest.tps_guard_interval = frontend.tps_snapshot.parameters.guard_interval;
     latest.tps_mode = frontend.tps_snapshot.parameters.mode;
     latest.tps_hierarchy = frontend.tps_snapshot.parameters.hierarchy;
+    latest.tps_frame_number = frontend.tps_snapshot.parameters.frame_number;
+    latest.tps_cell_id_present =
+        frontend.tps_snapshot.parameters.cell_id_present;
+    latest.tps_cell_id = frontend.tps_snapshot.cell_id;
     latest.carrier_bin_offset = 0;
     latest.acquisition_start =
         static_cast<std::size_t>(sync.start_pos % period);
@@ -645,6 +649,9 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
                                : state.selected_parameters.code_rate.value_or(
                                      latest.tps_code_rate);
         record.hierarchy = latest.tps_hierarchy;
+        record.tps_frame_number = latest.tps_frame_number;
+        record.cell_id_present = latest.tps_cell_id_present;
+        record.cell_id = latest.tps_cell_id;
         record.fft_size = latest.fft_size;
         record.guard_size = latest.guard_size;
         record.carrier_bin_offset = latest.carrier_bin_offset;

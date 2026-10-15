@@ -70,6 +70,7 @@ std::optional<TpsParameters> decode(const std::deque<std::uint8_t> &bits) {
     if ((!even && !odd) || !valid_bch(bits)) {
         return std::nullopt;
     }
+    const unsigned int length_indicator = value(bits, 17, 6);
     const unsigned int constellation_code = value(bits, 25, 2);
     const unsigned int hierarchy = value(bits, 27, 3);
     const auto hp = code_rate(value(bits, 30, 3));
@@ -80,6 +81,11 @@ std::optional<TpsParameters> decode(const std::deque<std::uint8_t> &bits) {
         guard_code > 3 || mode_code > 1) {
         return std::nullopt;
     }
+    // EN 300 744 defines 23 bits (no cell identifier), 31 bits (with it)
+    // and 33 bits (cell identifier plus DVB-H signalling). The BCH already
+    // protects the frame, so any other value only means no identifier.
+    const bool cell_id_present =
+        length_indicator == 31 || length_indicator == 33;
     const std::array constellations{Constellation::qpsk, Constellation::qam16,
                                     Constellation::qam64};
     const std::array guards{GuardInterval::gi_1_32, GuardInterval::gi_1_16,
@@ -92,6 +98,7 @@ std::optional<TpsParameters> decode(const std::deque<std::uint8_t> &bits) {
         .mode = mode_code == 0 ? TransmissionMode::k2 : TransmissionMode::k8,
         .hierarchy = static_cast<std::uint8_t>(hierarchy),
         .frame_number = static_cast<std::uint8_t>(value(bits, 23, 2)),
+        .cell_id_present = cell_id_present,
         .cell_id_byte = static_cast<std::uint8_t>(value(bits, 40, 8)),
     };
 }
@@ -103,6 +110,30 @@ struct TpsDecoder::Impl {
     std::deque<std::uint8_t> bits;
     TpsSnapshot latest;
     bool frame_synchronized{};
+    // High byte of the cell identifier from the most recent frame 0 or 2,
+    // pending the low byte from the frame that directly follows it.
+    std::optional<std::uint8_t> pending_cell_id_high;
+    std::uint8_t pending_frame_number{};
+
+    void assemble_cell_id(const TpsParameters &parameters) {
+        if (!parameters.cell_id_present) {
+            latest.cell_id.reset();
+            pending_cell_id_high.reset();
+            return;
+        }
+        if ((parameters.frame_number & 1U) == 0U) {
+            pending_cell_id_high = parameters.cell_id_byte;
+            pending_frame_number = parameters.frame_number;
+            return;
+        }
+        if (pending_cell_id_high.has_value() &&
+            parameters.frame_number == pending_frame_number + 1U) {
+            latest.cell_id = static_cast<std::uint16_t>(
+                (static_cast<unsigned int>(*pending_cell_id_high) << 8U) |
+                parameters.cell_id_byte);
+        }
+        pending_cell_id_high.reset();
+    }
 };
 
 TpsDecoder::TpsDecoder() : impl_(std::make_unique<Impl>()) {}
@@ -136,9 +167,12 @@ TpsDecoder::process(const std::span<const std::complex<float>> carriers) {
                 impl_->latest = {.ever_locked = true,
                                  .currently_valid = true,
                                  .symbol_index = 67,
-                                 .parameters = *parameters};
+                                 .parameters = *parameters,
+                                 .cell_id = impl_->latest.cell_id};
                 impl_->frame_synchronized = true;
+                impl_->assemble_cell_id(*parameters);
             } else if (impl_->frame_synchronized) {
+                impl_->pending_cell_id_high.reset();
                 // Only an expected frame boundary can invalidate a healthy
                 // lock. Resume the sliding search so a phase slip or the next
                 // valid frame can re-establish synchronization.

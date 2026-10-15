@@ -187,6 +187,10 @@ using nlohmann::json;
         {"constellation", constellation_name(record.constellation)},
         {"code_rate", code_rate_name(record.code_rate)},
         {"hierarchy", record.hierarchy},
+        {"tps_frame_number", record.tps_frame_number},
+        {"cell_id_present", record.cell_id_present},
+        {"cell_id", record.cell_id.has_value() ? json(*record.cell_id)
+                                               : json(nullptr)},
         {"fft_size", record.fft_size},
         {"guard_size", record.guard_size}};
     result["acquisition"] = {

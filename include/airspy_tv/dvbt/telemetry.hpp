@@ -91,6 +91,9 @@ struct DemodWindowTelemetry {
     Constellation constellation{Constellation::qpsk};
     CodeRate code_rate{CodeRate::rate_1_2};
     std::uint8_t hierarchy{};
+    std::uint8_t tps_frame_number{};
+    bool cell_id_present{};
+    std::optional<std::uint16_t> cell_id;
     std::uint32_t fft_size{};
     std::uint32_t guard_size{};
     int carrier_bin_offset{};

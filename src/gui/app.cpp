@@ -48,6 +48,7 @@ void update_app_state(AppState &state) {
     state.frame.pipeline = state.session.pipeline_snapshot();
     state.frame.iq_recording_stats = state.session.recording_stats();
     state.frame.ts_recording_stats = state.session.ts_recording_stats();
+    state.frame.transport_clock = state.session.transport_clock_snapshot();
     state.frame.rtp_stats = state.session.rtp_streaming_stats();
     update_standard_state(state);
     float queue_pressure = 0.0F;
@@ -218,7 +219,12 @@ int run_gui(std::optional<std::filesystem::path> report_directory) {
              .dropped_bytes = playback.dropped_bytes,
              .queued_bytes = playback.queued_bytes,
              .queue_capacity_bytes = playback.queue_capacity,
-             .error = {}},
+             .error = {},
+             .pacing = TransportOutputPacing{
+                 .rate = playback.playback_speed,
+                 .queued_seconds = playback.queued_seconds,
+                 .stalls = playback.buffering_stalls,
+                 .clock_offset_ppm = playback.clock_offset_ppm}},
         };
     });
     initialize_standard_state(state);

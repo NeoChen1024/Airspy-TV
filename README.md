@@ -199,7 +199,13 @@ respective streams to tolerate ordinary scheduler jitter; RF input remains
 non-blocking because live hardware cannot accept backpressure. The separate
 mpv queue has an 8 MiB capacity, enters buffering below 1 MiB, and resumes at
 2 MiB so a short decoder dropout does not immediately become playback
-stutter.
+stutter. Over a long session the broadcast clock and the audio or system
+clock that paces playback differ by some tens of ppm, which would otherwise
+drain or fill the queue within hours; the playback rate is therefore steered
+by at most ±0.5 % to hold the queue near 2.5 MiB. The playback panel shows the
+queue depth in stream seconds (from the service's PCR), the requested rate,
+how many times playback stalled, and the multiplex bit rate and PCR clock
+offset measured at the decoder output.
 
 ## Command-line tools
 

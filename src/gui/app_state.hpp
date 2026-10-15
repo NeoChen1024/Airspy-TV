@@ -120,6 +120,7 @@ struct AppFrameSnapshot {
     RecordingStats iq_recording_stats;
     TransportRecordingStats ts_recording_stats;
     RtpUdpStats rtp_stats;
+    TransportClockSnapshot transport_clock;
     PlaybackTelemetry playback;
 };
 
