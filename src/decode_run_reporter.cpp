@@ -62,7 +62,8 @@ double DecodeRunReporter::elapsed_seconds() const {
 
 void DecodeRunReporter::restore_telemetry_selection(ReceiverSession &session) {
     session.set_telemetry_enabled(is_debug_enabled(),
-                                  std::chrono::steady_clock::now());
+                                  std::chrono::steady_clock::now(),
+                                  is_debug_enabled());
 }
 
 bool DecodeRunReporter::abandon(ReceiverSession &session,
@@ -97,13 +98,14 @@ void DecodeRunReporter::prepare(ReceiverSession &session) {
     }
     if (!directory_.has_value()) {
         session.set_telemetry_enabled(is_debug_enabled(),
-                                      std::chrono::steady_clock::now());
+                                      std::chrono::steady_clock::now(),
+                                      is_debug_enabled());
         return;
     }
     auto &writer = report(session);
     if (!writer.is_open()) {
         started_at_ = std::chrono::steady_clock::now();
-        session.set_telemetry_enabled(true, started_at_);
+        session.set_telemetry_enabled(true, started_at_, is_debug_enabled());
     }
     last_periodic_ = std::chrono::steady_clock::now();
     source_timeline_baseline_ = session.input_timeline_snapshot();

@@ -70,7 +70,8 @@ class ReceiverSession {
     void
     set_telemetry_enabled(bool enabled,
                           std::chrono::steady_clock::time_point started_at =
-                              std::chrono::steady_clock::now());
+                              std::chrono::steady_clock::now(),
+                          bool verbose = false);
     [[nodiscard]] std::vector<dvbt::TelemetryRecord> drain_dvbt_telemetry();
     [[nodiscard]] DvbTSessionSnapshot dvbt_snapshot() const;
     // One-line lock and quality summary of the active demodulator for
@@ -121,6 +122,7 @@ class ReceiverSession {
     dvbt::ReceiverParameters dvbt_parameters_;
     dvbt::StreamDecoder *dvbt_{};
     bool telemetry_enabled_{};
+    bool telemetry_verbose_{};
     std::chrono::steady_clock::time_point telemetry_started_at_{
         std::chrono::steady_clock::now()};
     DiscontinuityCallback discontinuity_callback_;

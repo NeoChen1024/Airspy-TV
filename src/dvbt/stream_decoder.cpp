@@ -428,8 +428,10 @@ StreamDecoderStats StreamDecoder::stats() const {
 }
 
 void StreamDecoder::set_telemetry_enabled(
-    const bool enabled, const TelemetryClock::time_point run_started_at) {
-    impl_->demod_stage->set_telemetry_enabled(enabled, run_started_at);
+    const bool enabled, const TelemetryClock::time_point run_started_at,
+    const bool verbose) {
+    impl_->demod_stage->set_telemetry_enabled(enabled, run_started_at,
+                                              verbose);
 }
 
 std::vector<TelemetryRecord> StreamDecoder::drain_telemetry() {

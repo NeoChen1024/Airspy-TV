@@ -198,7 +198,10 @@ so they incur no record retention. No decoder worker may serialize JSON or
 write the report.
 
 Collection is enabled when either `--report-dir` or `--debug` requires detailed
-records. After each drain, the owning application path passes the same record
+records. Input blocks arrive several hundred times per second, so without
+`--debug` the frontend stream is sampled: one block per second plus every
+notable block. The `frontend::*` timing aggregates in `stats.json` are
+therefore statistics of the sampled blocks, not of every block. After each drain, the owning application path passes the same record
 batch to zero or more consumers:
 
 1. a report router that batches records by their homogeneous JSONL stream;
@@ -240,7 +243,7 @@ The first report version uses these homogeneous streams:
 | File | Record type | Emission point | Purpose |
 | --- | --- | --- | --- |
 | `source-sessions.jsonl` | `source_session` | one source session ends | Source/destination/configuration, correlation ranges, per-source totals, outcome, and final decoder state |
-| `frontend.jsonl` | `frontend_block` | one input block completes | CS16 conversion, resampling, SRO actuator, and source/output sample spans |
+| `frontend.jsonl` | `frontend_block` | one input block completes: every block with `--debug`, otherwise at most one per second plus blocks with a seam, an abandoned block or a bootstrap/re-bootstrap change | CS16 conversion, resampling, SRO actuator, and source/output sample spans of that block |
 | `pipeline.jsonl` | `pipeline_sample` | once per wall-clock second | Queue occupancy, worker states, latest locks/quality, transport clock facts, and cumulative progress |
 | `transport-outputs.jsonl` | `transport_output_sample` | once per wall-clock second for each active/used sink | Per-sink activity, required/failure state, accepted/processed/drop/error counters, and queue occupancy/capacity |
 | `dvbt-demod.jsonl` | `demod_window` | one stats window completes | Lock, RF/OFDM quality, CFO/SRO/timing state, and demod/symbol timing |

@@ -2,6 +2,11 @@
 
 namespace airspy_tv::dvbt {
 
+namespace {
+constexpr double frontend_telemetry_interval_ms = 1000.0;
+} // namespace
+
+
 DemodStage::Impl::Impl(SampleChannel &selected_samples,
                        ClockControlTimeline &selected_clock,
                        FecStage &selected_fec,
@@ -396,6 +401,23 @@ void DemodStage::publish_frontend_block(
     if (!impl_->events_enabled()) {
         return;
     }
+    const double elapsed_ms = impl_->telemetry_elapsed_ms();
+    const bool notable =
+        publication.stamp.discontinuity_before || publication.abandoned ||
+        publication.bootstrap_attempts !=
+            impl_->frontend_telemetry_last_bootstrap_attempts ||
+        latest.cfo_rebootstrap_count !=
+            impl_->frontend_telemetry_last_rebootstrap_count;
+    if (!impl_->telemetry_verbose && !notable &&
+        elapsed_ms - impl_->frontend_telemetry_last_ms <
+            frontend_telemetry_interval_ms) {
+        return;
+    }
+    impl_->frontend_telemetry_last_ms = elapsed_ms;
+    impl_->frontend_telemetry_last_bootstrap_attempts =
+        publication.bootstrap_attempts;
+    impl_->frontend_telemetry_last_rebootstrap_count =
+        latest.cfo_rebootstrap_count;
 
     const double accounted =
         static_cast<double>(publication.convert_time_ms) +
@@ -407,7 +429,7 @@ void DemodStage::publish_frontend_block(
         .sequence = ++impl_->frontend_telemetry_sequence,
         .decoder_generation = publication.generation,
         .source_epoch = publication.stamp.stream_epoch,
-        .wall_elapsed_ms = impl_->telemetry_elapsed_ms(),
+        .wall_elapsed_ms = elapsed_ms,
     };
     record.input_sample_rate_hz = publication.input_rate_hz;
     record.channel_bandwidth_hz = publication.bandwidth_hz;
@@ -533,12 +555,17 @@ StreamDecoderStats DemodStage::stats() const {
 }
 
 void DemodStage::set_telemetry_enabled(
-    const bool enabled, const TelemetryClock::time_point run_started_at) {
+    const bool enabled, const TelemetryClock::time_point run_started_at,
+    const bool verbose) {
     const std::scoped_lock lock(impl_->mutex);
     impl_->telemetry_enabled.store(enabled, std::memory_order_relaxed);
+    impl_->telemetry_verbose = verbose;
     impl_->telemetry_started_at = run_started_at;
     impl_->telemetry_queue.clear();
     impl_->frontend_telemetry_sequence = 0;
+    impl_->frontend_telemetry_last_ms = -1e9;
+    impl_->frontend_telemetry_last_bootstrap_attempts = 0;
+    impl_->frontend_telemetry_last_rebootstrap_count = 0;
     impl_->fec_telemetry_sequence = 0;
     impl_->event_telemetry_sequence = 0;
     impl_->channel_profile_telemetry_sequence = 0;

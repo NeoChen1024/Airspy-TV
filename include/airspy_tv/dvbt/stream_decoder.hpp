@@ -276,10 +276,13 @@ class StreamDecoder : public Demodulator {
     void set_signal_smoothing(bool enabled, int speed) override;
     [[nodiscard]] StreamDecoderStats stats() const;
     // Detailed records are opt-in. Workers only append typed values; callers
-    // drain and serialize them outside the real-time pipeline.
+    // drain and serialize them outside the real-time pipeline. `verbose`
+    // records every input block instead of one per second plus notable
+    // blocks.
     void set_telemetry_enabled(
         bool enabled,
-        TelemetryClock::time_point run_started_at = TelemetryClock::now());
+        TelemetryClock::time_point run_started_at = TelemetryClock::now(),
+        bool verbose = false);
     [[nodiscard]] std::vector<TelemetryRecord> drain_telemetry();
 
   private:

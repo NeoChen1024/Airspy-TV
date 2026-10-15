@@ -25,8 +25,9 @@ using dvbt::TransmissionMode;
 
 void initialize_standard_state(AppState &state) {
     if (state.frame.standard == ReceiveStandard::DvbT) {
-        state.session.set_telemetry_enabled(
-            is_debug_enabled(), std::chrono::steady_clock::now());
+        state.session.set_telemetry_enabled(is_debug_enabled(),
+                                            std::chrono::steady_clock::now(),
+                                            is_debug_enabled());
         state.session.set_dvbt_parameters(state.standard.dvbt.parameters);
     }
 }

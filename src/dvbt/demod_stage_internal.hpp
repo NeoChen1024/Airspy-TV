@@ -175,9 +175,16 @@ struct DemodStage::Impl { // NOLINT(clang-analyzer-optin.performance.Padding)
     OfdmTrackingState frontend;
     StreamDecoderStats latest;
     std::atomic_bool telemetry_enabled{};
+    // Every input block produces a frontend record only in verbose mode;
+    // otherwise one per second plus every block that carries a seam,
+    // an abandoned block or a bootstrap/re-bootstrap change.
+    bool telemetry_verbose{};
     TelemetryClock::time_point telemetry_started_at{TelemetryClock::now()};
     std::deque<TelemetryRecord> telemetry_queue;
     std::uint64_t frontend_telemetry_sequence{};
+    double frontend_telemetry_last_ms{-1e9};
+    std::uint64_t frontend_telemetry_last_bootstrap_attempts{};
+    std::uint64_t frontend_telemetry_last_rebootstrap_count{};
     std::uint64_t fec_telemetry_sequence{};
     std::uint64_t event_telemetry_sequence{};
     std::uint64_t channel_profile_telemetry_sequence{};

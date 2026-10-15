@@ -99,7 +99,8 @@ void ReceiverSession::install_demodulator(
     std::unique_ptr<Demodulator> demodulator, const ReceiveStandard standard) {
     dvbt_ = dynamic_cast<dvbt::StreamDecoder *>(demodulator.get());
     if (dvbt_ != nullptr) {
-        dvbt_->set_telemetry_enabled(telemetry_enabled_, telemetry_started_at_);
+        dvbt_->set_telemetry_enabled(telemetry_enabled_, telemetry_started_at_,
+                                     telemetry_verbose_);
     }
     receiver_.set_demodulator(std::move(demodulator));
     standard_ = standard;
@@ -166,12 +167,13 @@ ReceiverSession::dvbt_parameters() const noexcept {
 }
 
 void ReceiverSession::set_telemetry_enabled(
-    const bool enabled,
-    const std::chrono::steady_clock::time_point started_at) {
+    const bool enabled, const std::chrono::steady_clock::time_point started_at,
+    const bool verbose) {
     telemetry_enabled_ = enabled;
+    telemetry_verbose_ = verbose;
     telemetry_started_at_ = started_at;
     if (dvbt_ != nullptr) {
-        dvbt_->set_telemetry_enabled(enabled, started_at);
+        dvbt_->set_telemetry_enabled(enabled, started_at, verbose);
     }
 }
 

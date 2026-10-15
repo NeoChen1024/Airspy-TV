@@ -65,7 +65,8 @@ class DemodStage {
     [[nodiscard]] StreamDecoderStats stats() const;
     void set_telemetry_enabled(
         bool enabled,
-        TelemetryClock::time_point run_started_at = TelemetryClock::now());
+        TelemetryClock::time_point run_started_at = TelemetryClock::now(),
+        bool verbose = false);
     [[nodiscard]] std::vector<TelemetryRecord> drain_telemetry();
 
   private:
