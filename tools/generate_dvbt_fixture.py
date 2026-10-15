@@ -28,6 +28,36 @@ TRANSMISSION_MODES = {
     "2k": (dtv.T2k, 2_048, 1_512),
     "8k": (dtv.T8k, 8_192, 6_048),
 }
+ACTIVE_CARRIERS = {"2k": 1_705, "8k": 6_817}
+FRACTIONAL_DELAY_TAPS = 32
+NOISE_POWER_ESTIMATE_SAMPLES = 65_536
+
+# ETSI EN 300 744 Annex B echo set shared by the fixed Ricean (F1) and
+# Rayleigh (P1) channels: (rho_i, tau_i in microseconds, theta_i in radians).
+ANNEX_B_ECHOES = (
+    (0.057662, 1.003019, 4.855121),
+    (0.176809, 5.422091, 3.419109),
+    (0.407163, 0.518650, 5.864470),
+    (0.303585, 2.751772, 2.215894),
+    (0.258782, 0.602895, 3.758058),
+    (0.061831, 1.016585, 5.430202),
+    (0.150340, 0.143556, 3.952093),
+    (0.051534, 0.153832, 1.093586),
+    (0.185074, 3.324866, 5.775198),
+    (0.400967, 1.935570, 0.154459),
+    (0.295723, 0.429948, 5.928383),
+    (0.350825, 3.228872, 3.053023),
+    (0.262909, 0.848831, 0.628578),
+    (0.225894, 0.073883, 2.128544),
+    (0.170996, 0.203952, 1.099463),
+    (0.149723, 0.194207, 3.462951),
+    (0.240140, 0.924450, 3.664773),
+    (0.116587, 1.381320, 2.833799),
+    (0.221155, 0.640512, 3.334290),
+    (0.259730, 1.368671, 0.393889),
+)
+ANNEX_B_RICEAN_K = 10.0
+BUILTIN_CHANNEL_PROFILES = ("ricean", "rayleigh")
 GUARD_INTERVALS = {
     "1/32": (dtv.GI_1_32, 32),
     "1/16": (dtv.GI_1_16, 16),
@@ -133,6 +163,178 @@ def parse_ppm_knots(
     return PpmProfile(tuple(knots))
 
 
+@dataclass(frozen=True)
+class ChannelTap:
+    delay_us: float
+    gain: complex
+    doppler_hz: float
+
+    @property
+    def power_db(self) -> float:
+        return 20.0 * math.log10(abs(self.gain))
+
+    @property
+    def phase_deg(self) -> float:
+        return math.degrees(math.atan2(self.gain.imag, self.gain.real))
+
+
+def normalize_taps(taps: list[ChannelTap]) -> list[ChannelTap]:
+    """Scale the tap set to unit total power so the mean signal power, and
+    therefore the --snr-db reference, is unchanged by the channel."""
+    total = sum(abs(tap.gain) ** 2 for tap in taps)
+    if total <= 0.0:
+        raise ValueError("channel taps carry no power")
+    scale = 1.0 / math.sqrt(total)
+    return [
+        ChannelTap(tap.delay_us, tap.gain * scale, tap.doppler_hz) for tap in taps
+    ]
+
+
+def builtin_channel_profile(name: str) -> list[ChannelTap]:
+    """EN 300 744 Annex B: y(t) = (rho_0 x(t) + sum rho_i e^{-j theta_i}
+    x(t - tau_i)) / sqrt(sum rho_i^2); rho_0 = sqrt(K sum rho_i^2) for the
+    Ricean channel (K = 10) and 0 for the Rayleigh channel."""
+    taps = [
+        ChannelTap(tau, rho * complex(math.cos(-theta), math.sin(-theta)), 0.0)
+        for rho, tau, theta in ANNEX_B_ECHOES
+    ]
+    if name == "ricean":
+        direct = math.sqrt(ANNEX_B_RICEAN_K * sum(rho**2 for rho, _, _ in ANNEX_B_ECHOES))
+        taps.insert(0, ChannelTap(0.0, complex(direct, 0.0), 0.0))
+    elif name != "rayleigh":
+        raise ValueError(f"unknown built-in channel profile: {name}")
+    return normalize_taps(taps)
+
+
+def load_channel_profile(
+    spec: str, min_presence: float, phase_seed: int
+) -> tuple[str, list[ChannelTap]]:
+    """`ricean`, `rayleigh`, or FILE[:NAME] in the airspy-tv-channel-profile/0
+    format written by tools/summarize_channel_profile.py. Measured taps carry
+    no phase, so each gets a seeded pseudo-random one."""
+    if spec in BUILTIN_CHANNEL_PROFILES:
+        return spec, builtin_channel_profile(spec)
+    path_text, _, name = spec.partition(":")
+    path = Path(path_text)
+    profiles = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(profiles, dict):
+        profiles = [profiles]
+    if name:
+        matches = [profile for profile in profiles if profile.get("name") == name]
+        if not matches:
+            raise ValueError(f"no channel profile named {name!r} in {path}")
+        profile = matches[0]
+    else:
+        profile = profiles[0]
+    if profile.get("format") != "airspy-tv-channel-profile/0":
+        raise ValueError(f"{path}: unsupported channel profile format")
+    rng = np.random.default_rng(phase_seed)
+    taps = []
+    for entry in profile["taps"]:
+        phase = float(rng.uniform(0.0, 2.0 * math.pi))
+        if entry.get("presence", 1.0) < min_presence:
+            continue
+        if "phase_deg" in entry:
+            phase = math.radians(float(entry["phase_deg"]))
+        amplitude = 10.0 ** (float(entry["power_db"]) / 20.0)
+        taps.append(
+            ChannelTap(
+                float(entry["delay_us"]),
+                amplitude * complex(math.cos(phase), math.sin(phase)),
+                float(entry.get("doppler_hz") or 0.0),
+            )
+        )
+    if not taps:
+        raise ValueError(f"{path}: profile {profile.get('name')!r} has no taps")
+    return f"{path.name}:{profile.get('name')}", normalize_taps(taps)
+
+
+def parse_channel_tap(text: str) -> ChannelTap:
+    """DELAY_US:POWER_DB[:PHASE_DEG[:DOPPLER_HZ]]"""
+    parts = text.split(":")
+    if len(parts) < 2 or len(parts) > 4:
+        raise ValueError(f"invalid --channel-tap {text!r}")
+    delay_us = float(parts[0])
+    amplitude = 10.0 ** (float(parts[1]) / 20.0)
+    phase = math.radians(float(parts[2])) if len(parts) > 2 else 0.0
+    doppler_hz = float(parts[3]) if len(parts) > 3 else 0.0
+    if not all(math.isfinite(value) for value in (delay_us, amplitude, phase, doppler_hz)):
+        raise ValueError(f"non-finite --channel-tap {text!r}")
+    return ChannelTap(delay_us, amplitude * complex(math.cos(phase), math.sin(phase)), doppler_hz)
+
+
+class MultipathChannel:
+    """Static multipath (plus optional per-tap Doppler) at the transmitter
+    sample rate. Every tap is a Kaiser-windowed-sinc fractional delay; taps
+    without Doppler are merged into one FIR applied by FFT convolution, the
+    others are filtered separately and rotated. The common latency (half the
+    sinc length plus the shift that makes the earliest tap causal) applies to
+    every tap and is irrelevant to the receiver."""
+
+    def __init__(self, taps: list[ChannelTap], sample_rate_hz: float) -> None:
+        self._sample_rate_hz = sample_rate_hz
+        half = FRACTIONAL_DELAY_TAPS // 2
+        window = np.kaiser(FRACTIONAL_DELAY_TAPS, 8.0)
+        static_length = 0
+        kernels: list[tuple[np.ndarray, int, float]] = []
+        # A pre-echo (negative delay relative to the reference path) is
+        # realized by delaying every tap so the earliest one sits at zero.
+        earliest_us = min(tap.delay_us for tap in taps)
+        for tap in taps:
+            delay_samples = (tap.delay_us - earliest_us) * 1e-6 * sample_rate_hz
+            integer = int(math.floor(delay_samples))
+            fraction = delay_samples - integer
+            kernel = np.sinc(np.arange(FRACTIONAL_DELAY_TAPS) - half - fraction) * window
+            kernel = (kernel / np.sum(kernel)).astype(np.complex128) * tap.gain
+            kernels.append((kernel, integer, tap.doppler_hz))
+            if tap.doppler_hz == 0.0:
+                static_length = max(static_length, integer + FRACTIONAL_DELAY_TAPS)
+        self._static = np.zeros(static_length, dtype=np.complex128)
+        self._moving: list[tuple[np.ndarray, float]] = []
+        for kernel, integer, doppler_hz in kernels:
+            if doppler_hz == 0.0:
+                self._static[integer : integer + FRACTIONAL_DELAY_TAPS] += kernel
+            else:
+                shifted = np.zeros(integer + FRACTIONAL_DELAY_TAPS, dtype=np.complex128)
+                shifted[integer:] = kernel
+                self._moving.append((shifted, doppler_hz))
+        self._history_length = max(
+            [self._static.size] + [kernel.size for kernel, _ in self._moving]
+        ) - 1
+        self._history = np.zeros(self._history_length, dtype=np.complex64)
+        self._position = 0
+
+    @staticmethod
+    def _convolve_valid(signal: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+        """Convolution restricted to outputs with full kernel support."""
+        if kernel.size == 0:
+            return np.zeros(signal.size, dtype=np.complex128)
+        size = 1 << (signal.size + kernel.size - 1).bit_length()
+        product = np.fft.fft(signal, size) * np.fft.fft(kernel, size)
+        full = np.fft.ifft(product)[: signal.size + kernel.size - 1]
+        return full[kernel.size - 1 : signal.size]
+
+    def process(self, block: np.ndarray) -> np.ndarray:
+        if block.size == 0:
+            return block
+        signal = np.concatenate((self._history, block)).astype(np.complex128)
+        output = np.zeros(block.size, dtype=np.complex128)
+        if self._static.size != 0:
+            output += self._convolve_valid(signal, self._static)[-block.size :]
+        if self._moving:
+            time_seconds = (
+                np.arange(self._position, self._position + block.size, dtype=np.float64)
+                / self._sample_rate_hz
+            )
+            for kernel, doppler_hz in self._moving:
+                path = self._convolve_valid(signal, kernel)[-block.size :]
+                output += path * np.exp(2j * np.pi * doppler_hz * time_seconds)
+        self._position += block.size
+        if self._history_length != 0:
+            self._history = np.concatenate((self._history, block))[-self._history_length :]
+        return output.astype(np.complex64)
+
+
 class StreamingCs16Sink(gr.sync_block):
     """Apply independent SRO/CFO impairments and emit bounded CS16 chunks."""
 
@@ -147,6 +349,10 @@ class StreamingCs16Sink(gr.sync_block):
         sample_clock_profile: PpmProfile | None = None,
         lo_ppm_profile: PpmProfile | None = None,
         center_frequency_hz: float = 0.0,
+        channel: MultipathChannel | None = None,
+        snr_db: float | None = None,
+        noise_bandwidth_hz: float = 0.0,
+        noise_seed: int = 1,
     ) -> None:
         super().__init__(
             name="DVB-T streaming CS16 sink",
@@ -154,6 +360,11 @@ class StreamingCs16Sink(gr.sync_block):
             out_sig=None,
         )
         self._output = output
+        self._channel = channel
+        self._snr_db = snr_db
+        self._noise_bandwidth_hz = noise_bandwidth_hz
+        self._noise_rng = np.random.default_rng(noise_seed)
+        self._noise_sigma: float | None = None
         self._output_samples = output_samples
         self._sample_clock_ppm = sample_clock_ppm
         self._sample_clock_drift_ppm_per_minute = sample_clock_drift_ppm_per_minute
@@ -210,11 +421,27 @@ class StreamingCs16Sink(gr.sync_block):
             return -1
         incoming = np.asarray(input_items[0], dtype=np.complex64)
         if incoming.size != 0:
+            if self._channel is not None:
+                incoming = self._channel.process(incoming)
             self._pending = np.concatenate((self._pending, incoming.copy()))
         self._emit_available()
         return -1 if self._done else len(incoming)
 
     def finish(self) -> None:
+        if self._snr_db is not None and self._noise_sigma is None:
+            self._noise_sigma = 0.0
+            self._noise_ready()
+            if self._pending.size != 0:
+                self._noise_sigma = None
+                reference = self._pending.astype(np.complex128)
+                signal_power = float(np.mean(np.abs(reference) ** 2))
+                noise_power = (
+                    signal_power
+                    / (10.0 ** (self._snr_db / 10.0))
+                    * (OUTPUT_SAMPLE_RATE / self._noise_bandwidth_hz)
+                )
+                self._noise_sigma = math.sqrt(noise_power / 2.0)
+                self._emit_available()
         try:
             self._output.flush()
         except (BrokenPipeError, OSError) as exception:
@@ -228,7 +455,36 @@ class StreamingCs16Sink(gr.sync_block):
                 f"{self._emitted} of {self._output_samples}"
             )
 
+    def _noise_ready(self) -> bool:
+        """The AWGN level follows the mean post-channel signal power, measured
+        once over the first NOISE_POWER_ESTIMATE_SAMPLES samples. --snr-db is
+        C/N inside the occupied signal bandwidth; the noise is white across
+        the whole output rate, so its total power is scaled up accordingly."""
+        if self._snr_db is None or self._noise_sigma is not None:
+            return True
+        if self._pending.size < NOISE_POWER_ESTIMATE_SAMPLES:
+            return False
+        reference = self._pending[:NOISE_POWER_ESTIMATE_SAMPLES]
+        signal_power = float(np.mean(np.abs(reference.astype(np.complex128)) ** 2))
+        noise_power = (
+            signal_power
+            / (10.0 ** (self._snr_db / 10.0))
+            * (OUTPUT_SAMPLE_RATE / self._noise_bandwidth_hz)
+        )
+        self._noise_sigma = math.sqrt(noise_power / 2.0)
+        return True
+
+    def _add_noise(self, samples: np.ndarray) -> np.ndarray:
+        if self._noise_sigma is None:
+            return samples
+        noise = self._noise_rng.standard_normal(
+            (samples.size, 2), dtype=np.float32
+        ) * np.float32(self._noise_sigma)
+        return samples + (noise[:, 0] + 1j * noise[:, 1]).astype(np.complex64)
+
     def _emit_available(self) -> None:
+        if not self._noise_ready():
+            return
         while self._emitted < self._output_samples and self._pending.size >= 2:
             last_source_sample = self._pending_start + self._pending.size - 1
             available_span = last_source_sample - self._source_position
@@ -302,7 +558,7 @@ class StreamingCs16Sink(gr.sync_block):
                 )
                 impaired *= np.exp(1j * phase).astype(np.complex64)
 
-            self._write(impaired)
+            self._write(self._add_noise(impaired))
             if self._error:
                 self._done = True
                 return
@@ -561,9 +817,70 @@ def parse_args() -> argparse.Namespace:
             "repeat for each knot, starting at 0 seconds"
         ),
     )
+    parser.add_argument(
+        "--channel-profile",
+        metavar="ricean|rayleigh|FILE[:NAME]",
+        help=(
+            "multipath channel: the EN 300 744 Annex B fixed Ricean (F1) or "
+            "Rayleigh (P1) profile, or a measured profile written by "
+            "tools/summarize_channel_profile.py (NAME selects one entry of "
+            "the file, default the first)"
+        ),
+    )
+    parser.add_argument(
+        "--channel-tap",
+        action="append",
+        metavar="DELAY_US:POWER_DB[:PHASE_DEG[:DOPPLER_HZ]]",
+        help=(
+            "add one echo to a 0 dB direct path; repeat per echo "
+            "(for example 0 dB echo tests: --channel-tap 50:0)"
+        ),
+    )
+    parser.add_argument(
+        "--channel-min-presence",
+        type=float,
+        default=0.5,
+        help="skip measured-profile taps seen in fewer frames than this fraction (default: 0.5)",
+    )
+    parser.add_argument(
+        "--channel-phase-seed",
+        type=int,
+        default=1,
+        help="seed of the pseudo-random phases given to measured-profile taps",
+    )
+    parser.add_argument(
+        "--snr-db",
+        type=float,
+        help=(
+            "add white Gaussian noise so that C/N in the occupied signal "
+            "bandwidth is this many dB (EN 300 744 convention)"
+        ),
+    )
+    parser.add_argument(
+        "--noise-seed", type=int, default=1, help="seed of the noise generator"
+    )
     args = parser.parse_args()
     if args.duration <= 0.0:
         parser.error("duration must be positive")
+    if args.channel_profile is not None and args.channel_tap:
+        parser.error("--channel-profile cannot be combined with --channel-tap")
+    args.channel_name = None
+    args.channel_taps = None
+    try:
+        if args.channel_profile is not None:
+            args.channel_name, args.channel_taps = load_channel_profile(
+                args.channel_profile, args.channel_min_presence, args.channel_phase_seed
+            )
+        elif args.channel_tap:
+            args.channel_name = "taps"
+            args.channel_taps = normalize_taps(
+                [ChannelTap(0.0, complex(1.0, 0.0), 0.0)]
+                + [parse_channel_tap(text) for text in args.channel_tap]
+            )
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as exception:
+        parser.error(f"invalid channel profile: {exception}")
+    if args.snr_db is not None and not math.isfinite(args.snr_db):
+        parser.error("--snr-db must be finite")
     impairment_values = (
         args.sample_clock_ppm,
         args.sample_clock_drift_ppm_per_minute,
@@ -610,6 +927,35 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def occupied_bandwidth_hz(config: DvbtConfig) -> float:
+    """Span of the active carriers: (K - 1) / Tu."""
+    _, fft_length, _ = TRANSMISSION_MODES[config.transmission_mode]
+    elementary_rate = config.bandwidth_hz * 8.0 / 7.0
+    return (ACTIVE_CARRIERS[config.transmission_mode] - 1) * elementary_rate / fft_length
+
+
+def channel_metadata(args: argparse.Namespace, config: DvbtConfig) -> dict:
+    return {
+        "profile": args.channel_name,
+        "taps": (
+            [
+                {
+                    "delay_us": tap.delay_us,
+                    "power_db": tap.power_db,
+                    "phase_deg": tap.phase_deg,
+                    "doppler_hz": tap.doppler_hz,
+                }
+                for tap in args.channel_taps
+            ]
+            if args.channel_taps is not None
+            else None
+        ),
+        "snr_db": args.snr_db,
+        "snr_reference_bandwidth_hz": occupied_bandwidth_hz(config),
+        "noise_seed": args.noise_seed if args.snr_db is not None else None,
+    }
+
+
 def run_generator(
     args: argparse.Namespace,
     output: BinaryIO,
@@ -626,6 +972,11 @@ def run_generator(
         args.sample_clock_drift_ppm_per_minute,
         args.sample_clock_profile,
     )
+    channel = (
+        MultipathChannel(args.channel_taps, OUTPUT_SAMPLE_RATE)
+        if args.channel_taps is not None
+        else None
+    )
     sink = StreamingCs16Sink(
         output,
         sample_count,
@@ -636,6 +987,10 @@ def run_generator(
         args.sample_clock_profile,
         args.lo_ppm_profile,
         args.center_frequency,
+        channel,
+        args.snr_db,
+        occupied_bandwidth_hz(config),
+        args.noise_seed,
     )
     DvbtTransmitter(expected_ts, sink, transmitter_sample_count, config).run()
     sink.finish()
@@ -685,6 +1040,7 @@ def write_metadata(
                 else None
             ),
         },
+        "channel": channel_metadata(args, config),
         "quantization": {
             "cs16_scale": CS16_SCALE,
             "rms_dbfs": sink.rms_dbfs,
@@ -733,6 +1089,21 @@ def report_result(
         f"LO {lo_description}",
         file=sys.stderr,
     )
+    if args.channel_taps is not None or args.snr_db is not None:
+        channel_description = (
+            f"{args.channel_name} ({len(args.channel_taps)} taps)"
+            if args.channel_taps is not None
+            else "ideal"
+        )
+        snr_description = (
+            f"{args.snr_db:g} dB in {occupied_bandwidth_hz(config) / 1e6:.3f} MHz"
+            if args.snr_db is not None
+            else "none"
+        )
+        print(
+            f"channel: {channel_description}; AWGN C/N {snr_description}",
+            file=sys.stderr,
+        )
     print(f"source transport stream: {expected_ts}", file=sys.stderr)
     if sidecar is not None:
         print(f"metadata: {sidecar}", file=sys.stderr)

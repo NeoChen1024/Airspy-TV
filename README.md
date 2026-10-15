@@ -419,6 +419,35 @@ python3 tools/generate_dvbt_fixture.py /tmp/airspy-tv-reversal.cs16 \
   --lo-ppm-knot 0:5 --lo-ppm-knot 30:-5 --lo-ppm-knot 60:5
 ```
 
+Multipath and noise are injected the same way. `--channel-profile` applies
+the fixed Ricean (F1, K = 10 dB) or Rayleigh (P1) 20-echo channel of EN 300 744
+Annex B, or a measured profile written by `tools/summarize_channel_profile.py`
+from a decode report (`FILE[:NAME]` selects one recording's entry; measured
+taps get seeded pseudo-random phases and keep their relative Doppler).
+`--channel-tap DELAY_US:POWER_DB[:PHASE_DEG[:DOPPLER_HZ]]` adds echoes to a
+0 dB direct path for guard-interval and SFN tests. `--snr-db` adds white
+Gaussian noise so that C/N inside the occupied signal bandwidth is the given
+value (the EN 300 744 convention; the noise is white across the full 10 MS/s
+output). Multipath is applied at the transmitter rate before the sample-clock
+and LO impairments; the noise is added last. Every tap set is normalized to
+unit power, so the fixture level and the C/N reference stay unchanged.
+
+```sh
+python3 tools/generate_dvbt_fixture.py /tmp/airspy-tv-rayleigh.cs16 \
+  --duration 20 --channel-profile rayleigh --snr-db 22
+
+python3 tools/generate_dvbt_fixture.py /tmp/airspy-tv-sfn.cs16 \
+  --duration 20 --channel-tap 50:0:90
+
+python3 tools/summarize_channel_profile.py /tmp/report-557 \
+  --output /tmp/profiles.json
+python3 tools/generate_dvbt_fixture.py /tmp/airspy-tv-measured.cs16 \
+  --duration 20 --channel-profile /tmp/profiles.json:report-557 --snr-db 25
+```
+
+The sidecar's `channel` block records the resolved taps, the C/N and its
+reference bandwidth, and the noise seed.
+
 Run the end-to-end clock regression to generate and decode sample-clock-only,
 LO-only, and independent sample/LO drift fixtures:
 
