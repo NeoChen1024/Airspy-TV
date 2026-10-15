@@ -464,7 +464,11 @@ it is valid:
   re-anchor carried state;
 - signal and tracking: MER, fade indicator, tracked and residual CFO, raw,
   filtered and physical timing, observed/smoothed drift, timing/CIR confidence,
-  and accepted/rejected measurement counts;
+  and accepted/rejected measurement counts. The MER is the decision error of
+  the equalized payload carriers weighted by their channel power relative to
+  the median carrier (capped at 1), the same weight the demapper applies, so a
+  selective channel is judged by the carriers the decoder relies on rather
+  than by the few in deep notches;
 - pipeline: queue occupancy and capacity, worker state/count, dropped blocks,
   FEC gating state and cumulative TS bytes;
 - FEC: session ID, pre/post-Viterbi error and compared bits, RS packets and
@@ -488,9 +492,10 @@ correlation of consecutive responses (`response_pair_count` pairs, spaced
 
 - `taps`: local maxima of the profile that are at least 30 dB below the
   strongest tap and 6 dB above the median bin, strongest first, at most 16.
-  `delay_us` is relative to the FFT window anchor, so the strongest tap sits a
-  few microseconds after zero (the window is anchored inside the guard
-  interval) and a pre-echo can be negative. `power_db` is relative to the
+  `delay_us` is relative to the FFT window start. The window is placed so
+  that the significant paths sit in the middle of the ISI-free range, so the
+  strongest tap of a short channel is found near half the guard interval; a
+  pre-echo has a smaller delay and is negative when it precedes the window. `power_db` is relative to the
   strongest tap. `doppler_hz` is the tap's phase rotation rate; the CFO loop
   removes the common frequency offset, so values are relative to the tracked
   carrier and are unambiguous up to half the response rate (about ±84 Hz for

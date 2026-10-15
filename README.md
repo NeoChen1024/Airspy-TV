@@ -311,6 +311,16 @@ converts and resamples CS16 input into an absolute-position sample ring. The
 serial demod thread owns acquisition, FFT-window position, carrier and timing
 loops, channel state, TPS, and symbol order.
 
+Channel estimation keeps the scattered pilots of the last four symbols as a
+grid on every third carrier. The equalizer response is interpolated through
+the delay domain: the grid becomes an impulse response over Tu/3, every path
+outside the measured delay spread is suppressed, and the response is
+transformed back at single-carrier spacing. The same impulse response gives
+the timing estimate (the energy centroid of the significant paths), verifies
+the pilot phase of each new symbol, and once per TPS frame places the FFT
+window in the middle of the ISI-free range; the grid follows window moves,
+so the equalizer stays complete across them.
+
 Independent symbol postprocessing is dispatched to a worker pool and rejoined
 by sequence. A separate FEC thread sends overlapping mother-code windows to
 the Viterbi pool, performs another ordered join, then serializes convolutional
@@ -448,26 +458,14 @@ python3 tools/generate_dvbt_fixture.py /tmp/airspy-tv-measured.cs16 \
 The sidecar's `channel` block records the resolved taps, the C/N and its
 reference bandwidth, and the noise seed.
 
-Run the end-to-end clock regression to generate and decode sample-clock-only,
-LO-only, and independent sample/LO drift fixtures:
-
-```sh
-python3 tools/validate_dvbt_clock_drift.py \
-  --build-dir build \
-  --duration 20
-```
-
 The decoder always feeds the DVB-T timing estimator's SRO command into the
 common variable-rate resampler. Commands use a fixed sample-domain activation
 horizon and each applied ratio is tracked against the exact input/output sample
-span which it generated. The validator checks both the estimated and applied
-correction; there is no separate legacy integer timing-actuator mode.
-
-By default, generated fixtures, decoder logs, and transport streams use a
-temporary directory that is removed after the run. Pass `--work-dir PATH` to
-retain those artifacts for inspection. The validator checks the recovered SRO
-and CFO independently, requires non-empty TS output, and rejects timing/FEC
-failure events.
+span which it generated; there is no separate legacy integer timing-actuator
+mode. Sample-clock-only, LO-only and independent sample/LO drift fixtures are
+decoded by `scripts/run_validation.py --clock-regressions`, which requires the
+recovered transport stream to match the source stream without TEI packets and
+rejects any CFO re-bootstrap during the run.
 
 The retained 60-second 2K/8K SRO/LO matrix is opt-in and writes its results to
 the normal machine-readable validation report. It uses QPSK 1/2 to isolate

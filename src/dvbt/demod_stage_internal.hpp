@@ -9,6 +9,7 @@
 #include "airspy_tv/dvbt/tps_decoder.hpp"
 #include "airspy_tv/fftw_plan.hpp"
 #include "airspy_tv/thread_name.hpp"
+#include "channel_grid.hpp"
 #include "channel_profile.hpp"
 
 #include "clock_control_timeline.hpp"

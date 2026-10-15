@@ -180,8 +180,12 @@ void DemodStage::Impl::reset_frontend_state() noexcept {
     frontend.phase_discontinuities = 0;
     frontend.last_symbol_start = 0;
     frontend.symbol_contiguous = false;
+    frontend.grid_contiguous = false;
     frontend.symbol_start = 0;
+    frontend.pilot_grid.reset();
     frontend.profiler.reset();
+    frontend.profiler_active = false;
+    frontend.window_moved = false;
     frontend.just_seeded = false;
     frontend.tps_decoder.reset();
     frontend.tps_snapshot = {};

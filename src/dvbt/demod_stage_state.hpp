@@ -9,6 +9,7 @@ struct DemodWindowMetrics {
     double sample_count{};
     float input_seconds{};
     float timing_offset{};
+    double physical_timing_offset{};
     double cir_offset{};
     double observed_drift{};
     double smoothed_timing_drift{};
@@ -36,7 +37,6 @@ struct DemodRuntimeState {
     std::vector<std::complex<float>> fft_in;
     std::vector<std::complex<float>> fft_out;
     std::vector<std::complex<float>> channel_scratch;
-    std::array<double, 1024> timing_estimates_scratch{};
     FftwfPlan plan;
     std::vector<std::size_t> continual_indices;
     std::vector<std::size_t> tps_indices;
@@ -99,7 +99,6 @@ struct DemodRuntimeState {
     double channel_notch_time_sum_ms{};
     double channel_timing_time_sum_ms{};
     double channel_timing_generate_time_sum_ms{};
-    double channel_timing_select_time_sum_ms{};
     double channel_cir_time_sum_ms{};
     double channel_interpolate_time_sum_ms{};
     double channel_tps_extract_time_sum_ms{};
@@ -109,6 +108,9 @@ struct DemodRuntimeState {
     double postprocess_wait_time_sum_ms{};
     double output_time_sum_ms{};
     double timing_acc{};
+    // Accepted timing plus the applied window offset: the path position
+    // in the sample stream, invariant under FFT-window moves.
+    double physical_timing_acc{};
     std::uint64_t timing_count{};
     double latest_raw_timing{};
     std::uint64_t timing_raw_count{};
@@ -133,10 +135,8 @@ struct DemodRuntimeState {
     std::size_t tau_history_count{};
     bool sro_estimator_ready{};
     std::optional<std::uint64_t> last_timing_sample_position;
-    double last_windowed_cir_avg{};
     double window_cir_offset_sum{};
     int applied_cir_offset{};
-    int applied_timing_offset{};
     double cir_confidence{};
     float acquisition_time_ms{};
     float fft_plan_time_ms{};

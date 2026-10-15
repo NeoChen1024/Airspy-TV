@@ -163,6 +163,9 @@ void DemodStage::Impl::demod_execute_fft_and_measure_cfo(
         frontend.have_previous_continual &&
         start ==
             frontend.last_symbol_start + static_cast<std::uint64_t>(period);
+    frontend.grid_contiguous =
+        frontend.symbol_contiguous || frontend.window_moved;
+    frontend.window_moved = false;
     frontend.symbol_start = start;
     frontend.last_symbol_start = start;
     frontend.previous_continual.swap(current_continual);
@@ -315,24 +318,58 @@ DemodStage::Impl::demod_lock_pilots(DemodRuntimeState &state) {
             // fade, which restores the pre-fade stable
             // offset.
             constexpr float expected_phase_confidence_threshold = 0.90F;
+            // A competing phase must be this confident and this much
+            // better than the expected one before the lock moves: in
+            // multipath every candidate scores poorly against a stale
+            // reference, and following the momentary maximum mislabels
+            // the grid and feeds the next verification a wrong reference.
+            constexpr float competing_phase_confidence_threshold = 0.5F;
+            constexpr float competing_phase_ratio = 2.0F;
             const int expected_phase = (frontend.previous_phase + 1) % 4;
-            const auto expected_score = score_pilot_phase_at_offset(
-                fft_out, maximum, frontend.carrier_offset, expected_phase,
-                timing_tracker.filtered());
+            // Verify against the pilots this phase delivered four symbols
+            // ago (the grid, re-ramped across window moves) when they are
+            // still valid for this window; otherwise against the timing
+            // ramp of a single dominant path.
+            const auto score_phase = [&](const int phase) {
+                return frontend.grid_contiguous &&
+                               frontend.pilot_grid.has_phase(phase)
+                           ? score_pilot_phase_with_reference(
+                                 fft_out, maximum, frontend.carrier_offset,
+                                 phase, frontend.pilot_grid.values())
+                           : score_pilot_phase_at_offset(
+                                 fft_out, maximum, frontend.carrier_offset,
+                                 phase, timing_tracker.filtered());
+            };
+            const auto expected_score = score_phase(expected_phase);
             ++state.pilot_expected_phase_checks;
             state.pilot_expected_confidence_sum += expected_score.confidence;
             state.pilot_expected_confidence_min = std::min(
                 state.pilot_expected_confidence_min, expected_score.confidence);
+            lock = PilotLock{expected_phase, frontend.carrier_offset};
             if (expected_score.confidence >=
                 expected_phase_confidence_threshold) {
                 ++state.pilot_expected_phase_fast_accepts;
-                lock = PilotLock{expected_phase, frontend.carrier_offset};
             } else {
                 ++state.pilot_expected_phase_fallbacks;
-                lock = PilotLock{lock_phase_at_offset(
-                                     fft_out, maximum, frontend.carrier_offset,
-                                     timing_tracker.filtered()),
-                                 frontend.carrier_offset};
+                int best_phase = expected_phase;
+                PilotPhaseScore best_score = expected_score;
+                for (int phase = 0; phase < 4; ++phase) {
+                    if (phase == expected_phase) {
+                        continue;
+                    }
+                    const auto candidate = score_phase(phase);
+                    if (candidate.confidence > best_score.confidence) {
+                        best_phase = phase;
+                        best_score = candidate;
+                    }
+                }
+                if (best_phase != expected_phase &&
+                    best_score.confidence >=
+                        competing_phase_confidence_threshold &&
+                    best_score.confidence >=
+                        competing_phase_ratio * expected_score.confidence) {
+                    lock = PilotLock{best_phase, frontend.carrier_offset};
+                }
                 if (events_enabled()) {
                     emit_event(
                         "pilot_phase_fast_path_fallback",
@@ -344,6 +381,8 @@ DemodStage::Impl::demod_lock_pilots(DemodRuntimeState &state) {
                           static_cast<std::int64_t>(lock.phase)},
                          {"confidence",
                           static_cast<double>(expected_score.confidence)},
+                         {"best_confidence",
+                          static_cast<double>(best_score.confidence)},
                          {"threshold",
                           static_cast<double>(
                               expected_phase_confidence_threshold)}});
@@ -353,6 +392,9 @@ DemodStage::Impl::demod_lock_pilots(DemodRuntimeState &state) {
         if (frontend.previous_phase >= 0 &&
             lock.phase != (frontend.previous_phase + 1) % 4) {
             ++frontend.phase_discontinuities;
+            // The slots the grid holds were labelled by the old phase
+            // sequence; they would verify and equalize the wrong carriers.
+            frontend.pilot_grid.reset();
             if (events_enabled()) {
                 emit_event(
                     "pilot_phase_jump", DecoderEventSeverity::warning,
@@ -435,7 +477,6 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
     auto &fft_size = state.fft_size;
     auto &window_cir_offset_sum = state.window_cir_offset_sum;
     auto &applied_cir_offset = state.applied_cir_offset;
-    auto &applied_timing_offset = state.applied_timing_offset;
     auto &fade_indicator = state.fade_indicator;
     auto &cir_confidence = state.cir_confidence;
     auto &guard_size = state.guard_size;
@@ -458,13 +499,25 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
                          ? std::complex<float>{sent, 0.0F} / received
                          : std::complex<float>{};
     }
+    frontend.pilot_grid.update(channel, lock.phase, frontend.grid_contiguous);
     state.channel_pilot_time_sum_ms += duration_ms(channel_stage_started_at);
 
     channel_stage_started_at = std::chrono::steady_clock::now();
-    frontend.profiler.add_symbol(
-        channel, lock.phase, frontend.symbol_contiguous, frontend.symbol_start);
-    if (auto profile = frontend.profiler.take_frame()) {
-        emit_channel_profile(state.demod_generation, std::move(*profile));
+    // Channel profile for the run report; only measured while telemetry
+    // is enabled so the GUI path does not pay for the per-frame IFFTs.
+    if (events_enabled()) {
+        if (!frontend.profiler_active) {
+            frontend.profiler.reset();
+            frontend.profiler_active = true;
+        }
+        frontend.profiler.add_symbol(
+            frontend.pilot_grid.values(), frontend.pilot_grid.complete(),
+            frontend.symbol_contiguous, frontend.symbol_start);
+        if (auto profile = frontend.profiler.take_frame()) {
+            emit_channel_profile(state.demod_generation, std::move(*profile));
+        }
+    } else {
+        frontend.profiler_active = false;
     }
     state.channel_cir_time_sum_ms += duration_ms(channel_stage_started_at);
 
@@ -489,26 +542,22 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
         state.frozen_symbol_count != 0 || state.cfo_recovery_symbol_count != 0;
     const bool evaluate_timing =
         timing_recovery || symbol_count % steady_timing_estimator_cadence == 0;
-    const bool measure_timing_breakdown = events_enabled();
+    // Timing from the pilot-grid impulse response: the energy centroid
+    // of the taps within 20 dB of the strongest one, in samples relative
+    // to the FFT window start. Unlike a pilot phase slope it stays
+    // defined for multipath, where the group delay alternates between
+    // the paths from carrier to carrier.
     std::optional<double> measured_tau;
-    if (evaluate_timing) {
-        auto timing_substage_started_at =
-            measure_timing_breakdown ? std::chrono::steady_clock::now()
-                                     : std::chrono::steady_clock::time_point{};
-        const std::size_t timing_estimate_count =
-            generate_scattered_timing_estimates(
-                channel, static_cast<std::size_t>(lock.phase), maximum,
-                fft_size, state.timing_estimates_scratch);
-        if (measure_timing_breakdown) {
-            state.channel_timing_generate_time_sum_ms +=
-                duration_ms(timing_substage_started_at);
-            timing_substage_started_at = std::chrono::steady_clock::now();
-        }
-        measured_tau = select_exact_median(std::span<double>{
-            state.timing_estimates_scratch.data(), timing_estimate_count});
-        if (measure_timing_breakdown) {
-            state.channel_timing_select_time_sum_ms +=
-                duration_ms(timing_substage_started_at);
+    if (evaluate_timing && frontend.pilot_grid.complete()) {
+        const auto timing_substage_started_at =
+            std::chrono::steady_clock::now();
+        const auto summary =
+            frontend.profiler.response_summary(frontend.pilot_grid.values());
+        state.channel_timing_generate_time_sum_ms +=
+            duration_ms(timing_substage_started_at);
+        if (summary.valid) {
+            measured_tau =
+                summary.centroid_bin * ChannelProfiler::bin_samples(fft_size);
         }
     }
     if (measured_tau.has_value()) {
@@ -532,6 +581,8 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
             }
             timing_acc += *accepted_tau * (2.0 * std::numbers::pi_v<double>) /
                           static_cast<double>(fft_size);
+            state.physical_timing_acc +=
+                *accepted_tau + static_cast<double>(applied_cir_offset);
             ++timing_count;
         } else {
             ++timing_rejected_count;
@@ -552,111 +603,49 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
     // Accumulate the exact applied position before the CIR
     // update below can move the anchor for the next symbol.
     channel_stage_started_at = std::chrono::steady_clock::now();
-    window_cir_offset_sum +=
-        static_cast<double>(applied_cir_offset + applied_timing_offset);
-    // CIR / delay-spread estimate (scattered pilots -> IFFT ->
-    // impulse response) for adaptive FFT-window placement.
-    // Once per TPS frame: negligible cost. When the measured
-    // delay spread is significant (>= guard/4) the window
-    // slides toward the middle of the ISI-free range
-    // [spread, guard], balancing the pre/post-ISI margins;
-    // the offset steps by at most +/-4 samples per frame so
-    // the timing loop is never perturbed by a jump.
+    window_cir_offset_sum += static_cast<double>(applied_cir_offset);
+    // Adaptive FFT-window placement from the pilot-grid impulse response,
+    // once per TPS frame. The window is recentred inside the ISI-free range
+    // whenever a significant path approaches either edge of it.
+    int window_delta = 0;
     if (++frontend.cir_symbol_count >= 68) {
         frontend.cir_symbol_count = 0;
-        if (fade_indicator > 0.25F && frontend.cir_plan &&
-            !frontend.cir_response.empty()) {
-            std::fill(frontend.cir_grid.begin(), frontend.cir_grid.end(),
-                      std::complex<float>{});
-            const std::size_t phase = static_cast<std::size_t>(lock.phase);
-            std::size_t slot = 0;
-            for (std::size_t k = phase * 3; k <= maximum; k += 12) {
-                if (slot >= frontend.cir_grid.size()) {
-                    break;
+        if (fade_indicator > 0.25F && frontend.pilot_grid.complete()) {
+            const auto summary = frontend.profiler.response_summary(
+                frontend.pilot_grid.values());
+            cir_confidence = summary.peak_share;
+            if (summary.valid) {
+                // Path delays relative to the current window start. The
+                // window is ISI-free while every significant path lies
+                // inside [0, guard]: its guard copy covers the window
+                // start and its useful part covers the window end.
+                // Recentre only when a path is within guard/8 of either
+                // edge; the move is applied in one step (bounded to half
+                // a guard per frame so the sample ring keeps the data)
+                // because the measurement is absolute.
+                const double bin = ChannelProfiler::bin_samples(fft_size);
+                const double first = summary.first_bin * bin;
+                const double last = summary.last_bin * bin;
+                const auto guard = static_cast<double>(guard_size);
+                const double margin = guard / 8.0;
+                if (first < margin || last > guard - margin) {
+                    const double shift = first - (guard - (last - first)) / 2.0;
+                    frontend.cir_offset = static_cast<float>(std::clamp(
+                        static_cast<double>(applied_cir_offset) + shift, -guard,
+                        guard));
                 }
-                frontend.cir_grid[slot] = channel[k];
-                ++slot;
-            }
-            frontend.cir_plan.execute();
-            const std::size_t n = frontend.cir_response.size();
-            auto &energy = frontend.cir_energy;
-            if (energy.size() != n) {
-                energy.resize(n);
-            }
-            double total = 0.0;
-            std::size_t peak = 0;
-            double peak_energy = -1.0;
-            for (std::size_t i = 0; i < n; ++i) {
-                energy[i] =
-                    static_cast<double>(std::norm(frontend.cir_response[i]));
-                total += energy[i];
-                if (energy[i] > peak_energy) {
-                    peak_energy = energy[i];
-                    peak = i;
-                }
-            }
-            cir_confidence = total > 0.0 ? peak_energy / total : 0.0;
-            // Only trust a structured response: the peak tap
-            // must hold a meaningful share of the energy, so
-            // a noise-driven CIR cannot drag the window.
-            if (n != 0 && total > 0.0 && peak_energy / total > 0.05) {
-                // Contiguous main lobe: taps above 1% of the
-                // peak, wrapping the IFFT window (taps that
-                // arrive before the FFT window fold to its
-                // tail). Underestimating the spread is safe:
-                // the offset only moves the window inside
-                // the ISI-free range [d_max, G + d_min].
-                const double lobe_threshold = peak_energy * 0.01;
-                std::size_t lo = peak;
-                std::size_t hi = peak;
-                while (energy[(lo + n - 1) % n] >= lobe_threshold &&
-                       (lo + n - 1) % n != hi) {
-                    lo = (lo + n - 1) % n;
-                }
-                while (energy[(hi + 1) % n] >= lobe_threshold &&
-                       (hi + 1) % n != lo) {
-                    hi = (hi + 1) % n;
-                }
-                const std::size_t lobe_width = (hi + n - lo) % n + 1;
-                const double scale = static_cast<double>(fft_size) /
-                                     static_cast<double>(12 * frontend.cir_n);
-                const double spread_samples =
-                    static_cast<double>(lobe_width) * scale;
-                // Slide the window to the middle of the
-                // ISI-free range [spread, guard] (in offset
-                // coordinates relative to the effective
-                // symbol start), balancing the pre- and
-                // post-ISI margins. Only act when the delay
-                // spread is significant: for a single-path /
-                // short-delay channel the current anchor is
-                // already inside the (wide) ISI-free range,
-                // and sliding the window there buys nothing
-                // while perturbing the timing loop.
-                const double spread_threshold =
-                    0.25 * static_cast<double>(guard_size);
-                const double target =
-                    spread_samples > spread_threshold
-                        ? std::clamp((spread_samples -
-                                      static_cast<double>(guard_size)) /
-                                         2.0,
-                                     -static_cast<double>(guard_size), 0.0)
-                        : 0.0;
-                frontend.cir_offset = static_cast<float>(
-                    0.9 * static_cast<double>(frontend.cir_offset) +
-                    0.1 * target);
                 const int applied =
                     static_cast<int>(std::lround(frontend.cir_offset));
-                // Step the anchor by at most +/-4 samples per
-                // frame. The timing loop is now rebased onto
-                // the window's average position (so slides do
-                // not read as sample-clock steps), but the
-                // step bound still limits how often the CFO
-                // update is skipped by the boundary crossing
-                // and keeps a mis-estimated target from
-                // sliding far into the ISI region in one
-                // frame.
-                const int delta =
-                    std::clamp(applied - applied_cir_offset, -4, 4);
+                const int step_limit =
+                    static_cast<int>(std::max<std::size_t>(guard_size / 2, 1));
+                const int delta = std::clamp(applied - applied_cir_offset,
+                                             -step_limit, step_limit);
+                window_delta = delta;
+                // The equalizer passband follows the measured delay spread
+                // (every path above the noise floor); the window shift
+                // below moves it along with the grid.
+                frontend.pilot_grid.set_passband(summary.extent_first_bin * bin,
+                                                 summary.extent_last_bin * bin);
                 if (delta != 0) {
                     if (delta > 0) {
                         next_symbol_start += static_cast<std::uint64_t>(delta);
@@ -665,7 +654,13 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
                     }
                     applied_cir_offset += delta;
                     // The window moved mid-stream. The contiguous-pair gate
-                    // skips the residual-CFO update for this boundary.
+                    // skips the residual-CFO update for this boundary; the
+                    // pilot grid and the timing tracker follow the move so
+                    // the next symbol verifies its pilot phase against a
+                    // valid reference and the next centroid is not
+                    // rejected as an outlier.
+                    timing_tracker.rebase_window(static_cast<double>(delta));
+                    frontend.window_moved = true;
                 }
             }
         } else {
@@ -674,21 +669,14 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
     }
     state.channel_cir_time_sum_ms += duration_ms(channel_stage_started_at);
 
+    // Equalizer response from the four-symbol pilot grid (three-carrier
+    // spacing once complete).
     channel_stage_started_at = std::chrono::steady_clock::now();
-    for (std::size_t i = 1; i < pilots.size(); ++i) {
-        const std::size_t left = pilots[i - 1];
-        const std::size_t right = pilots[i];
-        for (std::size_t k = left; k <= right; ++k) {
-            const float f =
-                static_cast<float>(k - left) / static_cast<float>(right - left);
-            channel[k] = channel[left] + (channel[right] - channel[left]) * f;
-        }
-    }
-    std::fill(channel.begin(),
-              channel.begin() + static_cast<std::ptrdiff_t>(pilots.front()),
-              channel[pilots.front()]);
-    std::fill(channel.begin() + static_cast<std::ptrdiff_t>(pilots.back()),
-              channel.end(), channel[pilots.back()]);
+    frontend.pilot_grid.interpolate_inverse(
+        channel, timing_tracker.filtered().value_or(0.0));
+    // This symbol was equalized with the grid as measured; the following
+    // symbols see the moved window.
+    frontend.pilot_grid.shift_window(window_delta);
     state.channel_interpolate_time_sum_ms +=
         duration_ms(channel_stage_started_at);
 

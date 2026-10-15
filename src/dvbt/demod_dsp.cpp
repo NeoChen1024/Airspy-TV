@@ -69,46 +69,6 @@ const char *event_code_rate_name(const CodeRate rate) {
     return "unknown";
 }
 
-std::size_t generate_scattered_timing_estimates(
-    const std::span<const std::complex<float>> channel, const std::size_t phase,
-    const std::size_t maximum, const std::size_t fft_size,
-    const std::span<double> estimates) {
-    std::size_t estimate_count = 0;
-    const std::size_t first = phase * 3;
-    for (std::size_t left = first; left + timing_pilot_spacing <= maximum;
-         left += timing_pilot_spacing) {
-        const std::size_t right = left + timing_pilot_spacing;
-        if (std::norm(channel[left]) <= minimum_power ||
-            std::norm(channel[right]) <= minimum_power ||
-            estimate_count == estimates.size()) {
-            continue;
-        }
-        const double slope =
-            std::arg(channel[right] * std::conj(channel[left])) /
-            static_cast<double>(timing_pilot_spacing);
-        if (std::isfinite(slope)) {
-            estimates[estimate_count++] = slope *
-                                          static_cast<double>(fft_size) /
-                                          (2.0 * std::numbers::pi_v<double>);
-        }
-    }
-    return estimate_count;
-}
-
-std::optional<double> select_exact_median(const std::span<double> values) {
-    if (values.empty()) {
-        return std::nullopt;
-    }
-    const std::size_t middle_index = values.size() / 2;
-    auto middle = values.begin() + static_cast<std::ptrdiff_t>(middle_index);
-    std::ranges::nth_element(values, middle);
-    if (values.size() % 2 != 0) {
-        return *middle;
-    }
-    const auto lower = std::ranges::max_element(values.begin(), middle);
-    return 0.5 * (*lower + *middle);
-}
-
 float timing_measurement_confidence(
     const std::uint64_t accepted_measurements,
     const std::uint64_t attempted_measurements) noexcept {
@@ -150,10 +110,46 @@ float estimate_channel_notch_db(
     return *lower - *median;
 }
 
+namespace {
+
+// Coherent pilot correlation in chunks of eight pilots: a correct phase sums
+// coherently inside each chunk, a wrong one (data carriers) does not.
+template <typename Sampler>
+PilotPhaseScore accumulate_pilot_score(const std::size_t phase,
+                                       const std::size_t maximum,
+                                       Sampler &&sample_at) {
+    std::complex<float> correlation{};
+    float score = 0.0F;
+    double normalization = 0.0;
+    double chunk_power = 0.0;
+    std::size_t chunk_count = 0;
+    for (std::size_t pilot = phase * 3U; pilot <= maximum;
+         pilot += timing_pilot_spacing) {
+        const std::complex<float> sample = sample_at(pilot);
+        correlation += sample;
+        chunk_power += std::norm(sample);
+        if (++chunk_count == 8) {
+            score += std::norm(correlation);
+            normalization += static_cast<double>(chunk_count) * chunk_power;
+            correlation = {};
+            chunk_power = 0.0;
+            chunk_count = 0;
+        }
+    }
+    score += std::norm(correlation);
+    normalization += static_cast<double>(chunk_count) * chunk_power;
+    return {.score = score,
+            .confidence = normalization > 0.0
+                              ? static_cast<float>(static_cast<double>(score) /
+                                                   normalization)
+                              : 0.0F};
+}
+
+} // namespace
+
 PilotPhaseScore score_pilot_phase_at_offset(
     const std::span<const std::complex<float>> fft, const std::size_t maximum,
-    const int offset, const int phase,
-    const std::optional<double> timing_tau) {
+    const int offset, const int phase, const std::optional<double> timing_tau) {
     if (phase < 0 || phase >= 4) {
         throw std::invalid_argument("pilot phase is outside [0, 4)");
     }
@@ -188,61 +184,47 @@ PilotPhaseScore score_pilot_phase_at_offset(
             }
             previous_pilot = pilot;
         }
-        dephase_slope =
-            ramp_count != 0
-                ? -ramp_sum /
-                      static_cast<double>(ramp_count * timing_pilot_spacing)
-                : 0.0;
+        dephase_slope = ramp_count != 0
+                            ? -ramp_sum / static_cast<double>(
+                                              ramp_count * timing_pilot_spacing)
+                            : 0.0;
     }
 
-    std::complex<float> correlation{};
-    float score = 0.0F;
-    double normalization = 0.0;
-    double chunk_power = 0.0;
-    std::size_t chunk_count = 0;
-    for (auto pilot = static_cast<std::size_t>(phase) * 3U;
-         pilot <= maximum; pilot += timing_pilot_spacing) {
-        const float value =
-            pilot_prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
-        const auto dephase =
-            static_cast<float>(dephase_slope * static_cast<double>(pilot));
-        const auto sample =
-            value * std::conj(std::polar(1.0F, dephase) *
-                              active_carrier(fft, pilot, maximum, offset));
-        correlation += sample;
-        chunk_power += std::norm(sample);
-        if (++chunk_count == 8) {
-            score += std::norm(correlation);
-            normalization += static_cast<double>(chunk_count) * chunk_power;
-            correlation = {};
-            chunk_power = 0.0;
-            chunk_count = 0;
-        }
-    }
-    score += std::norm(correlation);
-    normalization += static_cast<double>(chunk_count) * chunk_power;
-    return {.score = score,
-            .confidence = normalization > 0.0
-                              ? static_cast<float>(
-                                    static_cast<double>(score) / normalization)
-                              : 0.0F};
+    return accumulate_pilot_score(
+        static_cast<std::size_t>(phase), maximum, [&](const std::size_t pilot) {
+            const float value =
+                pilot_prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+            const auto dephase =
+                static_cast<float>(dephase_slope * static_cast<double>(pilot));
+            return value *
+                   std::conj(std::polar(1.0F, dephase) *
+                             active_carrier(fft, pilot, maximum, offset));
+        });
 }
 
-int lock_phase_at_offset(const std::span<const std::complex<float>> fft,
-                         const std::size_t maximum, const int offset,
-                         const std::optional<double> timing_tau) {
-    int best_phase = 0;
-    float best_score = -1.0F;
-    for (int phase = 0; phase < 4; ++phase) {
-        const float score = score_pilot_phase_at_offset(
-                                fft, maximum, offset, phase, timing_tau)
-                                .score;
-        if (score > best_score) {
-            best_score = score;
-            best_phase = phase;
-        }
+PilotPhaseScore score_pilot_phase_with_reference(
+    const std::span<const std::complex<float>> fft, const std::size_t maximum,
+    const int offset, const int phase,
+    const std::span<const std::complex<float>> grid_values) {
+    if (phase < 0 || phase >= 4) {
+        throw std::invalid_argument("pilot phase is outside [0, 4)");
     }
-    return best_phase;
+    return accumulate_pilot_score(
+        static_cast<std::size_t>(phase), maximum, [&](const std::size_t pilot) {
+            const std::size_t slot = pilot / 3;
+            const std::complex<float> response = slot < grid_values.size()
+                                                     ? grid_values[slot]
+                                                     : std::complex<float>{};
+            if (std::norm(response) <= 0.0F) {
+                return std::complex<float>{};
+            }
+            const float value =
+                pilot_prbs[pilot] == 0U ? 4.0F / 3.0F : -4.0F / 3.0F;
+            // Matched filter: conj(H) weights each pilot by its channel
+            // power, so notched pilots do not dominate the chunk.
+            return value * active_carrier(fft, pilot, maximum, offset) *
+                   std::conj(response);
+        });
 }
 
 bool listed(const std::span<const int> list, const std::size_t value) {

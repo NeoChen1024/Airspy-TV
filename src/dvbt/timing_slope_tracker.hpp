@@ -1,10 +1,10 @@
-// Demod-thread-owned pilot-slope unwrapping and robust filtering.
+// Demod-thread-owned timing unwrapping and robust filtering.
 struct TimingSlopeTracker {
     void reset(const std::size_t fft_size = 0) noexcept {
-        ambiguity_period = fft_size == 0
-                               ? 0.0
-                               : static_cast<double>(fft_size) /
-                                     static_cast<double>(timing_pilot_spacing);
+        // The impulse response that yields tau is periodic in Tu/3 (the
+        // four-symbol pilot grid spacing).
+        ambiguity_period =
+            fft_size == 0 ? 0.0 : static_cast<double>(fft_size) / 3.0;
         history.fill(0.0);
         history_head = 0;
         accepted_count = 0;

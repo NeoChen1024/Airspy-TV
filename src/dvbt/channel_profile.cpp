@@ -13,17 +13,22 @@ constexpr std::uint32_t frame_symbols = 68;
 constexpr std::size_t maximum_taps = 16;
 constexpr double tap_floor_relative = 1e-3;  // -30 dB below the peak
 constexpr double tap_floor_over_noise = 4.0; // +6 dB above the median bin
+constexpr double placement_peak_share = 0.05;
+constexpr float placement_tap_relative = 1e-2F; // -20 dB below the peak
+constexpr float extent_tap_relative = 1e-5F;    // -50 dB below the peak
+constexpr float extent_tap_over_noise = 32.0F;  // +15 dB above the median bin
 
 } // namespace
 
 void ChannelProfiler::configure(const std::size_t fft_size,
+                                const std::size_t guard_size,
                                 const std::size_t maximum,
-                                const double sample_rate_hz,
-                                const std::size_t symbol_period_samples) {
+                                const double sample_rate_hz) {
     fft_size_ = fft_size;
+    guard_size_ = guard_size;
     slots_ = (maximum / 3) + 1;
     sample_rate_hz_ = sample_rate_hz;
-    period_ = symbol_period_samples;
+    period_ = fft_size + guard_size;
     window_.resize(slots_);
     for (std::size_t j = 0; j < slots_; ++j) {
         window_[j] = static_cast<float>(
@@ -48,7 +53,7 @@ void ChannelProfiler::configure(const std::size_t fft_size,
 
 void ChannelProfiler::reset() noexcept {
     std::ranges::fill(grid_, std::complex<float>{});
-    phase_mask_ = 0;
+    symbols_since_response_ = 0;
     have_previous_ = false;
     pair_contiguous_ = false;
     reset_frame();
@@ -66,13 +71,13 @@ void ChannelProfiler::reset_frame() noexcept {
 }
 
 void ChannelProfiler::add_symbol(
-    const std::span<const std::complex<float>> inverse_channel, const int phase,
+    const std::span<const std::complex<float>> grid_values, const bool complete,
     const bool contiguous, const std::uint64_t symbol_start) {
-    if (!plan_ || phase < 0 || phase > 3) {
+    if (!plan_) {
         return;
     }
     if (!contiguous) {
-        phase_mask_ = 0;
+        symbols_since_response_ = 0;
         pair_contiguous_ = false;
     }
     if (frame_symbols_ == 0) {
@@ -80,21 +85,112 @@ void ChannelProfiler::add_symbol(
     }
     frame_end_ = symbol_start + period_;
     ++frame_symbols_;
-    for (auto j = static_cast<std::size_t>(phase); j < slots_; j += 4) {
-        const std::size_t k = 3 * j;
-        const std::complex<float> inverse = k < inverse_channel.size()
-                                                ? inverse_channel[k]
-                                                : std::complex<float>{};
-        grid_[j] =
-            std::norm(inverse) > 0.0F
-                ? window_[j] * (std::complex<float>{1.0F, 0.0F} / inverse)
-                : std::complex<float>{};
+    if (!complete || ++symbols_since_response_ < 4) {
+        return;
     }
-    phase_mask_ |= 1U << static_cast<unsigned>(phase);
-    if (phase_mask_ == 0xFU) {
-        compute_response();
-        phase_mask_ = 0;
+    symbols_since_response_ = 0;
+    for (std::size_t j = 0; j < slots_ && j < grid_values.size(); ++j) {
+        grid_[j] = window_[j] * grid_values[j];
     }
+    compute_response();
+}
+
+std::span<const float> ChannelProfiler::response_energy(
+    const std::span<const std::complex<float>> grid_values) {
+    if (!plan_) {
+        return {};
+    }
+    for (std::size_t j = 0; j < slots_ && j < grid_values.size(); ++j) {
+        grid_[j] = window_[j] * grid_values[j];
+    }
+    plan_.execute();
+    if (energy_.size() != response_bins) {
+        energy_.resize(response_bins);
+    }
+    for (std::size_t i = 0; i < response_bins; ++i) {
+        energy_[i] = std::norm(response_[i]);
+    }
+    return energy_;
+}
+
+ChannelProfiler::ResponseSummary ChannelProfiler::response_summary(
+    const std::span<const std::complex<float>> grid_values) {
+    ResponseSummary summary;
+    const auto energy = response_energy(grid_values);
+    const std::size_t n = energy.size();
+    if (n == 0) {
+        return summary;
+    }
+    double total = 0.0;
+    std::size_t peak = 0;
+    float peak_energy = -1.0F;
+    for (std::size_t i = 0; i < n; ++i) {
+        total += energy[i];
+        if (energy[i] > peak_energy) {
+            peak_energy = energy[i];
+            peak = i;
+        }
+    }
+    if (total <= 0.0) {
+        return summary;
+    }
+    summary.peak_share = static_cast<double>(peak_energy) / total;
+    // Only trust a structured response: the peak tap must hold a
+    // meaningful share of the energy, so a noise-driven response cannot
+    // drag the window or the timing loop.
+    if (summary.peak_share <= placement_peak_share) {
+        return summary;
+    }
+    const float threshold = peak_energy * placement_tap_relative;
+    if (scratch_.size() != n) {
+        scratch_.resize(n);
+    }
+    std::ranges::copy(energy, scratch_.begin());
+    const auto median = scratch_.begin() + static_cast<std::ptrdiff_t>(n / 2);
+    std::ranges::nth_element(scratch_, median);
+    const float extent_threshold = std::max(peak_energy * extent_tap_relative,
+                                            *median * extent_tap_over_noise);
+    const auto half = static_cast<std::ptrdiff_t>(n / 2);
+    double weighted = 0.0;
+    double weight = 0.0;
+    std::ptrdiff_t first = 0;
+    std::ptrdiff_t last = 0;
+    std::ptrdiff_t extent_first = 0;
+    std::ptrdiff_t extent_last = 0;
+    for (std::ptrdiff_t offset = -half + 1; offset <= half; ++offset) {
+        const std::size_t i =
+            (peak + n + static_cast<std::size_t>(offset + half)) % n;
+        const std::size_t index = (i + n - static_cast<std::size_t>(half)) % n;
+        const float value = energy[index];
+        if (value < extent_threshold) {
+            continue;
+        }
+        extent_first = std::min(extent_first, offset);
+        extent_last = std::max(extent_last, offset);
+        if (value < threshold) {
+            continue;
+        }
+        weighted += static_cast<double>(value) * static_cast<double>(offset);
+        weight += value;
+        first = std::min(first, offset);
+        last = std::max(last, offset);
+    }
+    const double peak_bin =
+        peak > n / 2 ? static_cast<double>(peak) - static_cast<double>(n)
+                     : static_cast<double>(peak);
+    summary.valid = true;
+    summary.peak_bin = peak_bin;
+    summary.first_bin = peak_bin + static_cast<double>(first);
+    summary.last_bin = peak_bin + static_cast<double>(last);
+    summary.extent_first_bin = peak_bin + static_cast<double>(extent_first);
+    summary.extent_last_bin = peak_bin + static_cast<double>(extent_last);
+    summary.centroid_bin = peak_bin + (weighted / weight);
+    return summary;
+}
+
+double ChannelProfiler::bin_samples(const std::size_t fft_size) noexcept {
+    return static_cast<double>(fft_size) /
+           static_cast<double>(3 * response_bins);
 }
 
 void ChannelProfiler::compute_response() {
@@ -166,11 +262,22 @@ std::optional<ChannelProfileTelemetry> ChannelProfiler::take_frame() {
     const double threshold =
         std::max(peak * tap_floor_relative, noise_floor * tap_floor_over_noise);
 
-    const auto delay_of = [](const std::size_t bin) {
-        return bin <= response_bins / 2
-                   ? static_cast<double>(bin)
-                   : static_cast<double>(bin) -
-                         static_cast<double>(response_bins);
+    // The response is periodic in Tu/3; report delays in the period centred
+    // on the middle of the guard interval, where the window placement keeps
+    // the significant paths, so a late echo inside the guard does not show
+    // up as a pre-echo.
+    const double centre_bin =
+        static_cast<double>(guard_size_) / (2.0 * bin_samples(fft_size_));
+    const auto delay_of = [centre_bin](const std::size_t bin) {
+        double delay = static_cast<double>(bin);
+        const auto bins = static_cast<double>(response_bins);
+        while (delay - centre_bin > bins / 2.0) {
+            delay -= bins;
+        }
+        while (delay - centre_bin <= -bins / 2.0) {
+            delay += bins;
+        }
+        return delay;
     };
     const double peak_delay = delay_of(peak_bin);
 

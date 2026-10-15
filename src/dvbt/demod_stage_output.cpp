@@ -169,13 +169,10 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
     auto &timing_raw_count = state.timing_raw_count;
     auto &timing_acc = state.timing_acc;
     auto &fft_size = state.fft_size;
-    auto &guard_size = state.guard_size;
-    auto &next_symbol_start = state.next_symbol_start;
     auto &applied_cir_offset = state.applied_cir_offset;
     auto &window_cir_offset_sum = state.window_cir_offset_sum;
     auto &smoothed_sample_clock_ppm = state.smoothed_sample_clock_ppm;
     auto &last_windowed_timing = state.last_windowed_timing;
-    auto &last_windowed_cir_avg = state.last_windowed_cir_avg;
     const float fade_indicator = state.fade_indicator;
     constexpr std::size_t tau_history_n = DemodRuntimeState::tau_history_n;
     constexpr std::size_t tau_history_fast_min =
@@ -209,6 +206,10 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
         window_symbols == 0
             ? static_cast<double>(applied_cir_offset)
             : window_cir_offset_sum / static_cast<double>(window_symbols);
+    const double physical_timing_offset =
+        timing_count == 0
+            ? 0.0
+            : state.physical_timing_acc / static_cast<double>(timing_count);
     double observed_drift = 0.0;
     const std::uint64_t output_begin_sample = state.window_output_begin_sample;
     const std::uint64_t output_end_sample = state.next_symbol_start;
@@ -241,24 +242,18 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
         // chase the channel (a constant ~+35 samples at the 581
         // capture). Track only the slow drift between consecutive
         // windows — the sample-clock offset — with a long time
-        // constant, and apply it through the frontend resampler. The CIR
-        // window slides shift tau by exactly the slide, so both
-        // references are expressed relative to the window's
-        // average position, keeping the drift estimate blind to
-        // the adaptive placement. (A window slide of d samples
-        // moves the measured timing offset by -d, so the offset
-        // is rebased onto the window's average position by
-        // adding the slide back.)
-        observed_drift = (static_cast<double>(timing_offset) + window_cir_avg) -
-                         (last_windowed_timing + last_windowed_cir_avg);
-        last_windowed_timing = static_cast<double>(timing_offset);
-        last_windowed_cir_avg = window_cir_avg;
-        // Store timing in the CIR-rebased physical coordinate. The median
-        // first-difference estimator below sees residual sample-clock drift;
-        // the applied resampler correction is added back per interval to
-        // recover the source SRO without an integer-window feedback path.
-        tau_history[tau_history_head] =
-            static_cast<double>(timing_offset) + window_cir_avg;
+        // constant, and apply it through the frontend resampler. The
+        // physical timing (measured tau plus the applied window offset at
+        // the time of each measurement) is invariant under the adaptive
+        // window placement, so a window move inside a window does not
+        // read as a sample-clock step.
+        observed_drift = physical_timing_offset - last_windowed_timing;
+        last_windowed_timing = physical_timing_offset;
+        // The median first-difference estimator below sees residual
+        // sample-clock drift; the applied resampler correction is added
+        // back per interval to recover the source SRO without an
+        // integer-window feedback path.
+        tau_history[tau_history_head] = physical_timing_offset;
         tau_sample_history[tau_history_head] = timing_sample_position;
         double interval_correction = 0.0;
         {
@@ -384,28 +379,6 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                 latest.sro_pending_commands = scheduled.pending_sro;
             }
         }
-        if (sro_estimator_ready && std::abs(smoothed_sample_clock_ppm) >= 5.0 &&
-            std::abs(timing_offset) > timing_outlier_limit_samples &&
-            guard_size != 0) {
-            // Frequency correction stops further timing drift but cannot undo
-            // the FFT displacement accumulated while a large startup SRO was
-            // being estimated and slewed. Recenter by at most one guard
-            // interval per statistics window. SampleChannel retains that
-            // bounded history, and applied_timing_offset rebases subsequent
-            // drift measurements so the step is not mistaken for new SRO.
-            const int limit = static_cast<int>(std::min<std::size_t>(
-                guard_size,
-                static_cast<std::size_t>(std::numeric_limits<int>::max())));
-            const int shift = std::clamp(
-                static_cast<int>(std::lround(timing_offset)), -limit, limit);
-            if (shift < 0) {
-                next_symbol_start -= static_cast<std::uint64_t>(-shift);
-            } else {
-                next_symbol_start += static_cast<std::uint64_t>(shift);
-            }
-            state.applied_timing_offset += shift;
-            state.timing_tracker.rebase_window(static_cast<double>(shift));
-        }
     }
     const double residual_cfo_hz =
         static_cast<double>(frontend.residual_phase_ema) *
@@ -459,6 +432,7 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
             .sample_count = window_sample_count,
             .input_seconds = input_seconds,
             .timing_offset = timing_offset,
+            .physical_timing_offset = physical_timing_offset,
             .cir_offset = window_cir_avg,
             .observed_drift = observed_drift,
             .smoothed_timing_drift = smoothed_timing_drift,
@@ -521,10 +495,7 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
     latest.raw_timing_offset_samples = static_cast<float>(latest_raw_timing);
     latest.timing_offset_samples = timing_offset;
     latest.physical_timing_offset_samples =
-        timing_count == 0
-            ? 0.0F
-            : static_cast<float>(static_cast<double>(timing_offset) +
-                                 window_cir_avg);
+        static_cast<float>(metrics.physical_timing_offset);
     latest.observed_timing_drift_samples = static_cast<float>(observed_drift);
     latest.smoothed_timing_drift_samples =
         static_cast<float>(smoothed_timing_drift);
@@ -599,12 +570,9 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         static_cast<float>(state.channel_timing_time_sum_ms);
     latest.demod_channel_timing_generate_time_ms =
         static_cast<float>(state.channel_timing_generate_time_sum_ms);
-    latest.demod_channel_timing_select_time_ms =
-        static_cast<float>(state.channel_timing_select_time_sum_ms);
     latest.demod_channel_timing_filter_time_ms = static_cast<float>(
         std::max(0.0, state.channel_timing_time_sum_ms -
-                          state.channel_timing_generate_time_sum_ms -
-                          state.channel_timing_select_time_sum_ms));
+                          state.channel_timing_generate_time_sum_ms));
     latest.demod_channel_cir_time_ms =
         static_cast<float>(state.channel_cir_time_sum_ms);
     latest.demod_channel_interpolate_time_ms =
@@ -789,8 +757,6 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
             {"demod::channel::timing", latest.demod_channel_timing_time_ms},
             {"demod::channel::timing::generate",
              latest.demod_channel_timing_generate_time_ms},
-            {"demod::channel::timing::select",
-             latest.demod_channel_timing_select_time_ms},
             {"demod::channel::timing::filter",
              latest.demod_channel_timing_filter_time_ms},
             {"demod::channel::cir", latest.demod_channel_cir_time_ms},
@@ -840,7 +806,6 @@ void DemodStage::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
     state.channel_notch_time_sum_ms = 0.0;
     state.channel_timing_time_sum_ms = 0.0;
     state.channel_timing_generate_time_sum_ms = 0.0;
-    state.channel_timing_select_time_sum_ms = 0.0;
     state.channel_cir_time_sum_ms = 0.0;
     state.channel_interpolate_time_sum_ms = 0.0;
     state.channel_tps_extract_time_sum_ms = 0.0;
@@ -850,6 +815,7 @@ void DemodStage::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
     state.postprocess_wait_time_sum_ms = 0.0;
     state.output_time_sum_ms = 0.0;
     state.timing_acc = 0.0;
+    state.physical_timing_acc = 0.0;
     state.timing_count = 0;
     state.latest_raw_timing = 0.0;
     state.timing_raw_count = 0;

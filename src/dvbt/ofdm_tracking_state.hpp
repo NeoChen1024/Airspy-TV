@@ -34,23 +34,24 @@ struct OfdmTrackingState {
     bool just_seeded{false};
     TpsDecoder tps_decoder;
     TpsSnapshot tps_snapshot;
-    // CIR / delay-spread estimation for adaptive FFT-window placement.
-    // Updated once per TPS frame (68 symbols) from the scattered pilots,
-    // so the added work is negligible; `cir_offset` is the smoothed FFT
+    // Adaptive FFT-window placement from the pilot-grid impulse response,
+    // updated once per TPS frame (68 symbols); `cir_offset` is the smoothed FFT
     // window offset (samples, <= 0) relative to the effective symbol
     // start (start_pos + guard_size), sliding the window toward the
     // latest strong tap when the delay spread leaves guard margin.
-    std::vector<std::complex<float>> cir_grid;
-    std::vector<std::complex<float>> cir_response;
-    std::vector<double> cir_energy;
-    FftwfPlan cir_plan;
-    std::size_t cir_n{0};
     float cir_offset{0.0F};
     int cir_symbol_count{0};
-    // Channel profile measurement for the run report (see
-    // ChannelProfiler); `symbol_contiguous` and `symbol_start` describe
-    // the symbol currently being processed.
+    // Scattered-pilot grid (equalizer and pilot phase reference) and the
+    // channel profile measurement for the run report. `symbol_contiguous`
+    // says the symbol being processed follows the previous one by exactly
+    // one period; `grid_contiguous` also admits the decoder's own window
+    // moves, which the grid follows by a known phase ramp. `window_moved`
+    // carries that fact from the move to the next symbol.
+    ScatteredPilotGrid pilot_grid;
     ChannelProfiler profiler;
+    bool profiler_active{false};
     bool symbol_contiguous{false};
+    bool grid_contiguous{false};
+    bool window_moved{false};
     std::uint64_t symbol_start{0};
 };

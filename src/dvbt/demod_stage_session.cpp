@@ -82,19 +82,10 @@ void DemodStage::Impl::demod_build_grid(DemodRuntimeState &state) {
     std::ranges::fill(state.fft_in, std::complex<float>{});
     std::ranges::fill(state.fft_out, std::complex<float>{});
 
-    // One CIR tap per scattered-pilot slot. The response spans Tu/12.
-    frontend.cir_n = state.fft_size == 8192 ? 1024 : 256;
-    frontend.cir_grid.assign(frontend.cir_n, std::complex<float>{});
-    frontend.cir_response.assign(frontend.cir_n, std::complex<float>{});
-    frontend.cir_energy.assign(frontend.cir_n, 0.0);
-    frontend.cir_plan = FftwfPlan::dft_1d(
-        static_cast<int>(frontend.cir_n),
-        reinterpret_cast<fftwf_complex *>(frontend.cir_grid.data()),
-        reinterpret_cast<fftwf_complex *>(frontend.cir_response.data()),
-        FFTW_BACKWARD, FFTW_ESTIMATE);
-    frontend.profiler.configure(state.fft_size, state.maximum,
-                                static_cast<double>(sync.resampled_rate),
-                                state.fft_size + state.guard_size);
+    frontend.pilot_grid.configure(state.maximum, state.fft_size,
+                                  state.guard_size);
+    frontend.profiler.configure(state.fft_size, state.guard_size, state.maximum,
+                                static_cast<double>(sync.resampled_rate));
 }
 
 void DemodStage::Impl::demod_reset_timing(DemodRuntimeState &state,
@@ -104,7 +95,6 @@ void DemodStage::Impl::demod_reset_timing(DemodRuntimeState &state,
     state.latest_cp_snr_db = 0.0F;
     state.latest_deepest_notch_db = 0.0F;
     state.last_windowed_timing = 0.0;
-    state.last_windowed_cir_avg = 0.0;
     state.tau_history.fill(0.0);
     state.tau_sample_history.fill(0);
     state.tau_interval_correction_history.fill(0.0);
@@ -112,7 +102,6 @@ void DemodStage::Impl::demod_reset_timing(DemodRuntimeState &state,
     state.tau_history_count = 0;
     state.sro_estimator_ready = false;
     state.last_timing_sample_position.reset();
-    state.applied_timing_offset = 0;
     if (reset_window_cir) {
         state.window_cir_offset_sum = 0.0;
     }

@@ -169,6 +169,28 @@ class SymbolPostprocessorPool {
     [[nodiscard]] PostprocessedSymbol process(Task task,
                                               WorkerScratch &scratch) const {
         const auto preprocess_started_at = std::chrono::steady_clock::now();
+        // Noise on an equalized carrier grows with the equalizer power, so
+        // the carriers in a fade are weighted down (relative to the median
+        // carrier) wherever the symbol is judged as a whole: the common
+        // gain below and the demapper reliabilities. Without the weight a
+        // deep notch at 0 dB echo floods the gain estimate with
+        // noise-amplified outliers and the whole symbol is misscaled.
+        std::ranges::copy(task.equalizer_power,
+                          scratch.equalizer_power_order.begin());
+        auto equalizer_middle = scratch.equalizer_power_order.begin() +
+                                static_cast<std::ptrdiff_t>(
+                                    scratch.equalizer_power_order.size() / 2);
+        std::ranges::nth_element(scratch.equalizer_power_order,
+                                 equalizer_middle);
+        const float median_equalizer_power =
+            std::max(*equalizer_middle, minimum_power);
+        const auto relative_channel_power = [&](const std::size_t index) {
+            return median_equalizer_power /
+                   std::max(task.equalizer_power[index], minimum_power);
+        };
+
+        // Decision-directed common gain (residual phase and amplitude of
+        // this symbol relative to the channel estimate).
         for (int iteration = 0; iteration < 2; ++iteration) {
             reference_.slice_nearest(task.carriers, scratch.nearest);
             std::complex<double> numerator{};
@@ -176,10 +198,16 @@ class SymbolPostprocessorPool {
             for (std::size_t index = 0; index < task.carriers.size(); ++index) {
                 const auto value = task.carriers[index];
                 const auto reference = scratch.nearest[index];
+                const auto weight = static_cast<double>(
+                    std::min(relative_channel_power(index), 1.0F));
                 numerator +=
+                    weight *
                     std::conj(static_cast<std::complex<double>>(reference)) *
                     static_cast<std::complex<double>>(value);
-                denominator += std::norm(reference);
+                denominator += weight * std::norm(reference);
+            }
+            if (denominator <= 0.0) {
+                break;
             }
             const auto gain =
                 static_cast<std::complex<float>>(numerator / denominator);
@@ -191,36 +219,34 @@ class SymbolPostprocessorPool {
             }
         }
 
+        // Error power weighted like the gain above: the MER of a symbol in
+        // a selective channel then measures the carriers the decoder relies
+        // on instead of being swamped by the few in deep notches.
         reference_.slice_nearest(task.carriers, scratch.nearest);
+        double weighted_error = 0.0;
+        double error_weight = 0.0;
         for (std::size_t index = 0; index < task.carriers.size(); ++index) {
             scratch.errors[index] =
                 std::norm(task.carriers[index] - scratch.nearest[index]);
+            const auto weight = static_cast<double>(
+                std::min(relative_channel_power(index), 1.0F));
+            weighted_error += weight * scratch.errors[index];
+            error_weight += weight;
         }
-        const double mean_error =
-            std::accumulate(scratch.errors.begin(), scratch.errors.end(), 0.0) /
-            static_cast<double>(scratch.errors.size());
+        const double mean_error = error_weight > 0.0
+                                      ? weighted_error / error_weight
+                                      : std::numeric_limits<double>::infinity();
         auto middle = scratch.errors.begin() +
                       static_cast<std::ptrdiff_t>(scratch.errors.size() / 2);
         std::ranges::nth_element(scratch.errors, middle);
         const float reliability =
             1.0F / std::max(*middle / std::log(2.0F), 1.0e-4F);
 
-        std::ranges::copy(task.equalizer_power,
-                          scratch.equalizer_power_order.begin());
-        auto equalizer_middle = scratch.equalizer_power_order.begin() +
-                                static_cast<std::ptrdiff_t>(
-                                    scratch.equalizer_power_order.size() / 2);
-        std::ranges::nth_element(scratch.equalizer_power_order,
-                                 equalizer_middle);
-        const float median_equalizer_power =
-            std::max(*equalizer_middle, minimum_power);
         std::vector<float> reliabilities(task.carriers.size());
         for (std::size_t index = 0; index < reliabilities.size(); ++index) {
-            const float relative_channel_power =
-                median_equalizer_power /
-                std::max(task.equalizer_power[index], minimum_power);
             reliabilities[index] =
-                reliability * std::clamp(relative_channel_power, 0.01F, 16.0F);
+                reliability *
+                std::clamp(relative_channel_power(index), 0.01F, 16.0F);
         }
 
         const auto demap_started_at = std::chrono::steady_clock::now();

@@ -84,7 +84,6 @@ struct StreamDecoderStats { // NOLINT(clang-analyzer-optin.performance.Padding)
     float demod_channel_notch_time_ms{};
     float demod_channel_timing_time_ms{};
     float demod_channel_timing_generate_time_ms{};
-    float demod_channel_timing_select_time_ms{};
     float demod_channel_timing_filter_time_ms{};
     float demod_channel_cir_time_ms{};
     float demod_channel_interpolate_time_ms{};

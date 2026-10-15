@@ -9,10 +9,12 @@ the old implementation would let `tau` approach a branch boundary.
 
 The production baseline now includes:
 
-- one robust scattered-pilot timing estimate shared by tracking and pilot
-  verification;
+- one timing estimate, the energy centroid of the pilot-grid impulse
+  response, shared by tracking and FFT-window placement, with pilot-phase
+  verification against the grid;
 - branch unwrapping and outlier rejection;
-- feedback-debiased physical timing and SRO telemetry;
+- physical timing (tracked timing plus the applied window offset, invariant
+  to window moves) driving the SRO telemetry;
 - variable-rate resampler correction as the sole long-term SRO actuator;
 - independent sample-clock and LO/CFO tracking;
 - acquisition-only frontend CFO centering with sample-stamped residual-CFO
@@ -31,9 +33,8 @@ Use the following as the reference before changing timing control:
   GB and 151.6 minutes.
 - Offline decoder: the native `StreamDecoder` through `--decode-iq`.
 - Event logging: pass `--debug` to the receiver CLI.
-- Synthetic tools:
-  - `tools/generate_dvbt_fixture.py`
-  - `tools/validate_dvbt_clock_drift.py`
+- Synthetic tools: `tools/generate_dvbt_fixture.py` and the clock cases of
+  `scripts/run_validation.py --clock-regressions`.
 - Independently configurable fixture impairments:
   - initial sample-clock offset and ppm/minute drift;
   - initial LO offset and Hz/minute drift;
