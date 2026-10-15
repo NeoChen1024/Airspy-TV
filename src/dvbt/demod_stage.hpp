@@ -54,6 +54,7 @@ class DemodStage {
     publish_acquisition(const FrontendAcquisitionPublication &publication);
     void publish_command(const FrontendCommandPublication &publication);
     void publish_frontend_block(const FrontendBlockPublication &publication);
+    void publish_gap(const FrontendGapPublication &publication);
 
     void publish_fec_session(const FecStageSession &session);
     void publish_fec_window(const FecStageWindow &window);

@@ -133,16 +133,39 @@ queue/ring condition variables; synchronization is no longer split across the
 coordinator and worker methods.
 
 - Live `submit()` rejects a block when the queue is full and increments
-  `dropped_blocks`.
+  `dropped_blocks`; the block's stamp was already issued, so the next block
+  begins after a hole in the source timeline.
 - Offline `submit_blocking()` waits for capacity.
-- Source-reported sample loss requests an asynchronous decoder reset so the
-  following samples cannot be concatenated to stale DSP state.
+- Source-reported sample loss advances the stamped timeline by the reported
+  count. Neither kind of loss resets the decoder: the frontend detects the
+  hole from the stamps and publishes it (see below), and the stream continues.
 
 ### Frontend and sample ring
 
 `FrontendStage` owns the `dvbt-frontend` worker. It converts interleaved CS16
 to normalized complex samples and runs `StreamingResampler` at the DVB-T
 baseband rate (`bandwidth * 8 / 7`).
+
+Each production block must continue the previous block's stamp (same stream
+epoch, `begin_sample` equal to the previous end). A block that begins later
+marks an input gap: the ring is still written contiguously, and the frontend
+publishes the ring write position together with the number of missing source
+samples and their resampled equivalent (`input_gaps`,
+`input_gap_source_samples`). A block that rewinds cannot be accounted for and
+restarts the bootstrap. The demod applies a published gap when the symbol
+window it just read touches the hole: every symbol whose transmitted span
+meets the hole is lost, the grid resumes at the next intact symbol minus the
+missing samples, carrier tracking and the TPS/FEC configuration carry (the
+contiguity gate skips one residual-CFO update and the expected pilot phase
+advances by the lost count), and a placeholder for the lost symbols travels
+through the ordered postprocessor and MER gate to the FEC. Up to one TPS frame
+of lost symbols becomes the same number of neutral-metric symbols
+(`erased_symbols`), so the trellis and the outer deinterleaver stay aligned
+and output resumes without an outer re-synchronisation; a longer hole closes
+the FEC region instead (`fec_region_reset`). Each applied gap is an
+`input_gap` event with the lost-symbol count and the action taken. Symbols
+buffered before the first TPS lock are discarded at a gap because their
+deinterleave parity is derived from their distance to the lock.
 The common arbitrary resampler retains Q32.32 phase and FIR history across
 input blocks. Caller blocks are split into bounded 50 ms processing quanta;
 parallel workers evaluate independent output ranges inside each quantum and

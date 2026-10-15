@@ -21,9 +21,23 @@ struct OfdmAcquisition {
     int carrier_offset{};
     int pilot_phase{};
     float score{};
+    // Scattered-pilot lock energy of the corrected spectrum as received, and
+    // of the same spectrum with I and Q swapped. The cyclic-prefix search
+    // cannot tell the two apart; only the pilot pattern can.
+    float pilot_score{};
+    float mirrored_pilot_score{};
     TransmissionMode mode{TransmissionMode::k8};
     GuardInterval guard{GuardInterval::gi_1_4};
 };
+
+// Resamples one conditioned source block to the nominal DVB-T baseband rate
+// with a fresh filter state, optionally translating by -cfo_hz. Acquisition
+// previews use this; production streaming uses StreamingResampler.
+[[nodiscard]] std::vector<std::complex<float>>
+resample_preview(std::span<const std::complex<float>> samples,
+                 std::uint32_t sample_rate_hz,
+                 std::uint32_t channel_bandwidth_hz, double cfo_hz,
+                 std::size_t requested_workers = 1);
 
 // Reusable partitioned CS16 resampler. Worker threads and filter state remain
 // alive across process() calls; process() itself is synchronous and must only

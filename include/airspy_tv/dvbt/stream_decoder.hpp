@@ -117,6 +117,11 @@ struct StreamDecoderStats { // NOLINT(clang-analyzer-optin.performance.Padding)
     float acquisition_fractional_cfo_hz{};
     float acquisition_cfo_hz{};
     int acquisition_carrier_bin_offset{};
+    // Channel centre located in the source spectrum before acquisition and
+    // folded into the initial translation; zero for a centred source.
+    float acquisition_coarse_offset_hz{};
+    // The source is conjugated because its pilots only lined up mirrored.
+    bool input_mirrored{};
     std::uint64_t bootstrap_attempts{};
     std::uint64_t bootstrap_replayed_input_samples{};
     std::uint64_t bootstrap_retained_peak_samples{};
@@ -180,6 +185,13 @@ struct StreamDecoderStats { // NOLINT(clang-analyzer-optin.performance.Padding)
     std::uint64_t processed_chunks{};
     std::uint64_t processed_input_samples{};
     std::uint64_t dropped_blocks{};
+    // Holes in the stamped source timeline seen by the production frontend
+    // (reported hardware drops and refused blocks), the source samples they
+    // covered, and the OFDM symbols replaced by FEC erasures to keep the
+    // outer interleaver aligned across them.
+    std::uint64_t input_gaps{};
+    std::uint64_t input_gap_source_samples{};
+    std::uint64_t erased_symbols{};
     std::uint64_t ofdm_symbols{};
     std::uint64_t transport_bytes{};
     std::size_t queued_blocks{};

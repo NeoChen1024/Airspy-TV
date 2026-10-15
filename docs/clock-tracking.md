@@ -303,18 +303,50 @@ resampler emits anything:
 
 ```text
 raw source buffer
-    -> temporary nominal preview resampler
+    -> channel location in the source power spectrum (coarse offset)
+    -> source conditioning: slow DC removal (off-centre channel only),
+       conjugation when mirrored
+    -> temporary nominal preview resampler, translated by the coarse offset
     -> CP acquisition and corrected acquisition FFT
-    -> fractional CFO plus integer carrier-bin offset
+    -> fractional CFO plus integer carrier-bin offset; mirrored-pilot check
     -> configure production resampler frequency translation
     -> replay the retained raw source buffer from its beginning
     -> centered production sample ring
 ```
 
 The preview and production resamplers use the same filter and nominal ratio and
-both begin from reset phase/history. Frequency translation does not change
-sample timing, so the preview symbol position maps directly into the replayed
-production output. The production demod starts at the predicted position,
+both begin from reset phase/history, and the replay conditions the retained
+buffer from the same zero DC state as the preview. Frequency translation does
+not change sample timing, so the preview symbol position maps directly into the
+replayed production output.
+
+Source conditioning runs at the source rate ahead of the mixer. For a channel
+located away from the source centre, a slow estimate of the radio's DC offset
+(block means with a 50 ms time constant) is subtracted so the centre spike
+cannot be translated onto a data carrier; native Airspy input already arrives
+DC-free, so this matters for SoapySDR sources and recordings. A centred
+channel is never DC-corrected: its own centre carrier sits at DC (a boosted
+continual pilot in 8K mode, carrier 3408), so the block mean is that carrier
+rather than an impairment, and the demodulator tolerates a spike on one
+carrier as it always has. The channel locator finds the window of the channel's occupied
+width holding the most power and accepts it only when both edges stand at
+least 6 dB above the band beside them and lie inside the source band; the
+centre comes from the half-power crossings at the two edges. A located offset
+inside the acquisition integer-bin search (48 carriers) is ignored, so a
+centred source keeps its unchanged path; a larger one becomes the coarse part
+of the initial translation and is reported as `coarse_offset_hz`. At 10 MS/s
+this reaches roughly ±2 MHz for a 6 MHz channel and ±1 MHz for 8 MHz; a
+channel whose edge leaves the source band is not located and acquisition fails
+as before.
+
+The cyclic-prefix search cannot tell a mirrored stream (I and Q swapped by the
+radio or the file format) from an upright one; only the scattered-pilot
+pattern can. Acquisition scores the pilot lock on the corrected spectrum and
+on the same spectrum reversed and conjugated, which costs no second FFT. When
+the mirrored pattern wins by a factor of 1.5 the preview is conjugated and
+acquired again, and the source is conjugated ahead of the mixer from then on
+(`input_mirrored`). The reported coarse offset is then the channel's offset in
+the conjugated source. The production demod starts at the predicted position,
 seeds the acquisition pilot phase, fixes the carrier-bin offset at zero, and
 performs only centered-stream phase/timing validation. Re-acquisition within an
 already centered production stream disables the wide integer-bin search.
@@ -326,8 +358,9 @@ This startup path must satisfy the following invariants:
   source samples or add the steady-state command horizon to startup latency;
 - CP acquisition estimates fractional CFO and an acquisition-local corrected
   FFT plus wide pilot search determines the integer carrier-bin offset;
-- bootstrap publishes the combined initial CFO in hertz, mode, guard interval,
-  predicted symbol position, and pilot phase;
+- bootstrap publishes the combined initial CFO in hertz (coarse channel offset
+  plus acquisition CFO), the coarse offset and mirror decision on their own,
+  mode, guard interval, predicted symbol position, and pilot phase;
 - steady-state FFT input is already centered, so payload demodulation uses zero
   carrier-bin offset and no per-symbol time-domain NCO rotation;
 - the production demod only performs centered-stream timing/pilot validation;
@@ -341,13 +374,13 @@ bootstrap; it is not a second continuous DSP path.
 
 The common resampler exposes frequency translation as an optional
 standard-neutral actuator. Its Q0.64 mixer phase persists across ratio and
-frequency updates, parallel output ranges are seeded from the same absolute
-output phase, and the oscillator resets only with the resampler stream state.
-Translation is fused after each FIR output, avoiding an additional memory
-pass. A zero command remains bit-identical to the unmixed path. The DVB-T
-passband-to-stopband transition is substantially wider than the acquisition
-CFO range, so the anti-alias filter does not need a pre-FIR mixer for the
-supported acquisition range.
+frequency updates and resets only with the resampler stream state. The mixer
+runs at the source rate ahead of the anti-alias FIR, so the translated channel
+is centred in the passband before the filter acts on it; edge carriers of an
+offset channel are therefore never attenuated by the transition band, and the
+same path can centre a channel recorded away from the source centre. The FIR
+history holds translated samples. A zero command from a zero phase remains
+bit-identical to the unmixed path.
 
 Only steady-state tracking uses delayed sample-domain command scheduling.
 Initial centering is installed before production replay. The resampler timeline

@@ -25,6 +25,9 @@ struct SoftViterbiTiming {
 // feeds the outer stage window-aligned; callers with other chunk shapes may
 // feed arbitrary sizes instead.
 inline constexpr std::size_t viterbi_output_bytes = 7680 / 8;
+// Quantized metric that favours neither bit value: punctured positions and
+// erasures.
+inline constexpr std::uint8_t neutral_soft_metric = 128;
 
 // Soft-input rate-1/2 convolutional (171,133) decoder built on
 // ViterbiDecoderCpp with an ordered worker pool. Input is mother-code metrics

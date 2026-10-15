@@ -73,6 +73,12 @@ void DemodStage::Impl::run() {
                 if (input_flow == DemodInputFlow::stop) {
                     return;
                 }
+                if (demod_apply_gaps(runtime)) {
+                    // The window just read straddles a source hole; the
+                    // grid moved past it, so read again from there.
+                    finish_symbol_attempt();
+                    continue;
+                }
                 auto stage_started_at = std::chrono::steady_clock::now();
                 demod_execute_fft_and_measure_cfo(runtime);
                 runtime.fft_cfo_time_sum_ms += duration_ms(stage_started_at);

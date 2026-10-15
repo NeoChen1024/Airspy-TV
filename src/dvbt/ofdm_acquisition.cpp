@@ -77,6 +77,23 @@ resample_cs16(const std::span<const std::int16_t> interleaved_iq,
                              channel_bandwidth_hz);
 }
 
+std::vector<std::complex<float>>
+resample_preview(const std::span<const std::complex<float>> samples,
+                 const std::uint32_t sample_rate_hz,
+                 const std::uint32_t channel_bandwidth_hz, const double cfo_hz,
+                 const std::size_t requested_workers) {
+    if (samples.empty() || sample_rate_hz == 0 || channel_bandwidth_hz == 0) {
+        return {};
+    }
+    solid_resampler::FrequencyTranslatingResampler resampler(
+        std::max<std::size_t>(requested_workers, 1U), "an-resamp-");
+    resampler.configure(
+        make_resampler_config(sample_rate_hz, channel_bandwidth_hz));
+    resampler.set_frequency_shift(-cfo_hz);
+    const auto output = resampler.process(samples);
+    return {output.begin(), output.end()};
+}
+
 OfdmAcquisition acquire_ofdm(const std::span<const std::complex<float>> samples,
                              const ReceiverParameters &parameters,
                              const bool search_carrier_offset) {
@@ -217,6 +234,22 @@ OfdmAcquisition acquire_ofdm(const std::span<const std::complex<float>> samples,
                                : lock_pilots_at_offset(fft_output, maximum, 0);
     best.carrier_offset = lock.offset;
     best.pilot_phase = lock.phase;
+    best.pilot_score = lock.score;
+    // Conjugating the time signal conjugates the spectrum and reverses the
+    // bins, and the corrected fractional CFO changes sign with it, so the
+    // mirrored hypothesis needs no second search or FFT.
+    for (std::size_t index = 1; index < best.fft_size / 2; ++index) {
+        const std::size_t reverse = best.fft_size - index;
+        const auto low = std::conj(fft_output[index]);
+        fft_output[index] = std::conj(fft_output[reverse]);
+        fft_output[reverse] = low;
+    }
+    fft_output[0] = std::conj(fft_output[0]);
+    fft_output[best.fft_size / 2] = std::conj(fft_output[best.fft_size / 2]);
+    best.mirrored_pilot_score =
+        (search_carrier_offset ? lock_pilots(fft_output, maximum)
+                               : lock_pilots_at_offset(fft_output, maximum, 0))
+            .score;
     best.total_cfo_phase_per_sample = best.fractional_cfo_phase_per_sample +
                                       (2.0F * std::numbers::pi_v<float> *
                                        static_cast<float>(best.carrier_offset) /

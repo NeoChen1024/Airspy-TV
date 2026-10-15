@@ -1,6 +1,13 @@
 #include "frontend_stage_internal.hpp"
 
+#include "channel_locator.hpp"
+
 namespace airspy_tv::dvbt {
+namespace {
+
+constexpr float acquisition_accept_score = 0.20F;
+
+} // namespace
 
 // FrontendStage worker definition.
 
@@ -13,6 +20,9 @@ namespace airspy_tv::dvbt {
 void FrontendStage::Impl::run() {
     std::unique_ptr<StreamingResampler> resampler;
     std::vector<std::complex<float>> convert_buffer;
+    InputConditioner conditioner;
+    // Stamp of the last production block; the next block must continue it.
+    std::optional<InputSampleStamp> expected_stamp;
     std::optional<InputBlock> bootstrap_block;
     bool production_ready = false;
     std::uint64_t bootstrap_attempts = 0;
@@ -37,6 +47,8 @@ void FrontendStage::Impl::run() {
             resampler->set_cfo_correction_hz(0.0);
             resampler->reset();
         }
+        conditioner = {};
+        expected_stamp.reset();
         clock.reset();
 
         const std::uint64_t sync_version =
@@ -68,6 +80,8 @@ void FrontendStage::Impl::run() {
                 resampler->set_cfo_correction_hz(0.0);
                 resampler->reset();
             }
+            conditioner = {};
+            expected_stamp.reset();
             callbacks.notify_fec_cancelled();
             samples.complete_frontend_reset(generation);
             continue;
@@ -110,6 +124,8 @@ void FrontendStage::Impl::run() {
                 // Retune: drop the filter state and invalidate the sync;
                 // the demod re-acquires itself on the new rate.
                 resampler->reset();
+                conditioner = {};
+                expected_stamp.reset();
                 clock.reset();
                 clock.set_bandwidth(block.bandwidth);
                 production_ready = false;
@@ -167,13 +183,65 @@ void FrontendStage::Impl::run() {
                 // begin later inside it. Acquisition.start must remain
                 // relative to the complete raw prefix that production will
                 // replay.
-                const auto preview = resample_cs16(
-                    bootstrap_block->samples, bootstrap_block->rate,
-                    bootstrap_block->bandwidth, block_resample_workers);
+                //
+                // Locating the channel in the source spectrum before the
+                // preview matters because the preview filter removes a
+                // channel sitting away from the centre; the located offset
+                // becomes part of the initial translation and acquisition
+                // then only sees the residual. The preview is conditioned
+                // exactly as the replay will be: DC removal is enabled only
+                // for an off-centre channel, its estimate starts from zero
+                // on this same buffer, and the mirror is decided below.
+                const std::size_t bootstrap_count =
+                    bootstrap_block->samples.size() / 2U;
+                convert_buffer.resize(bootstrap_count);
+                dsp::convert_cs16_to_cf32(bootstrap_block->samples,
+                                          convert_buffer);
+                const ChannelLocation location =
+                    locate_channel(convert_buffer, bootstrap_block->rate,
+                                   bootstrap_block->bandwidth);
+                double coarse_offset_hz =
+                    location.found && std::abs(location.offset_hz) >
+                                          coarse_offset_threshold_hz(
+                                              bootstrap_block->bandwidth)
+                        ? location.offset_hz
+                        : 0.0;
+                conditioner.reset_dc();
+                conditioner.remove_dc = coarse_offset_hz != 0.0;
+                conditioner.mirror = false;
+                conditioner.apply(convert_buffer, bootstrap_block->rate);
+                auto preview =
+                    resample_preview(convert_buffer, bootstrap_block->rate,
+                                     bootstrap_block->bandwidth,
+                                     coarse_offset_hz, block_resample_workers);
                 ++bootstrap_attempts;
-                const OfdmAcquisition acquisition =
+                OfdmAcquisition acquisition =
                     acquire_ofdm(preview, bootstrap_parameters, true);
-                if (acquisition.score < 0.20F) {
+                bool mirrored = false;
+                if (acquisition.score >= acquisition_accept_score &&
+                    acquisition.mirrored_pilot_score >
+                        mirror_score_ratio * acquisition.pilot_score) {
+                    // The pilots line up only with the spectrum reversed.
+                    // The conjugated preview is the mirrored source
+                    // translated by the opposite offset, so acquire on it
+                    // directly and keep the result only if it still prefers
+                    // the upright pattern there.
+                    for (auto &value : preview) {
+                        value = std::conj(value);
+                    }
+                    const OfdmAcquisition mirrored_acquisition =
+                        acquire_ofdm(preview, bootstrap_parameters, true);
+                    if (mirrored_acquisition.score >=
+                            acquisition_accept_score &&
+                        mirrored_acquisition.pilot_score >
+                            mirror_score_ratio *
+                                mirrored_acquisition.mirrored_pilot_score) {
+                        acquisition = mirrored_acquisition;
+                        mirrored = true;
+                        coarse_offset_hz = -coarse_offset_hz;
+                    }
+                }
+                if (acquisition.score < acquisition_accept_score) {
                     // Keep a rolling acquisition-sized raw window. This bounds
                     // memory on noise-only/live inputs while allowing the next
                     // source block to move the preview forward.
@@ -201,13 +269,18 @@ void FrontendStage::Impl::run() {
                 const double resampled_rate =
                     static_cast<double>(bootstrap_block->bandwidth) * 8.0 / 7.0;
                 const double initial_cfo_hz =
-                    static_cast<double>(
-                        acquisition.total_cfo_phase_per_sample) *
-                    resampled_rate / (2.0 * std::numbers::pi_v<double>);
+                    coarse_offset_hz +
+                    (static_cast<double>(
+                         acquisition.total_cfo_phase_per_sample) *
+                     resampled_rate / (2.0 * std::numbers::pi_v<double>));
                 const double initial_fractional_cfo_hz =
                     static_cast<double>(
                         acquisition.fractional_cfo_phase_per_sample) *
                     resampled_rate / (2.0 * std::numbers::pi_v<double>);
+                // The replay below conditions the retained buffer again from
+                // the same zero DC state, now with the mirror decided.
+                conditioner.reset_dc();
+                conditioner.mirror = mirrored;
                 resampler->configure(bootstrap_block->rate,
                                      bootstrap_block->bandwidth);
                 resampler->set_cfo_correction_hz(initial_cfo_hz);
@@ -225,6 +298,9 @@ void FrontendStage::Impl::run() {
                          .initial_cfo_hz = static_cast<float>(initial_cfo_hz),
                          .initial_fractional_cfo_hz =
                              static_cast<float>(initial_fractional_cfo_hz),
+                         .coarse_offset_hz =
+                             static_cast<float>(coarse_offset_hz),
+                         .mirrored = mirrored,
                          .bootstrap_attempts = bootstrap_attempts,
                          .bootstrap_replayed_input_samples = buffered,
                          .bootstrap_retained_peak_samples =
@@ -236,10 +312,54 @@ void FrontendStage::Impl::run() {
                 production_ready = true;
             }
             resampler->configure(block.rate, block.bandwidth);
+            if (expected_stamp.has_value() &&
+                (block.stamp.stream_epoch != expected_stamp->stream_epoch ||
+                 block.stamp.begin_sample != expected_stamp->end_sample())) {
+                // The source skipped samples (a reported hardware drop or a
+                // block the full input queue refused). The ring is written
+                // contiguously, so tell the demodulator where the hole sits
+                // in output coordinates and how long it is. A source that
+                // rewinds cannot be accounted for; a fresh bootstrap on the
+                // new position is the only consistent recovery.
+                const std::uint64_t expected_begin =
+                    expected_stamp->end_sample();
+                if (block.stamp.begin_sample > expected_begin) {
+                    const std::uint64_t missing =
+                        block.stamp.begin_sample - expected_begin;
+                    callbacks.publish_gap(
+                        {.generation = block.generation,
+                         .stream_epoch = block.stamp.stream_epoch,
+                         .source_sample = expected_begin,
+                         .missing_source_samples = missing,
+                         .output_sample = samples.write_position(),
+                         .missing_resampled_samples =
+                             static_cast<double>(missing) *
+                             resampler->effective_ratio()});
+                } else {
+                    resampler->reset();
+                    conditioner = {};
+                    expected_stamp.reset();
+                    clock.reset();
+                    clock.set_bandwidth(block.bandwidth);
+                    production_ready = false;
+                    bootstrap_block.reset();
+                    bootstrap_attempts = 0;
+                    bootstrap_replayed_input_samples = 0;
+                    bootstrap_retained_peak_samples = 0;
+                    const std::uint64_t sync_version =
+                        callbacks.invalidate_sync(block.generation);
+                    samples.publish_sync_version(sync_version);
+                    bootstrap_block = std::move(block);
+                    samples.finish_frontend_work();
+                    continue;
+                }
+            }
+            expected_stamp = block.stamp;
             const std::size_t complex_count = block.samples.size() / 2;
             const auto convert_started_at = std::chrono::steady_clock::now();
             convert_buffer.resize(complex_count);
             dsp::convert_cs16_to_cf32(block.samples, convert_buffer);
+            conditioner.apply(convert_buffer, block.rate);
             const float convert_time_ms =
                 frontend_duration_ms(convert_started_at);
             float resample_time_ms = 0.0F;

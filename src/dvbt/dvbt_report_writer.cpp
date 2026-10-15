@@ -561,6 +561,9 @@ struct DvbTReportWriter::Impl {
             {"ofdm_symbols", stats.ofdm_symbols},
             {"transport_bytes", stats.transport_bytes},
             {"dropped_blocks", stats.dropped_blocks},
+            {"input_gaps", stats.input_gaps},
+            {"input_gap_source_samples", stats.input_gap_source_samples},
+            {"erased_symbols", stats.erased_symbols},
             {"phase_discontinuities", stats.pilot_phase_discontinuities},
         };
         record["quality"] = {
@@ -822,6 +825,9 @@ struct DvbTReportWriter::Impl {
                  json_finite_or_null(stats.acquisition_fractional_cfo_hz)},
                 {"acquisition_carrier_bin_offset",
                  stats.acquisition_carrier_bin_offset},
+                {"acquisition_coarse_offset_hz",
+                 json_finite_or_null(stats.acquisition_coarse_offset_hz)},
+                {"input_mirrored", stats.input_mirrored},
                 {"estimated_cfo_hz",
                  json_finite_or_null(stats.tracked_carrier_offset_hz)},
                 {"residual_cfo_hz",

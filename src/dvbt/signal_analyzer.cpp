@@ -2,8 +2,10 @@
 #include "airspy_tv/fftw_plan.hpp"
 #include "airspy_tv/thread_name.hpp"
 
+#include "airspy_tv/dsp/vector_ops.hpp"
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 
+#include "channel_locator.hpp"
 #include "ofdm_carrier.hpp"
 
 #include <fftw3.h>
@@ -144,8 +146,54 @@ analyze(const std::span<const std::int16_t> scalars,
         const ReceiverParameters &parameters) {
     SignalAnalysisSnapshot snapshot;
     const double target_rate = static_cast<double>(bandwidth) * 8.0 / 7.0;
-    const auto resampled = resample_cs16(scalars, sample_rate, bandwidth);
-    const OfdmAcquisition acquisition = acquire_ofdm(resampled, parameters);
+    if (scalars.size() % 2 != 0 || scalars.empty()) {
+        return snapshot;
+    }
+    // Condition the raw window the way the streaming frontend does: locate a
+    // channel sitting away from the source centre and translate it ahead of
+    // the preview filter, remove the DC offset only in that off-centre case
+    // (a centred channel has its own centre carrier at DC), and read the
+    // pilot pattern mirrored when I and Q are swapped.
+    std::vector<std::complex<float>> raw(scalars.size() / 2);
+    dsp::convert_cs16_to_cf32(scalars, raw);
+    const ChannelLocation location =
+        locate_channel(raw, sample_rate, bandwidth);
+    double coarse_offset_hz =
+        location.found && std::abs(location.offset_hz) >
+                              coarse_offset_threshold_hz(bandwidth)
+            ? location.offset_hz
+            : 0.0;
+    if (coarse_offset_hz != 0.0) {
+        std::complex<float> dc{};
+        for (const auto value : raw) {
+            dc += value;
+        }
+        dc /= static_cast<float>(raw.size());
+        for (auto &value : raw) {
+            value -= dc;
+        }
+    }
+    auto resampled =
+        resample_preview(raw, sample_rate, bandwidth, coarse_offset_hz);
+    OfdmAcquisition acquisition = acquire_ofdm(resampled, parameters);
+    bool mirrored = false;
+    if (acquisition.score >= 0.20F &&
+        acquisition.mirrored_pilot_score >
+            mirror_score_ratio * acquisition.pilot_score) {
+        for (auto &value : resampled) {
+            value = std::conj(value);
+        }
+        const OfdmAcquisition mirrored_acquisition =
+            acquire_ofdm(resampled, parameters);
+        if (mirrored_acquisition.score >= 0.20F &&
+            mirrored_acquisition.pilot_score >
+                mirror_score_ratio *
+                    mirrored_acquisition.mirrored_pilot_score) {
+            acquisition = mirrored_acquisition;
+            mirrored = true;
+            coarse_offset_hz = -coarse_offset_hz;
+        }
+    }
     if (acquisition.score < 0.20F) {
         return snapshot;
     }
@@ -215,11 +263,15 @@ analyze(const std::span<const std::int16_t> scalars,
     // CP correlation estimates fractional CFO modulo one subcarrier. The
     // scattered-pilot search also finds an integer bin displacement, but that
     // result is not a trustworthy physical-frequency estimate until continual
-    // pilots/TPS confirm it. Keep the public metric fractional-only.
-    snapshot.carrier_offset_hz = std::arg(acquisition.phase) *
-                                 static_cast<float>(target_rate) /
-                                 (2.0F * std::numbers::pi_v<float> *
-                                  static_cast<float>(acquisition.fft_size));
+    // pilots/TPS confirm it. The public metric is the spectrum-located coarse
+    // offset plus the fractional part only.
+    snapshot.coarse_offset_hz = static_cast<float>(coarse_offset_hz);
+    snapshot.input_mirrored = mirrored;
+    snapshot.carrier_offset_hz =
+        snapshot.coarse_offset_hz +
+        (std::arg(acquisition.phase) * static_cast<float>(target_rate) /
+         (2.0F * std::numbers::pi_v<float> *
+          static_cast<float>(acquisition.fft_size)));
     snapshot.mode = acquisition.mode;
     snapshot.guard_interval = acquisition.guard;
     snapshot.locked = true;

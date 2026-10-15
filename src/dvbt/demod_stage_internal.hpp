@@ -53,6 +53,10 @@ inline constexpr float cfo_rebootstrap_phase_threshold =
     0.75F * std::numbers::pi_v<float>;
 inline constexpr std::size_t cfo_rebootstrap_freeze_symbols = 2U * 68U;
 inline constexpr std::size_t gate_window_symbols = 68;
+// Longest input gap bridged with FEC erasures. Beyond one TPS frame the
+// outer decoder re-synchronises faster than it could digest the neutral
+// metrics, so the region is reset instead.
+inline constexpr std::size_t maximum_erased_symbols = 68;
 inline constexpr std::array continual_2k{
     0,    48,   54,   87,   141,  156,  192,  201,  255,  279,  282,  333,
     432,  450,  483,  525,  531,  618,  636,  714,  759,  765,  780,  804,
@@ -132,6 +136,9 @@ struct DemodStage::Impl { // NOLINT(clang-analyzer-optin.performance.Padding)
     void demod_publish_stats_window(DemodRuntimeState &state);
     static void demod_reset_stats_window(DemodRuntimeState &state);
     void demod_advance_symbol(DemodRuntimeState &state);
+    [[nodiscard]] bool demod_apply_gaps(DemodRuntimeState &state);
+    void demod_forward_gate_symbol(DemodRuntimeState &state,
+                                   PostprocessedSymbol &symbol);
     [[nodiscard]] bool demod_maybe_reacquire(DemodRuntimeState &state);
     [[nodiscard]] bool demod_request_cfo_rebootstrap(DemodRuntimeState &state,
                                                      const char *reason,
@@ -170,6 +177,9 @@ struct DemodStage::Impl { // NOLINT(clang-analyzer-optin.performance.Padding)
     std::uint64_t fec_telemetry_sequence{};
     std::uint64_t event_telemetry_sequence{};
     std::optional<TransportDiscontinuity> pending_discontinuity;
+    // Source holes published by the frontend, in ring order, not yet
+    // reached by the symbol loop.
+    std::deque<FrontendGapPublication> pending_gaps;
     StreamDecoder::EqualizedCallback equalized_callback;
     std::unique_ptr<SymbolPostprocessorPool> symbol_postprocessor;
     std::atomic<int> demod_state{static_cast<int>(WorkerState::idle)};

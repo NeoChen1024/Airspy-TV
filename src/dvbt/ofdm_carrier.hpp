@@ -12,6 +12,9 @@ namespace airspy_tv::dvbt {
 struct PilotLock {
     int phase{};
     int offset{};
+    // Coherent scattered-pilot correlation energy of the winning phase and
+    // offset; comparable between candidates evaluated on the same spectrum.
+    float score{};
 };
 
 [[nodiscard]] constexpr std::array<std::uint8_t, 6817> make_pilot_prbs() {
@@ -66,6 +69,7 @@ lock_pilots_at_offset(const std::span<const std::complex<float>> fft,
         if (score > best_score) {
             best_score = score;
             best.phase = phase;
+            best.score = score;
         }
     }
     return best;
@@ -108,6 +112,7 @@ lock_pilots(const std::span<const std::complex<float>> fft,
         if (score > best_score) {
             best_score = score;
             best = candidate;
+            best.score = score;
         }
     }
     return best;

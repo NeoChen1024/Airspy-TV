@@ -219,8 +219,20 @@ std::uint64_t DemodStage::invalidate_sync(const std::uint64_t generation) {
     if (generation == impl_->sample_channel.generation()) {
         impl_->sync.valid = false;
         ++impl_->sync.version;
+        impl_->pending_gaps.clear();
     }
     return impl_->sync.version;
+}
+
+void DemodStage::publish_gap(const FrontendGapPublication &publication) {
+    const std::scoped_lock lock(impl_->mutex);
+    if (publication.generation != impl_->sample_channel.generation()) {
+        return;
+    }
+    ++impl_->latest.input_gaps;
+    impl_->latest.input_gap_source_samples +=
+        publication.missing_source_samples;
+    impl_->pending_gaps.push_back(publication);
 }
 
 std::uint64_t DemodStage::publish_rebootstrap(
@@ -233,6 +245,7 @@ std::uint64_t DemodStage::publish_rebootstrap(
     latest.processed_input_samples += result.consumed_input_samples;
     impl_->sync.valid = false;
     ++impl_->sync.version;
+    impl_->pending_gaps.clear();
     latest.decoder_generation = result.new_generation;
     latest.ofdm_locked = false;
     latest.tps_locked = false;
@@ -291,6 +304,8 @@ std::uint64_t DemodStage::publish_acquisition(
     latest.acquisition_fractional_cfo_hz =
         publication.initial_fractional_cfo_hz;
     latest.acquisition_carrier_bin_offset = acquisition.carrier_offset;
+    latest.acquisition_coarse_offset_hz = publication.coarse_offset_hz;
+    latest.input_mirrored = publication.mirrored;
     latest.bootstrap_attempts = publication.bootstrap_attempts;
     latest.bootstrap_replayed_input_samples =
         publication.bootstrap_replayed_input_samples;

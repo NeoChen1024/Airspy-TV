@@ -325,14 +325,32 @@ void test_frequency_translation() {
     require(first.size() == command_boundary &&
                 second.size() == constant.size() - command_boundary,
             "unity-ratio frequency-command output count");
-    const double boundary_phase = 2.0 * std::numbers::pi * first_shift_hz *
-                                  static_cast<double>(command_boundary) /
-                                  unity_config.output_rate_hz;
-    const std::complex<float> expected_boundary{
+    // The mixer runs ahead of the filter, so after the command the translated
+    // input is the second tone rotated by the phase the first tone reached at
+    // the boundary. Once the filter window lies entirely past the boundary
+    // the output must match a steady second-tone run rotated the same way.
+    FrequencyTranslatingResampler steady{4};
+    steady.configure(unity_config);
+    steady.set_frequency_shift(second_shift_hz);
+    const auto steady_output = copy_output(steady, constant);
+    const double boundary_phase =
+        2.0 * std::numbers::pi * (first_shift_hz - second_shift_hz) *
+        static_cast<double>(command_boundary) / unity_config.input_rate_hz;
+    const std::complex<float> boundary_rotation{
         static_cast<float>(std::cos(boundary_phase)),
         static_cast<float>(std::sin(boundary_phase))};
-    require(std::abs(second.front() - expected_boundary) < 2.0e-3F,
-            "frequency command update reset the mixer phase");
+    const std::size_t settled = command_boundary + 2U * changing.filter_taps();
+    float boundary_error = 0.0F;
+    for (std::size_t index = settled; index < constant.size(); ++index) {
+        boundary_error = std::max(
+            boundary_error, std::abs(second[index - command_boundary] -
+                                     steady_output[index] * boundary_rotation));
+    }
+    if (boundary_error >= 2.0e-3F) {
+        throw std::runtime_error(
+            "frequency command update reset the mixer phase: " +
+            std::to_string(boundary_error));
+    }
 }
 
 [[nodiscard]] double measure_tone_gain(FrequencyTranslatingResampler &resampler,

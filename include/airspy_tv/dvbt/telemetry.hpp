@@ -102,6 +102,8 @@ struct DemodWindowTelemetry {
     std::optional<double> acquisition_fractional_cfo_hz;
     std::optional<double> acquisition_cfo_hz;
     int acquisition_carrier_bin_offset{};
+    std::optional<double> acquisition_coarse_offset_hz;
+    bool input_mirrored{};
     bool cfo_resampler_ready{};
     double cfo_command_hz{};
     double cfo_applied_hz{};

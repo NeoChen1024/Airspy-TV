@@ -20,6 +20,12 @@ float DemodStage::Impl::demod_fec_floor(
 void DemodStage::Impl::demod_process_batch(
     DemodRuntimeState &state, std::vector<PostprocessedSymbol> batch) {
     for (auto &symbol : batch) {
+        if (symbol.erased_symbols != 0) {
+            // A placeholder has nothing to measure or display; it only
+            // holds its place in the gate for the FEC hand-off below.
+            state.gate_buffer.push_back(std::move(symbol));
+            continue;
+        }
         state.mer_sum += symbol.mer_db;
         state.preprocess_time_sum += symbol.preprocess_time_ms;
         state.demap_time_sum += symbol.demap_time_ms;
@@ -45,8 +51,10 @@ void DemodStage::Impl::demod_process_batch(
                 residual_cfo_hz;
             analysis_publisher.publish(
                 symbol.carriers, symbol.mer_db, state.latest_cp_snr_db,
-                state.latest_deepest_notch_db, carrier_offset_hz, frontend.mode,
-                frontend.guard, state.decoder_parameters->constellation);
+                state.latest_deepest_notch_db, carrier_offset_hz,
+                latest.acquisition_coarse_offset_hz, latest.input_mirrored,
+                frontend.mode, frontend.guard,
+                state.decoder_parameters->constellation);
         }
         state.gate_buffer.push_back(std::move(symbol));
     }
@@ -62,10 +70,17 @@ void DemodStage::Impl::demod_process_batch(
         demod_fec_floor(state.decoder_parameters->constellation) - 2.0F;
     while (state.gate_buffer.size() >= gate_window_symbols) {
         double window_mer = 0.0;
+        std::size_t measured = 0;
         for (std::size_t i = 0; i < gate_window_symbols; ++i) {
-            window_mer += state.gate_buffer[i].mer_db;
+            if (state.gate_buffer[i].erased_symbols == 0) {
+                window_mer += state.gate_buffer[i].mer_db;
+                ++measured;
+            }
         }
-        window_mer /= static_cast<double>(gate_window_symbols);
+        // A window of placeholders alone carries no evidence either way;
+        // the erasures are forwarded and the FEC decides.
+        window_mer = measured == 0 ? static_cast<double>(floor)
+                                   : window_mer / static_cast<double>(measured);
         const bool hopeless = static_cast<float>(window_mer) < floor;
         state.hopeless_window_count =
             hopeless ? state.hopeless_window_count + 1 : 0;
@@ -106,15 +121,7 @@ void DemodStage::Impl::demod_process_batch(
         }
         if (!hopeless) {
             for (std::size_t i = 0; i < gate_window_symbols; ++i) {
-                static_cast<void>(enqueue_fec(
-                    {.kind = FecItem::Kind::symbol,
-                     .generation = state.demod_generation,
-                     .parameters = {},
-                     .mother_metrics =
-                         std::move(state.gate_buffer[i].mother_metrics),
-                     .symbol_index = state.gate_buffer[i].symbol_index,
-                     .demod_window_sequence = state.window_sequence + 1,
-                     .source_epoch = state.window_source_epoch}));
+                demod_forward_gate_symbol(state, state.gate_buffer[i]);
             }
         }
         state.gate_buffer.erase(
@@ -311,9 +318,8 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                                      : 0.5 * (diffs[diffs_count / 2 - 1] +
                                               diffs[diffs_count / 2]);
             if (tau_history_count >= tau_history_min) {
-                smoothed_sample_clock_ppm =
-                    0.1 * source_sro_estimate_ppm +
-                    0.9 * smoothed_sample_clock_ppm;
+                smoothed_sample_clock_ppm = 0.1 * source_sro_estimate_ppm +
+                                            0.9 * smoothed_sample_clock_ppm;
                 sro_estimator_ready = true;
             } else {
                 // A receiver may begin as far as 20 ppm from nominal. Waiting
@@ -378,8 +384,7 @@ DemodStage::Impl::demod_update_timing_window(DemodRuntimeState &state) {
                 latest.sro_pending_commands = scheduled.pending_sro;
             }
         }
-        if (sro_estimator_ready &&
-            std::abs(smoothed_sample_clock_ppm) >= 5.0 &&
+        if (sro_estimator_ready && std::abs(smoothed_sample_clock_ppm) >= 5.0 &&
             std::abs(timing_offset) > timing_outlier_limit_samples &&
             guard_size != 0) {
             // Frequency correction stops further timing drift but cannot undo
@@ -596,10 +601,10 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         static_cast<float>(state.channel_timing_generate_time_sum_ms);
     latest.demod_channel_timing_select_time_ms =
         static_cast<float>(state.channel_timing_select_time_sum_ms);
-    latest.demod_channel_timing_filter_time_ms = static_cast<float>(std::max(
-        0.0, state.channel_timing_time_sum_ms -
-                 state.channel_timing_generate_time_sum_ms -
-                 state.channel_timing_select_time_sum_ms));
+    latest.demod_channel_timing_filter_time_ms = static_cast<float>(
+        std::max(0.0, state.channel_timing_time_sum_ms -
+                          state.channel_timing_generate_time_sum_ms -
+                          state.channel_timing_select_time_sum_ms));
     latest.demod_channel_cir_time_ms =
         static_cast<float>(state.channel_cir_time_sum_ms);
     latest.demod_channel_interpolate_time_ms =
@@ -687,7 +692,10 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
             record.acquisition_cfo_hz = latest.acquisition_cfo_hz;
             record.acquisition_carrier_bin_offset =
                 latest.acquisition_carrier_bin_offset;
+            record.acquisition_coarse_offset_hz =
+                latest.acquisition_coarse_offset_hz;
         }
+        record.input_mirrored = latest.input_mirrored;
         if (timing_count != 0) {
             record.raw_timing_samples = latest.raw_timing_offset_samples;
             record.filtered_timing_samples = latest.timing_offset_samples;
@@ -743,8 +751,7 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
         record.cfo_rebootstrap_source_sample =
             latest.cfo_rebootstrap_source_sample;
         record.phase_discontinuities = latest.pilot_phase_discontinuities;
-        record.pilot_expected_phase_checks =
-            state.pilot_expected_phase_checks;
+        record.pilot_expected_phase_checks = state.pilot_expected_phase_checks;
         record.pilot_expected_phase_fast_accepts =
             state.pilot_expected_phase_fast_accepts;
         record.pilot_expected_phase_fallbacks =
@@ -851,6 +858,128 @@ void DemodStage::Impl::demod_reset_stats_window(DemodRuntimeState &state) {
 
 void DemodStage::Impl::demod_advance_symbol(DemodRuntimeState &state) {
     state.next_symbol_start += state.period;
+}
+
+// Hands one gate entry to the FEC stage. A placeholder becomes the same
+// number of neutral-metric symbols, so the trellis and the outer
+// deinterleaver stay aligned across a short hole; a longer one is cheaper
+// to re-synchronise after, so it closes the region instead.
+void DemodStage::Impl::demod_forward_gate_symbol(DemodRuntimeState &state,
+                                                 PostprocessedSymbol &symbol) {
+    if (symbol.erased_symbols == 0) {
+        static_cast<void>(
+            enqueue_fec({.kind = FecItem::Kind::symbol,
+                         .generation = state.demod_generation,
+                         .parameters = {},
+                         .mother_metrics = std::move(symbol.mother_metrics),
+                         .symbol_index = symbol.symbol_index,
+                         .demod_window_sequence = state.window_sequence + 1,
+                         .source_epoch = state.window_source_epoch}));
+        return;
+    }
+    if (symbol.erased_symbols > maximum_erased_symbols) {
+        static_cast<void>(
+            enqueue_fec({.kind = FecItem::Kind::end,
+                         .generation = state.demod_generation,
+                         .parameters = {},
+                         .mother_metrics = {},
+                         .symbol_index = 0,
+                         .demod_window_sequence = state.window_sequence + 1,
+                         .source_epoch = state.window_source_epoch}));
+        static_cast<void>(enqueue_fec({.kind = FecItem::Kind::begin,
+                                       .generation = state.demod_generation,
+                                       .parameters = *state.decoder_parameters,
+                                       .mother_metrics = {},
+                                       .symbol_index = 0}));
+        return;
+    }
+    const std::size_t metrics =
+        state.postprocessor->mother_metrics_per_symbol();
+    for (std::size_t index = 0; index < symbol.erased_symbols; ++index) {
+        static_cast<void>(enqueue_fec(
+            {.kind = FecItem::Kind::symbol,
+             .generation = state.demod_generation,
+             .parameters = {},
+             .mother_metrics =
+                 std::vector<std::uint8_t>(metrics, fec::neutral_soft_metric),
+             .symbol_index = 0,
+             .demod_window_sequence = state.window_sequence + 1,
+             .source_epoch = state.window_source_epoch}));
+    }
+    const std::scoped_lock guard(mutex);
+    latest.erased_symbols += symbol.erased_symbols;
+}
+
+// Accounts for source holes the frontend published ahead of the window
+// that was just read at next_symbol_start. The ring is contiguous, so every
+// position after a hole is short by its length: the symbols whose
+// transmitted span touches the hole are lost, and the grid continues at the
+// next intact symbol minus the missing samples. Carrier tracking carries
+// (the contiguity gate skips one CFO update), the expected pilot phase
+// advances by the lost count, and the FEC receives erasures in their place.
+bool DemodStage::Impl::demod_apply_gaps(DemodRuntimeState &state) {
+    bool moved = false;
+    while (true) {
+        std::optional<FrontendGapPublication> gap;
+        {
+            const std::scoped_lock guard(mutex);
+            if (pending_gaps.empty()) {
+                break;
+            }
+            const auto &front = pending_gaps.front();
+            if (front.output_sample >= state.next_symbol_start + state.period) {
+                break; // beyond the current window
+            }
+            gap = front;
+            pending_gaps.pop_front();
+        }
+        const auto start = static_cast<std::int64_t>(state.next_symbol_start);
+        const auto period = static_cast<std::int64_t>(state.period);
+        const auto hole = static_cast<std::int64_t>(gap->output_sample);
+        const auto missing = static_cast<std::int64_t>(
+            std::llround(gap->missing_resampled_samples));
+        if (hole < start) {
+            // A re-anchor already placed the grid on the far side.
+            continue;
+        }
+        // Lost symbols: those whose span [start + k*period, +period) meets
+        // the missing span [hole, hole + missing); the window being read
+        // is k = 0 and it touches the hole by construction.
+        const std::int64_t last_missing =
+            hole + std::max<std::int64_t>(missing, 1) - 1;
+        const std::int64_t lost = ((last_missing - start) / period) + 1;
+        const std::int64_t resume = start + (lost * period) - missing;
+        state.next_symbol_start = static_cast<std::uint64_t>(resume);
+        moved = true;
+        if (frontend.previous_phase >= 0) {
+            frontend.previous_phase =
+                static_cast<int>((frontend.previous_phase + lost) % 4);
+        }
+        const char *action = "pre_lock_discarded";
+        if (state.postprocessor != nullptr) {
+            state.postprocessor->submit_placeholder(
+                static_cast<std::size_t>(lost));
+            ++state.postprocessor_pending_symbols;
+            action = static_cast<std::size_t>(lost) > maximum_erased_symbols
+                         ? "fec_region_reset"
+                         : "erased";
+        } else {
+            // Symbols buffered before TPS lock derive their deinterleave
+            // parity from their distance to the lock; a hole breaks that.
+            state.pending_symbols.clear();
+        }
+        if (events_enabled()) {
+            emit_event(
+                "input_gap", DecoderEventSeverity::warning,
+                state.demod_generation, gap->output_sample, state.symbol_count,
+                {{"source_sample", gap->source_sample},
+                 {"missing_source_samples", gap->missing_source_samples},
+                 {"missing_resampled_samples", gap->missing_resampled_samples},
+                 {"lost_symbols", static_cast<std::uint64_t>(lost)},
+                 {"action", std::string(action)}});
+        }
+    }
+    return moved;
 }
 
 bool DemodStage::Impl::demod_dispatch_payload(
@@ -966,13 +1095,20 @@ void DemodStage::Impl::demod_finish_stream(DemodRuntimeState &state) {
     }
     if (!gate_buffer.empty() && decoder_parameters) {
         double window_mer = 0.0;
+        std::size_t measured = 0;
         for (const auto &symbol : gate_buffer) {
-            window_mer += symbol.mer_db;
+            if (symbol.erased_symbols == 0) {
+                window_mer += symbol.mer_db;
+                ++measured;
+            }
         }
-        window_mer /= static_cast<double>(gate_buffer.size());
+        if (measured != 0) {
+            window_mer /= static_cast<double>(measured);
+        }
         const float floor =
             demod_fec_floor(decoder_parameters->constellation) - 2.0F;
-        const bool hopeless = static_cast<float>(window_mer) < floor;
+        const bool hopeless =
+            !gate_buffer.empty() && static_cast<float>(window_mer) < floor;
         if (hopeless && !in_hopeless_region) {
             in_hopeless_region = true;
         } else if (!hopeless && in_hopeless_region) {
@@ -985,14 +1121,7 @@ void DemodStage::Impl::demod_finish_stream(DemodRuntimeState &state) {
         }
         if (!hopeless) {
             for (auto &symbol : gate_buffer) {
-                static_cast<void>(enqueue_fec(
-                    {.kind = FecItem::Kind::symbol,
-                     .generation = demod_generation,
-                     .parameters = {},
-                     .mother_metrics = std::move(symbol.mother_metrics),
-                     .symbol_index = symbol.symbol_index,
-                     .demod_window_sequence = state.window_sequence + 1,
-                     .source_epoch = state.window_source_epoch}));
+                demod_forward_gate_symbol(state, symbol);
             }
         }
         gate_buffer.clear();

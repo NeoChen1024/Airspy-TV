@@ -42,12 +42,10 @@ struct ReceiverPipeline::Impl {
     }
 
     void handle_discontinuity(const std::uint64_t dropped_samples) {
+        // The stamped timeline carries the hole to the decoder, which
+        // accounts for it in place; the stream is not reset.
         recorder.add_source_dropped_samples(dropped_samples);
         input_timeline.mark_discontinuity(dropped_samples);
-        analyzer.reset();
-        if (demodulator) {
-            demodulator->request_reset();
-        }
     }
 
     void handle_unexpected_stop() {

@@ -148,6 +148,7 @@ bool DemodStage::Impl::demod_handle_sync_change(DemodRuntimeState &state) {
         demod_reset_timing(state, 0, true);
         demod_reset_stats_window(state);
         reset_frontend_state();
+        pending_gaps.clear();
         stable_mode.reset();
         stable_guard.reset();
         if (sample_channel.snapshot().reset_requested) {

@@ -544,12 +544,15 @@ struct SampleChannel::Impl {
                 }
             }
         }
-        // Keep one guard interval behind the current FFT. Large but valid
-        // startup SRO can require the demodulator to recenter the next FFT
-        // window toward earlier samples; retaining this bounded history makes
-        // that correction possible without weakening the ring invariants.
-        ring.read_position =
-            needed >= guard_size ? needed - guard_size : std::uint64_t{0};
+        // Keep one guard interval behind the current window. Large but
+        // valid startup SRO can require the demodulator to recenter the next
+        // FFT window toward earlier samples, and an input gap published for
+        // this window moves the grid back by the missing samples (never
+        // before the window start); retaining this bounded history makes
+        // both corrections possible without weakening the ring invariants.
+        ring.read_position = next_symbol_start >= guard_size
+                                 ? next_symbol_start - guard_size
+                                 : std::uint64_t{0};
         const float copy_time_ms = duration_ms(copy_started_at);
         lock.unlock();
         ring_space.notify_all();

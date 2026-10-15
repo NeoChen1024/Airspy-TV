@@ -8,7 +8,8 @@ namespace airspy_tv::dvbt {
 void AnalysisPublisher::publish(
     const std::span<const std::complex<float>> carriers, const float mer_db,
     const float cp_snr_db, const float deepest_notch_db,
-    const float carrier_offset_hz, const TransmissionMode mode,
+    const float carrier_offset_hz, const float coarse_offset_hz,
+    const bool input_mirrored, const TransmissionMode mode,
     const GuardInterval guard_interval, const Constellation constellation) {
     SignalAnalysisSnapshot next;
     next.point_count = std::min(carriers.size(), next.points.size());
@@ -22,6 +23,8 @@ void AnalysisPublisher::publish(
     next.cp_snr_db = cp_snr_db;
     next.deepest_notch_db = deepest_notch_db;
     next.carrier_offset_hz = carrier_offset_hz;
+    next.coarse_offset_hz = coarse_offset_hz;
+    next.input_mirrored = input_mirrored;
     next.mode = mode;
     next.guard_interval = guard_interval;
     next.constellation = constellation;

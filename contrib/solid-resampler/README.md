@@ -19,8 +19,9 @@ The retained concepts are:
 
 Airspy-TV replaces liquid-dsp's input-driven mutable filter bank with a Q32.32
 output-driven scheduler. Output ranges are independent and run on a persistent
-worker pool. An optional output mixer provides phase-continuous frequency
-translation in the same output pass. Only this common resampler is included;
+worker pool. An optional input-rate mixer ahead of the FIR provides
+phase-continuous frequency translation, so an offset channel is centred before
+the anti-alias filter. Only this common resampler is included;
 liquid-dsp's buffers, logging, generic filters, FFT, modem, and other DSP
 modules are not vendored.
 

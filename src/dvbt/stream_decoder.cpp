@@ -218,6 +218,10 @@ struct StreamDecoder::Impl { // NOLINT(clang-analyzer-optin.performance.Padding)
                       [this](const FrontendBlockPublication &publication) {
                           demod_stage->publish_frontend_block(publication);
                       },
+                  .publish_gap =
+                      [this](const FrontendGapPublication &publication) {
+                          demod_stage->publish_gap(publication);
+                      },
                   .clear_fec = [this] { fec_stage->clear(); },
                   .notify_fec_cancelled =
                       [this] { fec_stage->notify_cancelled(); },

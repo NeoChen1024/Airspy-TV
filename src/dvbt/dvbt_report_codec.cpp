@@ -195,6 +195,9 @@ using nlohmann::json;
         {"fractional_cfo_hz",
          optional_number(record.acquisition_fractional_cfo_hz)},
         {"cfo_hz", optional_number(record.acquisition_cfo_hz)},
+        {"coarse_offset_hz",
+         optional_number(record.acquisition_coarse_offset_hz)},
+        {"input_mirrored", record.input_mirrored},
         {"score", json_finite_or_null(record.acquisition_score)},
         {"start", record.acquisition_start}};
     result["signal"] = {
@@ -458,13 +461,16 @@ void format_debug_telemetry(std::ostream &stream,
                 }
                 stream << std::format(
                     "  clock::frequency acquisition={:+.2f}Hz "
-                    "fractional={:+.2f}Hz bins={} estimated={:+.2f}Hz "
+                    "fractional={:+.2f}Hz bins={} coarse={:+.0f}Hz "
+                    "mirrored={} estimated={:+.2f}Hz "
                     "residual={:+.2f}Hz resampler={:+.2f}/{:+.2f}Hz "
                     "delay={} late={} pending={} rebootstrap={}/{} "
                     "last={:+.2f}Hz\n",
                     value.acquisition_cfo_hz.value_or(0.0),
                     value.acquisition_fractional_cfo_hz.value_or(0.0),
                     value.acquisition_carrier_bin_offset,
+                    value.acquisition_coarse_offset_hz.value_or(0.0),
+                    value.input_mirrored,
                     value.tracked_cfo_hz.value_or(0.0),
                     value.residual_cfo_hz.value_or(0.0), value.cfo_command_hz,
                     value.cfo_applied_hz, value.cfo_fixed_delay_samples,

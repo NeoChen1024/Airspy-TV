@@ -439,13 +439,13 @@ struct FrequencyTranslatingResampler::Impl {
                 "frequency shift requires a configured resampler");
         }
         if (!std::isfinite(frequency_hz) ||
-            std::abs(frequency_hz) >= 0.5 * config.output_rate_hz) {
+            std::abs(frequency_hz) >= 0.5 * config.input_rate_hz) {
             throw std::invalid_argument(
-                "frequency shift must be finite and inside output Nyquist");
+                "frequency shift must be finite and inside input Nyquist");
         }
         const long double normalized =
             static_cast<long double>(frequency_hz) /
-            static_cast<long double>(config.output_rate_hz);
+            static_cast<long double>(config.input_rate_hz);
         const long double rounded = std::round(normalized * q64_turn);
         if (rounded < static_cast<long double>(
                           std::numeric_limits<std::int64_t>::min()) ||
@@ -513,12 +513,10 @@ struct FrequencyTranslatingResampler::Impl {
                                          std::memory_order_relaxed);
         const double frequency_shift = static_cast<double>(
             static_cast<long double>(frequency_step) *
-            static_cast<long double>(config.output_rate_hz) / q64_turn);
+            static_cast<long double>(config.input_rate_hz) / q64_turn);
         applied_frequency_shift_hz.store(frequency_shift,
                                          std::memory_order_relaxed);
         const std::uint64_t phase_at_block_start = phase_q32;
-        const std::uint64_t frequency_phase_at_block_start =
-            frequency_phase_q64;
         if (input.size() > std::numeric_limits<std::uint32_t>::max()) {
             throw std::length_error(
                 "arbitrary resampler input exceeds Q32.32 block range");
@@ -542,9 +540,19 @@ struct FrequencyTranslatingResampler::Impl {
         }
         output.resize_for_overwrite(output_count);
 
+        // Translation happens at the input rate, ahead of the anti-alias
+        // filter, so a channel sitting away from the source centre is moved
+        // into the passband before the filter can remove it. The history
+        // therefore holds translated samples. A zero shift from a zero phase
+        // bypasses the mixer and stays bit-identical to the plain path.
+        const std::span<const std::complex<float>> filter_input =
+            frequency_step != 0 || frequency_phase_q64 != 0U
+                ? translate_input(input, frequency_step)
+                : input;
+
         std::copy(history.begin(), history.end(), boundary.begin());
         const std::size_t prefix = std::min(history.size(), input.size());
-        std::copy_n(input.begin(), prefix,
+        std::copy_n(filter_input.begin(), prefix,
                     boundary.begin() +
                         static_cast<std::ptrdiff_t>(history.size()));
         if (prefix < history.size()) {
@@ -553,13 +561,11 @@ struct FrequencyTranslatingResampler::Impl {
                       boundary.end(), std::complex<float>{});
         }
 
-        task_input = input.data();
+        task_input = filter_input.data();
         task_output = output.data();
         task_output_count = output_count;
         task_phase_q32 = phase_at_block_start;
         task_step_q32 = step;
-        task_frequency_phase_q64 = frequency_phase_at_block_start;
-        task_frequency_step_q64 = frequency_step;
 
         const std::size_t active =
             output_count < minimum_parallel_outputs
@@ -579,34 +585,48 @@ struct FrequencyTranslatingResampler::Impl {
             work_done.wait(lock, [this] { return remaining_workers == 0U; });
         }
 
-        update_history(input);
+        update_history(filter_input);
         frequency_phase_q64 +=
-            static_cast<std::uint64_t>(frequency_step) * output_count;
+            static_cast<std::uint64_t>(frequency_step) * input.size();
         return output.view();
     }
 
-    void process_range(const std::size_t begin,
-                       const std::size_t end) const noexcept {
-        const std::size_t phase_stride = tap_count * 2U;
-        const bool translate = task_frequency_step_q64 != 0;
-        std::complex<float> oscillator{1.0F, 0.0F};
-        std::complex<float> oscillator_step{1.0F, 0.0F};
+    // Multiplies the block by the Q0.64 oscillator continuing from
+    // frequency_phase_q64. The oscillator is re-seeded from the exact phase
+    // word every 512 samples so the single-precision recurrence cannot drift.
+    [[nodiscard]] std::span<const std::complex<float>>
+    translate_input(const std::span<const std::complex<float>> input,
+                    const std::int64_t frequency_step) {
         const auto phase_radians = [](const std::uint64_t word) {
             return static_cast<float>(2.0L * std::numbers::pi_v<long double> *
                                       static_cast<long double>(word) /
                                       q64_turn);
         };
-        if (translate) {
-            const std::uint64_t phase =
-                task_frequency_phase_q64 +
-                static_cast<std::uint64_t>(task_frequency_step_q64) * begin;
-            oscillator = std::polar(1.0F, phase_radians(phase));
-            oscillator_step = std::polar(
-                1.0F, static_cast<float>(
-                          2.0L * std::numbers::pi_v<long double> *
-                          static_cast<long double>(task_frequency_step_q64) /
-                          q64_turn));
+        translated.resize_for_overwrite(input.size());
+        std::complex<float> *const out = translated.data();
+        std::complex<float> oscillator =
+            std::polar(1.0F, phase_radians(frequency_phase_q64));
+        const std::complex<float> oscillator_step = std::polar(
+            1.0F, static_cast<float>(2.0L * std::numbers::pi_v<long double> *
+                                     static_cast<long double>(frequency_step) /
+                                     q64_turn));
+        for (std::size_t index = 0; index < input.size(); ++index) {
+            out[index] = input[index] * oscillator;
+            oscillator *= oscillator_step;
+            if ((index & 511U) == 511U) {
+                oscillator = std::polar(
+                    1.0F,
+                    phase_radians(frequency_phase_q64 +
+                                  static_cast<std::uint64_t>(frequency_step) *
+                                      (index + 1U)));
+            }
         }
+        return translated.view();
+    }
+
+    void process_range(const std::size_t begin,
+                       const std::size_t end) const noexcept {
+        const std::size_t phase_stride = tap_count * 2U;
         for (std::size_t output_index = begin; output_index < end;
              ++output_index) {
             const std::uint64_t position =
@@ -622,20 +642,8 @@ struct FrequencyTranslatingResampler::Impl {
             } else {
                 window = task_input + source - history.size();
             }
-            const auto filtered = dot_product(
+            task_output[output_index] = dot_product(
                 window, coefficients.data() + phase * phase_stride, tap_count);
-            task_output[output_index] =
-                translate ? filtered * oscillator : filtered;
-            if (translate) {
-                oscillator *= oscillator_step;
-                if (((output_index - begin) & 511U) == 511U) {
-                    const std::uint64_t next_phase =
-                        task_frequency_phase_q64 +
-                        static_cast<std::uint64_t>(task_frequency_step_q64) *
-                            (output_index + 1U);
-                    oscillator = std::polar(1.0F, phase_radians(next_phase));
-                }
-            }
         }
     }
 
@@ -707,6 +715,7 @@ struct FrequencyTranslatingResampler::Impl {
     std::vector<float> coefficients;
     std::vector<std::complex<float>> history;
     std::vector<std::complex<float>> boundary;
+    OutputBuffer translated;
     OutputBuffer output;
     std::atomic<double> requested_ratio_{};
     std::atomic<double> max_slew_rate_ppm_per_second{};
@@ -734,8 +743,6 @@ struct FrequencyTranslatingResampler::Impl {
     std::size_t task_output_count{};
     std::uint64_t task_phase_q32{};
     std::uint64_t task_step_q32{};
-    std::uint64_t task_frequency_phase_q64{};
-    std::int64_t task_frequency_step_q64{};
 };
 
 FrequencyTranslatingResampler::FrequencyTranslatingResampler(

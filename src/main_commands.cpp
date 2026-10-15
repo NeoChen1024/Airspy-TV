@@ -140,7 +140,9 @@ int inspect_iq_cli(const std::filesystem::path &path,
                   << " dB, mer=" << analysis.mer_db
                   << " dB, channel-notch=" << analysis.deepest_notch_db
                   << " dB, carrier-offset=" << analysis.carrier_offset_hz
-                  << " Hz, constellation=";
+                  << " Hz (coarse " << analysis.coarse_offset_hz << " Hz), iq="
+                  << (analysis.input_mirrored ? "mirrored" : "upright")
+                  << ", constellation=";
         switch (analysis.constellation) {
         case dvbt::Constellation::qpsk:
             std::cout << "QPSK";

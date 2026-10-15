@@ -31,6 +31,11 @@ struct FrontendAcquisitionPublication {
     float resampled_rate_hz{};
     float initial_cfo_hz{};
     float initial_fractional_cfo_hz{};
+    // Channel centre found in the source spectrum before acquisition; zero
+    // when the channel was close enough to the centre for acquisition alone.
+    float coarse_offset_hz{};
+    // The source is conjugated ahead of the mixer.
+    bool mirrored{};
     std::uint64_t bootstrap_attempts{};
     std::uint64_t bootstrap_replayed_input_samples{};
     std::uint64_t bootstrap_retained_peak_samples{};
@@ -44,6 +49,20 @@ struct FrontendCommandPublication {
     std::optional<ClockControlTimeline::CfoCommand> cfo;
     std::size_t pending_sro{};
     std::size_t pending_cfo{};
+};
+
+// A hole in the stamped source timeline inside one generation: the block
+// that follows it begins `missing_source_samples` after the previous block
+// ended. The ring stays contiguous, so `output_sample` (the ring write
+// position when the gap was found) is where the demodulator must account for
+// `missing_resampled_samples` that never existed.
+struct FrontendGapPublication {
+    std::uint64_t generation{};
+    std::uint64_t stream_epoch{};
+    std::uint64_t source_sample{};
+    std::uint64_t missing_source_samples{};
+    std::uint64_t output_sample{};
+    double missing_resampled_samples{};
 };
 
 struct FrontendBlockPublication {
@@ -82,6 +101,7 @@ class FrontendStage {
             publish_acquisition;
         std::function<void(const FrontendCommandPublication &)> publish_command;
         std::function<void(const FrontendBlockPublication &)> publish_block;
+        std::function<void(const FrontendGapPublication &)> publish_gap;
         std::function<void()> clear_fec;
         std::function<void()> notify_fec_cancelled;
         std::function<void(std::exception_ptr, std::string)> worker_failure;

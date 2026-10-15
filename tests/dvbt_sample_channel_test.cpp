@@ -1,5 +1,5 @@
-#include "sample_channel.hpp"
 #include "absolute_sample_ring.hpp"
+#include "sample_channel.hpp"
 
 #include <array>
 #include <atomic>
@@ -83,11 +83,19 @@ bool test_queue_ring_and_lifecycle() {
     std::array<std::complex<float>, 4> recovered{};
     const auto read = channel.read_symbol(1, 0, recovered.size(), 0, false,
                                           std::span{recovered});
+    // The window just read stays retained (a published input gap may move
+    // the grid back into it); everything before it is released.
     if (!require(read.status == SampleChannel::WaitStatus::ready &&
                      recovered == samples,
                  "ring read preserves sample order") ||
-        !require(channel.snapshot().ring_used_samples == 0,
-                 "ring read advances the absolute consumer position")) {
+        !require(channel.read_position() == 0 &&
+                     channel.snapshot().ring_used_samples == samples.size(),
+                 "ring read releases only data before the current window")) {
+        return false;
+    }
+    channel.discard_all();
+    if (!require(channel.snapshot().ring_used_samples == 0,
+                 "discarding releases the retained window")) {
         return false;
     }
 

@@ -26,6 +26,10 @@ struct SignalAnalysisSnapshot {
     float cp_snr_db{};
     float deepest_notch_db{};
     float carrier_offset_hz{};
+    // Channel centre located in the source spectrum (part of
+    // carrier_offset_hz), and whether the pilots only lined up mirrored.
+    float coarse_offset_hz{};
+    bool input_mirrored{};
     TransmissionMode mode{TransmissionMode::k8};
     GuardInterval guard_interval{GuardInterval::gi_1_4};
     Constellation constellation{Constellation::qam64};

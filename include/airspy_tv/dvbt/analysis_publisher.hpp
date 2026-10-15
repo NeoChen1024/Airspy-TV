@@ -16,7 +16,8 @@ class AnalysisPublisher {
   public:
     void publish(std::span<const std::complex<float>> carriers, float mer_db,
                  float cp_snr_db, float deepest_notch_db,
-                 float carrier_offset_hz, TransmissionMode mode,
+                 float carrier_offset_hz, float coarse_offset_hz,
+                 bool input_mirrored, TransmissionMode mode,
                  GuardInterval guard_interval, Constellation constellation);
     void reset();
     void set_smoothing(bool enabled, int speed);

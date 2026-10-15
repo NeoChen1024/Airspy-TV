@@ -393,7 +393,8 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
                     "same common resampler independently of SRO. The third "
                     "displayed value is residual CFO; the bar uses applied "
                     "CFO only.\n"
-                    "Acquisition fractional %+.2f Hz, integer bins %+d.\n"
+                    "Acquisition fractional %+.2f Hz, integer bins %+d, "
+                    "coarse channel offset %+.0f Hz, input %s.\n"
                     "Estimated %+.2f Hz, residual %+.2f Hz, command %+.2f Hz.\n"
                     "Bootstrap attempts %llu, replayed %llu samples, retained "
                     "peak %llu samples.\n"
@@ -404,6 +405,9 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
                     "target %llu, actual %llu.",
                     state.frame.dvbt.decoder.acquisition_fractional_cfo_hz,
                     state.frame.dvbt.decoder.acquisition_carrier_bin_offset,
+                    state.frame.dvbt.decoder.acquisition_coarse_offset_hz,
+                    state.frame.dvbt.decoder.input_mirrored ? "mirrored"
+                                                            : "upright",
                     state.frame.dvbt.decoder.tracked_carrier_offset_hz,
                     state.frame.dvbt.decoder.residual_carrier_offset_hz,
                     state.frame.dvbt.decoder.cfo_resampler_command_hz,

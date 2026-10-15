@@ -35,9 +35,18 @@ so GNU Radio appears only as an offline test fixture.
   carrier offset, pre-/post-Viterbi BER, and decoder/CPU queue diagnostics.
 - Native 2K/8K DVB-T demodulation with QPSK, 16-QAM, 64-QAM, all
   non-hierarchical code rates, soft Viterbi, and RS(204,188) decoding.
+- Source conditioning at startup: a channel recorded or tuned away from the
+  source centre is located in the spectrum and translated ahead of the
+  anti-alias filter, a stream with I and Q swapped is detected from the pilot
+  pattern and conjugated, and for an off-centre channel a slow DC offset is
+  removed before mixing.
 - BCH-validated TPS discovery of transmission mode, guard interval,
   constellation, and high-priority code rate, with manual overrides for
   testing.
+- Live input holes (reported Airspy drops or blocks refused by a full input
+  queue) are measured from the sample timeline rather than re-acquired: the
+  lost OFDM symbols are replaced by FEC erasures so the outer interleaver stays
+  aligned and the transport stream resumes right after the hole.
 - Embedded libmpv video/audio playback rendered into the application OpenGL
   surface, with service selection, volume, and mute controls.
 - Sidebar EPG now/next guide for the selected service, decoded from EIT

@@ -4,6 +4,7 @@
 #include "airspy_tv/dvbt/ofdm_acquisition.hpp"
 #include "airspy_tv/dvbt/soft_demapper.hpp"
 #include "airspy_tv/fec/reed_solomon.hpp"
+#include "airspy_tv/sample_timeline.hpp"
 #include <fftw3.h>
 
 #include <algorithm>
@@ -303,8 +304,8 @@ payload_indices(const std::size_t phase) {
 
 [[nodiscard]] constexpr std::array<std::uint8_t, 68> make_tps_frame() {
     std::array<std::uint8_t, 68> bits{};
-    constexpr std::array<std::uint8_t, 16> sync_even{
-        0, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0};
+    constexpr std::array<std::uint8_t, 16> sync_even{0, 0, 1, 1, 0, 1, 0, 1,
+                                                     1, 1, 1, 0, 1, 1, 1, 0};
     for (std::size_t index = 0; index < sync_even.size(); ++index) {
         bits[1 + index] = sync_even[index];
     }
@@ -320,9 +321,9 @@ payload_indices(const std::size_t phase) {
         const unsigned int feedback = (data ^ reg) & 1U;
         reg >>= 1U;
         reg |= feedback << 13U;
-        reg ^= (feedback << 12U) ^ (feedback << 11U) ^
-               (feedback << 9U) ^ (feedback << 8U) ^
-               (feedback << 7U) ^ (feedback << 5U) ^ (feedback << 4U);
+        reg ^= (feedback << 12U) ^ (feedback << 11U) ^ (feedback << 9U) ^
+               (feedback << 8U) ^ (feedback << 7U) ^ (feedback << 5U) ^
+               (feedback << 4U);
     }
     for (std::size_t bit = 0; bit < 14; ++bit) {
         bits[54 + bit] = static_cast<std::uint8_t>((reg >> bit) & 1U);
@@ -344,8 +345,7 @@ constexpr auto tps_frame = make_tps_frame();
 
 [[nodiscard]] std::vector<std::int16_t>
 make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F,
-        const bool valid_tps = false,
-        const std::size_t total_symbols = symbols,
+        const bool valid_tps = false, const std::size_t total_symbols = symbols,
         const std::size_t tps_start_symbol = 0) {
     const MaxLogDemapper demapper{Constellation::qpsk};
     const SymbolDeinterleaver symbol_permutation{TransmissionMode::k8};
@@ -366,10 +366,9 @@ make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F,
                   reinterpret_cast<float *>(frequency) + (2 * fft_size), 0.0F);
         const std::size_t phase = symbol % 4;
         const auto payload = payload_indices(phase);
-        const auto symbol_metrics =
-            metrics.subspan((symbol % symbols) * payload_carriers *
-                                bits_per_carrier,
-                            payload_carriers * bits_per_carrier);
+        const auto symbol_metrics = metrics.subspan(
+            (symbol % symbols) * payload_carriers * bits_per_carrier,
+            payload_carriers * bits_per_carrier);
         const auto bit_metrics = bit_interleave(symbol_metrics);
         const auto transmitted =
             symbol_interleave(bit_metrics, symbol_permutation, symbol);
@@ -384,8 +383,8 @@ make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F,
             if (continual || scattered) {
                 value = pilot_value(carrier);
             } else if (tps && valid_tps && symbol >= tps_start_symbol) {
-                value = pilot_value(carrier) *
-                        tps_sign(symbol - tps_start_symbol);
+                value =
+                    pilot_value(carrier) * tps_sign(symbol - tps_start_symbol);
             } else if (!tps) {
                 std::size_t label = 0;
                 for (std::size_t bit = 0; bit < bits_per_carrier; ++bit) {
@@ -416,8 +415,7 @@ make_iq(const std::span<const float> metrics, const float payload_gain = 1.0F,
             // A small, CP-only impairment on later prefixes makes the
             // acquisition score prefer that anchor instead of choosing an
             // arbitrary equal-score symbol at the end of an ideal capture.
-            if (symbol != 0 &&
-                (!valid_tps || symbol < tps_start_symbol)) {
+            if (symbol != 0 && (!valid_tps || symbol < tps_start_symbol)) {
                 const float noise =
                     0.002F * std::sin((static_cast<float>(index) * 0.071F) +
                                       static_cast<float>(symbol));
@@ -564,6 +562,35 @@ void submit_in_blocks(StreamDecoder &decoder,
     }
 }
 
+// Submits the stream with its own stamped timeline, leaving out
+// [gap_begin, gap_begin + gap_length) complex samples and reporting that
+// loss to the timeline the way a source-reported drop does.
+void submit_with_gap(StreamDecoder &decoder,
+                     const std::span<const std::int16_t> iq,
+                     const std::span<const std::size_t> block_sizes,
+                     const std::size_t gap_begin,
+                     const std::size_t gap_length) {
+    airspy_tv::InputSampleTimeline timeline;
+    timeline.begin_stream(sample_rate);
+    const auto submit = [&](const std::size_t begin, const std::size_t end) {
+        std::size_t offset = begin;
+        std::size_t block = 0;
+        while (offset < end) {
+            const std::size_t count =
+                std::min(block_sizes[block % block_sizes.size()], end - offset);
+            decoder.submit_blocking(iq.subspan(offset * 2, count * 2),
+                                    sample_rate, channel_bandwidth,
+                                    timeline.stamp(count, sample_rate));
+            offset += count;
+            ++block;
+        }
+    };
+    const std::size_t total = iq.size() / 2;
+    submit(0, gap_begin);
+    timeline.mark_discontinuity(gap_length);
+    submit(gap_begin + gap_length, total);
+}
+
 [[nodiscard]] bool has_known_run(const std::span<const std::uint8_t> output,
                                  const std::span<const std::uint8_t> expected) {
     constexpr std::size_t trellis_warmup_packets = 8;
@@ -612,6 +639,91 @@ decode_in_blocks(const std::span<const std::int16_t> iq,
         result.signal = decoder.signal_snapshot();
     }
     return result;
+}
+
+// A hole in the stamped source timeline is applied from the stamps: the
+// lost symbols become FEC erasures, the FEC region is not reset, and the
+// transport stream before and after the hole is the reference stream.
+void test_8k_input_gap_keeps_fec_alignment() {
+    const auto encoded = encode_transport();
+    constexpr std::size_t repetitions = 4;
+    const auto iq = repeat_iq(make_iq(encoded.metrics), repetitions);
+    constexpr std::array<std::size_t, 5> block_sizes{4097, 12345, 8191, 777,
+                                                     16384};
+    const auto reference = decode_in_blocks(iq, block_sizes, 4);
+    require(has_known_run(reference.transport, encoded.transport),
+            "gap reference produced no known TS run");
+
+    // 1.46 symbols starting inside symbol 100 (the second repetition).
+    constexpr std::size_t gap_begin = (100 * symbol_size) + 3000;
+    constexpr std::size_t gap_length = 15000;
+    DecodeResult result;
+    std::mutex callback_mutex;
+    {
+        StreamDecoder decoder;
+        decoder.set_parameters({.channel_bandwidth_hz = channel_bandwidth,
+                                .mode = TransmissionMode::k8,
+                                .guard_interval = GuardInterval::gi_1_4,
+                                .constellation = Constellation::qpsk,
+                                .code_rate = CodeRate::rate_1_2,
+                                .worker_threads = 4});
+        decoder.set_transport_callback(
+            [&](const std::span<const std::uint8_t> output) {
+                const std::scoped_lock lock(callback_mutex);
+                result.transport.insert(result.transport.end(), output.begin(),
+                                        output.end());
+            });
+        decoder.set_discontinuity_callback(
+            [&](const TransportDiscontinuity discontinuity) {
+                const std::scoped_lock lock(callback_mutex);
+                result.discontinuities.push_back(discontinuity);
+            });
+        submit_with_gap(decoder, iq, block_sizes, gap_begin, gap_length);
+        decoder.flush();
+        decoder.wait_until_idle();
+        result.stats = decoder.stats();
+    }
+
+    require(result.stats.input_gaps == 1, "the input gap was not counted");
+    require(result.stats.input_gap_source_samples == gap_length,
+            "the input gap length was not taken from the stamps");
+    // A 1.46-symbol hole touches two symbols, or three when it starts near
+    // the end of one.
+    require(result.stats.erased_symbols >= 2 &&
+                result.stats.erased_symbols <= 3,
+            "the lost symbols were not erased");
+    // The reference stream ends with stream_end and the region reset of the
+    // flushed decoder; a short input gap must not add a reset or a retune.
+    require(result.discontinuities == reference.discontinuities,
+            "a short input gap changed the transport discontinuity sequence");
+
+    // The output before the hole is the reference prefix; after the trellis
+    // and the outer deinterleaver have flushed the erasures (a bounded span
+    // of packets), the output is the reference suffix again.
+    constexpr std::size_t gap_packet =
+        (gap_begin / symbol_size) * packet_count / symbols;
+    constexpr std::size_t damage_bound_packets = 60;
+    const std::size_t prefix =
+        std::min(result.transport.size(), reference.transport.size());
+    std::size_t common_prefix = 0;
+    while (common_prefix < prefix && result.transport[common_prefix] ==
+                                         reference.transport[common_prefix]) {
+        ++common_prefix;
+    }
+    require(common_prefix >=
+                (gap_packet - damage_bound_packets) * ts_packet_size,
+            "transport before the input gap diverged from the reference");
+    std::size_t common_suffix = 0;
+    while (common_suffix < prefix &&
+           result.transport[result.transport.size() - 1 - common_suffix] ==
+               reference
+                   .transport[reference.transport.size() - 1 - common_suffix]) {
+        ++common_suffix;
+    }
+    require(common_suffix +
+                    ((gap_packet + damage_bound_packets) * ts_packet_size) >=
+                reference.transport.size(),
+            "transport after the input gap did not resume on the reference");
 }
 
 void test_8k_queue_capacity_multiplier() {
@@ -664,12 +776,12 @@ void test_8k_clean_signal() {
     require(result.stats.timing_confidence > 0.0F &&
                 result.stats.timing_confidence <= 1.0F,
             "timing confidence is outside its normalized range");
-    require(std::abs(result.stats.timing_confidence -
-                     static_cast<float>(
-                         result.stats.timing_accepted_measurements) /
-                         static_cast<float>(result.stats.timing_measurements)) <
-                1.0e-6F,
-            "timing confidence does not match measurement acceptance");
+    require(
+        std::abs(result.stats.timing_confidence -
+                 static_cast<float>(result.stats.timing_accepted_measurements) /
+                     static_cast<float>(result.stats.timing_measurements)) <
+            1.0e-6F,
+        "timing confidence does not match measurement acceptance");
     require(result.analysis.locked &&
                 result.analysis.source == SignalAnalysisSource::demodulator,
             "GUI analysis did not switch to production demod telemetry");
@@ -961,8 +1073,8 @@ void test_8k_automatic_manual_transitions() {
     constexpr std::array<std::size_t, 5> block_sizes{4097, 8191, 12345, 777,
                                                      16384};
     constexpr std::size_t tps_preamble_symbols = 40;
-    constexpr std::size_t transition_symbols = tps_preamble_symbols +
-                                                (2 * symbols);
+    constexpr std::size_t transition_symbols =
+        tps_preamble_symbols + (2 * symbols);
     constexpr std::array<std::uint8_t, 4> salts{0x11, 0x43, 0x79, 0xB5};
 
     std::vector<std::uint8_t> output;
@@ -1020,9 +1132,8 @@ void test_8k_automatic_manual_transitions() {
             boundary = output.size();
         }
         const auto encoded = encode_transport(salts[phase]);
-        const auto iq =
-            make_iq(encoded.metrics, 1.0F, true, transition_symbols,
-                    tps_preamble_symbols);
+        const auto iq = make_iq(encoded.metrics, 1.0F, true, transition_symbols,
+                                tps_preamble_symbols);
         if (phase == 0) {
             const auto resampled = airspy_tv::dvbt::resample_cs16(
                 iq, sample_rate, channel_bandwidth, 2);
@@ -1043,11 +1154,11 @@ void test_8k_automatic_manual_transitions() {
         submit_in_blocks(decoder, iq, block_sizes);
 
         std::unique_lock lock(callback_mutex);
-        const bool decoded = callback_changed.wait_for(
-            lock, std::chrono::seconds(30), [&] {
-                return has_known_run(std::span<const std::uint8_t>{output}
-                                         .subspan(boundary),
-                                     encoded.transport);
+        const bool decoded =
+            callback_changed.wait_for(lock, std::chrono::seconds(30), [&] {
+                return has_known_run(
+                    std::span<const std::uint8_t>{output}.subspan(boundary),
+                    encoded.transport);
             });
         if (!decoded) {
             const auto stats = decoder.stats();
@@ -1124,10 +1235,9 @@ void test_8k_submit_reset_stress() {
         for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
             operation_start.arrive_and_wait();
             state = state * 1664525U + 1013904223U;
-            const std::size_t begin =
-                (static_cast<std::size_t>(state) %
-                 (iq.size() / 2U - symbol_size)) *
-                2U;
+            const std::size_t begin = (static_cast<std::size_t>(state) %
+                                       (iq.size() / 2U - symbol_size)) *
+                                      2U;
             decoder.submit(std::span<const std::int16_t>{iq}.subspan(
                                begin, symbol_size * 2U),
                            sample_rate, channel_bandwidth);
@@ -1163,10 +1273,10 @@ void test_8k_submit_reset_stress() {
     decoder.wait_until_idle();
 
     const std::scoped_lock lock(callback_mutex);
-    require(has_known_run(
-                std::span<const std::uint8_t>{output}.subspan(boundary),
-                encoded.transport),
-            "decoder did not recover after submit/reset stress");
+    require(
+        has_known_run(std::span<const std::uint8_t>{output}.subspan(boundary),
+                      encoded.transport),
+        "decoder did not recover after submit/reset stress");
     require(decoder.stats().queued_blocks == 0,
             "finite producer did not drain before lifecycle completion");
 }
@@ -1309,6 +1419,7 @@ int main() {
             }
         };
         run("clean", test_8k_clean_signal);
+        run("input-gap", test_8k_input_gap_keeps_fec_alignment);
         run("cfo-centering", test_8k_frontend_cfo_centering);
         run("cfo-drift", test_8k_frontend_cfo_drift_tracking);
         run("cfo-rebootstrap", test_8k_frontend_abrupt_cfo_rebootstrap);

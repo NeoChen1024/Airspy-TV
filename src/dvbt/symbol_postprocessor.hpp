@@ -4,6 +4,9 @@ struct PostprocessedSymbol {
     std::vector<float> reliabilities;
     std::vector<std::uint8_t> mother_metrics;
     std::size_t symbol_index{};
+    // Non-zero marks a placeholder for that many OFDM symbols the source
+    // never delivered; it carries no carriers, metrics, or MER.
+    std::size_t erased_symbols{};
     float mer_db{};
     float preprocess_time_ms{};
     float demap_time_ms{};
@@ -83,6 +86,32 @@ class SymbolPostprocessorPool {
             tasks_.push_back(std::move(task));
         }
         task_ready_.notify_one();
+    }
+
+    // Queues a placeholder for `erased_symbols` missing symbols at the
+    // current position of the ordered stream; it is ready immediately.
+    void submit_placeholder(const std::size_t erased_symbols) {
+        {
+            std::unique_lock lock(mutex_);
+            space_available_.wait(lock, [this] {
+                return stopping_ || worker_error_ ||
+                       outstanding_ < maximum_queued_;
+            });
+            rethrow_worker_error();
+            if (stopping_) {
+                return;
+            }
+            ++outstanding_;
+            PostprocessedSymbol placeholder;
+            placeholder.erased_symbols = erased_symbols;
+            completed_.emplace(next_sequence_++, std::move(placeholder));
+        }
+        finished_.notify_all();
+    }
+
+    [[nodiscard]] std::size_t mother_metrics_per_symbol() const noexcept {
+        return depunctured_size(
+            payload_carrier_count(mode_) * bits_per_carrier_, code_rate_);
     }
 
     [[nodiscard]]
