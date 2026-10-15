@@ -95,6 +95,7 @@ endif()
 add_library(airspy-tv-dvbt STATIC
     src/dvbt/analysis_publisher.cpp
     src/dvbt/channel_locator.cpp
+    src/dvbt/channel_profile.cpp
     src/dvbt/clock_control_timeline.cpp
     src/dvbt/decoder.cpp
     src/dvbt/demod_dsp.cpp

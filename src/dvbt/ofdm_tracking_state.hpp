@@ -47,4 +47,10 @@ struct OfdmTrackingState {
     std::size_t cir_n{0};
     float cir_offset{0.0F};
     int cir_symbol_count{0};
+    // Channel profile measurement for the run report (see
+    // ChannelProfiler); `symbol_contiguous` and `symbol_start` describe
+    // the symbol currently being processed.
+    ChannelProfiler profiler;
+    bool symbol_contiguous{false};
+    std::uint64_t symbol_start{0};
 };

@@ -23,6 +23,7 @@ REPORT_DIR/
   dvbt-demod.jsonl
   dvbt-fec.jsonl
   events.jsonl
+  dvbt-channel.jsonl
 ```
 
 Each JSONL file contains exactly one record schema. Different subsystems or
@@ -245,6 +246,7 @@ The first report version uses these homogeneous streams:
 | `dvbt-demod.jsonl` | `demod_window` | one stats window completes | Lock, RF/OFDM quality, CFO/SRO/timing state, and demod/symbol timing |
 | `dvbt-fec.jsonl` | `fec_window` | a numbered stats marker reaches FEC | FEC timing, session identity, output deltas, BER, RS, TEI, and sync state |
 | `events.jsonl` | `decoder_event` | a diagnostic state transition occurs | Acquisition, lock, fade, phase, timing-rejection, and FEC-gating events |
+| `dvbt-channel.jsonl` | `channel_profile` | one TPS frame of channel responses completes | Pilot-based power delay profile, per-tap Doppler and coherence, delay spread |
 
 Run lifecycle belongs in `manifest.json` and `stats.json`. Per-source lifecycle
 and configuration belong in the homogeneous `source_session` stream, not as
@@ -471,6 +473,53 @@ it is valid:
 
 Unavailable measurements are `null`, not magic zero values. Enum values and
 states are stable lowercase strings rather than implementation ordinals.
+
+### Channel profile
+
+`channel_profile` records describe the propagation channel once per TPS frame
+(68 symbols) while the demodulator is pilot-locked. Each group of four
+consecutive symbols places scattered pilots on every third carrier; their
+channel responses are Hann-windowed, zero-padded and inverse-transformed into
+one impulse response that is unambiguous over `delay_window_us` (Tu/3) with
+`delay_resolution_us` per bin. The frame's responses (`response_count`,
+normally 17) are averaged into a power delay profile, and the complex
+correlation of consecutive responses (`response_pair_count` pairs, spaced
+`response_interval_us` apart) gives the per-tap time variation.
+
+- `taps`: local maxima of the profile that are at least 30 dB below the
+  strongest tap and 6 dB above the median bin, strongest first, at most 16.
+  `delay_us` is relative to the FFT window anchor, so the strongest tap sits a
+  few microseconds after zero (the window is anchored inside the guard
+  interval) and a pre-echo can be negative. `power_db` is relative to the
+  strongest tap. `doppler_hz` is the tap's phase rotation rate; the CFO loop
+  removes the common frequency offset, so values are relative to the tracked
+  carrier and are unambiguous up to half the response rate (about ±84 Hz for
+  8K with a 1/4 guard). `coherence` is the normalized magnitude of that
+  correlation: 1 for a path whose amplitude is stable over one response
+  interval, lower for fading or Doppler spread inside the bin. Both are `null`
+  when the frame held fewer than two contiguous responses.
+- `rms_delay_spread_us` and `max_excess_delay_us` are computed over every bin
+  above the tap threshold; `main_tap_energy_share` is the fraction of that
+  energy inside the Hann main lobe around the strongest tap.
+- `noise_floor_db` is the median bin relative to the strongest tap; it bounds
+  the weakest echo the profile can show.
+
+A gain or phase mismatch between the four interleaved symbols folds energy
+into images at multiples of Tu/12; taps near those delays with the same
+Doppler as the main tap should be read with that in mind. The Hann window's
+first sidelobe sits about 0.4 µs from a strong tap at roughly -27 dB, so a
+weak tap at that spacing is usually the window, not a path.
+
+`tools/summarize_channel_profile.py REPORT_DIR...` condenses the stream into
+one profile per recording (`airspy-tv-channel-profile/0`): each frame's taps
+are re-referenced to the earliest tap within 3 dB of the strongest (so a late
+echo that briefly outgrows the direct path, or the FFT window anchor moving
+between frames, does not shift the delay origin), clustered by relative delay,
+and every cluster present in at least 20 % of frames becomes a tap with its
+median delay, median and p10/p90 power, presence fraction, relative Doppler
+and coherence. The `statistics` block carries the per-frame delay-spread and
+main-tap-share quantiles. Without a `.jsonl` argument it reads
+`dvbt-channel.jsonl` from each report directory.
 
 ## Source-session correlation
 

@@ -297,6 +297,9 @@ In GUI mode the report starts with the first opened source and is finalized at
 application shutdown. Each I/Q replay, source reopen, sample-rate restart, or
 retune appends one final record to `source-sessions.jsonl`; `stats.json` remains
 a run-wide summary. The directory must be absent or empty when the run starts.
+The report also carries a pilot-based channel profile (delay taps, Doppler,
+coherence) once per TPS frame; `tools/summarize_channel_profile.py DIR...`
+condenses one or more reports into per-recording multipath profiles.
 
 ## Decoder architecture
 

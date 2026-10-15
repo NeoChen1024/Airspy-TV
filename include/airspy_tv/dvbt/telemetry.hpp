@@ -9,6 +9,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace airspy_tv::dvbt {
@@ -193,8 +194,41 @@ struct DecoderEventTelemetry {
     DecoderEventFields fields;
 };
 
+// One resolved path of the pilot-based channel impulse response. Power is
+// relative to the strongest tap; Doppler and coherence come from the
+// complex correlation of consecutive responses and are absent when the
+// frame held fewer than two contiguous responses.
+struct ChannelProfileTap {
+    double delay_us{};
+    double power_db{};
+    std::optional<double> doppler_hz;
+    std::optional<double> coherence;
+};
+
+// Per-TPS-frame channel profile: a power delay profile averaged over the
+// frame's scattered-pilot channel responses plus the per-tap time
+// variation. Delays are relative to the FFT window anchor, so a path that
+// arrives before the anchor has a negative delay.
+struct ChannelProfileTelemetry {
+    TelemetryEnvelope envelope;
+    std::uint64_t resampled_begin_sample{};
+    std::uint64_t resampled_end_sample{};
+    std::uint32_t symbol_count{};
+    std::uint32_t response_count{};
+    std::uint32_t response_pair_count{};
+    double delay_window_us{};
+    double delay_resolution_us{};
+    double response_interval_us{};
+    double noise_floor_db{};
+    double rms_delay_spread_us{};
+    double max_excess_delay_us{};
+    double main_tap_energy_share{};
+    std::vector<ChannelProfileTap> taps;
+};
+
 using TelemetryRecord =
     std::variant<FrontendBlockTelemetry, DemodWindowTelemetry,
-                 FecWindowTelemetry, DecoderEventTelemetry>;
+                 FecWindowTelemetry, DecoderEventTelemetry,
+                 ChannelProfileTelemetry>;
 
 } // namespace airspy_tv::dvbt

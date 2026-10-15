@@ -101,8 +101,9 @@ void DemodStage::Impl::demod_execute_fft_and_measure_cfo(
         current_continual.resize(continual_indices.size());
     }
     for (std::size_t index = 0; index < continual_indices.size(); ++index) {
-        current_continual[index] = active_carrier(
-            fft_out, continual_indices[index], maximum, frontend.carrier_offset);
+        current_continual[index] =
+            active_carrier(fft_out, continual_indices[index], maximum,
+                           frontend.carrier_offset);
     }
     float residual_phase = 0.0F;
     fade_indicator = 1.0F; // Only update the CFO loop from a
@@ -158,6 +159,11 @@ void DemodStage::Impl::demod_execute_fft_and_measure_cfo(
                 (0.1F * residual_phase) + (0.9F * frontend.residual_phase_ema);
         }
     }
+    frontend.symbol_contiguous =
+        frontend.have_previous_continual &&
+        start ==
+            frontend.last_symbol_start + static_cast<std::uint64_t>(period);
+    frontend.symbol_start = start;
     frontend.last_symbol_start = start;
     frontend.previous_continual.swap(current_continual);
     frontend.have_previous_continual = true;
@@ -324,8 +330,7 @@ DemodStage::Impl::demod_lock_pilots(DemodRuntimeState &state) {
             } else {
                 ++state.pilot_expected_phase_fallbacks;
                 lock = PilotLock{lock_phase_at_offset(
-                                     fft_out, maximum,
-                                     frontend.carrier_offset,
+                                     fft_out, maximum, frontend.carrier_offset,
                                      timing_tracker.filtered()),
                                  frontend.carrier_offset};
                 if (events_enabled()) {
@@ -339,8 +344,9 @@ DemodStage::Impl::demod_lock_pilots(DemodRuntimeState &state) {
                           static_cast<std::int64_t>(lock.phase)},
                          {"confidence",
                           static_cast<double>(expected_score.confidence)},
-                         {"threshold", static_cast<double>(
-                                           expected_phase_confidence_threshold)}});
+                         {"threshold",
+                          static_cast<double>(
+                              expected_phase_confidence_threshold)}});
                 }
             }
         }
@@ -455,6 +461,14 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
     state.channel_pilot_time_sum_ms += duration_ms(channel_stage_started_at);
 
     channel_stage_started_at = std::chrono::steady_clock::now();
+    frontend.profiler.add_symbol(
+        channel, lock.phase, frontend.symbol_contiguous, frontend.symbol_start);
+    if (auto profile = frontend.profiler.take_frame()) {
+        emit_channel_profile(state.demod_generation, std::move(*profile));
+    }
+    state.channel_cir_time_sum_ms += duration_ms(channel_stage_started_at);
+
+    channel_stage_started_at = std::chrono::steady_clock::now();
     if ((symbol_count % analysis_interval_symbols) == 0U) {
         latest_deepest_notch_db = estimate_channel_notch_db(
             channel, static_cast<std::size_t>(lock.phase), maximum);
@@ -472,11 +486,9 @@ DemodStage::Impl::demod_estimate_channel(DemodRuntimeState &state,
     const bool timing_recovery =
         state.tau_history_count < DemodRuntimeState::tau_history_min ||
         fade_indicator <= 0.5F || state.hopeless_window_count != 0 ||
-        state.frozen_symbol_count != 0 ||
-        state.cfo_recovery_symbol_count != 0;
+        state.frozen_symbol_count != 0 || state.cfo_recovery_symbol_count != 0;
     const bool evaluate_timing =
-        timing_recovery ||
-        symbol_count % steady_timing_estimator_cadence == 0;
+        timing_recovery || symbol_count % steady_timing_estimator_cadence == 0;
     const bool measure_timing_breakdown = events_enabled();
     std::optional<double> measured_tau;
     if (evaluate_timing) {

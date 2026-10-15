@@ -135,6 +135,8 @@ struct TelemetryAggregate {
         ++event_counts[record.event];
     }
 
+    void add(const dvbt::ChannelProfileTelemetry & /*record*/) {}
+
     [[nodiscard]] json measurements() const {
         return {{"mer_db", mer.value()},
                 {"sro_ppm", sro.value()},
@@ -405,6 +407,9 @@ struct DvbTReportWriter::Impl {
                                   {.key = "events",
                                    .path = "events.jsonl",
                                    .record_type = "decoder_event"},
+                                  {.key = "channel",
+                                   .path = "dvbt-channel.jsonl",
+                                   .record_type = "channel_profile"},
                               });
 
         json manifest_streams = json::array();
@@ -442,6 +447,7 @@ struct DvbTReportWriter::Impl {
         std::vector<json> demod;
         std::vector<json> fec;
         std::vector<json> events;
+        std::vector<json> channel;
         for (const auto &record : records) {
             std::visit(
                 [this](const auto &value) {
@@ -466,12 +472,16 @@ struct DvbTReportWriter::Impl {
             case DvbTReportStream::event:
                 events.push_back(std::move(encoded.value));
                 break;
+            case DvbTReportStream::channel:
+                channel.push_back(std::move(encoded.value));
+                break;
             }
         }
         router->write_batch("frontend", frontend);
         router->write_batch("demod", demod);
         router->write_batch("fec", fec);
         router->write_batch("events", events);
+        router->write_batch("channel", channel);
     }
 
     void begin_source(DvbTSourceSessionConfig selected,

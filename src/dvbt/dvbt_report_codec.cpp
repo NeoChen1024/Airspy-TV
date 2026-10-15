@@ -341,6 +341,36 @@ event_severity_name(const dvbt::DecoderEventSeverity severity) {
     return result;
 }
 
+[[nodiscard]] json encode(const dvbt::ChannelProfileTelemetry &record) {
+    json taps = json::array();
+    for (const auto &tap : record.taps) {
+        taps.push_back({{"delay_us", json_finite_or_null(tap.delay_us)},
+                        {"power_db", json_finite_or_null(tap.power_db)},
+                        {"doppler_hz", optional_number(tap.doppler_hz)},
+                        {"coherence", optional_number(tap.coherence)}});
+    }
+    json result = envelope(record.envelope, "channel_profile");
+    result["resampled_begin_sample"] = record.resampled_begin_sample;
+    result["resampled_end_sample"] = record.resampled_end_sample;
+    result["symbol_count"] = record.symbol_count;
+    result["response_count"] = record.response_count;
+    result["response_pair_count"] = record.response_pair_count;
+    result["delay_window_us"] = json_finite_or_null(record.delay_window_us);
+    result["delay_resolution_us"] =
+        json_finite_or_null(record.delay_resolution_us);
+    result["response_interval_us"] =
+        json_finite_or_null(record.response_interval_us);
+    result["noise_floor_db"] = json_finite_or_null(record.noise_floor_db);
+    result["rms_delay_spread_us"] =
+        json_finite_or_null(record.rms_delay_spread_us);
+    result["max_excess_delay_us"] =
+        json_finite_or_null(record.max_excess_delay_us);
+    result["main_tap_energy_share"] =
+        json_finite_or_null(record.main_tap_energy_share);
+    result["taps"] = std::move(taps);
+    return result;
+}
+
 } // namespace
 
 const char *dvbt_worker_state_name(const dvbt::WorkerState state) {
@@ -379,6 +409,9 @@ DvbTJsonRecord encode_dvbt_telemetry(const dvbt::TelemetryRecord &record) {
             } else if constexpr (std::is_same_v<Value,
                                                 dvbt::FecWindowTelemetry>) {
                 return {DvbTReportStream::fec, encode(value)};
+            } else if constexpr (std::is_same_v<
+                                     Value, dvbt::ChannelProfileTelemetry>) {
+                return {DvbTReportStream::channel, encode(value)};
             } else {
                 return {DvbTReportStream::event, encode(value)};
             }
@@ -470,8 +503,7 @@ void format_debug_telemetry(std::ostream &stream,
                     value.acquisition_fractional_cfo_hz.value_or(0.0),
                     value.acquisition_carrier_bin_offset,
                     value.acquisition_coarse_offset_hz.value_or(0.0),
-                    value.input_mirrored,
-                    value.tracked_cfo_hz.value_or(0.0),
+                    value.input_mirrored, value.tracked_cfo_hz.value_or(0.0),
                     value.residual_cfo_hz.value_or(0.0), value.cfo_command_hz,
                     value.cfo_applied_hz, value.cfo_fixed_delay_samples,
                     value.cfo_late_samples, value.cfo_pending_commands,
@@ -496,6 +528,27 @@ void format_debug_telemetry(std::ostream &stream,
                     value.delta.rs_uncorrectable_packets,
                     value.delta.tei_packets, value.fec_total_ms,
                     value.transport_nested_ms);
+            } else if constexpr (std::is_same_v<
+                                     Value, dvbt::ChannelProfileTelemetry>) {
+                stream << std::format(
+                    "[channel_profile] seq={} resampled={}..{} responses={} "
+                    "rms_spread={:.2f}us max_excess={:.2f}us main={:.3f} "
+                    "floor={:.1f}dB\n",
+                    value.envelope.sequence, value.resampled_begin_sample,
+                    value.resampled_end_sample, value.response_count,
+                    value.rms_delay_spread_us, value.max_excess_delay_us,
+                    value.main_tap_energy_share, value.noise_floor_db);
+                for (const auto &tap : value.taps) {
+                    stream << std::format(
+                        "  tap delay={:+.2f}us power={:.1f}dB doppler={} "
+                        "coherence={}\n",
+                        tap.delay_us, tap.power_db,
+                        tap.doppler_hz
+                            ? std::format("{:+.2f}Hz", *tap.doppler_hz)
+                            : "--",
+                        tap.coherence ? std::format("{:.3f}", *tap.coherence)
+                                      : "--");
+                }
             } else {
                 stream << std::format("[evt] {} severity={}", value.event,
                                       event_severity_name(value.severity));

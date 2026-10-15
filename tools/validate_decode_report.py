@@ -23,6 +23,7 @@ EXPECTED_RECORD_TYPES = {
     "demod_window",
     "fec_window",
     "decoder_event",
+    "channel_profile",
 }
 
 
@@ -387,7 +388,7 @@ def validate_decode_report(
         set(streams) == EXPECTED_RECORD_TYPES,
         "manifest stream inventory is incomplete",
     )
-    for record_type in EXPECTED_RECORD_TYPES - {"decoder_event"}:
+    for record_type in EXPECTED_RECORD_TYPES - {"decoder_event", "channel_profile"}:
         require(streams[record_type], f"{record_type} stream is empty")
 
     stats = loaded["stats"]

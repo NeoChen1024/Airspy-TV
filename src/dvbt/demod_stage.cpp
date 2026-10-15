@@ -127,6 +127,29 @@ void DemodStage::Impl::emit_diagnostic_event(
     telemetry_queue.emplace_back(std::move(record));
 }
 
+void DemodStage::Impl::emit_channel_profile(const std::uint64_t generation,
+                                            ChannelProfileTelemetry profile) {
+    if (!events_enabled()) {
+        return;
+    }
+    const std::scoped_lock lock(mutex);
+    if (!events_enabled()) {
+        return;
+    }
+    std::uint64_t source_epoch = 0;
+    if (const auto mapped =
+            clock_control.input_at_output(profile.resampled_begin_sample)) {
+        source_epoch = mapped->stream_epoch;
+    }
+    profile.envelope = {
+        .sequence = ++channel_profile_telemetry_sequence,
+        .decoder_generation = generation,
+        .source_epoch = source_epoch,
+        .wall_elapsed_ms = telemetry_elapsed_ms(),
+    };
+    telemetry_queue.emplace_back(std::move(profile));
+}
+
 void DemodStage::Impl::fire_pending_discontinuity() {
     std::optional<TransportDiscontinuity> pending;
     {
@@ -156,6 +179,9 @@ void DemodStage::Impl::reset_frontend_state() noexcept {
     frontend.previous_phase = -1;
     frontend.phase_discontinuities = 0;
     frontend.last_symbol_start = 0;
+    frontend.symbol_contiguous = false;
+    frontend.symbol_start = 0;
+    frontend.profiler.reset();
     frontend.just_seeded = false;
     frontend.tps_decoder.reset();
     frontend.tps_snapshot = {};
@@ -511,6 +537,7 @@ void DemodStage::set_telemetry_enabled(
     impl_->frontend_telemetry_sequence = 0;
     impl_->fec_telemetry_sequence = 0;
     impl_->event_telemetry_sequence = 0;
+    impl_->channel_profile_telemetry_sequence = 0;
 }
 
 std::vector<TelemetryRecord> DemodStage::drain_telemetry() {

@@ -92,6 +92,9 @@ void DemodStage::Impl::demod_build_grid(DemodRuntimeState &state) {
         reinterpret_cast<fftwf_complex *>(frontend.cir_grid.data()),
         reinterpret_cast<fftwf_complex *>(frontend.cir_response.data()),
         FFTW_BACKWARD, FFTW_ESTIMATE);
+    frontend.profiler.configure(state.fft_size, state.maximum,
+                                static_cast<double>(sync.resampled_rate),
+                                state.fft_size + state.guard_size);
 }
 
 void DemodStage::Impl::demod_reset_timing(DemodRuntimeState &state,

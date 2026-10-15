@@ -9,6 +9,7 @@
 #include "airspy_tv/dvbt/tps_decoder.hpp"
 #include "airspy_tv/fftw_plan.hpp"
 #include "airspy_tv/thread_name.hpp"
+#include "channel_profile.hpp"
 
 #include "clock_control_timeline.hpp"
 #include "demod_dsp.hpp"
@@ -116,6 +117,8 @@ struct DemodStage::Impl { // NOLINT(clang-analyzer-optin.performance.Padding)
                                std::uint64_t demod_window_sequence,
                                std::uint64_t fec_session,
                                std::optional<std::uint64_t> tps_symbol_index);
+    void emit_channel_profile(std::uint64_t generation,
+                              ChannelProfileTelemetry profile);
     void fire_pending_discontinuity();
     [[nodiscard]] bool enqueue_fec(FecItem item) const;
     void reset_frontend_state() noexcept;
@@ -176,6 +179,7 @@ struct DemodStage::Impl { // NOLINT(clang-analyzer-optin.performance.Padding)
     std::uint64_t frontend_telemetry_sequence{};
     std::uint64_t fec_telemetry_sequence{};
     std::uint64_t event_telemetry_sequence{};
+    std::uint64_t channel_profile_telemetry_sequence{};
     std::optional<TransportDiscontinuity> pending_discontinuity;
     // Source holes published by the frontend, in ring order, not yet
     // reached by the symbol loop.

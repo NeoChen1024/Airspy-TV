@@ -9,7 +9,7 @@
 
 namespace airspy_tv {
 
-enum class DvbTReportStream { frontend, demod, fec, event };
+enum class DvbTReportStream { frontend, demod, fec, event, channel };
 
 struct DvbTJsonRecord {
     DvbTReportStream stream;
