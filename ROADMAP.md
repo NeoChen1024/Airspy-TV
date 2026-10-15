@@ -111,11 +111,13 @@ measured regressions or a concrete second receiver implementation.
 
 ### Multipath and SFN behavior
 
-- Validate adaptive FFT-window placement on captured long-delay/SFN signals.
-- Replace or augment the current scattered-pilot CIR spread estimate when
-  echoes exceed its unaliased delay range or form separated clusters.
-- Compare candidate energy-CDF or multi-cluster estimators without allowing
-  noisy CIR movement to bias the sample-clock loop.
+- Validate adaptive FFT-window placement and the delay-domain equalizer
+  passband on captured long-delay/SFN signals; synthetic 0 dB echoes, the
+  ETSI Rayleigh/Ricean profiles and the measured 557 MHz profile decode, but
+  no off-air SFN capture has been exercised.
+- Handle echoes beyond the Tu/3 unambiguous range of the pilot-grid impulse
+  response and separated clusters wider than the guard interval, which the
+  current placement cannot keep ISI-free.
 - Retain hard-versus-soft comparisons only where they help explain weak-signal
   or multipath behavior; the production path remains soft-decision decoding.
 

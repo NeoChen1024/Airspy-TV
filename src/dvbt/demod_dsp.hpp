@@ -26,9 +26,6 @@ timing_measurement_confidence(std::uint64_t accepted_measurements,
 [[nodiscard]] float
 estimate_channel_notch_db(std::span<const std::complex<float>> inverse_channel,
                           std::size_t phase, std::size_t maximum);
-[[nodiscard]] int lock_phase_at_offset(std::span<const std::complex<float>> fft,
-                                       std::size_t maximum, int offset,
-                                       std::optional<double> timing_tau);
 [[nodiscard]] PilotPhaseScore
 score_pilot_phase_at_offset(std::span<const std::complex<float>> fft,
                             std::size_t maximum, int offset, int phase,

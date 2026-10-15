@@ -377,6 +377,35 @@ DVB-T-specific diagnostics.
 | Playback and discontinuities                          | `src/mpv_player.cpp`, `include/airspy_tv/mpv_player.hpp`, `include/airspy_tv/transport_stream.hpp` |
 | Raw/TS recording                                      | `src/recorder.cpp`, `include/airspy_tv/recorder.hpp`                                                 |
 
+## Performance changes
+
+The serial `dvbt-demod` thread and the `dvbt-fec` coordinator are the two
+closely matched throughput limits; optimizing one alone moves the limit to the
+other. Measured optimization history is in git. Any change aimed at throughput
+must report the affected timing bucket (nested values are non-additive),
+complete decoder throughput and queue pressure, and must pass:
+
+- the Debug and Release unit/integration suites;
+- the clean `557mhz-horizontal`, `581mhz-2` and `581mhz-3` captures with
+  byte-identical TS for behavior-preserving changes;
+- the marginal `545M-DVB-T-公視-3`, `581mhz` and `557mhz-vertical` captures,
+  comparing emitted and usable non-TEI packets, RS/TEI counts, MER, timing
+  confidence, branch rejection, phase discontinuities, re-anchor positions
+  and SRO command/applied error for tracking-aware changes;
+- synthetic positive/negative SRO and CFO, drift and reversal cases, plus 2K,
+  guard-interval and bandwidth fixtures;
+- repeated one-worker and automatic-worker runs, so symbol and recovery
+  boundaries stay deterministic;
+- a completed non-reporting Release run as the throughput record.
+
+Measured and rejected, not to be revisited without new evidence: splitting
+the serial demod ownership loop into another stage; raising the offline
+queue multiplier above the 4x default without a workload-specific A/B; adding
+Viterbi workers before Viterbi wait is separated from RS coordinator time;
+batching Reed-Solomon blocks across workers at the current call granularity;
+a process-wide allocator swap; and FFTW threading without a complete-pipeline
+gain.
+
 ## Remaining architecture work
 
 - Add queue, ordering, lifecycle, and portable-backend regressions listed in
@@ -385,9 +414,6 @@ DVB-T-specific diagnostics.
   current fraction is a policy, not an automatically tuned optimum.
 - Retain stage telemetry that identifies overload without exposing
   implementation-specific counters through common GUI code.
-- Work through the measured demodulator and FEC optimization and validation
-  plan in
-  [dvbt-demod-fec-performance-todo.md](dvbt-demod-fec-performance-todo.md).
 - Keep timing/CIR/second-order-loop experiments in
   [clock-tracking.md](clock-tracking.md).
 - Preserve these ordering, generation, and backpressure invariants while
