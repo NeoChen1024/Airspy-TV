@@ -445,8 +445,14 @@ FEC session/delta/cumulative counters also separate `rs_clean_packets`,
 `rs_packets` after outer lock. The five `fec::outer::rs_decode::*` values are
 nested sampled attribution within `rs_decode`, not additive peers of it.
 
-Demod windows include `pilot_phase_fast_path` with check, fast-accept, fallback,
-and confidence values. `setup_ms.fft_plan` records one-time FFT planning cost;
+Demod windows include `pilot_phase_fast_path` with check, fast-accept and
+fallback counts, the mean and minimum confidence of the expected pilot phase,
+and `confidence_threshold`, the fast-accept bar in effect at the window's last
+check. The bar adapts to the channel: a chunked coherent pilot sum is capped by
+frequency-selective multipath, so the decoder accepts the expected phase at a
+fraction of the level it has confirmed on this stream (bounded above by the
+clean-channel figure 0.90). Fallbacks are counted here only; no per-symbol
+event is emitted for them. `setup_ms.fft_plan` records one-time FFT planning cost;
 it is zero in later windows and is not part of the window serial-busy sum.
 
 Each record also carries its applicable total wall time, sample/symbol count,

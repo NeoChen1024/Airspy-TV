@@ -189,8 +189,8 @@ using nlohmann::json;
         {"hierarchy", record.hierarchy},
         {"tps_frame_number", record.tps_frame_number},
         {"cell_id_present", record.cell_id_present},
-        {"cell_id", record.cell_id.has_value() ? json(*record.cell_id)
-                                               : json(nullptr)},
+        {"cell_id",
+         record.cell_id.has_value() ? json(*record.cell_id) : json(nullptr)},
         {"fft_size", record.fft_size},
         {"guard_size", record.guard_size}};
     result["acquisition"] = {
@@ -271,7 +271,9 @@ using nlohmann::json;
         {"confidence_mean",
          optional_number(record.pilot_expected_phase_confidence_mean)},
         {"confidence_min",
-         optional_number(record.pilot_expected_phase_confidence_min)}};
+         optional_number(record.pilot_expected_phase_confidence_min)},
+        {"confidence_threshold",
+         optional_number(record.pilot_expected_phase_confidence_threshold)}};
     result["setup_ms"] = {
         {"fft_plan", json_finite_or_null(record.fft_plan_time_ms)}};
     result["timing_ms"] = {

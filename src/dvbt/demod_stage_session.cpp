@@ -28,6 +28,7 @@ void DemodStage::Impl::demod_cold_seed(DemodRuntimeState &state) {
     // production symbol validates the predicted next phase instead of
     // entering any wide carrier-search path.
     frontend.previous_phase = (sync.acquisition_pilot_phase + 3) % 4;
+    frontend.expected_phase_confidence_baseline = -1.0F;
     frontend.tps_decoder.reset();
     frontend.tps_snapshot = {};
     frontend.just_seeded = true;

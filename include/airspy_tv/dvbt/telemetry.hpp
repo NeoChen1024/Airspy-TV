@@ -157,6 +157,8 @@ struct DemodWindowTelemetry {
     std::uint64_t pilot_expected_phase_fallbacks{};
     std::optional<double> pilot_expected_phase_confidence_mean;
     std::optional<double> pilot_expected_phase_confidence_min;
+    // Fast-accept bar in effect at the window's last check.
+    std::optional<double> pilot_expected_phase_confidence_threshold;
     double fft_plan_time_ms{};
     double wall_time_ms{};
     double serial_busy_time_ms{};

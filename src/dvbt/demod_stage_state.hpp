@@ -93,6 +93,7 @@ struct DemodRuntimeState {
     std::uint64_t pilot_expected_phase_fallbacks{};
     double pilot_expected_confidence_sum{};
     float pilot_expected_confidence_min{1.0F};
+    float pilot_expected_confidence_threshold{};
     double reacquisition_time_sum_ms{};
     double channel_estimate_time_sum_ms{};
     double channel_pilot_time_sum_ms{};

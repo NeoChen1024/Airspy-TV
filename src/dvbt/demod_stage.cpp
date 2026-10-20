@@ -6,7 +6,6 @@ namespace {
 constexpr double frontend_telemetry_interval_ms = 1000.0;
 } // namespace
 
-
 DemodStage::Impl::Impl(SampleChannel &selected_samples,
                        ClockControlTimeline &selected_clock,
                        FecStage &selected_fec,
@@ -182,6 +181,7 @@ void DemodStage::Impl::reset_frontend_state() noexcept {
     frontend.carrier_offset = std::numeric_limits<int>::max();
     frontend.previous_continual.clear();
     frontend.previous_phase = -1;
+    frontend.expected_phase_confidence_baseline = -1.0F;
     frontend.phase_discontinuities = 0;
     frontend.last_symbol_start = 0;
     frontend.symbol_contiguous = false;

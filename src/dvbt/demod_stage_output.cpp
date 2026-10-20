@@ -737,6 +737,8 @@ void DemodStage::Impl::demod_publish_stats_window(DemodRuntimeState &state) {
                 static_cast<double>(state.pilot_expected_phase_checks);
             record.pilot_expected_phase_confidence_min =
                 state.pilot_expected_confidence_min;
+            record.pilot_expected_phase_confidence_threshold =
+                state.pilot_expected_confidence_threshold;
         }
         record.fft_plan_time_ms = state.fft_plan_time_ms;
         record.wall_time_ms = latest.demod_window_wall_time_ms;

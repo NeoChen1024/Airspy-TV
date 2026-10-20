@@ -25,6 +25,12 @@ struct OfdmTrackingState {
     std::vector<std::complex<float>> current_continual;
     bool have_previous_continual{};
     int previous_phase{-1};
+    // Running level of the confirmed expected-phase pilot score on this
+    // channel. The score is a chunked coherent sum, so frequency-selective
+    // multipath caps it well below 1 even with a perfect lock; the fast path
+    // accepts relative to this level rather than to a fixed figure. Negative
+    // until the first confirmed symbol after a (re-)anchor.
+    float expected_phase_confidence_baseline{-1.0F};
     std::uint64_t phase_discontinuities{0};
     // Absolute stream position of the most recent processed symbol; the
     // CFO loop only updates from contiguous symbol pairs (start ==

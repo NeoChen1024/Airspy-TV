@@ -32,6 +32,7 @@ bool DemodStage::Impl::demod_maybe_reacquire(DemodRuntimeState &state) {
         frontend.carrier_offset = frontend.stable_carrier_offset;
         frontend.previous_phase =
             static_cast<int>((frontend.stable_phase + state.symbol_count) % 4);
+        frontend.expected_phase_confidence_baseline = -1.0F;
         state.lock_hold = 1;
     }
     // Acquisition moved the boundary, so the in-flight symbol is stale.
@@ -317,7 +318,18 @@ DemodStage::Impl::demod_lock_pilots(DemodRuntimeState &state) {
             // re-established by a re-anchor after a real
             // fade, which restores the pre-fade stable
             // offset.
+            // A confident expected phase skips the three competing scores.
+            // The score of the true phase is capped by the channel (a
+            // chunked coherent sum loses to amplitude variation across the
+            // chunk's pilots: the 545 MHz rooftop capture with a -7 dB echo
+            // at 53 us never exceeds 0.93 and sits near 0.86), so the bar is
+            // a fraction of the level this channel has confirmed, bounded
+            // by the absolute figure a clean channel reaches and by the
+            // level a competing phase would need anyway. A wrong phase
+            // sums data carriers and scores near 1/8.
             constexpr float expected_phase_confidence_threshold = 0.90F;
+            constexpr float expected_phase_baseline_ratio = 0.85F;
+            constexpr float expected_phase_baseline_gain = 1.0F / 64.0F;
             // A competing phase must be this confident and this much
             // better than the expected one before the lock moves: in
             // multipath every candidate scores poorly against a stale
@@ -346,8 +358,16 @@ DemodStage::Impl::demod_lock_pilots(DemodRuntimeState &state) {
             state.pilot_expected_confidence_min = std::min(
                 state.pilot_expected_confidence_min, expected_score.confidence);
             lock = PilotLock{expected_phase, frontend.carrier_offset};
-            if (expected_score.confidence >=
-                expected_phase_confidence_threshold) {
+            const float baseline = frontend.expected_phase_confidence_baseline;
+            const float fast_threshold =
+                baseline >= 0.0F
+                    ? std::min(
+                          expected_phase_confidence_threshold,
+                          std::max(competing_phase_confidence_threshold,
+                                   baseline * expected_phase_baseline_ratio))
+                    : expected_phase_confidence_threshold;
+            state.pilot_expected_confidence_threshold = fast_threshold;
+            if (expected_score.confidence >= fast_threshold) {
                 ++state.pilot_expected_phase_fast_accepts;
             } else {
                 ++state.pilot_expected_phase_fallbacks;
@@ -370,23 +390,16 @@ DemodStage::Impl::demod_lock_pilots(DemodRuntimeState &state) {
                         competing_phase_ratio * expected_score.confidence) {
                     lock = PilotLock{best_phase, frontend.carrier_offset};
                 }
-                if (events_enabled()) {
-                    emit_event(
-                        "pilot_phase_fast_path_fallback",
-                        DecoderEventSeverity::info, state.demod_generation,
-                        state.next_symbol_start, symbol_count,
-                        {{"expected_phase",
-                          static_cast<std::int64_t>(expected_phase)},
-                         {"selected_phase",
-                          static_cast<std::int64_t>(lock.phase)},
-                         {"confidence",
-                          static_cast<double>(expected_score.confidence)},
-                         {"best_confidence",
-                          static_cast<double>(best_score.confidence)},
-                         {"threshold",
-                          static_cast<double>(
-                              expected_phase_confidence_threshold)}});
-                }
+            }
+            // The window record carries the fallback counts and the
+            // confidence statistics; a per-symbol event here would be one
+            // line per symbol on any channel below the bar.
+            if (lock.phase == expected_phase) {
+                frontend.expected_phase_confidence_baseline =
+                    baseline >= 0.0F
+                        ? baseline + (expected_phase_baseline_gain *
+                                      (expected_score.confidence - baseline))
+                        : expected_score.confidence;
             }
         }
         if (frontend.previous_phase >= 0 &&
