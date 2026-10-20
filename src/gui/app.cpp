@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <format>
 #include <iostream>
 #include <ranges>
 #include <span>
@@ -126,7 +127,7 @@ void draw_top_bar(AppState &state) {
     ImGui::TextDisabled("MER");
     ImGui::SameLine();
     if (locked) {
-        ImGui::Text("%5.1f dB", state.frame.signal.mer_db);
+        draw_text(std::format("{:5.1f} dB", state.frame.signal.mer_db));
     } else {
         ImGui::TextUnformatted("   --");
     }
@@ -135,10 +136,10 @@ void draw_top_bar(AppState &state) {
     ImGui::SetCursorPosX(
         std::max(ImGui::GetCursorPosX(),
                  ImGui::GetWindowWidth() - status_width - 20.0F));
-    ImGui::TextColored(state.frame.iq_recording
+    draw_text_coloured(state.frame.iq_recording
                            ? ImVec4(1.0F, 0.30F, 0.28F, 1.0F)
                            : ImVec4(0.58F, 0.66F, 0.74F, 1.0F),
-                       "%s", state.ui.status.c_str());
+                       state.ui.status);
     ImGui::EndChild();
 }
 

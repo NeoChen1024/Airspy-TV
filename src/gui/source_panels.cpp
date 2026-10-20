@@ -186,7 +186,7 @@ void draw_source_panel(AppState &state) {
         ImGui::EndCombo();
     }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        draw_tooltip("%s", preview);
+        draw_tooltip(preview);
     }
     ImGui::Checkbox("Show Airspy through Soapy",
                     &state.source.show_soapy_airspy);
@@ -236,7 +236,7 @@ void draw_source_panel(AppState &state) {
         const DeviceDescriptor *descriptor = &*state.frame.descriptor;
         ImGui::TextColored(ImVec4(0.35F, 0.88F, 0.55F, 1.0F), "OPEN");
         ImGui::SameLine();
-        ImGui::TextWrapped("%s", descriptor->display_name.c_str());
+        draw_text_wrapped(descriptor->display_name);
         if (!descriptor->serial.empty()) {
             draw_disabled_wrapped("Serial: " + descriptor->serial);
         }
@@ -250,15 +250,15 @@ void draw_source_panel(AppState &state) {
         ImGui::EndDisabled();
 
         if (descriptor->backend == SdrBackend::File) {
-            ImGui::Text("Format       CS16 / INT16_IQ");
-            ImGui::Text(
-                "Sample rate  %.3f MSPS",
+            ImGui::TextUnformatted("Format       CS16 / INT16_IQ");
+            draw_text(std::format(
+                "Sample rate  {:.3f} MSPS",
                 static_cast<double>(state.source.settings.sample_rate_hz) /
-                    1e6);
-            ImGui::Text(
-                "Center       %.6f MHz",
+                    1e6));
+            draw_text(std::format(
+                "Center       {:.6f} MHz",
                 static_cast<double>(state.source.settings.center_frequency_hz) /
-                    1e6);
+                    1e6));
             if (!state.frame.source_streaming &&
                 ImGui::Button("Replay from beginning", ImVec2(-1.0F, 0.0F))) {
                 state.ui.status = state.reporting.controller
@@ -300,7 +300,7 @@ void draw_source_panel(AppState &state) {
 
     for (const std::string &warning : state.source.enumeration.warnings) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.64F, 0.25F, 1.0F));
-        ImGui::TextWrapped("%s", warning.c_str());
+        draw_text_wrapped(warning);
         ImGui::PopStyleColor();
     }
     ImGui::PopID();

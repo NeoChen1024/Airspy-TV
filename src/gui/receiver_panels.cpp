@@ -95,7 +95,7 @@ void draw_common_signal_panel(AppState &state) {
     }
     draw_status_indicator(pipeline_status, pipeline_colour);
     if (state.frame.pipeline.failed && !state.frame.pipeline.error.empty()) {
-        ImGui::TextWrapped("%s", state.frame.pipeline.error.c_str());
+        draw_text_wrapped(state.frame.pipeline.error);
     }
 
     // One row: each stage's queue or busy fraction, then the drop count.
@@ -109,8 +109,7 @@ void draw_common_signal_panel(AppState &state) {
         if (index != 0) {
             ImGui::SameLine(0.0F, 14.0F);
         }
-        ImGui::TextDisabled("%.*s", static_cast<int>(stage.name.size()),
-                            stage.name.data());
+        draw_text_disabled(stage.name);
         ImGui::SameLine();
         if (stage.queue_valid) {
             ImGui::TextUnformatted(
@@ -126,8 +125,7 @@ void draw_common_signal_panel(AppState &state) {
     }
     ImGui::TextDisabled("Drops");
     ImGui::SameLine();
-    ImGui::Text("%llu", static_cast<unsigned long long>(
-                            state.frame.pipeline.dropped_blocks));
+    draw_text(std::format("{}", state.frame.pipeline.dropped_blocks));
     ImGui::Separator();
 
     const std::string power =

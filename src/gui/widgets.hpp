@@ -23,6 +23,12 @@ void apply_dark_theme();
 
 [[nodiscard]] std::optional<std::uint64_t>
 draw_frequency_control(const char *id, std::uint64_t frequency_hz);
+// Text helpers taking formatted strings (std::format at the call site):
+// the printf-style ImGui::Text family is not used for values.
+void draw_text(std::string_view text);
+void draw_text_disabled(std::string_view text);
+void draw_text_wrapped(std::string_view text);
+void draw_text_coloured(ImVec4 colour, std::string_view text);
 void draw_metric(const char *label, const char *value, float fraction,
                  ImVec4 colour);
 // Two metrics side by side: begin, cell, metric, cell, metric, end.
@@ -31,7 +37,7 @@ void next_metric_cell();
 void end_metric_pair();
 void draw_disabled_wrapped(std::string_view text);
 // Tooltip wrapped to a readable width (SetTooltip never wraps).
-void draw_tooltip(const char *format, ...);
+void draw_tooltip(std::string_view text);
 void draw_status_indicator(const char *label, ImVec4 colour);
 void draw_bipolar_metric(const char *label, const char *value, float position,
                          ImVec4 colour);

@@ -61,17 +61,19 @@ void draw_standard_settings_panel(AppState &state) {
         state.session.set_dvbt_parameters(state.standard.dvbt.parameters);
     }
     ImGui::EndDisabled();
-    ImGui::TextDisabled("0 = Auto (%zu logical CPUs)",
-                        airspy_tv::dvbt::default_viterbi_worker_count());
+    draw_text_disabled(
+        std::format("0 = Auto ({} logical CPUs)",
+                    airspy_tv::dvbt::default_viterbi_worker_count()));
     const std::size_t active_workers =
         state.frame.dvbt.decoder.resample_workers +
         state.frame.dvbt.decoder.symbol_workers +
         state.frame.dvbt.decoder.transport.viterbi_workers;
     if (active_workers != 0) {
-        ImGui::TextDisabled("Workers: %zu resample, %zu symbol, %zu FEC",
-                            state.frame.dvbt.decoder.resample_workers,
-                            state.frame.dvbt.decoder.symbol_workers,
-                            state.frame.dvbt.decoder.transport.viterbi_workers);
+        draw_text_disabled(
+            std::format("Workers: {} resample, {} symbol, {} FEC",
+                        state.frame.dvbt.decoder.resample_workers,
+                        state.frame.dvbt.decoder.symbol_workers,
+                        state.frame.dvbt.decoder.transport.viterbi_workers));
     }
 
     bool parameters_changed = false;
@@ -268,7 +270,7 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
         if (state.frame.dvbt.decoder.failed) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                                   ImVec4(1.0F, 0.45F, 0.35F, 1.0F));
-            ImGui::TextWrapped("%s", state.frame.dvbt.decoder.error.c_str());
+            draw_text_wrapped(state.frame.dvbt.decoder.error);
             ImGui::PopStyleColor();
         }
 
@@ -336,28 +338,24 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
                                       .sro_fixed_delay_samples) /
                               state.frame.dvbt.decoder.sro_input_sample_rate_hz
                         : 0.0;
-                draw_tooltip(
+                draw_tooltip(std::format(
                     "DVB-T timing-loop command, correction currently applied "
                     "by the common variable-rate resampler, and filtered "
                     "pilot-slope timing offset. The bar uses applied ppm "
                     "only.\n"
-                    "Measured SRO %+.4f ppm, scheduled delay %.3f ms, late "
-                    "%llu samples, pending %zu.\n"
-                    "Command input %llu, target %llu, applied %llu.\n"
-                    "Requested ratio %.12f, effective ratio %.12f.",
+                    "Measured SRO {:+.4f} ppm, scheduled delay {:.3f} ms, late "
+                    "{} samples, pending {}.\n"
+                    "Command input {}, target {}, applied {}.\n"
+                    "Requested ratio {:.12f}, effective ratio {:.12f}.",
                     state.frame.dvbt.decoder.sample_clock_offset_ppm,
                     scheduled_delay_ms,
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.sro_schedule_late_samples),
+                    state.frame.dvbt.decoder.sro_schedule_late_samples,
                     state.frame.dvbt.decoder.sro_pending_commands,
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.sro_command_input_sample),
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.sro_effective_input_sample),
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.sro_applied_input_sample),
+                    state.frame.dvbt.decoder.sro_command_input_sample,
+                    state.frame.dvbt.decoder.sro_effective_input_sample,
+                    state.frame.dvbt.decoder.sro_applied_input_sample,
                     state.frame.dvbt.decoder.resampler_requested_ratio,
-                    state.frame.dvbt.decoder.resampler_effective_ratio);
+                    state.frame.dvbt.decoder.resampler_effective_ratio));
             }
             const bool cfo_resampler_ready =
                 state.frame.dvbt.decoder.cfo_resampler_ready;
@@ -391,60 +389,46 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
                                       .cfo_fixed_delay_samples) /
                               state.frame.dvbt.decoder.cfo_input_sample_rate_hz
                         : 0.0;
-                draw_tooltip(
+                const auto &decoder = state.frame.dvbt.decoder;
+                draw_tooltip(std::format(
                     "Initial CFO is acquired before production samples enter "
                     "the ring; steady-state residual CFO is fed back to the "
                     "same common resampler independently of SRO. The third "
                     "displayed value is residual CFO; the bar uses applied "
                     "CFO only.\n"
-                    "Acquisition fractional %+.2f Hz, integer bins %+d, "
-                    "coarse channel offset %+.0f Hz, input %s.\n"
-                    "Estimated %+.2f Hz, residual %+.2f Hz, command %+.2f Hz.\n"
-                    "Bootstrap attempts %llu, replayed %llu samples, retained "
-                    "peak %llu samples.\n"
-                    "CFO rebootstrap %llu/%llu, last trigger %+.2f Hz at "
-                    "source/output %llu/%llu.\n"
-                    "Scheduled delay %.3f ms, late %llu samples, pending %zu.\n"
-                    "Latest command input %llu, target %llu. Last applied "
-                    "target %llu, actual %llu.",
-                    state.frame.dvbt.decoder.acquisition_fractional_cfo_hz,
-                    state.frame.dvbt.decoder.acquisition_carrier_bin_offset,
-                    state.frame.dvbt.decoder.acquisition_coarse_offset_hz,
-                    state.frame.dvbt.decoder.input_mirrored ? "mirrored"
-                                                            : "upright",
-                    state.frame.dvbt.decoder.tracked_carrier_offset_hz,
-                    state.frame.dvbt.decoder.residual_carrier_offset_hz,
-                    state.frame.dvbt.decoder.cfo_resampler_command_hz,
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.bootstrap_attempts),
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder
-                            .bootstrap_replayed_input_samples),
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder
-                            .bootstrap_retained_peak_samples),
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.cfo_rebootstrap_count),
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.cfo_rebootstrap_requests),
-                    state.frame.dvbt.decoder.cfo_rebootstrap_last_residual_hz,
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.cfo_rebootstrap_source_sample),
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.cfo_rebootstrap_output_sample),
-                    scheduled_delay_ms,
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.cfo_schedule_late_samples),
-                    state.frame.dvbt.decoder.cfo_pending_commands,
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.cfo_command_input_sample),
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.cfo_effective_input_sample),
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder
-                            .cfo_applied_effective_input_sample),
-                    static_cast<unsigned long long>(
-                        state.frame.dvbt.decoder.cfo_applied_input_sample));
+                    "Acquisition fractional {:+.2f} Hz, integer bins {:+}, "
+                    "coarse channel offset {:+.0f} Hz, input {}.\n"
+                    "Estimated {:+.2f} Hz, residual {:+.2f} Hz, command "
+                    "{:+.2f} "
+                    "Hz.\n"
+                    "Bootstrap attempts {}, replayed {} samples, retained "
+                    "peak {} samples.\n"
+                    "CFO rebootstrap {}/{}, last trigger {:+.2f} Hz at "
+                    "source/output {}/{}.\n"
+                    "Scheduled delay {:.3f} ms, late {} samples, pending {}.\n"
+                    "Latest command input {}, target {}. Last applied "
+                    "target {}, actual {}.",
+                    decoder.acquisition_fractional_cfo_hz,
+                    decoder.acquisition_carrier_bin_offset,
+                    decoder.acquisition_coarse_offset_hz,
+                    decoder.input_mirrored ? "mirrored" : "upright",
+                    decoder.tracked_carrier_offset_hz,
+                    decoder.residual_carrier_offset_hz,
+                    decoder.cfo_resampler_command_hz,
+                    decoder.bootstrap_attempts,
+                    decoder.bootstrap_replayed_input_samples,
+                    decoder.bootstrap_retained_peak_samples,
+                    decoder.cfo_rebootstrap_count,
+                    decoder.cfo_rebootstrap_requests,
+                    decoder.cfo_rebootstrap_last_residual_hz,
+                    decoder.cfo_rebootstrap_source_sample,
+                    decoder.cfo_rebootstrap_output_sample, scheduled_delay_ms,
+                    decoder.cfo_schedule_late_samples,
+                    decoder.cfo_pending_commands,
+                    decoder.cfo_command_input_sample,
+                    decoder.cfo_effective_input_sample,
+                    decoder.cfo_applied_effective_input_sample,
+                    decoder.cfo_applied_input_sample));
             }
         }
         const auto ber_quality = [](const double ber) {
@@ -463,16 +447,13 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
                                               : 0.0F,
                         ImVec4(0.75F, 0.72F, 0.30F, 1.0F));
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-                draw_tooltip(
+                draw_tooltip(std::format(
                     "Bit errors before the outer FEC, measured against the "
                     "received mother-code metrics. For DVB-T this is the "
-                    "pre-Viterbi BER (re-encoded survivor path).\n%llu errors "
-                    "/ "
-                    "%llu compared bits",
-                    static_cast<unsigned long long>(
-                        transport.pre_viterbi_error_bits),
-                    static_cast<unsigned long long>(
-                        transport.pre_viterbi_compared_bits));
+                    "pre-Viterbi BER (re-encoded survivor path).\n{} errors "
+                    "/ {} compared bits",
+                    transport.pre_viterbi_error_bits,
+                    transport.pre_viterbi_compared_bits));
             }
 
             next_metric_cell();
@@ -492,29 +473,24 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
                                                : 0.0F,
                         ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-                draw_tooltip(
+                draw_tooltip(std::format(
                     "RS-derived outer error estimate: corrected payload bits "
                     "from valid codewords plus a full 188-byte penalty for "
-                    "each "
-                    "uncorrectable codeword. This keeps the metric live during "
-                    "outer-lock loss.\n%llu error bits / %llu attempted bits; "
-                    "%llu RS failures",
-                    static_cast<unsigned long long>(
-                        transport.post_viterbi_error_bits),
-                    static_cast<unsigned long long>(
-                        transport.post_viterbi_compared_bits),
-                    static_cast<unsigned long long>(
-                        transport.rs_uncorrectable_packets));
+                    "each uncorrectable codeword. This keeps the metric live "
+                    "during outer-lock loss.\n{} error bits / {} attempted "
+                    "bits; {} RS failures",
+                    transport.post_viterbi_error_bits,
+                    transport.post_viterbi_compared_bits,
+                    transport.rs_uncorrectable_packets));
             }
             end_metric_pair();
         }
-        ImGui::TextColored(
-            transport.rs_uncorrectable_packets == 0
-                ? ImVec4(0.45F, 0.82F, 0.62F, 1.0F)
-                : ImVec4(0.95F, 0.55F, 0.28F, 1.0F),
-            "RS failures %llu    TEI output %llu",
-            static_cast<unsigned long long>(transport.rs_uncorrectable_packets),
-            static_cast<unsigned long long>(transport.tei_packets));
+        draw_text_coloured(transport.rs_uncorrectable_packets == 0
+                               ? ImVec4(0.45F, 0.82F, 0.62F, 1.0F)
+                               : ImVec4(0.95F, 0.55F, 0.28F, 1.0F),
+                           std::format("RS failures {}    TEI output {}",
+                                       transport.rs_uncorrectable_packets,
+                                       transport.tei_packets));
         ImGui::Separator();
         // Two lines: the transmission parameters with their source, then the
         // bandwidth and cell identifier.
@@ -582,13 +558,14 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
             code_rate =
                 code_rate_name(*state.standard.dvbt.parameters.code_rate);
         }
-        ImGui::Text("%s · %s · %s · %s", mode, guard, modulation, code_rate);
+        draw_text(std::format("{} · {} · {} · {}", mode, guard, modulation,
+                              code_rate));
         if (source != nullptr || manual_code_rate) {
             ImGui::SameLine();
-            ImGui::TextDisabled("(%s%s%s)", source != nullptr ? source : "",
-                                source != nullptr && manual_code_rate ? ", "
-                                                                      : "",
-                                manual_code_rate ? "manual code rate" : "");
+            draw_text_disabled(
+                std::format("({}{}{})", source != nullptr ? source : "",
+                            source != nullptr && manual_code_rate ? ", " : "",
+                            manual_code_rate ? "manual code rate" : ""));
         }
         std::string cell_id = "--";
         if (decoder.tps_locked) {
@@ -601,16 +578,16 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
                 cell_id = "assembling";
             }
         }
-        ImGui::Text("%u MHz · Cell ID %s",
-                    state.standard.dvbt.parameters.channel_bandwidth_hz /
-                        1'000'000U,
-                    cell_id.c_str());
+        draw_text(std::format(
+            "{} MHz · Cell ID {}",
+            state.standard.dvbt.parameters.channel_bandwidth_hz / 1'000'000U,
+            cell_id));
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-            draw_tooltip("16-bit DVB-T cell identifier assembled from the TPS "
-                         "of two consecutive frames (frame %u of 4 at the last "
-                         "window). It names the SFN cell or network, not an "
-                         "individual transmitter.",
-                         static_cast<unsigned>(decoder.tps_frame_number) + 1U);
+            draw_tooltip(std::format(
+                "16-bit DVB-T cell identifier assembled from the TPS of two "
+                "consecutive frames (frame {} of 4 at the last window). It "
+                "names the SFN cell or network, not an individual transmitter.",
+                static_cast<unsigned>(decoder.tps_frame_number) + 1U));
         }
         draw_disabled_wrapped(
             state.frame.dvbt.decoder.tps_locked

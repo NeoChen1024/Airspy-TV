@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdarg>
 #include <format>
 #include <memory>
 #include <mutex>
@@ -298,7 +297,7 @@ void draw_metric_heading(const char *label, const char *value,
     ImGui::SameLine();
     ImGui::SetCursorScreenPos(
         ImVec2(std::max(label_end, start.x + width - value_width), start.y));
-    ImGui::TextColored(colour, "%s", value);
+    draw_text_coloured(colour, value);
 }
 
 } // namespace
@@ -327,15 +326,35 @@ void draw_metric(const char *label, const char *value, const float fraction,
     }
 }
 
-void draw_tooltip(const char *format, ...) {
+void draw_text(const std::string_view text) {
+    ImGui::TextUnformatted(text.data(), text.data() + text.size());
+}
+
+void draw_text_disabled(const std::string_view text) {
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    draw_text(text);
+    ImGui::PopStyleColor();
+}
+
+void draw_text_wrapped(const std::string_view text) {
+    ImGui::PushTextWrapPos(0.0F);
+    draw_text(text);
+    ImGui::PopTextWrapPos();
+}
+
+void draw_text_coloured(const ImVec4 colour, const std::string_view text) {
+    ImGui::PushStyleColor(ImGuiCol_Text, colour);
+    draw_text(text);
+    ImGui::PopStyleColor();
+}
+
+void draw_tooltip(const std::string_view text) {
     if (!ImGui::BeginTooltip()) {
         return;
     }
     ImGui::PushTextWrapPos(ImGui::GetFontSize() * 36.0F);
-    va_list args;
-    va_start(args, format);
-    ImGui::TextV(format, args);
-    va_end(args);
+    draw_text(text);
     ImGui::PopTextWrapPos();
     ImGui::EndTooltip();
 }
@@ -352,7 +371,7 @@ void end_metric_pair() { ImGui::EndTable(); }
 void draw_disabled_wrapped(const std::string_view text) {
     ImGui::PushStyleColor(ImGuiCol_Text,
                           ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextWrapped("%.*s", static_cast<int>(text.size()), text.data());
+    draw_text_wrapped(text);
     ImGui::PopStyleColor();
 }
 
@@ -364,7 +383,7 @@ void draw_status_indicator(const char *label, const ImVec4 colour) {
         indicator_position, 4.0F, ImGui::ColorConvertFloat4ToU32(colour));
     ImGui::Dummy(ImVec2(12.0F, ImGui::GetTextLineHeight()));
     ImGui::SameLine();
-    ImGui::TextColored(colour, "%s", label);
+    draw_text_coloured(colour, label);
 }
 
 void draw_bipolar_metric(const char *label, const char *value,

@@ -46,17 +46,16 @@ void draw_recorder_write_stats(ByteRateTracker &rate_tracker,
                                const Stats &stats) {
     const double write_mib_per_second =
         rate_tracker.update(stats.active, stats.bytes_written);
-    ImGui::Text("Duration: %s",
-                format_recording_duration(stats.elapsed_milliseconds).c_str());
-    ImGui::Text("Written: %.2f MiB",
-                static_cast<double>(stats.bytes_written) / (1024.0 * 1024.0));
-    ImGui::Text("Write rate: %.2f MiB/s", write_mib_per_second);
-    ImGui::Text("Queue drops: %llu",
-                static_cast<unsigned long long>(stats.dropped_blocks));
-    ImGui::Text("Write errors: %llu",
-                static_cast<unsigned long long>(stats.write_errors));
+    draw_text(std::format(
+        "Duration: {}", format_recording_duration(stats.elapsed_milliseconds)));
+    draw_text(std::format("Written: {:.2f} MiB",
+                          static_cast<double>(stats.bytes_written) /
+                              (1024.0 * 1024.0)));
+    draw_text(std::format("Write rate: {:.2f} MiB/s", write_mib_per_second));
+    draw_text(std::format("Queue drops: {}", stats.dropped_blocks));
+    draw_text(std::format("Write errors: {}", stats.write_errors));
     if (!stats.error.empty()) {
-        ImGui::TextWrapped("Last write error: %s", stats.error.c_str());
+        draw_text_wrapped(std::format("Last write error: {}", stats.error));
     }
 }
 
@@ -107,8 +106,7 @@ void draw_recorder_panel(AppState &state) {
 
     const auto stats = state.frame.iq_recording_stats;
     draw_recorder_write_stats(state.output.iq_write_rate, stats);
-    ImGui::Text("Source drops: %llu",
-                static_cast<unsigned long long>(stats.source_dropped_samples));
+    draw_text(std::format("Source drops: {}", stats.source_dropped_samples));
     ImGui::PopID();
 }
 
@@ -133,13 +131,11 @@ void draw_epg_panel(AppState &state) {
             return state.output.selected_service_id == service.service_id;
         });
     if (selected_service != state.frame.services.end()) {
-        ImGui::TextDisabled(
-            "%s", selected_service->name.empty()
-                      ? std::format("Service {}", selected_service->service_id)
-                            .c_str()
-                      : std::format("{}  ({})", selected_service->name,
-                                    selected_service->service_id)
-                            .c_str());
+        draw_text_disabled(
+            selected_service->name.empty()
+                ? std::format("Service {}", selected_service->service_id)
+                : std::format("{}  ({})", selected_service->name,
+                              selected_service->service_id));
     }
     const EpgSnapshot snapshot = state.frame.epg;
     if (snapshot.events.empty()) {
@@ -207,7 +203,7 @@ void draw_epg_panel(AppState &state) {
         const std::string start = format_time(event.start_time_utc);
         const std::string end =
             format_time(event.start_time_utc + event.duration_seconds);
-        ImGui::TextDisabled("%s  %s - %s", tag, start.c_str(), end.c_str());
+        draw_text_disabled(std::format("{}  {} - {}", tag, start, end));
         std::string title = trimmed(event.name);
         if (!event.genre.empty()) {
             title += "  [" + event.genre + "]";
@@ -216,13 +212,13 @@ void draw_epg_panel(AppState &state) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                                   ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
         }
-        ImGui::TextWrapped("%s", title.c_str());
+        draw_text_wrapped(title);
         if (is_now) {
             ImGui::PopStyleColor();
         }
         const std::string description = trimmed(event.description);
         if (!description.empty() && description != event.name) {
-            ImGui::TextWrapped("%s", description.c_str());
+            draw_text_wrapped(description);
         }
     };
     if (now_event != snapshot.events.end()) {
@@ -318,20 +314,19 @@ void draw_rtp_streaming_panel(AppState &state) {
 
     const double mib_per_second =
         state.output.rtp_write_rate.update(stats.active, stats.wire_bytes_sent);
-    ImGui::Text("Duration: %s",
-                format_recording_duration(stats.elapsed_milliseconds).c_str());
-    ImGui::Text("Sent: %.2f MiB",
-                static_cast<double>(stats.wire_bytes_sent) / (1024.0 * 1024.0));
-    ImGui::Text("Send rate: %.2f MiB/s", mib_per_second);
-    ImGui::Text("Datagrams: %llu",
-                static_cast<unsigned long long>(stats.datagrams_sent));
-    ImGui::Text("Queued: %.1f KiB",
-                static_cast<double>(stats.queued_bytes) / 1024.0);
-    ImGui::Text("Dropped: %llu   Send errors: %llu",
-                static_cast<unsigned long long>(stats.dropped_datagrams),
-                static_cast<unsigned long long>(stats.write_errors));
+    draw_text(std::format(
+        "Duration: {}", format_recording_duration(stats.elapsed_milliseconds)));
+    draw_text(std::format("Sent: {:.2f} MiB",
+                          static_cast<double>(stats.wire_bytes_sent) /
+                              (1024.0 * 1024.0)));
+    draw_text(std::format("Send rate: {:.2f} MiB/s", mib_per_second));
+    draw_text(std::format("Datagrams: {}", stats.datagrams_sent));
+    draw_text(std::format("Queued: {:.1f} KiB",
+                          static_cast<double>(stats.queued_bytes) / 1024.0));
+    draw_text(std::format("Dropped: {}   Send errors: {}",
+                          stats.dropped_datagrams, stats.write_errors));
     if (!stats.last_error.empty()) {
-        ImGui::TextWrapped("Last send error: %s", stats.last_error.c_str());
+        draw_text_wrapped(std::format("Last send error: {}", stats.last_error));
     }
     ImGui::PopID();
 }
@@ -362,8 +357,7 @@ void draw_playback_panel(AppState &state) {
     }
     ImGui::TextUnformatted("Position");
     ImGui::SameLine(115.0F);
-    ImGui::TextColored(ImVec4(0.52F, 0.82F, 1.0F, 1.0F), "%s",
-                       position.c_str());
+    draw_text_coloured(ImVec4(0.52F, 0.82F, 1.0F, 1.0F), position);
     if (begin_metric_pair("playback-metrics")) {
         next_metric_cell();
         const std::string av_sync =
@@ -417,9 +411,9 @@ void draw_playback_panel(AppState &state) {
         telemetry.queued_seconds.has_value()
             ? std::format("{:6.2f} s", *telemetry.queued_seconds)
             : std::string("    -- s");
-    ImGui::Text("Buffered        %s   speed %.4fx   stalls %llu",
-                buffered.c_str(), telemetry.playback_speed,
-                static_cast<unsigned long long>(telemetry.buffering_stalls));
+    draw_text(std::format("Buffered        {}   speed {:.4f}x   stalls {}",
+                          buffered, telemetry.playback_speed,
+                          telemetry.buffering_stalls));
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         draw_tooltip(
             "Queue depth in stream seconds at the service's PCR-measured bit "
@@ -437,8 +431,8 @@ void draw_playback_panel(AppState &state) {
             ? std::format("{:+.1f} ppm over {:.0f} s", *clock.clock_offset_ppm,
                           clock.clock_span_s)
             : std::string("--");
-    ImGui::Text("Mux rate        %s", mux_rate.c_str());
-    ImGui::Text("PCR clock       %s", clock_offset.c_str());
+    draw_text("Mux rate        " + mux_rate);
+    draw_text("PCR clock       " + clock_offset);
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         draw_tooltip(
             "Broadcast clock (PCR) against this computer's clock at the "
@@ -446,15 +440,12 @@ void draw_playback_panel(AppState &state) {
             "to the system clock. Only meaningful for live reception; for a "
             "recording it reflects the processing speed.");
     }
-    ImGui::Text("PCR/PTS/DTS     %llu / %llu / %llu",
-                static_cast<unsigned long long>(clock.pcr_count),
-                static_cast<unsigned long long>(clock.pts_count),
-                static_cast<unsigned long long>(clock.dts_count));
-    ImGui::Text(
-        "PCR seams       %llu+%llu   max gap %.0f ms",
-        static_cast<unsigned long long>(clock.pcr_flagged_discontinuities),
-        static_cast<unsigned long long>(clock.pcr_unflagged_discontinuities),
-        clock.pcr_interval_max_ms);
+    draw_text(std::format("PCR/PTS/DTS     {} / {} / {}", clock.pcr_count,
+                          clock.pts_count, clock.dts_count));
+    draw_text(std::format("PCR seams       {}+{}   max gap {:.0f} ms",
+                          clock.pcr_flagged_discontinuities,
+                          clock.pcr_unflagged_discontinuities,
+                          clock.pcr_interval_max_ms));
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         draw_tooltip(
             "Timestamps seen in the full multiplex, PCR seams announced by "
@@ -462,11 +453,10 @@ void draw_playback_panel(AppState &state) {
             "gap between consecutive PCRs of one PID (DVB bounds it at "
             "100 ms).");
     }
-    ImGui::Text("Dropped frames  %lld   (VO %lld)",
-                static_cast<long long>(telemetry.dropped_frames),
-                static_cast<long long>(telemetry.vo_dropped_frames));
-    ImGui::Text("Discontinuities  %llu",
-                static_cast<unsigned long long>(telemetry.discontinuities));
+    draw_text(std::format("Dropped frames  {}   (VO {})",
+                          telemetry.dropped_frames,
+                          telemetry.vo_dropped_frames));
+    draw_text(std::format("Discontinuities  {}", telemetry.discontinuities));
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         draw_tooltip(
             "Stream-level seams: FEC-region resets (fade gaps), stream ends, "
