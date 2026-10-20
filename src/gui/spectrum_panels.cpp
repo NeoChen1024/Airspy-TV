@@ -91,8 +91,7 @@ void draw_spectrum(const ImVec2 size, const SpectrumSnapshot &spectrum,
         const float level =
             ceiling_dbfs - (fraction * (ceiling_dbfs - floor_dbfs));
         const float y = origin.y + (canvas_size.y * fraction);
-        draw->AddLine(ImVec2(origin.x, y), ImVec2(extent.x, y),
-                      IM_COL32(38, 51, 65, 160));
+        draw->AddLineH(origin.x, extent.x, y, IM_COL32(38, 51, 65, 160));
         draw->AddText(ImVec2(origin.x + 3.0F,
                              y + (grid == grid_divisions ? -14.0F : 2.0F)),
                       IM_COL32(118, 133, 148, 220),
@@ -101,8 +100,7 @@ void draw_spectrum(const ImVec2 size, const SpectrumSnapshot &spectrum,
     for (int index = 0; index <= 4; ++index) {
         const float x =
             plot_origin.x + (plot_width * static_cast<float>(index) / 4.0F);
-        draw->AddLine(ImVec2(x, origin.y), ImVec2(x, extent.y),
-                      IM_COL32(38, 51, 65, 160));
+        draw->AddLineV(x, origin.y, extent.y, IM_COL32(38, 51, 65, 160));
     }
     draw_bandwidth_overlay(*draw, plot_origin, extent, spectrum.sample_rate_hz,
                            channel_bandwidth_hz);
@@ -262,10 +260,8 @@ void draw_constellation(const ImVec2 size, const SignalSnapshot &signal) {
                         (origin.y + extent.y) * 0.5F};
     ImDrawList *draw = ImGui::GetWindowDrawList();
     draw->AddRectFilled(origin, extent, IM_COL32(4, 9, 15, 255), 4.0F);
-    draw->AddLine(ImVec2(origin.x, center.y), ImVec2(extent.x, center.y),
-                  IM_COL32(50, 65, 80, 255));
-    draw->AddLine(ImVec2(center.x, origin.y), ImVec2(center.x, extent.y),
-                  IM_COL32(50, 65, 80, 255));
+    draw->AddLineH(origin.x, extent.x, center.y, IM_COL32(50, 65, 80, 255));
+    draw->AddLineV(center.x, origin.y, extent.y, IM_COL32(50, 65, 80, 255));
     if (signal.signal_locked) {
         constexpr float constellation_extent = 1.55F;
         const float scale = std::min(canvas_size.x, canvas_size.y) * 0.46F /

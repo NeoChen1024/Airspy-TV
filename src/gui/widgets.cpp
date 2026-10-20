@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdarg>
 #include <format>
 #include <memory>
 #include <mutex>
@@ -282,13 +283,71 @@ void request_center_frequency(AppState &state,
     state.ui.status = state.reporting.controller.retune(frequency_hz).message;
 }
 
+namespace {
+
+// Label at the left, value right-aligned on the same line. Screen
+// coordinates keep this correct inside table cells, where SameLine(offset)
+// would be measured from the window rather than the cell.
+void draw_metric_heading(const char *label, const char *value,
+                         const ImVec4 colour) {
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    const float width = ImGui::GetContentRegionAvail().x;
+    ImGui::TextUnformatted(label);
+    const float label_end = ImGui::GetItemRectMax().x + 8.0F;
+    const float value_width = ImGui::CalcTextSize(value).x;
+    ImGui::SameLine();
+    ImGui::SetCursorScreenPos(
+        ImVec2(std::max(label_end, start.x + width - value_width), start.y));
+    ImGui::TextColored(colour, "%s", value);
+}
+
+} // namespace
+
+// The bar is drawn by hand on an InvisibleButton rather than with
+// ProgressBar: a framed item sets the line's text baseline offset, which a
+// table would carry into the next cell of the row and shift its text down.
 void draw_metric(const char *label, const char *value, const float fraction,
                  const ImVec4 colour) {
-    ImGui::TextUnformatted(label);
-    ImGui::SameLine(115.0F);
-    ImGui::TextColored(colour, "%s", value);
-    ImGui::ProgressBar(fraction, ImVec2(-1.0F, 5.0F), "");
+    draw_metric_heading(label, value, colour);
+    ImGui::PushID(label);
+    ImGui::InvisibleButton("bar", ImVec2(-1.0F, 5.0F));
+    ImGui::PopID();
+    const ImVec2 bar_min = ImGui::GetItemRectMin();
+    const ImVec2 bar_max = ImGui::GetItemRectMax();
+    ImDrawList *draw = ImGui::GetWindowDrawList();
+    const float rounding = ImGui::GetStyle().FrameRounding;
+    draw->AddRectFilled(bar_min, bar_max, ImGui::GetColorU32(ImGuiCol_FrameBg),
+                        rounding);
+    const float fill = std::clamp(fraction, 0.0F, 1.0F);
+    if (fill > 0.0F) {
+        draw->AddRectFilled(
+            bar_min,
+            ImVec2(bar_min.x + ((bar_max.x - bar_min.x) * fill), bar_max.y),
+            ImGui::GetColorU32(ImGuiCol_PlotHistogram), rounding);
+    }
 }
+
+void draw_tooltip(const char *format, ...) {
+    if (!ImGui::BeginTooltip()) {
+        return;
+    }
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 36.0F);
+    va_list args;
+    va_start(args, format);
+    ImGui::TextV(format, args);
+    va_end(args);
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+}
+
+bool begin_metric_pair(const char *id) {
+    return ImGui::BeginTable(
+        id, 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoPadOuterX);
+}
+
+void next_metric_cell() { ImGui::TableNextColumn(); }
+
+void end_metric_pair() { ImGui::EndTable(); }
 
 void draw_disabled_wrapped(const std::string_view text) {
     ImGui::PushStyleColor(ImGuiCol_Text,
@@ -310,9 +369,7 @@ void draw_status_indicator(const char *label, const ImVec4 colour) {
 
 void draw_bipolar_metric(const char *label, const char *value,
                          const float position, const ImVec4 colour) {
-    ImGui::TextUnformatted(label);
-    ImGui::SameLine(115.0F);
-    ImGui::TextColored(colour, "%s", value);
+    draw_metric_heading(label, value, colour);
 
     ImGui::PushID(label);
     ImGui::InvisibleButton("meter", ImVec2(-1.0F, 5.0F));
@@ -331,11 +388,10 @@ void draw_bipolar_metric(const char *label, const char *value,
                             ImVec2(std::max(center_x, marker_x), bar_max.y),
                             ImGui::ColorConvertFloat4ToU32(colour));
     }
-    draw->AddLine(ImVec2(center_x, bar_min.y - 1.0F),
-                  ImVec2(center_x, bar_max.y + 1.0F),
-                  IM_COL32(225, 235, 245, 220));
-    draw->AddLine(ImVec2(marker_x, bar_min.y), ImVec2(marker_x, bar_max.y),
-                  ImGui::ColorConvertFloat4ToU32(colour), 2.0F);
+    draw->AddLineV(center_x, bar_min.y - 1.0F, bar_max.y + 1.0F,
+                   IM_COL32(225, 235, 245, 220));
+    draw->AddLineV(marker_x, bar_min.y, bar_max.y,
+                   ImGui::ColorConvertFloat4ToU32(colour), 2.0F);
 }
 
 void consume_file_dialog_result(AppState &state,

@@ -115,7 +115,7 @@ void draw_source_panel(AppState &state) {
                        airspy_tv::max_frequency_correction_ppm);
     }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip(
+        draw_tooltip(
             "Positive values tune the hardware LO higher than the nominal "
             "frequency. Applying a new value while streaming retunes the SDR "
             "and resets decoder tracking.");
@@ -186,7 +186,7 @@ void draw_source_panel(AppState &state) {
         ImGui::EndCombo();
     }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip("%s", preview);
+        draw_tooltip("%s", preview);
     }
     ImGui::Checkbox("Show Airspy through Soapy",
                     &state.source.show_soapy_airspy);

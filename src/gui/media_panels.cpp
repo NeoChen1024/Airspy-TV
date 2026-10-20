@@ -364,55 +364,64 @@ void draw_playback_panel(AppState &state) {
     ImGui::SameLine(115.0F);
     ImGui::TextColored(ImVec4(0.52F, 0.82F, 1.0F, 1.0F), "%s",
                        position.c_str());
-    const std::string av_sync = std::format("{:+.1f} ms", telemetry.avsync_ms);
-    draw_metric(
-        "A/V sync", av_sync.c_str(),
-        std::clamp(1.0F - static_cast<float>(std::abs(telemetry.avsync_ms)) /
-                              50.0F,
-                   0.0F, 1.0F),
-        std::abs(telemetry.avsync_ms) < 20.0
-            ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
-            : (std::abs(telemetry.avsync_ms) < 80.0
-                   ? ImVec4(0.95F, 0.72F, 0.30F, 1.0F)
-                   : ImVec4(0.95F, 0.38F, 0.28F, 1.0F)));
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip(
-            "Audio-vs-video presentation offset reported by libmpv. Positive "
-            "means audio is ahead of video. Sustained drift here is an A/V "
-            "clock problem; RF loss instead shows up as discontinuity growth "
-            "and a queued-buffer dip.");
-    }
-    const std::string buffer =
-        std::format("{:.1f} / {:.1f} MiB",
-                    static_cast<double>(telemetry.queued_bytes) /
-                        static_cast<double>(1U << 20U),
-                    static_cast<double>(telemetry.queue_capacity) /
-                        static_cast<double>(1U << 20U));
-    draw_metric(
-        "TS buffer", buffer.c_str(),
-        telemetry.queue_capacity == 0
-            ? 0.0F
-            : static_cast<float>(static_cast<double>(telemetry.queued_bytes) /
-                                 static_cast<double>(telemetry.queue_capacity)),
-        ImVec4(0.52F, 0.82F, 1.0F, 1.0F));
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip(
-            "Decoded TS bytes of the selected service queued for libmpv vs "
-            "the queue capacity. Playback buffers to 2 MiB at startup and "
-            "after a stall, re-enters buffering below 1 MiB, and the "
-            "playback rate is steered by a fraction of a percent to hold the "
-            "queue near 2.5 MiB so clock mismatch cannot drain or overflow "
-            "it over a long session.");
+    if (begin_metric_pair("playback-metrics")) {
+        next_metric_cell();
+        const std::string av_sync =
+            std::format("{:+7.1f} ms", telemetry.avsync_ms);
+        draw_metric("A/V sync", av_sync.c_str(),
+                    std::clamp(1.0F - static_cast<float>(
+                                          std::abs(telemetry.avsync_ms)) /
+                                          50.0F,
+                               0.0F, 1.0F),
+                    std::abs(telemetry.avsync_ms) < 20.0
+                        ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
+                        : (std::abs(telemetry.avsync_ms) < 80.0
+                               ? ImVec4(0.95F, 0.72F, 0.30F, 1.0F)
+                               : ImVec4(0.95F, 0.38F, 0.28F, 1.0F)));
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            draw_tooltip(
+                "Audio-vs-video presentation offset reported by libmpv. "
+                "Positive "
+                "means audio is ahead of video. Sustained drift here is an A/V "
+                "clock problem; RF loss instead shows up as discontinuity "
+                "growth "
+                "and a queued-buffer dip.");
+        }
+        next_metric_cell();
+        const std::string buffer =
+            std::format("{:4.1f} / {:4.1f} MiB",
+                        static_cast<double>(telemetry.queued_bytes) /
+                            static_cast<double>(1U << 20U),
+                        static_cast<double>(telemetry.queue_capacity) /
+                            static_cast<double>(1U << 20U));
+        draw_metric("TS buffer", buffer.c_str(),
+                    telemetry.queue_capacity == 0
+                        ? 0.0F
+                        : static_cast<float>(
+                              static_cast<double>(telemetry.queued_bytes) /
+                              static_cast<double>(telemetry.queue_capacity)),
+                    ImVec4(0.52F, 0.82F, 1.0F, 1.0F));
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            draw_tooltip(
+                "Decoded TS bytes of the selected service queued for libmpv vs "
+                "the queue capacity. Playback buffers to 2 MiB at startup and "
+                "after a stall, re-enters buffering below 1 MiB, and the "
+                "playback rate is steered by a fraction of a percent to hold "
+                "the "
+                "queue near 2.5 MiB so clock mismatch cannot drain or overflow "
+                "it over a long session.");
+        }
+        end_metric_pair();
     }
     const std::string buffered =
         telemetry.queued_seconds.has_value()
-            ? std::format("{:.2f} s", *telemetry.queued_seconds)
-            : std::string("-- s");
+            ? std::format("{:6.2f} s", *telemetry.queued_seconds)
+            : std::string("    -- s");
     ImGui::Text("Buffered        %s   speed %.4fx   stalls %llu",
                 buffered.c_str(), telemetry.playback_speed,
                 static_cast<unsigned long long>(telemetry.buffering_stalls));
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip(
+        draw_tooltip(
             "Queue depth in stream seconds at the service's PCR-measured bit "
             "rate, the playback rate currently requested from libmpv, and "
             "how many times playback drained the queue and had to wait for "
@@ -431,23 +440,23 @@ void draw_playback_panel(AppState &state) {
     ImGui::Text("Mux rate        %s", mux_rate.c_str());
     ImGui::Text("PCR clock       %s", clock_offset.c_str());
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip(
+        draw_tooltip(
             "Broadcast clock (PCR) against this computer's clock at the "
             "decoder output: positive means the broadcast runs fast relative "
             "to the system clock. Only meaningful for live reception; for a "
             "recording it reflects the processing speed.");
     }
+    ImGui::Text("PCR/PTS/DTS     %llu / %llu / %llu",
+                static_cast<unsigned long long>(clock.pcr_count),
+                static_cast<unsigned long long>(clock.pts_count),
+                static_cast<unsigned long long>(clock.dts_count));
     ImGui::Text(
-        "PCR/PTS/DTS     %llu / %llu / %llu   seams %llu+%llu   "
-        "max %.0f ms",
-        static_cast<unsigned long long>(clock.pcr_count),
-        static_cast<unsigned long long>(clock.pts_count),
-        static_cast<unsigned long long>(clock.dts_count),
+        "PCR seams       %llu+%llu   max gap %.0f ms",
         static_cast<unsigned long long>(clock.pcr_flagged_discontinuities),
         static_cast<unsigned long long>(clock.pcr_unflagged_discontinuities),
         clock.pcr_interval_max_ms);
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip(
+        draw_tooltip(
             "Timestamps seen in the full multiplex, PCR seams announced by "
             "the discontinuity indicator + unannounced jumps, and the longest "
             "gap between consecutive PCRs of one PID (DVB bounds it at "
@@ -459,7 +468,7 @@ void draw_playback_panel(AppState &state) {
     ImGui::Text("Discontinuities  %llu",
                 static_cast<unsigned long long>(telemetry.discontinuities));
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip(
+        draw_tooltip(
             "Stream-level seams: FEC-region resets (fade gaps), stream ends, "
             "and retunes. These are out-of-band events reported by the "
             "decoder, distinct from per-packet TEI corruption; retunes "
@@ -519,9 +528,9 @@ void draw_video_panel(AppState &state) {
         state.ui.video_expanded = !state.ui.video_expanded;
     }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip(state.ui.video_expanded
-                              ? "Show the panels again (Esc or F)"
-                              : "Hide the panels and fill the window (F)");
+        draw_tooltip(state.ui.video_expanded
+                         ? "Show the panels again (Esc or F)"
+                         : "Hide the panels and fill the window (F)");
     }
 
     const ImVec2 center{(origin.x + extent.x) * 0.5F,

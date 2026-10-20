@@ -69,6 +69,7 @@ void draw_common_signal_panel(AppState &state) {
     draw_status_indicator(state.frame.signal.signal_locked ? "SIGNAL LOCKED"
                                                            : "SIGNAL UNLOCKED",
                           lock_colour);
+    ImGui::SameLine(0.0F, 14.0F);
     const ImVec4 transport_colour = state.frame.signal.transport_locked
                                         ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
                                         : ImVec4(0.95F, 0.72F, 0.30F, 1.0F);
@@ -97,45 +98,42 @@ void draw_common_signal_panel(AppState &state) {
         ImGui::TextWrapped("%s", state.frame.pipeline.error.c_str());
     }
 
+    // One row: each stage's queue or busy fraction, then the drop count.
     const auto format_percent = [](const float fraction) {
         return std::format("{:3.0f}%",
                            std::clamp(fraction * 100.0F, 0.0F, 100.0F));
     };
-    if (ImGui::BeginTable("common-pipeline-stages", 2,
-                          ImGuiTableFlags_SizingStretchProp |
-                              ImGuiTableFlags_PadOuterX)) {
-        ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed,
-                                72.0F);
-        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
-        for (std::size_t index = 0; index < state.frame.pipeline.stage_count;
-             ++index) {
-            const auto &stage = state.frame.pipeline.stages[index];
-            ImGui::TableNextColumn();
-            ImGui::TextDisabled("%.*s", static_cast<int>(stage.name.size()),
-                                stage.name.data());
-            ImGui::TableNextColumn();
-            if (stage.queue_valid) {
-                ImGui::TextUnformatted(
-                    format_percent(stage.queue_fraction).c_str());
-            } else if (stage.busy_valid) {
-                ImGui::TextUnformatted(
-                    format_percent(stage.busy_fraction).c_str());
-            } else {
-                ImGui::TextUnformatted(" --%");
-            }
+    for (std::size_t index = 0; index < state.frame.pipeline.stage_count;
+         ++index) {
+        const auto &stage = state.frame.pipeline.stages[index];
+        if (index != 0) {
+            ImGui::SameLine(0.0F, 14.0F);
         }
-        ImGui::TableNextColumn();
-        ImGui::TextDisabled("Drops");
-        ImGui::TableNextColumn();
-        ImGui::Text("%llu", static_cast<unsigned long long>(
-                                state.frame.pipeline.dropped_blocks));
-        ImGui::EndTable();
+        ImGui::TextDisabled("%.*s", static_cast<int>(stage.name.size()),
+                            stage.name.data());
+        ImGui::SameLine();
+        if (stage.queue_valid) {
+            ImGui::TextUnformatted(
+                format_percent(stage.queue_fraction).c_str());
+        } else if (stage.busy_valid) {
+            ImGui::TextUnformatted(format_percent(stage.busy_fraction).c_str());
+        } else {
+            ImGui::TextUnformatted("--");
+        }
     }
+    if (state.frame.pipeline.stage_count != 0) {
+        ImGui::SameLine(0.0F, 14.0F);
+    }
+    ImGui::TextDisabled("Drops");
+    ImGui::SameLine();
+    ImGui::Text("%llu", static_cast<unsigned long long>(
+                            state.frame.pipeline.dropped_blocks));
     ImGui::Separator();
 
     const std::string power =
         state.frame.spectrum.valid
-            ? std::format("{:.1f} dBFS", state.frame.spectrum.signal_power_dbfs)
+            ? std::format("{:6.1f} dBFS",
+                          state.frame.spectrum.signal_power_dbfs)
             : "-- dBFS";
     const float power_fraction =
         state.frame.spectrum.valid
@@ -145,39 +143,55 @@ void draw_common_signal_panel(AppState &state) {
                       (signal_meter_ceiling_dbfs - signal_meter_floor_dbfs),
                   0.0F, 1.0F)
             : 0.0F;
-    draw_metric("Signal power", power.c_str(), power_fraction,
-                ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
-
     const bool has_snr = state.frame.signal.signal_locked ||
                          state.frame.spectrum.channel_metrics_valid;
     const float snr_value = state.frame.signal.signal_locked
                                 ? state.frame.signal.snr_db
                                 : state.frame.spectrum.rf_snr_db;
     const std::string snr =
-        has_snr ? std::format("{:.1f} dB", snr_value) : "-- dB";
-    draw_metric(
-        state.frame.signal.signal_locked ? "Demod SNR est." : "RF SNR est.",
-        snr.c_str(),
-        has_snr ? std::clamp((snr_value + 5.0F) / 40.0F, 0.0F, 1.0F) : 0.0F,
-        ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
-
+        has_snr ? std::format("{:5.1f} dB", snr_value) : "   -- dB";
     const bool has_notch = state.frame.signal.signal_locked ||
                            state.frame.spectrum.channel_metrics_valid;
     const float notch_value = state.frame.signal.signal_locked
                                   ? state.frame.signal.deepest_notch_db
                                   : state.frame.spectrum.deepest_notch_db;
     const std::string notch =
-        has_notch ? std::format("{:.1f} dB", notch_value) : "-- dB";
-    draw_metric("Deepest notch", notch.c_str(),
-                has_notch ? std::clamp(1.0F + (notch_value / 40.0F), 0.0F, 1.0F)
-                          : 0.0F,
-                ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
+        has_notch ? std::format("{:5.1f} dB", notch_value) : "   -- dB";
+    const std::string mer =
+        state.frame.signal.signal_locked
+            ? std::format("{:5.1f} dB", state.frame.signal.mer_db)
+            : "   -- dB";
+    if (begin_metric_pair("signal-metrics")) {
+        next_metric_cell();
+        draw_metric("Signal power", power.c_str(), power_fraction,
+                    ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
+        next_metric_cell();
+        draw_metric("Deepest notch", notch.c_str(),
+                    has_notch
+                        ? std::clamp(1.0F + (notch_value / 40.0F), 0.0F, 1.0F)
+                        : 0.0F,
+                    ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
+        next_metric_cell();
+        draw_metric(
+            state.frame.signal.signal_locked ? "Demod SNR" : "RF SNR est.",
+            snr.c_str(),
+            has_snr ? std::clamp((snr_value + 5.0F) / 40.0F, 0.0F, 1.0F) : 0.0F,
+            ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
+        next_metric_cell();
+        draw_metric(
+            "MER", mer.c_str(),
+            state.frame.signal.signal_locked
+                ? std::clamp(state.frame.signal.mer_db / 40.0F, 0.0F, 1.0F)
+                : 0.0F,
+            ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
+        end_metric_pair();
+    }
 
     const std::string carrier_offset =
         state.frame.signal.signal_locked
-            ? std::format("{:+.2f} kHz",
+            ? std::format("{:+7.2f} kHz",
                           state.frame.signal.carrier_offset_hz / 1000.0F)
-            : "-- kHz";
+            : "     -- kHz";
     const float carrier_position =
         state.frame.signal.signal_locked &&
                 state.frame.signal.carrier_offset_limit_hz > 0.0F
@@ -190,15 +204,6 @@ void draw_common_signal_panel(AppState &state) {
     draw_bipolar_metric("Carrier offset", carrier_offset.c_str(),
                         carrier_position, ImVec4(0.52F, 0.82F, 1.0F, 1.0F));
 
-    const std::string mer =
-        state.frame.signal.signal_locked
-            ? std::format("{:.1f} dB", state.frame.signal.mer_db)
-            : "-- dB";
-    draw_metric("MER", mer.c_str(),
-                state.frame.signal.signal_locked
-                    ? std::clamp(state.frame.signal.mer_db / 40.0F, 0.0F, 1.0F)
-                    : 0.0F,
-                ImVec4(0.35F, 0.78F, 0.95F, 1.0F));
     ImGui::PopID();
 }
 

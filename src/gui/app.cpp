@@ -110,6 +110,26 @@ void draw_top_bar(AppState &state) {
         request_center_frequency(state, *frequency);
     }
     ImGui::EndDisabled();
+
+    // Lock state and MER stay visible whatever the columns show.
+    ImGui::SameLine(0.0F, 28.0F);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 10.0F);
+    const bool locked = state.frame.signal.signal_locked;
+    const bool transport_locked = state.frame.signal.transport_locked;
+    draw_status_indicator(transport_locked ? "TS LOCKED"
+                          : locked         ? "OFDM LOCKED"
+                                           : "NO LOCK",
+                          transport_locked ? ImVec4(0.35F, 0.88F, 0.55F, 1.0F)
+                          : locked         ? ImVec4(0.95F, 0.72F, 0.30F, 1.0F)
+                                           : ImVec4(1.0F, 0.38F, 0.25F, 1.0F));
+    ImGui::SameLine(0.0F, 18.0F);
+    ImGui::TextDisabled("MER");
+    ImGui::SameLine();
+    if (locked) {
+        ImGui::Text("%5.1f dB", state.frame.signal.mer_db);
+    } else {
+        ImGui::TextUnformatted("   --");
+    }
     ImGui::SameLine();
     const float status_width = ImGui::CalcTextSize(state.ui.status.c_str()).x;
     ImGui::SetCursorPosX(

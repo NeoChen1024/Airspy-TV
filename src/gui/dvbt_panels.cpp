@@ -237,6 +237,7 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
         draw_status_indicator(locked ? "OFDM MONITOR LOCKED"
                                      : "OFDM MONITOR UNLOCKED",
                               lock_colour);
+        ImGui::SameLine(0.0F, 14.0F);
 
         const bool transport_locked =
             state.frame.dvbt.decoder.transport.rs_synchronized &&
@@ -271,21 +272,29 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
             ImGui::PopStyleColor();
         }
 
-        // Continual-carrier fade indicator: the GUI diag dump already logs
-        // it every 10 s, but a real-time bar helps correlate a drift/stall
-        // with a marginal channel before consulting logs.
-        {
+        // Timing confidence next to the fade indicator, SRO and CFO on their
+        // own rows (long values), inner and outer BER side by side.
+        if (begin_metric_pair("fec-health")) {
+            next_metric_cell();
             const float fi = state.frame.dvbt.decoder.fade_indicator;
             const std::string fi_text = std::format("{:.3f}", fi);
             draw_metric("Fade ind", fi_text.c_str(), std::clamp(fi, 0.0F, 1.0F),
                         ImVec4(0.62F, 0.92F, 0.45F, 1.0F));
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-                ImGui::SetTooltip(
+                draw_tooltip(
                     "Continual-carrier normalized correlation; ~1 = healthy, "
                     "<= 0.25 freeze, 0.25-0.5 marginal grid.\n"
                     "If it stays high while the grid drifts, the alias was "
                     "latched before the correlation collapsed.");
             }
+            next_metric_cell();
+            const std::string confidence_text = std::format(
+                "{:5.1f}%",
+                state.frame.dvbt.decoder.timing_confidence * 100.0F);
+            draw_metric("Timing conf", confidence_text.c_str(),
+                        state.frame.dvbt.decoder.timing_confidence,
+                        ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
+            end_metric_pair();
         }
         {
             const bool timing_valid =
@@ -296,16 +305,16 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
             const std::string actuator_text =
                 sro_resampler_ready
                     ? std::format(
-                          "{:+.3f} / {:+.3f} ppm / {}",
+                          "{:+7.3f} / {:+7.3f} ppm / {}",
                           state.frame.dvbt.decoder.sro_resampler_command_ppm,
                           state.frame.dvbt.decoder.sro_resampler_applied_ppm,
-                          timing_valid ? std::format("{:.1f} smp",
+                          timing_valid ? std::format("{:7.1f} smp",
                                                      state.frame.dvbt.decoder
                                                          .timing_offset_samples)
                                        : "-- smp")
                     : std::format("-- / -- ppm / {}",
                                   timing_valid
-                                      ? std::format("{:.1f} smp",
+                                      ? std::format("{:7.1f} smp",
                                                     state.frame.dvbt.decoder
                                                         .timing_offset_samples)
                                       : "-- smp");
@@ -327,7 +336,7 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
                                       .sro_fixed_delay_samples) /
                               state.frame.dvbt.decoder.sro_input_sample_rate_hz
                         : 0.0;
-                ImGui::SetTooltip(
+                draw_tooltip(
                     "DVB-T timing-loop command, correction currently applied "
                     "by the common variable-rate resampler, and filtered "
                     "pilot-slope timing offset. The bar uses applied ppm "
@@ -350,18 +359,12 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
                     state.frame.dvbt.decoder.resampler_requested_ratio,
                     state.frame.dvbt.decoder.resampler_effective_ratio);
             }
-            const std::string confidence_text = std::format(
-                "{:.1f}%%",
-                state.frame.dvbt.decoder.timing_confidence * 100.0F);
-            draw_metric("Timing conf", confidence_text.c_str(),
-                        state.frame.dvbt.decoder.timing_confidence,
-                        ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
             const bool cfo_resampler_ready =
                 state.frame.dvbt.decoder.cfo_resampler_ready;
             const std::string cfo_text =
                 cfo_resampler_ready
                     ? std::format(
-                          "{:+.1f} / {:+.1f} / {:+.2f} Hz",
+                          "{:+7.1f} / {:+7.1f} / {:+6.2f} Hz",
                           state.frame.dvbt.decoder.acquisition_cfo_hz,
                           state.frame.dvbt.decoder.cfo_resampler_applied_hz,
                           state.frame.dvbt.decoder.residual_carrier_offset_hz)
@@ -388,7 +391,7 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
                                       .cfo_fixed_delay_samples) /
                               state.frame.dvbt.decoder.cfo_input_sample_rate_hz
                         : 0.0;
-                ImGui::SetTooltip(
+                draw_tooltip(
                     "Initial CFO is acquired before production samples enter "
                     "the ring; steady-state residual CFO is fed back to the "
                     "same common resampler independently of SRO. The third "
@@ -450,51 +453,60 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
                        : std::clamp(static_cast<float>(-std::log10(ber) / 7.0),
                                     0.0F, 1.0F);
         };
-        const std::string pre_viterbi_text =
-            pre_viterbi_available ? std::format("{:.2e}", pre_viterbi_ber)
-                                  : "--";
-        draw_metric("Inner BER", pre_viterbi_text.c_str(),
-                    pre_viterbi_available ? ber_quality(pre_viterbi_ber) : 0.0F,
-                    ImVec4(0.75F, 0.72F, 0.30F, 1.0F));
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-            ImGui::SetTooltip(
-                "Bit errors before the outer FEC, measured against the "
-                "received mother-code metrics. For DVB-T this is the "
-                "pre-Viterbi BER (re-encoded survivor path).\n%llu errors / "
-                "%llu compared bits",
-                static_cast<unsigned long long>(
-                    transport.pre_viterbi_error_bits),
-                static_cast<unsigned long long>(
-                    transport.pre_viterbi_compared_bits));
-        }
+        if (begin_metric_pair("fec-ber")) {
+            next_metric_cell();
+            const std::string pre_viterbi_text =
+                pre_viterbi_available ? std::format("{:.2e}", pre_viterbi_ber)
+                                      : "--";
+            draw_metric("Inner BER", pre_viterbi_text.c_str(),
+                        pre_viterbi_available ? ber_quality(pre_viterbi_ber)
+                                              : 0.0F,
+                        ImVec4(0.75F, 0.72F, 0.30F, 1.0F));
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                draw_tooltip(
+                    "Bit errors before the outer FEC, measured against the "
+                    "received mother-code metrics. For DVB-T this is the "
+                    "pre-Viterbi BER (re-encoded survivor path).\n%llu errors "
+                    "/ "
+                    "%llu compared bits",
+                    static_cast<unsigned long long>(
+                        transport.pre_viterbi_error_bits),
+                    static_cast<unsigned long long>(
+                        transport.pre_viterbi_compared_bits));
+            }
 
-        const bool post_viterbi_available =
-            transport.post_viterbi_compared_bits != 0;
-        const double post_viterbi_ber =
-            post_viterbi_available
-                ? static_cast<double>(transport.post_viterbi_error_bits) /
-                      static_cast<double>(transport.post_viterbi_compared_bits)
-                : 0.0;
-        const std::string post_viterbi_text =
-            post_viterbi_available ? std::format("{:.2e}", post_viterbi_ber)
-                                   : "--";
-        draw_metric("Outer BER", post_viterbi_text.c_str(),
-                    post_viterbi_available ? ber_quality(post_viterbi_ber)
-                                           : 0.0F,
-                    ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-            ImGui::SetTooltip(
-                "RS-derived outer error estimate: corrected payload bits "
-                "from valid codewords plus a full 188-byte penalty for each "
-                "uncorrectable codeword. This keeps the metric live during "
-                "outer-lock loss.\n%llu error bits / %llu attempted bits; "
-                "%llu RS failures",
-                static_cast<unsigned long long>(
-                    transport.post_viterbi_error_bits),
-                static_cast<unsigned long long>(
-                    transport.post_viterbi_compared_bits),
-                static_cast<unsigned long long>(
-                    transport.rs_uncorrectable_packets));
+            next_metric_cell();
+            const bool post_viterbi_available =
+                transport.post_viterbi_compared_bits != 0;
+            const double post_viterbi_ber =
+                post_viterbi_available
+                    ? static_cast<double>(transport.post_viterbi_error_bits) /
+                          static_cast<double>(
+                              transport.post_viterbi_compared_bits)
+                    : 0.0;
+            const std::string post_viterbi_text =
+                post_viterbi_available ? std::format("{:.2e}", post_viterbi_ber)
+                                       : "--";
+            draw_metric("Outer BER", post_viterbi_text.c_str(),
+                        post_viterbi_available ? ber_quality(post_viterbi_ber)
+                                               : 0.0F,
+                        ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                draw_tooltip(
+                    "RS-derived outer error estimate: corrected payload bits "
+                    "from valid codewords plus a full 188-byte penalty for "
+                    "each "
+                    "uncorrectable codeword. This keeps the metric live during "
+                    "outer-lock loss.\n%llu error bits / %llu attempted bits; "
+                    "%llu RS failures",
+                    static_cast<unsigned long long>(
+                        transport.post_viterbi_error_bits),
+                    static_cast<unsigned long long>(
+                        transport.post_viterbi_compared_bits),
+                    static_cast<unsigned long long>(
+                        transport.rs_uncorrectable_packets));
+            }
+            end_metric_pair();
         }
         ImGui::TextColored(
             transport.rs_uncorrectable_packets == 0
@@ -504,138 +516,101 @@ static void draw_dvbt_diagnostics_panel(AppState &state) {
             static_cast<unsigned long long>(transport.rs_uncorrectable_packets),
             static_cast<unsigned long long>(transport.tei_packets));
         ImGui::Separator();
+        // Two lines: the transmission parameters with their source, then the
+        // bandwidth and cell identifier.
+        const auto &decoder = state.frame.dvbt.decoder;
+        const auto &signal = state.frame.dvbt.signal;
         const char *mode = "--";
         const char *guard = "--";
         const char *modulation = "--";
         const char *code_rate = "--";
-        if (state.standard.dvbt.parameters.code_rate.has_value()) {
-            switch (*state.standard.dvbt.parameters.code_rate) {
-            case airspy_tv::dvbt::CodeRate::rate_1_2:
-                code_rate = "1/2 (manual)";
-                break;
-            case airspy_tv::dvbt::CodeRate::rate_2_3:
-                code_rate = "2/3 (manual)";
-                break;
-            case airspy_tv::dvbt::CodeRate::rate_3_4:
-                code_rate = "3/4 (manual)";
-                break;
-            case airspy_tv::dvbt::CodeRate::rate_5_6:
-                code_rate = "5/6 (manual)";
-                break;
-            case airspy_tv::dvbt::CodeRate::rate_7_8:
-                code_rate = "7/8 (manual)";
-                break;
-            }
-        }
-        if (state.frame.dvbt.signal.locked) {
-            mode = state.frame.dvbt.signal.mode ==
-                           airspy_tv::dvbt::TransmissionMode::k8
-                       ? "8K"
-                       : "2K";
-            switch (state.frame.dvbt.signal.guard_interval) {
-            case airspy_tv::dvbt::GuardInterval::gi_1_32:
-                guard = "1/32";
-                break;
-            case airspy_tv::dvbt::GuardInterval::gi_1_16:
-                guard = "1/16";
-                break;
-            case airspy_tv::dvbt::GuardInterval::gi_1_8:
-                guard = "1/8";
-                break;
-            case airspy_tv::dvbt::GuardInterval::gi_1_4:
-                guard = "1/4";
-                break;
-            }
-            switch (state.frame.dvbt.signal.constellation) {
-            case airspy_tv::dvbt::Constellation::qpsk:
-                modulation = "QPSK";
-                break;
-            case airspy_tv::dvbt::Constellation::qam16:
-                modulation = "16-QAM";
-                break;
-            case airspy_tv::dvbt::Constellation::qam64:
-                modulation = "64-QAM";
-                break;
-            }
-        }
-        if (state.frame.dvbt.decoder.tps_locked) {
-            mode = state.frame.dvbt.decoder.tps_mode == TransmissionMode::k8
-                       ? "8K (TPS)"
-                       : "2K (TPS)";
-            switch (state.frame.dvbt.decoder.tps_guard_interval) {
+        const char *source = nullptr;
+        const auto guard_name = [](const GuardInterval value) {
+            switch (value) {
             case GuardInterval::gi_1_32:
-                guard = "1/32 (TPS)";
-                break;
+                return "GI 1/32";
             case GuardInterval::gi_1_16:
-                guard = "1/16 (TPS)";
-                break;
+                return "GI 1/16";
             case GuardInterval::gi_1_8:
-                guard = "1/8 (TPS)";
-                break;
+                return "GI 1/8";
             case GuardInterval::gi_1_4:
-                guard = "1/4 (TPS)";
-                break;
+                return "GI 1/4";
             }
-            switch (state.frame.dvbt.decoder.tps_constellation) {
+            return "GI --";
+        };
+        const auto constellation_name = [](const Constellation value) {
+            switch (value) {
             case Constellation::qpsk:
-                modulation = "QPSK (TPS)";
-                break;
+                return "QPSK";
             case Constellation::qam16:
-                modulation = "16-QAM (TPS)";
-                break;
+                return "16-QAM";
             case Constellation::qam64:
-                modulation = "64-QAM (TPS)";
-                break;
+                return "64-QAM";
             }
-            if (!state.standard.dvbt.parameters.code_rate.has_value()) {
-                switch (state.frame.dvbt.decoder.tps_code_rate) {
-                case CodeRate::rate_1_2:
-                    code_rate = "1/2 (TPS)";
-                    break;
-                case CodeRate::rate_2_3:
-                    code_rate = "2/3 (TPS)";
-                    break;
-                case CodeRate::rate_3_4:
-                    code_rate = "3/4 (TPS)";
-                    break;
-                case CodeRate::rate_5_6:
-                    code_rate = "5/6 (TPS)";
-                    break;
-                case CodeRate::rate_7_8:
-                    code_rate = "7/8 (TPS)";
-                    break;
-                }
+            return "--";
+        };
+        const auto code_rate_name = [](const CodeRate value) {
+            switch (value) {
+            case CodeRate::rate_1_2:
+                return "1/2";
+            case CodeRate::rate_2_3:
+                return "2/3";
+            case CodeRate::rate_3_4:
+                return "3/4";
+            case CodeRate::rate_5_6:
+                return "5/6";
+            case CodeRate::rate_7_8:
+                return "7/8";
+            }
+            return "--";
+        };
+        if (decoder.tps_locked) {
+            mode = decoder.tps_mode == TransmissionMode::k8 ? "8K" : "2K";
+            guard = guard_name(decoder.tps_guard_interval);
+            modulation = constellation_name(decoder.tps_constellation);
+            code_rate = code_rate_name(decoder.tps_code_rate);
+            source = "TPS";
+        } else if (signal.locked) {
+            mode = signal.mode == TransmissionMode::k8 ? "8K" : "2K";
+            guard = guard_name(signal.guard_interval);
+            modulation = constellation_name(signal.constellation);
+            source = "OFDM monitor";
+        }
+        const bool manual_code_rate =
+            state.standard.dvbt.parameters.code_rate.has_value();
+        if (manual_code_rate) {
+            code_rate =
+                code_rate_name(*state.standard.dvbt.parameters.code_rate);
+        }
+        ImGui::Text("%s · %s · %s · %s", mode, guard, modulation, code_rate);
+        if (source != nullptr || manual_code_rate) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%s%s%s)", source != nullptr ? source : "",
+                                source != nullptr && manual_code_rate ? ", "
+                                                                      : "",
+                                manual_code_rate ? "manual code rate" : "");
+        }
+        std::string cell_id = "--";
+        if (decoder.tps_locked) {
+            if (!decoder.tps_cell_id_present) {
+                cell_id = "not transmitted";
+            } else if (decoder.tps_cell_id.has_value()) {
+                cell_id = std::format("0x{:04X} ({})", *decoder.tps_cell_id,
+                                      *decoder.tps_cell_id);
+            } else {
+                cell_id = "assembling";
             }
         }
-        ImGui::Text("Bandwidth      %u MHz",
+        ImGui::Text("%u MHz · Cell ID %s",
                     state.standard.dvbt.parameters.channel_bandwidth_hz /
-                        1'000'000U);
-        ImGui::Text("Mode           %s", mode);
-        ImGui::Text("Guard          %s", guard);
-        ImGui::Text("Modulation     %s", modulation);
-        ImGui::Text("Code rate      %s", code_rate);
-        {
-            const auto &decoder = state.frame.dvbt.decoder;
-            std::string cell_id = "--";
-            if (decoder.tps_locked) {
-                if (!decoder.tps_cell_id_present) {
-                    cell_id = "not transmitted";
-                } else if (decoder.tps_cell_id.has_value()) {
-                    cell_id = std::format("0x{:04X} ({})", *decoder.tps_cell_id,
-                                          *decoder.tps_cell_id);
-                } else {
-                    cell_id = "assembling";
-                }
-            }
-            ImGui::Text("Cell ID        %s", cell_id.c_str());
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-                ImGui::SetTooltip(
-                    "16-bit DVB-T cell identifier assembled from the TPS "
-                    "of two consecutive frames (frame %u of 4 at the last "
-                    "window). It names the SFN cell or network, not an "
-                    "individual transmitter.",
-                    static_cast<unsigned>(decoder.tps_frame_number) + 1U);
-            }
+                        1'000'000U,
+                    cell_id.c_str());
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            draw_tooltip("16-bit DVB-T cell identifier assembled from the TPS "
+                         "of two consecutive frames (frame %u of 4 at the last "
+                         "window). It names the SFN cell or network, not an "
+                         "individual transmitter.",
+                         static_cast<unsigned>(decoder.tps_frame_number) + 1U);
         }
         draw_disabled_wrapped(
             state.frame.dvbt.decoder.tps_locked
