@@ -1,5 +1,7 @@
 #pragma once
 
+#include <imgui.h>
+
 #include <cstdint>
 
 namespace airspy_tv::gui {
@@ -13,8 +15,9 @@ void request_center_frequency(AppState &state, std::uint64_t frequency_hz);
 void draw_source_panel(AppState &state);
 void draw_receiver_panel(AppState &state);
 void draw_standard_settings_panel(AppState &state);
-void draw_spectrum_panel(AppState &state);
-void draw_constellation_panel(AppState &state);
+void draw_display_settings_panel(AppState &state);
+void draw_spectrum_display(AppState &state, ImVec2 size);
+void draw_constellation_display(AppState &state, ImVec2 size);
 void draw_common_signal_panel(AppState &state);
 void draw_standard_diagnostics_panel(AppState &state);
 void draw_playback_panel(AppState &state);

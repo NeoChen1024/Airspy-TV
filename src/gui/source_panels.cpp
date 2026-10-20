@@ -101,8 +101,9 @@ void draw_source_panel(AppState &state) {
         ImGui::BeginDisabled();
     }
     ImGui::TextDisabled("Hardware LO = nominal × (1 + ppm / 1e6)");
+    ImGui::TextUnformatted("SDR correction (ppm)");
     ImGui::SetNextItemWidth(-1.0F);
-    if (ImGui::InputDouble("SDR correction (ppm)",
+    if (ImGui::InputDouble("##frequency-correction-ppm",
                            &state.source.settings.frequency_correction_ppm, 0.1,
                            1.0, "%.3f")) {
         if (!std::isfinite(state.source.settings.frequency_correction_ppm)) {

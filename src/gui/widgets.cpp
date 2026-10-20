@@ -10,6 +10,9 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <ranges>
+#include <string>
+#include <vector>
 
 namespace airspy_tv::gui {
 namespace {
@@ -102,20 +105,37 @@ void apply_dark_theme() {
     }
 
     // Dear ImGui does not consult the platform font fallback mechanism. Merge
-    // the first few fonts from Fontconfig's coverage-trimmed system fallback
-    // order to provide the behavior desktop toolkits normally supply. The
-    // query intentionally carries no language or character-set requirement.
-    constexpr int maximum_font_sources = 6;
+    // the first few font families from Fontconfig's coverage-trimmed system
+    // fallback order to provide the behavior desktop toolkits normally supply.
+    // The query intentionally carries no language or character-set
+    // requirement. One face per family: a second weight of the same family
+    // adds no coverage, and the slots are needed for the CJK fallbacks that
+    // come late in the order (e.g. a Simplified font sorted ahead of the
+    // Traditional one, each covering characters the other lacks).
+    constexpr int maximum_font_sources = 8;
     int loaded_sources = 0;
+    std::vector<std::string> loaded_families;
     for (int match_index = 0;
          match_index < matches->nfont && loaded_sources < maximum_font_sources;
          ++match_index) {
         FcChar8 *font_file = nullptr;
+        FcChar8 *family_name = nullptr;
         const FcPattern *match = matches->fonts[match_index];
         if (FcPatternGetString(match, FC_FILE, 0, &font_file) !=
                 FcResultMatch ||
             font_file == nullptr) {
             continue;
+        }
+        if (FcPatternGetString(match, FC_FAMILY, 0, &family_name) ==
+                FcResultMatch &&
+            family_name != nullptr) {
+            std::string match_family{
+                reinterpret_cast<const char *>(family_name)};
+            if (std::ranges::find(loaded_families, match_family) !=
+                loaded_families.end()) {
+                continue;
+            }
+            loaded_families.push_back(std::move(match_family));
         }
 
         int font_index = 0;

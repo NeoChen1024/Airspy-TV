@@ -178,8 +178,10 @@ int main(const int argc, char **argv) {
     if (device_id.has_value() && !decode_live) {
         cli_usage_error("--device is valid only with --decode-live");
     }
-    if (live_iq_input.has_value() && !decode_live) {
-        cli_usage_error("--iq-input is valid only with --decode-live");
+    if (live_iq_input.has_value() && !decode_live &&
+        (command_count != 0 || live_iq_input == std::filesystem::path("-"))) {
+        cli_usage_error(
+            "--iq-input is valid with --decode-live or the GUI receiver");
     }
     if (live_iq_input.has_value() && device_id.has_value()) {
         cli_usage_error("--device and --iq-input are mutually exclusive");
@@ -259,5 +261,6 @@ int main(const int argc, char **argv) {
         return record_first_cli(*record_path, duration_ms, settings);
     }
 
-    return airspy_tv::gui::run_gui(report_directory);
+    return airspy_tv::gui::run_gui(
+        {.report_directory = report_directory, .iq_input = live_iq_input});
 }

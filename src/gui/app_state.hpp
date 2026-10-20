@@ -127,6 +127,10 @@ struct AppFrameSnapshot {
 struct UiShellState {
     std::string status{"Ready"};
     SDL_Window *window{};
+    // Video-only view: the top bar, side columns and the display strip are
+    // hidden and the video fills the window (toggled from the video header,
+    // F or Escape).
+    bool video_expanded{};
 };
 
 struct ReportingUiState {
@@ -144,11 +148,14 @@ struct AppState {
         std::optional<std::filesystem::path> report_directory = std::nullopt)
         : reporting(session, source.settings, std::move(report_directory)) {}
 
+    // The player is declared before the session so it is destroyed after it:
+    // the decoder threads are joined by the session's destructor and may call
+    // the playback sink or the discontinuity callback until then.
+    OutputUiState output;
     ReceiverSession session;
     SourceUiState source;
     DisplayUiState display;
     StandardUiState standard;
-    OutputUiState output;
     UiShellState ui;
     ReportingUiState reporting;
     AppFrameSnapshot frame;

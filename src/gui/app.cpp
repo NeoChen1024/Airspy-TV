@@ -23,7 +23,10 @@
 namespace airspy_tv::gui {
 namespace {
 
-constexpr float panel_width = 410.0F;
+constexpr float column_max_width = 380.0F;
+constexpr float video_chrome_height = 92.0F;
+constexpr float strip_min_height = 240.0F;
+constexpr float strip_max_height = 360.0F;
 
 void update_app_state(AppState &state) {
     state.frame.standard = state.session.standard();
@@ -93,16 +96,7 @@ void update_app_state(AppState &state) {
     }
 }
 
-void draw_application(AppState &state) {
-    const ImGuiViewport *viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(viewport->WorkPos);
-    ImGui::SetNextWindowSize(viewport->WorkSize);
-    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
-                                       ImGuiWindowFlags_NoMove |
-                                       ImGuiWindowFlags_NoSavedSettings |
-                                       ImGuiWindowFlags_NoBringToFrontOnFocus;
-    ImGui::Begin("Airspy TV", nullptr, flags);
-
+void draw_top_bar(AppState &state) {
     ImGui::BeginChild("top-bar", ImVec2(0.0F, 58.0F), ImGuiChildFlags_Borders);
     ImGui::TextColored(accent, "AIRSPY TV");
     ImGui::SameLine(128.0F);
@@ -126,28 +120,99 @@ void draw_application(AppState &state) {
                            : ImVec4(0.58F, 0.66F, 0.74F, 1.0F),
                        "%s", state.ui.status.c_str());
     ImGui::EndChild();
+}
 
-    const float sidebar =
-        std::min(panel_width, ImGui::GetContentRegionAvail().x * 0.42F);
-    ImGui::BeginChild("side-panel", ImVec2(sidebar, 0.0F),
+// Spectrum/waterfall, constellation and EPG side by side under the video.
+void draw_display_strip(AppState &state, const float height) {
+    ImGui::BeginChild("display-strip", ImVec2(0.0F, height),
+                      ImGuiChildFlags_Borders);
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    const float constellation_width = std::min(available.y, 320.0F);
+    const float remaining =
+        available.x - constellation_width - (2.0F * spacing);
+    const float spectrum_width = std::max(200.0F, remaining * 0.58F);
+    draw_spectrum_display(state, ImVec2(spectrum_width, available.y));
+    ImGui::SameLine();
+    draw_constellation_display(state, ImVec2(constellation_width, available.y));
+    ImGui::SameLine();
+    ImGui::BeginChild("epg-strip", ImVec2(0.0F, available.y),
+                      ImGuiChildFlags_None);
+    draw_epg_panel(state);
+    ImGui::EndChild();
+    ImGui::EndChild();
+}
+
+void draw_application(AppState &state) {
+    const ImGuiViewport *viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->WorkPos);
+    ImGui::SetNextWindowSize(viewport->WorkSize);
+    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
+                                       ImGuiWindowFlags_NoMove |
+                                       ImGuiWindowFlags_NoSavedSettings |
+                                       ImGuiWindowFlags_NoBringToFrontOnFocus;
+    ImGui::Begin("Airspy TV", nullptr, flags);
+
+    if (!ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+            state.ui.video_expanded = !state.ui.video_expanded;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            state.ui.video_expanded = false;
+        }
+    }
+
+    if (state.ui.video_expanded) {
+        ImGui::BeginChild("video-panel", ImVec2(0.0F, 0.0F),
+                          ImGuiChildFlags_Borders);
+        draw_video_panel(state);
+        ImGui::EndChild();
+        ImGui::End();
+        return;
+    }
+
+    draw_top_bar(state);
+
+    const float column_width =
+        std::min(column_max_width, ImGui::GetContentRegionAvail().x * 0.24F);
+    ImGui::BeginChild("control-column", ImVec2(column_width, 0.0F),
                       ImGuiChildFlags_Borders,
                       ImGuiWindowFlags_AlwaysVerticalScrollbar);
     draw_source_panel(state);
-    draw_spectrum_panel(state);
     draw_receiver_panel(state);
-    draw_constellation_panel(state);
-    draw_common_signal_panel(state);
-    draw_standard_diagnostics_panel(state);
-    draw_playback_panel(state);
-    draw_epg_panel(state);
+    draw_display_settings_panel(state);
     draw_ts_recorder_panel(state);
     draw_rtp_streaming_panel(state);
     draw_recorder_panel(state);
     ImGui::EndChild();
     ImGui::SameLine();
-    ImGui::BeginChild("video-panel", ImVec2(0.0F, 0.0F),
+
+    const ImVec2 center = ImGui::GetContentRegionAvail();
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    const float center_width = center.x - column_width - spacing;
+    // The video keeps its 16:9 frame plus header and footer; the display
+    // strip takes the rest, within bounds, so a short window shrinks the
+    // video rather than the plots.
+    const float video_height =
+        ((center_width * 9.0F) / 16.0F) + video_chrome_height;
+    const float strip_height = std::clamp(center.y - video_height - spacing,
+                                          strip_min_height, strip_max_height);
+    ImGui::BeginChild("center-column", ImVec2(center_width, 0.0F),
+                      ImGuiChildFlags_None);
+    ImGui::BeginChild("video-panel",
+                      ImVec2(0.0F, center.y - strip_height - spacing),
                       ImGuiChildFlags_Borders);
     draw_video_panel(state);
+    ImGui::EndChild();
+    draw_display_strip(state, strip_height);
+    ImGui::EndChild();
+    ImGui::SameLine();
+
+    ImGui::BeginChild("monitor-column", ImVec2(0.0F, 0.0F),
+                      ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    draw_common_signal_panel(state);
+    draw_standard_diagnostics_panel(state);
+    draw_playback_panel(state);
     ImGui::EndChild();
 
     ImGui::End();
@@ -155,7 +220,7 @@ void draw_application(AppState &state) {
 
 } // namespace
 
-int run_gui(std::optional<std::filesystem::path> report_directory) {
+int run_gui(GuiOptions options) {
     SDL_SetAppMetadata("Airspy TV", "0.1.0", "io.github.airspy-tv");
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         std::cerr << "SDL_Init failed: " << SDL_GetError() << '\n';
@@ -204,7 +269,7 @@ int run_gui(std::optional<std::filesystem::path> report_directory) {
     ImGui_ImplSDL3_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
-    AppState state(std::move(report_directory));
+    AppState state(std::move(options.report_directory));
     state.reporting.decode_report.set_transport_output_provider([&state] {
         const auto playback = state.output.player.telemetry();
         return std::vector<TransportOutputTelemetry>{
@@ -220,11 +285,12 @@ int run_gui(std::optional<std::filesystem::path> report_directory) {
              .queued_bytes = playback.queued_bytes,
              .queue_capacity_bytes = playback.queue_capacity,
              .error = {},
-             .pacing = TransportOutputPacing{
-                 .rate = playback.playback_speed,
-                 .queued_seconds = playback.queued_seconds,
-                 .stalls = playback.buffering_stalls,
-                 .clock_offset_ppm = playback.clock_offset_ppm}},
+             .pacing =
+                 TransportOutputPacing{
+                     .rate = playback.playback_speed,
+                     .queued_seconds = playback.queued_seconds,
+                     .stalls = playback.buffering_stalls,
+                     .clock_offset_ppm = playback.clock_offset_ppm}},
         };
     });
     initialize_standard_state(state);
@@ -249,6 +315,10 @@ int run_gui(std::optional<std::filesystem::path> report_directory) {
             state.output.player.on_discontinuity(discontinuity);
         });
     refresh_devices(state);
+    if (options.iq_input.has_value()) {
+        state.ui.status =
+            state.reporting.controller.open_iq_file(*options.iq_input).message;
+    }
     bool running = true;
     while (running) {
         SDL_Event event;

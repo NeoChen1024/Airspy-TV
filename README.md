@@ -49,7 +49,7 @@ so GNU Radio appears only as an offline test fixture.
   aligned and the transport stream resumes right after the hole.
 - Embedded libmpv video/audio playback rendered into the application OpenGL
   surface, with service selection, volume, and mute controls.
-- Sidebar EPG now/next guide for the selected service, decoded from EIT
+- EPG now/next guide for the selected service, decoded from EIT
   present/following and TDT/TOT clock data with iconv-based DVB text support
   (Big5, GB2312, EUC-KR, ISO-8859-x, and the Taiwan mislabeled-UTF-16 quirk).
 - Raw CS16 I/Q and full-multiplex MPEG-TS recording with duration, size,
@@ -156,8 +156,13 @@ bootstrap, smoke mode, and independently adjustable parallelism.
 
 ## Using the receiver
 
-The Source panel exposes the decoder worker budget and available input sources.
-Open a native Airspy, a compatible SoapySDR device, or an I/Q recording, then:
+The window has a control column (Source, Demodulator, Display, recorders and
+RTP output), the video with the spectrum/waterfall, constellation and EPG strip
+under it, and a monitor column (signal quality, FEC and timing, playback). The
+Expand button in the video header, or the F key, hides everything but the
+video; Esc or F restores the panels. Open a native Airspy, a compatible
+SoapySDR device, or an I/Q recording from the Source panel (or start the GUI
+with `--iq-input PATH` to open a recording immediately), then:
 
 1. Select the DVB-T channel bandwidth (5, 6, 7, or 8 MHz).
 2. Tune the always-centered frequency control; the mouse wheel changes the
@@ -166,8 +171,8 @@ Open a native Airspy, a compatible SoapySDR device, or an I/Q recording, then:
    for diagnostics.
 4. Wait for OFDM and TS lock, then choose a service in the video footer.
 5. Adjust volume or mute playback, and optionally record raw I/Q or the full
-   MPEG transport stream. The EPG sidebar panel follows the selected service
-   and shows its current and next programs.
+   MPEG transport stream. The EPG strip follows the selected service and
+   shows its current and next programs.
 
 The service selector filters playback to the selected service's PMT, PCR,
 audio, and video PIDs while retaining required PSI/SI packets. MPEG-TS recording
@@ -285,7 +290,7 @@ CLI warns on stderr and drops the oldest queued TS blocks so reception stays at
 the live edge. An actual file/stdout write error fails the command. RTP/UDP
 queue pressure or send errors instead drop datagrams, update counters, and
 leave reception and other outputs running. The GUI exposes the same IPv4/IPv6
-RTP output between the MPEG-TS and raw I/Q recorder panels.
+RTP output in the control column next to the recorder panels.
 
 The decoder worker budget defaults to `std::thread::hardware_concurrency()`.
 `--decoder-threads N` overrides it; the same option appears in the GUI and is

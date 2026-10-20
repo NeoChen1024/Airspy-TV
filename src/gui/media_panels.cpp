@@ -63,8 +63,7 @@ void draw_recorder_write_stats(ByteRateTracker &rate_tracker,
 } // namespace
 
 void draw_recorder_panel(AppState &state) {
-    if (!ImGui::CollapsingHeader("Raw I/Q Recorder",
-                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (!ImGui::CollapsingHeader("Raw I/Q Recorder")) {
         return;
     }
     ImGui::PushID("iq-recorder");
@@ -114,10 +113,9 @@ void draw_recorder_panel(AppState &state) {
 }
 
 void draw_epg_panel(AppState &state) {
-    if (!ImGui::CollapsingHeader("EPG", ImGuiTreeNodeFlags_DefaultOpen)) {
-        return;
-    }
     ImGui::PushID("epg-panel");
+    ImGui::TextColored(ImVec4(0.59F, 0.65F, 0.72F, 1.0F), "EPG");
+    ImGui::SameLine();
     if (state.frame.services.empty()) {
         draw_disabled_wrapped("No services detected");
         ImGui::PopID();
@@ -201,50 +199,48 @@ void draw_epg_panel(AppState &state) {
         }
         return text.substr(begin, end - begin);
     };
+    // Time range on one line, then the title and the description wrapped to
+    // the strip width: a SameLine title would be clipped at the right edge.
     const auto draw_event = [&format_time, &trimmed](const char *tag,
                                                      const EpgEvent &event,
                                                      const bool is_now) {
-        ImGui::TextDisabled("%s", tag);
         const std::string start = format_time(event.start_time_utc);
         const std::string end =
             format_time(event.start_time_utc + event.duration_seconds);
-        const std::string name = trimmed(event.name);
-        const std::string description = trimmed(event.description);
-        ImGui::Text("  %s - %s", start.c_str(), end.c_str());
-        ImGui::SameLine();
-        if (is_now) {
-            ImGui::TextColored(ImVec4(0.35F, 0.88F, 0.55F, 1.0F), ">> %s",
-                               name.c_str());
-        } else {
-            ImGui::Text("%s", name.c_str());
-        }
+        ImGui::TextDisabled("%s  %s - %s", tag, start.c_str(), end.c_str());
+        std::string title = trimmed(event.name);
         if (!event.genre.empty()) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("[%s]", event.genre.c_str());
+            title += "  [" + event.genre + "]";
         }
-        if (!description.empty() && description != name) {
+        if (is_now) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(0.35F, 0.88F, 0.55F, 1.0F));
+        }
+        ImGui::TextWrapped("%s", title.c_str());
+        if (is_now) {
+            ImGui::PopStyleColor();
+        }
+        const std::string description = trimmed(event.description);
+        if (!description.empty() && description != event.name) {
             ImGui::TextWrapped("%s", description.c_str());
         }
     };
     if (now_event != snapshot.events.end()) {
         draw_event("NOW", *now_event, true);
     } else {
-        ImGui::TextDisabled("NOW");
-        ImGui::TextDisabled("  (no event currently running)");
+        ImGui::TextDisabled("NOW  (no event currently running)");
     }
     ImGui::Separator();
     if (next_event != snapshot.events.end()) {
         draw_event("NEXT", *next_event, false);
     } else {
-        ImGui::TextDisabled("NEXT");
-        ImGui::TextDisabled("  (no upcoming event)");
+        ImGui::TextDisabled("NEXT  (no upcoming event)");
     }
     ImGui::PopID();
 }
 
 void draw_ts_recorder_panel(AppState &state) {
-    if (!ImGui::CollapsingHeader("MPEG-TS Stream Recorder",
-                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (!ImGui::CollapsingHeader("MPEG-TS Stream Recorder")) {
         return;
     }
     ImGui::PushID("ts-recorder");
@@ -291,8 +287,7 @@ void draw_ts_recorder_panel(AppState &state) {
 }
 
 void draw_rtp_streaming_panel(AppState &state) {
-    if (!ImGui::CollapsingHeader("RTP/UDP MPEG-TS Streaming",
-                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (!ImGui::CollapsingHeader("RTP/UDP MPEG-TS Streaming")) {
         return;
     }
     ImGui::PushID("rtp-streaming");
@@ -442,16 +437,15 @@ void draw_playback_panel(AppState &state) {
             "to the system clock. Only meaningful for live reception; for a "
             "recording it reflects the processing speed.");
     }
-    ImGui::Text("PCR/PTS/DTS     %llu / %llu / %llu   seams %llu+%llu   "
-                "max %.0f ms",
-                static_cast<unsigned long long>(clock.pcr_count),
-                static_cast<unsigned long long>(clock.pts_count),
-                static_cast<unsigned long long>(clock.dts_count),
-                static_cast<unsigned long long>(
-                    clock.pcr_flagged_discontinuities),
-                static_cast<unsigned long long>(
-                    clock.pcr_unflagged_discontinuities),
-                clock.pcr_interval_max_ms);
+    ImGui::Text(
+        "PCR/PTS/DTS     %llu / %llu / %llu   seams %llu+%llu   "
+        "max %.0f ms",
+        static_cast<unsigned long long>(clock.pcr_count),
+        static_cast<unsigned long long>(clock.pts_count),
+        static_cast<unsigned long long>(clock.dts_count),
+        static_cast<unsigned long long>(clock.pcr_flagged_discontinuities),
+        static_cast<unsigned long long>(clock.pcr_unflagged_discontinuities),
+        clock.pcr_interval_max_ms);
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         ImGui::SetTooltip(
             "Timestamps seen in the full multiplex, PCR seams announced by "
@@ -517,8 +511,18 @@ void draw_video_panel(AppState &state) {
                       : selected_service->name);
     draw->AddText(ImVec2(origin.x + 16.0F, origin.y + 14.0F),
                   IM_COL32(220, 230, 240, 255), program_title.c_str());
-    draw->AddText(ImVec2(extent.x - 165.0F, origin.y + 14.0F),
-                  IM_COL32(90, 205, 255, 255), "VIDEO PREVIEW");
+    constexpr float expand_button_width = 92.0F;
+    ImGui::SetCursorScreenPos(
+        ImVec2(extent.x - expand_button_width - 12.0F, origin.y + 9.0F));
+    if (ImGui::Button(state.ui.video_expanded ? "Restore" : "Expand",
+                      ImVec2(expand_button_width, 0.0F))) {
+        state.ui.video_expanded = !state.ui.video_expanded;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip(state.ui.video_expanded
+                              ? "Show the panels again (Esc or F)"
+                              : "Hide the panels and fill the window (F)");
+    }
 
     const ImVec2 center{(origin.x + extent.x) * 0.5F,
                         (origin.y + footer_origin.y) * 0.5F};
