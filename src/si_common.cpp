@@ -16,6 +16,41 @@ namespace {
     return value < 0x20U && value != '\t';
 }
 
+// EN 300 468 Annex A.1: in ISO/IEC 10646 strings the C1 control codes
+// 0x80..0x9F are carried as U+E080..U+E09F. CR/LF (0x8A) becomes a line
+// break; emphasis and the other codes carry no text and are dropped.
+constexpr std::uint32_t dvb_control_first = 0xE080U;
+constexpr std::uint32_t dvb_control_last = 0xE09FU;
+constexpr std::uint32_t dvb_control_crlf = 0xE08AU;
+
+[[nodiscard]] constexpr bool
+is_dvb_control(const std::uint32_t value) noexcept {
+    return value >= dvb_control_first && value <= dvb_control_last;
+}
+
+// Applies the same mapping to UTF-8 text, where the codes are the three-byte
+// sequences EE 82 80..9F.
+std::string strip_dvb_controls(std::string text) {
+    std::string output;
+    output.reserve(text.size());
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const auto byte = static_cast<unsigned char>(text[index]);
+        if (byte == 0xEEU && index + 2 < text.size() &&
+            static_cast<unsigned char>(text[index + 1]) == 0x82U) {
+            const auto low = static_cast<unsigned char>(text[index + 2]);
+            if (low >= 0x80U && low <= 0x9FU) {
+                if ((dvb_control_first | (low - 0x80U)) == dvb_control_crlf) {
+                    output.push_back('\n');
+                }
+                index += 2;
+                continue;
+            }
+        }
+        output.push_back(text[index]);
+    }
+    return output;
+}
+
 std::string passthrough_text(const std::span<const std::uint8_t> bytes) {
     std::string text;
     text.reserve(bytes.size());
@@ -35,8 +70,12 @@ std::string utf16_text(const std::span<const std::uint8_t> bytes) {
             bytes[offset + 1];
         // Surrogate code units are outside the Basic Multilingual Plane and
         // have no valid UTF-8 form.
-        if (is_control(codepoint) ||
-            (codepoint >= 0xD800U && codepoint <= 0xDFFFU)) {
+        if (is_dvb_control(codepoint)) {
+            if (codepoint == dvb_control_crlf) {
+                text.push_back('\n');
+            }
+        } else if (is_control(codepoint) ||
+                   (codepoint >= 0xD800U && codepoint <= 0xDFFFU)) {
             text.push_back('?');
         } else if (codepoint < 0x80U) {
             text.push_back(static_cast<char>(codepoint));
@@ -118,7 +157,7 @@ std::string dvb_text(std::span<const std::uint8_t> bytes) {
     case 0x11U: // ISO/IEC 10646, UTF-16BE
         return utf16_text(payload);
     case 0x15U: // UTF-8: preserve bytes verbatim
-        return passthrough_text(payload);
+        return strip_dvb_controls(passthrough_text(payload));
     case 0x14U: // Big5 (Traditional Chinese)
         if (const auto text = iconv_text("BIG5", payload); !text.empty()) {
             return text;
